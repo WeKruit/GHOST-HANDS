@@ -9,6 +9,7 @@ import {
   resolveQualityPreset,
 } from './costControl.js';
 import { ProgressTracker, ProgressStep } from './progressTracker.js';
+import { loadModelConfig } from '../config/models.js';
 
 // --- Types ---
 
@@ -486,37 +487,18 @@ export class JobExecutor {
   private buildLLMClient(job: AutomationJob): LLMConfig {
     const tier = job.input_data.tier || 'starter';
 
-    // Map subscription tiers to model choices
-    // Premium uses Claude Sonnet, others use the default configured model
-    if (tier === 'premium' && process.env.ANTHROPIC_API_KEY) {
-      return {
-        provider: 'anthropic',
-        options: {
-          model: 'claude-sonnet-4-5-20250929',
-          apiKey: process.env.ANTHROPIC_API_KEY,
-        },
-      };
+    // Premium tier forces Claude Sonnet
+    if (tier === 'premium') {
+      const resolved = loadModelConfig('claude-sonnet');
+      return resolved.llmClient as LLMConfig;
     }
 
-    // Default: use Google Gemini (free tier) or OpenAI-generic if configured
-    if (process.env.OPENAI_API_KEY) {
-      return {
-        provider: 'openai',
-        options: {
-          model: process.env.GH_DEFAULT_MODEL || 'gpt-4o-mini',
-          apiKey: process.env.OPENAI_API_KEY,
-        },
-      };
-    }
-
-    // Fallback to Google AI (magnitude-core default)
-    return {
-      provider: 'google-ai',
-      options: {
-        model: 'gemini-2.5-pro-preview-05-06',
-        apiKey: process.env.GOOGLE_API_KEY,
-      },
-    };
+    // Use job-level model override, GH_MODEL env var, or config default
+    const modelOverride = job.metadata?.model
+      || process.env.GH_MODEL
+      || process.env.GH_DEFAULT_MODEL;
+    const resolved = loadModelConfig(modelOverride);
+    return resolved.llmClient as LLMConfig;
   }
 
   // --- Screenshot upload ---

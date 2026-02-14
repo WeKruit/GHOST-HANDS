@@ -211,7 +211,7 @@ function buildLLMClient(config: ModelsConfig, alias: string): ResolvedModel {
  */
 export function loadModelConfig(override?: string): ResolvedModel {
     const config = loadConfig();
-    const input = override || getModelFromArgs() || process.env.MODEL || config.default;
+    const input = override || getModelFromArgs() || process.env.GH_MODEL || process.env.MODEL || config.default;
     const alias = resolveAlias(config, input);
     return buildLLMClient(config, alias);
 }

@@ -27,7 +27,13 @@ export class MagnitudeAdapter implements BrowserAutomationAdapter {
       url: options.url,
       llm: {
         provider: options.llm.provider,
-        options: options.llm.options,
+        options: {
+          model: options.llm.options.model,
+          apiKey: options.llm.options.apiKey,
+          ...(options.llm.options.baseUrl && { baseUrl: options.llm.options.baseUrl }),
+          ...(options.llm.options.temperature !== undefined && { temperature: options.llm.options.temperature }),
+          ...(options.llm.options.headers && { headers: options.llm.options.headers }),
+        },
       } as any,
       connectors: options.connectors,
       prompt: options.systemPrompt,
