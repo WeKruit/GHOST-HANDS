@@ -1,1 +1,17 @@
 .env
+# Node modules
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Logs  
+*.log
+
+# Temp
+*.tmp
+tmp/
