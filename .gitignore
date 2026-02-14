@@ -9,9 +9,12 @@ node_modules/
 # OS
 .DS_Store
 
-# Logs  
+# Logs
 *.log
 
 # Temp
 *.tmp
 tmp/
+
+# Magnitude source (clone separately from upstream)
+magnitude-source/
