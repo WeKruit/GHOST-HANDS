@@ -1,0 +1,19 @@
+# fly.worker.toml -- GhostHands Worker
+# Deploy: fly deploy --config fly.worker.toml --app ghosthands-worker
+app = "ghosthands-worker"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  MAX_CONCURRENT_JOBS = "2"
+
+[processes]
+  worker = "bun packages/ghosthands/src/workers/main.ts"
+
+[[vm]]
+  size = "performance-2x"
+  memory = "4096mb"
+  cpus = 2

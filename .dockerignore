@@ -1,0 +1,37 @@
+.turbo
+dist
+node_modules
+
+# sst
+.sst
+
+# Git
+.git
+.gitignore
+
+# Environment files (secrets set via Fly.io / env vars)
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Docs and non-essential files for Docker build
+docs/
+evals/
+LICENSE
+.changeset/
+
+# Test files (not needed in production image)
+test/
+test-*.ts
+__tests__/
+*.test.ts
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,26 @@
+{
+  "name": "ghost-hands",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "dev:api": "bun --watch packages/ghosthands/src/api/server.ts",
+    "dev:worker": "bun --watch packages/ghosthands/src/workers/main.ts",
+    "test": "vitest run",
+    "test:unit": "vitest run packages/ghosthands/__tests__/unit",
+    "test:integration": "vitest run packages/ghosthands/__tests__/integration",
+    "test:e2e": "vitest run packages/ghosthands/__tests__/e2e",
+    "magnitude:update": "bun update magnitude-core magnitude-extract"
+  },
+  "packageManager": "bun@1.2.8^",
+  "devDependencies": {
+    "turbo": "^2.4.4",
+    "typescript": "5.8.2",
+    "vitest": "^4.0.18"
+  },
+  "dependencies": {
+    "patchright": "^1.52.5"
+  }
+}
