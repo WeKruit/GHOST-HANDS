@@ -10,8 +10,8 @@ import pg from 'pg';
 
 const { Pool } = pg;
 
-// Load .env from workspace root
-const envPath = join(__dirname, '../../../../.env');
+// Load .env from package root (packages/ghosthands/.env)
+const envPath = join(__dirname, '../../.env');
 const envContent = readFileSync(envPath, 'utf8');
 for (const line of envContent.split('\n')) {
   const match = line.match(/^([^#=]+)=(.*)$/);
