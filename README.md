@@ -1,92 +1,126 @@
 # GHOST-HANDS
 
-Browser automation system for job applications, built as an extension to [Magnitude](https://github.com/magnitudedev/browser-agent).
+Browser automation system for job applications with **adapter-based architecture** supporting multiple browser automation engines.
 
 ## 🏗️ Architecture
 
-GHOST-HANDS is a **hybrid system** combining multiple open-source browser automation tools:
-- **Magnitude** - Base browser automation framework (upstream dependency)
-- **Stagehand** - Visual understanding (planned integration)
-- **GhostHands** - Our custom glue layer (API, worker, VALET integration)
+GHOST-HANDS uses a **clean adapter pattern** to integrate multiple browser automation tools:
+- **Magnitude** - Current implementation (npm dependency)
+- **Stagehand** - Visual understanding (adapter ready, awaiting integration)
+- **Actionbook** - Pre-computed action manuals (adapter ready, awaiting integration)
 
-### Repository Contents
-- `docs/` - Architecture, security, and integration documentation
-- `examples/` - React components and usage examples  
-- `*.sql` - Supabase migration files for VALET integration
-- `magnitude-source/` - **Not tracked** - Clone separately from upstream
+### Repository Structure
+```
+GHOST-HANDS/
+├── packages/ghosthands/
+│   ├── src/adapters/          # Browser automation abstraction
+│   │   ├── types.ts           # BrowserAutomationAdapter interface
+│   │   ├── magnitude.ts       # Magnitude wrapper (current)
+│   │   ├── mock.ts            # Mock for testing
+│   │   └── index.ts           # Factory + exports
+│   ├── src/api/               # REST API (Hono)
+│   ├── src/workers/           # Job queue + executor
+│   ├── src/client/            # VALET integration SDK
+│   ├── src/monitoring/        # Logging, metrics, alerts
+│   ├── src/security/          # Rate limiting, encryption
+│   └── __tests__/e2e/         # 102 E2E tests
+├── docs/                      # Architecture, research, migration docs
+├── magnitude-source/          # Backup (not tracked, for reference)
+└── ...
+```
 
 ## 🚀 Quick Start
 
-### 1. Clone GHOST-HANDS
+### 1. Clone and Install
 \`\`\`bash
 git clone https://github.com/WeKruit/GHOST-HANDS.git
 cd GHOST-HANDS
+
+# Install dependencies (includes magnitude-core@0.3.1 via npm)
+bun install
+
+# Build
+bun run build
 \`\`\`
 
-### 2. Clone Magnitude (upstream)
+### 2. Set Up Environment
 \`\`\`bash
-# Clone the upstream Magnitude browser-agent
-git clone https://github.com/magnitudedev/browser-agent.git magnitude-source
-cd magnitude-source
+# Copy example env file
+cp .env.example packages/ghosthands/.env
 
-# Install dependencies
-bun install --ignore-scripts
+# Edit with your credentials
+nano packages/ghosthands/.env
 \`\`\`
 
-### 3. Add GhostHands Package
-The GhostHands code lives in \`magnitude-source/packages/ghosthands/\` (not tracked in this repo).
-
-To set it up from scratch:
+### 3. Run Database Migration
 \`\`\`bash
-cd magnitude-source/packages/ghosthands
-
-# Run database migration
+cd packages/ghosthands
 bun src/scripts/run-migration.ts
-
-# Verify setup
 bun src/scripts/verify-setup.ts
 \`\`\`
 
 ### 4. Start the System
 \`\`\`bash
-# Terminal 1: API Server
+# Terminal 1: API Server (port 3000)
 bun run api:dev
 
-# Terminal 2: Job Worker  
+# Terminal 2: Job Worker
 bun run worker:dev
 
 # Terminal 3: Run tests
 bun run test:e2e
 \`\`\`
 
-## 🔄 Updating Magnitude
+## 🔄 Updating Dependencies
 
-Pull the latest from upstream:
+Pull latest Magnitude updates:
 \`\`\`bash
-cd magnitude-source
-git pull origin main
+# Check for updates
+bun outdated
+
+# Update Magnitude
+bun update magnitude-core magnitude-extract
+
+# Rebuild
+bun run build
 \`\`\`
 
-Your GhostHands package (\`packages/ghosthands/\`) is separate and won't be affected.
+## 🛠️ What's Inside?
 
-## 🛠️ What's in GhostHands?
+### Core Components
+- **Adapter Layer** (`src/adapters/`) - Abstraction for Magnitude/Stagehand/Actionbook
+- **REST API** (`src/api/`) - Hono-based job management with auth
+- **Job Worker** (`src/workers/`) - Postgres LISTEN/NOTIFY + browser automation
+- **VALET Client** (`src/client/`) - Dual-mode (API + DB) integration SDK
+- **Monitoring** (`src/monitoring/`) - Structured logging, metrics, health checks
+- **Security** (`src/security/`) - Rate limiting, cost control, encryption, RLS
+- **Testing** (`__tests__/e2e/`) - 102 E2E tests covering all workflows
 
-The \`packages/ghosthands/\` package (local, not pushed to this repo) includes:
-
-- **REST API** (Hono) - Job management endpoints with auth
-- **Job Worker** - Postgres LISTEN/NOTIFY + browser automation
-- **VALET Client** - Dual-mode (API + DB) integration library
-- **Monitoring** - Structured logging, metrics, health checks
-- **Security** - Rate limiting, cost control, encryption, RLS
-- **Testing** - 102 E2E tests covering all workflows
+### Features
+✅ Browser automation via adapter pattern
+✅ Multiple engine support (Magnitude, Stagehand-ready, Actionbook-ready)
+✅ Job queue with instant pickup (LISTEN/NOTIFY)
+✅ Progress tracking (11-step lifecycle)
+✅ Cost tracking and budget enforcement
+✅ Rate limiting by tier and platform
+✅ Security: AES-256-GCM encryption, RLS policies, CSP headers
+✅ Deployment: Docker, Fly.io configs, CI/CD pipeline
 
 ## 📚 Documentation
 
-- [Architecture](docs/ARCHITECTURE.md)
-- [Security & Architecture Report](docs/SECURITY-AND-ARCHITECTURE-REPORT.md)
+### Architecture & Research
+- [Proposed Directory Structure](docs/15-proposed-directory-structure.md) - Clean architecture design
+- [Migration Plan](docs/16-migration-plan.md) - 5-phase migration to npm + adapters
+- [Adapter Validation](docs/adapter-validation.md) - Proof that Magnitude/Stagehand/Actionbook work
+- [Dependency Map](docs/dependency-map.md) - Code analysis and coupling report
+- [OSS Wrapping Patterns](docs/research/oss-wrapping-patterns.md) - Best practices research
+
+### Integration & Deployment
 - [VALET Integration](docs/12-valet-ghosthands-integration.md)
 - [Integration Architecture Decision](docs/13-integration-architecture-decision.md)
 - [Deployment Strategy](docs/14-deployment-strategy.md)
+- [Architecture Overview](docs/ARCHITECTURE.md)
+- [Security & Architecture Report](docs/SECURITY-AND-ARCHITECTURE-REPORT.md)
 
 ## 📋 Requirements
 
@@ -113,27 +147,45 @@ GOOGLE_API_KEY=...
 
 ## 🔮 Roadmap
 
-### Current (v0.1)
-- ✅ Magnitude-based browser automation
+### v0.1 - Foundation (Current) ✅
+- ✅ Clean adapter-based architecture
+- ✅ Magnitude integration via npm dependency
 - ✅ Job queue with Postgres LISTEN/NOTIFY
-- ✅ REST API + worker architecture
-- ✅ VALET integration
+- ✅ REST API + worker system
+- ✅ VALET integration SDK
+- ✅ Production-ready deployment configs
 
-### Planned (v0.2+)
-- 🔄 Stagehand integration for visual understanding
-- 🔄 Multi-provider automation (Magnitude + Stagehand + custom)
+### v0.2 - Multi-Engine Support (Next)
+- 🔄 Stagehand adapter implementation (validated, ready to build)
+- 🔄 Actionbook adapter implementation (validated, ready to build)
+- 🔄 HybridAdapter (smart routing between engines)
+- 🔄 Engine selection by task complexity
+- 🔄 Visual understanding via Stagehand
+
+### v0.3 - Intelligence Layer
 - 🔄 Smarter form detection and filling
 - 🔄 Enhanced progress tracking with screenshots
+- 🔄 Self-healing selectors
+- 🔄 Action replay and debugging tools
 
-## 📝 Why Not Track magnitude-source?
+## 🎯 Why This Architecture?
 
-We keep \`magnitude-source/\` in \`.gitignore\` because:
-1. It's an **upstream dependency** we pull from regularly
-2. Our custom code (\`packages/ghosthands/\`) is modular and separate
-3. Easier to test upstream updates without merge conflicts
-4. Allows switching to alternative tools (Stagehand) in the future
+### Adapter Pattern Benefits
+1. **Easy engine updates** - `bun update magnitude-core` pulls latest without conflicts
+2. **Swappable backends** - Switch between Magnitude/Stagehand/Actionbook via config
+3. **Clean separation** - Our code (`packages/ghosthands`) never touches upstream
+4. **Testing** - MockAdapter enables unit tests without browsers
+5. **Future-proof** - Add new engines without refactoring core logic
 
-For development, the GhostHands package is self-contained and can be extracted or migrated to a standalone package when needed.
+### npm vs Git Submodule
+We chose **npm dependencies** over git submodules because:
+- ✅ Standard tooling (bun/npm) - no git submodule complexity
+- ✅ Version pinning via package.json + bun.lock
+- ✅ Simpler CI/CD (no submodule init/update)
+- ✅ Better developer experience
+- ✅ Emergency hotfixes via `patch-package`
+
+See [docs/research/oss-wrapping-patterns.md](docs/research/oss-wrapping-patterns.md) for full analysis.
 
 ---
 
