@@ -37,6 +37,12 @@
       "name": "Anthropic",
       "envKey": "ANTHROPIC_API_KEY",
       "docs": "https://docs.anthropic.com/"
+    },
+    "zhipu": {
+      "name": "Zhipu AI (ChatGLM)",
+      "baseUrl": "https://open.bigmodel.cn/api/paas/v4/",
+      "envKey": "ZHIPU_API_KEY",
+      "docs": "https://open.bigmodel.cn/dev/api/thirdparty-frame/openai-sdk"
     }
   },
 
@@ -144,6 +150,13 @@
       "model": "claude-haiku-4-5-20251001",
       "vision": true,
       "cost": { "input": 0.80, "output": 4.00, "unit": "$/M tokens" }
+    },
+    "glm-5": {
+      "provider": "zhipu",
+      "model": "glm-5",
+      "vision": true,
+      "cost": { "input": 0.50, "output": 0.50, "unit": "$/M tokens" },
+      "note": "Zhipu AI GLM-5, supports vision via OpenAI-compatible API"
     }
   },
 

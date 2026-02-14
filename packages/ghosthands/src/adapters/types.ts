@@ -137,6 +137,9 @@ export interface LLMConfig {
   options: {
     model: string;
     apiKey?: string;
+    baseUrl?: string;
+    temperature?: number;
+    headers?: Record<string, string>;
   };
   /** LLM roles for multi-model setups (Magnitude) */
   roles?: ('act' | 'extract' | 'query')[];
