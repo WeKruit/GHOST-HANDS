@@ -1,0 +1,55 @@
+# docker-compose.yml
+# Local development environment for GhostHands API + Worker
+#
+# Usage:
+#   cp .env.example .env     # Fill in real values
+#   docker compose up         # Start all services
+#   docker compose up api     # Start API only
+#   docker compose up worker  # Start worker only
+#   docker compose logs -f    # Tail all logs
+
+services:
+  # ── GhostHands API Server ──────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["bun", "--watch", "packages/ghosthands/src/api/server.ts"]
+    ports:
+      - "${GH_API_PORT:-3100}:3100"
+    env_file: .env
+    environment:
+      - NODE_ENV=development
+      - GH_API_PORT=3100
+    volumes:
+      # Mount source for hot-reload with bun --watch
+      - ./packages/ghosthands/src:/app/packages/ghosthands/src:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3100/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── GhostHands Worker ──────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["bun", "--watch", "packages/ghosthands/src/workers/main.ts"]
+    env_file: .env
+    environment:
+      - NODE_ENV=development
+      - MAX_CONCURRENT_JOBS=1
+    volumes:
+      - ./packages/ghosthands/src:/app/packages/ghosthands/src:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+    restart: unless-stopped

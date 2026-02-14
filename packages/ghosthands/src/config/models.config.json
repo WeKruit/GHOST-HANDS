@@ -1,0 +1,170 @@
+{
+  "$schema": "./models.config.schema.json",
+  "version": 1,
+
+  "providers": {
+    "siliconflow": {
+      "name": "SiliconFlow",
+      "baseUrl": "https://api.siliconflow.cn/v1",
+      "envKey": "SILICONFLOW_API_KEY",
+      "docs": "https://docs.siliconflow.cn/en/userguide/capabilities/vision"
+    },
+    "deepseek": {
+      "name": "DeepSeek",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "envKey": "DEEPSEEK_API_KEY",
+      "docs": "https://platform.deepseek.com/docs"
+    },
+    "moonshot": {
+      "name": "Moonshot (Kimi)",
+      "baseUrl": "https://api.moonshot.ai/v1",
+      "envKey": "MOONSHOT_API_KEY",
+      "docs": "https://platform.moonshot.ai/docs"
+    },
+    "minimax": {
+      "name": "MiniMax",
+      "baseUrl": "https://api.minimax.io/v1",
+      "envKey": "MINIMAX_API_KEY",
+      "docs": "https://platform.minimax.io/docs/api-reference/text-openai-api"
+    },
+    "openai": {
+      "name": "OpenAI",
+      "baseUrl": "https://api.openai.com/v1",
+      "envKey": "OPENAI_API_KEY",
+      "docs": "https://platform.openai.com/docs"
+    },
+    "anthropic": {
+      "name": "Anthropic",
+      "envKey": "ANTHROPIC_API_KEY",
+      "docs": "https://docs.anthropic.com/"
+    }
+  },
+
+  "models": {
+    "qwen-7b": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+      "vision": true,
+      "cost": { "input": 0.05, "output": 0.15, "unit": "$/M tokens" }
+    },
+    "qwen-32b": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen2.5-VL-32B-Instruct",
+      "vision": true,
+      "cost": { "input": 0.26, "output": 0.78, "unit": "$/M tokens" }
+    },
+    "qwen-72b": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen2.5-VL-72B-Instruct",
+      "vision": true,
+      "cost": { "input": 0.25, "output": 0.75, "unit": "$/M tokens" }
+    },
+    "qwen3-8b": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen3-VL-8B-Instruct",
+      "vision": true,
+      "cost": { "input": 0.07, "output": 0.27, "unit": "$/M tokens" }
+    },
+    "qwen3-32b": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen3-VL-32B-Instruct",
+      "vision": true,
+      "cost": { "input": 0.14, "output": 0.55, "unit": "$/M tokens" }
+    },
+    "qwen3-235b": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen3-VL-235B-A22B-Instruct",
+      "vision": true,
+      "cost": { "input": 0.34, "output": 1.37, "unit": "$/M tokens" }
+    },
+    "deepseek-chat": {
+      "provider": "deepseek",
+      "model": "deepseek-chat",
+      "vision": false,
+      "cost": { "input": 0.27, "output": 1.10, "unit": "$/M tokens" },
+      "note": "No vision support; works with accessibility tree only"
+    },
+    "deepseek-reasoner": {
+      "provider": "deepseek",
+      "model": "deepseek-reasoner",
+      "vision": false,
+      "cost": { "input": 0.55, "output": 2.19, "unit": "$/M tokens" },
+      "note": "No vision support; reasoning model"
+    },
+    "kimi-8k": {
+      "provider": "moonshot",
+      "model": "moonshot-v1-8k-vision-preview",
+      "vision": true,
+      "cost": { "input": 0.60, "output": 3.00, "unit": "$/M tokens" }
+    },
+    "kimi-32k": {
+      "provider": "moonshot",
+      "model": "moonshot-v1-32k-vision-preview",
+      "vision": true,
+      "cost": { "input": 0.60, "output": 3.00, "unit": "$/M tokens" }
+    },
+    "kimi-128k": {
+      "provider": "moonshot",
+      "model": "moonshot-v1-128k-vision-preview",
+      "vision": true,
+      "cost": { "input": 0.60, "output": 3.00, "unit": "$/M tokens" }
+    },
+    "minimax-vl": {
+      "provider": "minimax",
+      "model": "MiniMax-VL-01",
+      "vision": true,
+      "cost": { "input": 0.20, "output": 1.10, "unit": "$/M tokens" }
+    },
+    "minimax-m2.5": {
+      "provider": "minimax",
+      "model": "MiniMax-M2.5",
+      "vision": false,
+      "cost": { "input": 0.20, "output": 1.10, "unit": "$/M tokens" }
+    },
+    "gpt-4o": {
+      "provider": "openai",
+      "model": "gpt-4o",
+      "vision": true,
+      "cost": { "input": 2.50, "output": 10.00, "unit": "$/M tokens" }
+    },
+    "gpt-4o-mini": {
+      "provider": "openai",
+      "model": "gpt-4o-mini",
+      "vision": true,
+      "cost": { "input": 0.15, "output": 0.60, "unit": "$/M tokens" }
+    },
+    "claude-sonnet": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5-20250929",
+      "vision": true,
+      "cost": { "input": 3.00, "output": 15.00, "unit": "$/M tokens" }
+    },
+    "claude-haiku": {
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5-20251001",
+      "vision": true,
+      "cost": { "input": 0.80, "output": 4.00, "unit": "$/M tokens" }
+    }
+  },
+
+  "presets": {
+    "speed": {
+      "description": "Fastest and cheapest -- good for rapid iteration and testing",
+      "model": "qwen-7b"
+    },
+    "balanced": {
+      "description": "Best value for browser automation -- good vision, very cheap",
+      "model": "qwen-72b"
+    },
+    "quality": {
+      "description": "Most capable model -- best for complex pages and reasoning",
+      "model": "qwen3-235b"
+    },
+    "premium": {
+      "description": "OpenAI GPT-4o -- high quality but expensive",
+      "model": "gpt-4o"
+    }
+  },
+
+  "default": "qwen-72b"
+}

@@ -1,0 +1,31 @@
+# fly.toml -- GhostHands API Server
+# Deploy: fly deploy --config fly.toml --app ghosthands-api
+app = "ghosthands-api"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  GH_API_PORT = "3100"
+
+[http_service]
+  internal_port = 3100
+  force_https = true
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "15s"
+  method = "GET"
+  path = "/health"
+  timeout = "3s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  cpus = 1
