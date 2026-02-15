@@ -2,6 +2,7 @@ import { createClient } from '@supabase/supabase-js';
 import { Client as PgClient } from 'pg';
 import { JobPoller } from './JobPoller.js';
 import { JobExecutor } from './JobExecutor.js';
+import { registerBuiltinHandlers } from './taskHandlers/index.js';
 
 /**
  * GhostHands Worker Entry Point
@@ -27,6 +28,10 @@ function requireEnv(name: string): string {
 
 async function main(): Promise<void> {
   console.log(`[Worker] Starting ${WORKER_ID}...`);
+
+  // Register all built-in task handlers
+  registerBuiltinHandlers();
+  console.log(`[Worker] Task handlers registered`);
 
   // Validate required environment variables
   const supabaseUrl = requireEnv('SUPABASE_URL');

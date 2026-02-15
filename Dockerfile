@@ -69,10 +69,11 @@ COPY --from=build /app/package.json ./
 COPY --from=build /app/packages/ghosthands/dist ./packages/ghosthands/dist
 COPY --from=build /app/packages/ghosthands/src ./packages/ghosthands/src
 COPY --from=build /app/packages/ghosthands/package.json ./packages/ghosthands/
-COPY --from=build /app/packages/ghosthands/node_modules ./packages/ghosthands/node_modules 2>/dev/null || true
+# Note: bun hoists all dependencies to root node_modules/, so
+# packages/ghosthands/node_modules/ typically doesn't exist.
 
 # Install Patchright browser binaries (Chromium only)
-RUN cd /app && npx patchright install chromium
+RUN bunx patchright install chromium
 
 # Create non-root user
 RUN groupadd -r ghosthands && useradd -r -g ghosthands -m ghosthands

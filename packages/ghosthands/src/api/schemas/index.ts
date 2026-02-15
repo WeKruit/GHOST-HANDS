@@ -15,3 +15,17 @@ export type {
   GetEventsQuery,
   JobStatus,
 } from './job.js';
+
+export {
+  ValetApplySchema,
+  ValetTaskSchema,
+  ResumeRefSchema,
+  ProfileSchema,
+  EducationSchema,
+  WorkHistorySchema,
+  LocationSchema,
+} from './valet.js';
+export type {
+  ValetApplyInput,
+  ValetTaskInput,
+} from './valet.js';

@@ -1,6 +1,5 @@
 import { SupabaseClient } from '@supabase/supabase-js';
 import { createAdapter, type BrowserAutomationAdapter, type TokenUsage, type AdapterType, type LLMConfig } from '../adapters';
-import { z } from 'zod';
 import {
   CostTracker,
   CostControlService,
@@ -10,23 +9,15 @@ import {
 } from './costControl.js';
 import { ProgressTracker, ProgressStep } from './progressTracker.js';
 import { loadModelConfig } from '../config/models.js';
+import { taskHandlerRegistry } from './taskHandlers/registry.js';
+import { callbackNotifier } from './callbackNotifier.js';
+import type { TaskContext, TaskResult } from './taskHandlers/types.js';
+
+// Re-export AutomationJob from the canonical location for backward compat
+export type { AutomationJob } from './taskHandlers/types.js';
+import type { AutomationJob } from './taskHandlers/types.js';
 
 // --- Types ---
-
-export interface AutomationJob {
-  id: string;
-  job_type: string;
-  target_url: string;
-  task_description: string;
-  input_data: Record<string, any>;
-  user_id: string;
-  timeout_seconds: number;
-  max_retries: number;
-  retry_count: number;
-  metadata: Record<string, any>;
-  priority: number;
-  tags: string[];
-}
 
 export interface JobExecutorOptions {
   supabase: SupabaseClient;
@@ -168,17 +159,39 @@ export class JobExecutor {
         action_limit: costTracker.getActionLimit(),
       });
 
-      // 2. Load user credentials if available
+      // 2. Resolve task handler
+      const handler = taskHandlerRegistry.getOrThrow(job.job_type);
+
+      // 3. Validate input if handler supports it
+      if (handler.validate) {
+        const validation = handler.validate(job.input_data);
+        if (!validation.valid) {
+          const msg = `Input validation failed: ${validation.errors?.join(', ')}`;
+          await this.updateJobStatus(job.id, 'failed', msg);
+          await this.supabase
+            .from('gh_automation_jobs')
+            .update({
+              status: 'failed',
+              completed_at: new Date().toISOString(),
+              error_code: 'validation_error',
+              error_details: { message: msg, errors: validation.errors },
+            })
+            .eq('id', job.id);
+          return;
+        }
+      }
+
+      // 4. Load user credentials if available
       const platform = detectPlatform(job.target_url);
       const credentials = await this.loadCredentials(job.user_id, platform);
 
-      // 3. Build data prompt from input_data
+      // 5. Build data prompt from input_data
       const dataPrompt = buildDataPrompt(job.input_data);
 
-      // 4. Build LLM client config
+      // 6. Build LLM client config
       const llmClient = this.buildLLMClient(job);
 
-      // 5. Create and start adapter
+      // 7. Create and start adapter
       const adapterType = (process.env.GH_BROWSER_ENGINE || 'magnitude') as AdapterType;
       adapter = createAdapter(adapterType);
       await adapter.start({
@@ -186,12 +199,12 @@ export class JobExecutor {
         llm: llmClient,
       });
 
-      // 6. Register credentials if available
+      // 8. Register credentials if available
       if (credentials) {
         adapter.registerCredentials(credentials);
       }
 
-      // 7. Wire up event tracking with cost control + progress
+      // 9. Wire up event tracking with cost control + progress
       await progress.setStep(ProgressStep.NAVIGATING);
 
       adapter.on('thought', (thought: string) => {
@@ -224,36 +237,33 @@ export class JobExecutor {
         }); // throws BudgetExceededError if over budget
       });
 
-      // 8. Execute the task with timeout
-      const timeoutMs = job.timeout_seconds * 1000;
-      await this.updateJobStatus(job.id, 'running', 'Executing browser actions');
+      // 10. Build TaskContext and delegate to handler
+      const ctx: TaskContext = {
+        job,
+        adapter,
+        costTracker,
+        progress,
+        credentials,
+        dataPrompt,
+      };
 
-      const actResult = await Promise.race([
-        adapter.act(job.task_description, {
-          prompt: dataPrompt,
-          data: job.input_data.user_data,
-        }),
+      const timeoutMs = job.timeout_seconds * 1000;
+      await this.updateJobStatus(job.id, 'running', `Executing ${handler.type} handler`);
+
+      const taskResult: TaskResult = await Promise.race([
+        handler.execute(ctx),
         this.createTimeout(timeoutMs),
       ]);
 
-      if (!actResult.success) {
-        throw new Error(`Action failed: ${actResult.message}`);
+      if (!taskResult.success) {
+        throw new Error(taskResult.error || `Task handler '${handler.type}' returned failure`);
       }
 
-      // 9. Extract results
-      await progress.setStep(ProgressStep.EXTRACTING_RESULTS);
-      await this.updateJobStatus(job.id, 'running', 'Extracting results');
-      const result = await adapter.extract(
-        'Extract any confirmation number, success message, or application ID visible on the page',
-        z.object({
-          confirmation_id: z.string().optional(),
-          success_message: z.string().optional(),
-          submitted: z.boolean(),
-        })
-      );
-
-      // 10. Take final screenshot and upload
+      // 11. Take final screenshot and upload
       const screenshotUrls: string[] = [];
+      if (taskResult.screenshotUrl) {
+        screenshotUrls.push(taskResult.screenshotUrl);
+      }
       try {
         const screenshotBuffer = await adapter.screenshot();
         const screenshotUrl = await this.uploadScreenshot(
@@ -266,31 +276,36 @@ export class JobExecutor {
         console.warn(`[JobExecutor] Screenshot failed for job ${job.id}:`, err);
       }
 
-      // 11. Get final cost snapshot
+      // 12. Get final cost snapshot
       const finalCost = costTracker.getSnapshot();
 
-      // 12. Mark progress complete and flush
+      // 13. Mark progress complete and flush
       await progress.setStep(ProgressStep.COMPLETED);
       await progress.flush();
 
       // Mark completed with cost data in result_data
+      const resultData = {
+        ...(taskResult.data || {}),
+        cost: {
+          input_tokens: finalCost.inputTokens,
+          output_tokens: finalCost.outputTokens,
+          total_cost_usd: finalCost.totalCost,
+          action_count: finalCost.actionCount,
+        },
+      };
+
+      const resultSummary =
+        taskResult.data?.success_message ||
+        taskResult.data?.summary ||
+        (taskResult.data?.submitted ? 'Application submitted successfully' : 'Task completed');
+
       await this.supabase
         .from('gh_automation_jobs')
         .update({
           status: 'completed',
           completed_at: new Date().toISOString(),
-          result_data: {
-            ...result,
-            cost: {
-              input_tokens: finalCost.inputTokens,
-              output_tokens: finalCost.outputTokens,
-              total_cost_usd: finalCost.totalCost,
-              action_count: finalCost.actionCount,
-            },
-          },
-          result_summary:
-            result.success_message ||
-            (result.submitted ? 'Application submitted successfully' : 'Task completed'),
+          result_data: resultData,
+          result_summary: resultSummary,
           screenshot_urls: screenshotUrls,
           llm_cost_cents: Math.round(finalCost.totalCost * 100),
           action_count: finalCost.actionCount,
@@ -299,17 +314,36 @@ export class JobExecutor {
         .eq('id', job.id);
 
       await this.logJobEvent(job.id, 'job_completed', {
-        result_summary: result.success_message || 'completed',
-        submitted: result.submitted,
+        handler: handler.type,
+        result_summary: resultSummary,
         action_count: finalCost.actionCount,
         total_tokens: finalCost.inputTokens + finalCost.outputTokens,
         cost_cents: Math.round(finalCost.totalCost * 100),
       });
 
-      // 13. Record cost against user's monthly usage
+      // 14. Record cost against user's monthly usage
       await costService.recordJobCost(job.user_id, job.id, finalCost);
 
-      console.log(`[JobExecutor] Job ${job.id} completed successfully (actions=${finalCost.actionCount}, tokens=${finalCost.inputTokens + finalCost.outputTokens}, cost=$${finalCost.totalCost.toFixed(4)})`);
+      // 15. Fire VALET callback if configured
+      if (job.callback_url) {
+        const jobRow = {
+          id: job.id,
+          valet_task_id: job.valet_task_id,
+          callback_url: job.callback_url,
+          status: 'completed',
+          result_data: resultData,
+          result_summary: resultSummary,
+          screenshot_urls: screenshotUrls,
+          llm_cost_cents: Math.round(finalCost.totalCost * 100),
+          action_count: finalCost.actionCount,
+          total_tokens: finalCost.inputTokens + finalCost.outputTokens,
+        };
+        callbackNotifier.notifyFromJob(jobRow).catch((err) => {
+          console.warn(`[JobExecutor] Callback notification failed for job ${job.id}:`, err);
+        });
+      }
+
+      console.log(`[JobExecutor] Job ${job.id} completed via ${handler.type} handler (actions=${finalCost.actionCount}, tokens=${finalCost.inputTokens + finalCost.outputTokens}, cost=$${finalCost.totalCost.toFixed(4)})`);
     } catch (error: unknown) {
       await progress.setStep(ProgressStep.FAILED);
       await progress.flush();
@@ -320,6 +354,24 @@ export class JobExecutor {
       if (snapshot.totalCost > 0) {
         await costService.recordJobCost(job.user_id, job.id, snapshot).catch((err) => {
           console.warn(`[JobExecutor] Failed to record partial cost for job ${job.id}:`, err);
+        });
+      }
+
+      // Fire VALET callback on failure too
+      if (job.callback_url) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        callbackNotifier.notifyFromJob({
+          id: job.id,
+          valet_task_id: job.valet_task_id,
+          callback_url: job.callback_url,
+          status: 'failed',
+          error_code: this.classifyError(errorMessage),
+          error_details: { message: errorMessage },
+          llm_cost_cents: Math.round(snapshot.totalCost * 100),
+          action_count: snapshot.actionCount,
+          total_tokens: snapshot.inputTokens + snapshot.outputTokens,
+        }).catch((err) => {
+          console.warn(`[JobExecutor] Callback notification failed for job ${job.id}:`, err);
         });
       }
     } finally {

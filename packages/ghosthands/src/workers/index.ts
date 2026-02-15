@@ -18,3 +18,7 @@ export type {
   UserUsage,
   PreflightResult,
 } from './costControl.js';
+export { CallbackNotifier, callbackNotifier } from './callbackNotifier.js';
+export type { CallbackPayload } from './callbackNotifier.js';
+export { ResumeDownloader } from './resumeDownloader.js';
+export type { ResumeRef } from './resumeDownloader.js';
