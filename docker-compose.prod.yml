@@ -1,0 +1,59 @@
+# docker-compose.prod.yml
+# Production deployment for GhostHands API + Worker
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up -d
+#   docker compose -f docker-compose.prod.yml logs -f
+#   docker compose -f docker-compose.prod.yml down
+
+services:
+  # GhostHands API Server
+  api:
+    image: ${ECR_IMAGE:-ghosthands:latest}
+    command: ["bun", "packages/ghosthands/src/api/server.ts"]
+    ports:
+      - "127.0.0.1:${GH_API_PORT:-3100}:3100"
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - GH_API_PORT=3100
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3100/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
+    restart: unless-stopped
+    logging:
+      driver: ${LOG_DRIVER:-json-file}
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # GhostHands Worker
+  worker:
+    image: ${ECR_IMAGE:-ghosthands:latest}
+    command: ["bun", "packages/ghosthands/src/workers/main.ts"]
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-2}
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+    restart: unless-stopped
+    logging:
+      driver: ${LOG_DRIVER:-json-file}
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,7 +1,7 @@
 # 14 - GhostHands Deployment Strategy & VALET Integration
 
-> Complete deployment architecture, Docker configuration, CI/CD pipeline,
-> and VALET integration guide for the GhostHands automation system.
+> Complete deployment architecture for GhostHands: Docker images pushed to ECR,
+> rolling updates controlled by VALET across its EC2 fleet.
 
 ---
 
@@ -10,13 +10,12 @@
 1. [Deployment Architecture](#1-deployment-architecture)
 2. [Process Architecture](#2-process-architecture)
 3. [Docker Configuration](#3-docker-configuration)
-4. [Platform Deployment (Fly.io)](#4-platform-deployment-flyio)
-5. [VALET Integration Guide](#5-valet-integration-guide)
+4. [CI/CD Pipeline](#4-cicd-pipeline)
+5. [VALET-Controlled Deployment](#5-valet-controlled-deployment)
 6. [Configuration Management](#6-configuration-management)
-7. [CI/CD Pipeline](#7-cicd-pipeline)
-8. [Scaling Strategy](#8-scaling-strategy)
-9. [Monitoring & Observability](#9-monitoring--observability)
-10. [Runbooks](#10-runbooks)
+7. [Scaling Strategy](#7-scaling-strategy)
+8. [Monitoring & Observability](#8-monitoring--observability)
+9. [Runbooks](#9-runbooks)
 
 ---
 
@@ -25,93 +24,78 @@
 ### 1.1 Architecture Diagram
 
 ```
-                    ┌──────────────────────────────────────────────────────────┐
-                    │                     INTERNET                             │
-                    └──────────┬──────────────────────────────┬────────────────┘
-                               │                              │
-                    ┌──────────▼──────────┐       ┌──────────▼──────────┐
-                    │   VALET Frontend    │       │   VALET Backend     │
-                    │   (Vercel/Next.js)  │       │   (Next.js API      │
-                    │                     │       │    Routes)           │
-                    └──────────┬──────────┘       └──────────┬──────────┘
-                               │                              │
-                    Supabase   │  Channel 1: DB Insert        │ Channel 2: REST API
-                    Realtime   │  (Direct Supabase)           │ (HTTP)
-                    (WebSocket)│                              │
-                               │                              │
-┌──────────────────────────────┼──────────────────────────────┼────────────────────────────┐
-│  Fly.io Private Network      │                              │                            │
-│                              │                              │                            │
-│  ┌───────────────────────────┼──────────────────────────────┼───────────────┐            │
-│  │  GhostHands API (Fly Machine)                            │               │            │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌────────────────┐   │               │            │
-│  │  │  Hono API   │  │  Auth       │  │  Rate Limiter  │   │               │            │
-│  │  │  Server     │◄─┤  Middleware │◄─┤  + CSP         │◄──┘               │            │
-│  │  │  :3100      │  │             │  │                │                    │            │
-│  │  └──────┬──────┘  └─────────────┘  └────────────────┘                    │            │
-│  │         │                                                                │            │
-│  └─────────┼────────────────────────────────────────────────────────────────┘            │
-│            │                                                                             │
-│  ┌─────────┼────────────────────────────────────────────────────────────────┐            │
-│  │         │  GhostHands Worker (Fly Machine, N instances)                  │            │
-│  │         │                                                                │            │
-│  │  ┌──────▼──────┐  ┌─────────────┐  ┌────────────────┐                   │            │
-│  │  │  JobPoller   │  │ JobExecutor │  │ BrowserAgent   │                   │            │
-│  │  │             │  │             │  │ (Patchright)   │                   │            │
-│  │  │ LISTEN/     │──▶  Cost      │──▶  ManualConn.   │                   │            │
-│  │  │ NOTIFY +    │  │  Control   │  │  LLM Calls     │                   │            │
-│  │  │ Poll Loop   │  │  Heartbeat │  │  Screenshots   │                   │            │
-│  │  └──────┬──────┘  └──────┬─────┘  └────────────────┘                   │            │
-│  │         │                │                                               │            │
-│  └─────────┼────────────────┼───────────────────────────────────────────────┘            │
-│            │                │                                                            │
-└────────────┼────────────────┼────────────────────────────────────────────────────────────┘
-             │                │
-             │                │
-    ┌────────▼────────────────▼──────────────────────────────┐
-    │              Supabase (Shared with VALET)               │
-    │                                                         │
-    │  ┌─────────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐ │
-    │  │  Postgres   │ │  Storage │ │  Auth    │ │Realtime│ │
-    │  │             │ │  (S3)    │ │          │ │        │ │
-    │  │ gh_auto_    │ │          │ │ JWT      │ │ Status │ │
-    │  │ mation_jobs │ │ screen-  │ │ Verify   │ │ Push   │ │
-    │  │ gh_job_     │ │ shots/   │ │          │ │        │ │
-    │  │ events      │ │ gh/...   │ │          │ │        │ │
-    │  │ gh_user_    │ │          │ │          │ │        │ │
-    │  │ credentials │ │          │ │          │ │        │ │
-    │  │ gh_user_    │ │          │ │          │ │        │ │
-    │  │ usage       │ │          │ │          │ │        │ │
-    │  └─────────────┘ └──────────┘ └──────────┘ └────────┘ │
-    └─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────┐
+│                          GitHub Actions CI/CD                             │
+│                                                                           │
+│  Push to main → typecheck → test → docker build → push to ECR            │
+│                                                       │                   │
+│                                                       ▼                   │
+│                                            ┌──────────────────┐           │
+│                                            │  AWS ECR          │           │
+│                                            │  ghosthands:sha   │           │
+│                                            │  ghosthands:latest│           │
+│                                            └────────┬─────────┘           │
+│                                                     │                     │
+│                           Webhook: deploy_ready     │                     │
+│                           (image tag + commit SHA)  │                     │
+└─────────────────────────────────────────────────────┼─────────────────────┘
+                                                      │
+                                                      ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│                     VALET Deployment Controller                           │
+│                                                                           │
+│  1. Receives webhook from GhostHands CI/CD                               │
+│  2. Validates HMAC signature                                             │
+│  3. Triggers rolling update across EC2 fleet:                            │
+│     ┌─────────────┐   ┌─────────────┐   ┌─────────────┐                 │
+│     │  EC2 #1     │   │  EC2 #2     │   │  EC2 #N     │                 │
+│     │  drain      │   │  (serving)  │   │  (serving)  │                 │
+│     │  pull new   │   │             │   │             │                 │
+│     │  restart    │   │             │   │             │                 │
+│     │  health ✓   │   │  → drain    │   │             │                 │
+│     │  (serving)  │   │  → update   │   │  → drain    │                 │
+│     │             │   │  → health ✓ │   │  → update   │                 │
+│     └─────────────┘   └─────────────┘   └─────────────┘                 │
+└───────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│  Per EC2 Instance (Docker Compose)                                        │
+│                                                                           │
+│  ┌──────────────────────┐     ┌──────────────────────────────────┐       │
+│  │  ghosthands-api      │     │  ghosthands-worker               │       │
+│  │  127.0.0.1:3100      │     │  2GB RAM, 2 CPU                 │       │
+│  │  512MB RAM            │     │  Chromium + Patchright           │       │
+│  │  Health: /health      │     │  MAX_CONCURRENT_JOBS=2           │       │
+│  └──────────┬───────────┘     └──────────────┬───────────────────┘       │
+│             │                                 │                           │
+│             └──────────┬──────────────────────┘                           │
+│                        │                                                  │
+│                        ▼                                                  │
+│             Supabase (shared with VALET)                                  │
+│             PostgreSQL + Storage + Auth + Realtime                        │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 1.2 Component Summary
 
 | Component | Runtime | Role | Instances |
 |-----------|---------|------|-----------|
-| **GhostHands API** | Bun on Fly.io Machine | REST API, auth, validation, monitoring | 1 (auto-scale to 2) |
-| **GhostHands Worker** | Bun on Fly.io Machine | Job polling, browser automation, LLM calls | 1-4 (scale by load) |
-| **Supabase** | Managed (supabase.com) | Postgres, Storage, Auth, Realtime | Shared with VALET |
-| **VALET Frontend** | Next.js on Vercel | User-facing web app | Managed by Vercel |
-| **VALET Backend** | Next.js API routes | Orchestration, user management | Managed by Vercel |
+| **GhostHands API** | Bun in Docker | REST API, auth, validation, monitoring | 1 per EC2 |
+| **GhostHands Worker** | Bun in Docker | Job polling, browser automation, LLM | 1 per EC2 |
+| **VALET Controller** | VALET backend | Receives webhook, triggers EC2 updates | Managed by VALET |
+| **ECR** | AWS | Docker image registry | Shared |
+| **Supabase** | Managed | Postgres, Storage, Auth, Realtime | Shared with VALET |
 
-### 1.3 Why Fly.io
+### 1.3 Key Design Decisions
 
-| Criterion | Fly.io | Railway | AWS ECS |
-|-----------|--------|---------|---------|
-| Chromium/Patchright support | Native (Linux VMs) | Docker-based (works) | Docker-based (works) |
-| Long-running processes | Fly Machines (persistent) | Excellent | Excellent |
-| Auto-scale from zero | Yes (Machine stop/start) | Yes | Complex (Fargate) |
-| Private networking | Built-in (WireGuard) | Private networking | VPC required |
-| Cost at low scale | ~$3-5/mo per machine | ~$5/mo per service | ~$15/mo minimum |
-| Deploy from Docker | Yes | Yes | Yes |
-| Regions | 30+ regions worldwide | Limited regions | All AWS regions |
-| Health checks | Built-in | Built-in | ALB health checks |
-
-**Decision:** Fly.io for the API and workers. Supabase remains managed.
-The worker needs a real Linux VM (not serverless) because Patchright/Chromium
-requires a persistent browser process with ~500MB memory per active session.
+| Decision | Rationale |
+|----------|-----------|
+| **ECR for images** | Same AWS account as VALET EC2, fast pulls, no egress fees |
+| **VALET controls deployment** | VALET owns the EC2 fleet; GhostHands doesn't need SSH keys or instance lists |
+| **Docker Compose on EC2** | Simple, no ECS/K8s overhead for current scale |
+| **API on 127.0.0.1:3100** | VPC-internal only; VALET calls localhost, not public internet |
+| **Webhook notification** | Decouples CI/CD from deployment; GhostHands builds, VALET deploys |
 
 ---
 
@@ -132,30 +116,21 @@ Process 1: API Server               Process 2: Worker
 │ - Auth middleware       │          │   gh_job_created       │
 │ - Zod validation       │          │ - Poll loop (5s)       │
 │ - CORS                 │          │ - JobExecutor          │
-│ - Monitoring routes    │          │   - BrowserAgent       │
-│                        │          │   - Cost control       │
-│ Connections:           │          │   - Heartbeat (30s)    │
-│ - Supabase pooled      │          │                        │
-│                        │          │ Connections:           │
-│ Port: 3100             │          │ - Supabase pooled      │
-│ Memory: ~128MB         │          │ - Postgres direct      │
-│ CPU: 0.25 vCPU         │          │   (for LISTEN/NOTIFY)  │
-└────────────────────────┘          │                        │
-                                    │ Memory: ~1-2GB         │
-                                    │ CPU: 1-2 vCPU          │
+│ - Monitoring routes    │          │   - TaskHandlerRegistry│
+│                        │          │   - BrowserAgent       │
+│ Connections:           │          │   - Cost control       │
+│ - Supabase pooled      │          │   - Heartbeat (30s)    │
+│                        │          │   - Callback notifier  │
+│ Port: 3100             │          │                        │
+│ Memory: ~128MB–512MB   │          │ Connections:           │
+│ CPU: 0.25 vCPU         │          │ - Supabase pooled      │
+└────────────────────────┘          │ - Postgres direct      │
+                                    │   (for LISTEN/NOTIFY)  │
+                                    │                        │
+                                    │ Memory: ~1–2GB         │
+                                    │ CPU: 1–2 vCPU          │
                                     └────────────────────────┘
 ```
-
-**Why separate processes:**
-
-1. **Different resource profiles** -- The API is lightweight (128MB, 0.25 CPU).
-   The worker runs Chromium browsers (1-2GB RAM per concurrent job).
-2. **Independent scaling** -- Scale workers based on queue depth without
-   scaling the stateless API.
-3. **Isolation** -- A browser crash in the worker does not affect API
-   availability.
-4. **Graceful shutdown** -- Workers drain active jobs on SIGTERM (30s
-   timeout). The API can restart instantly.
 
 ### 2.2 Graceful Shutdown Sequence
 
@@ -178,7 +153,7 @@ SIGTERM received
         6. Exit 0
 ```
 
-This is already implemented in `src/workers/main.ts` (lines 66-84).
+This is critical for rolling updates — VALET's deploy script sends `docker compose stop -t 35 worker` to allow active jobs to complete before restarting with the new image.
 
 ---
 
@@ -194,15 +169,11 @@ FROM oven/bun:1.2-debian AS deps
 
 WORKDIR /app
 
-# Copy workspace root files
 COPY package.json bun.lock turbo.json ./
-
-# Copy all package.json files for workspace resolution
 COPY packages/ghosthands/package.json packages/ghosthands/
 COPY packages/magnitude-core/package.json packages/magnitude-core/
 COPY packages/magnitude-extract/package.json packages/magnitude-extract/
 
-# Install all dependencies (including workspace links)
 RUN bun install --frozen-lockfile
 
 # ──────────────────────────────────────────────────
@@ -210,11 +181,9 @@ RUN bun install --frozen-lockfile
 # ──────────────────────────────────────────────────
 FROM deps AS build
 
-# Copy full source
 COPY packages/ packages/
 COPY turbo.json ./
 
-# Build all packages (magnitude-core -> magnitude-extract -> ghosthands)
 RUN bun run build
 
 # ──────────────────────────────────────────────────
@@ -224,31 +193,15 @@ FROM oven/bun:1.2-debian AS runtime
 
 # Install Chromium dependencies for Patchright
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libnss3 \
-    libnspr4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libdbus-1-3 \
-    libxkbcommon0 \
-    libatspi2.0-0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 \
-    libpango-1.0-0 \
-    libcairo2 \
-    libasound2 \
-    libwayland-client0 \
-    fonts-noto-color-emoji \
-    fonts-liberation \
+    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+    libdrm2 libdbus-1-3 libxkbcommon0 libatspi2.0-0 libxcomposite1 \
+    libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
+    libcairo2 libasound2 libwayland-client0 \
+    fonts-noto-color-emoji fonts-liberation curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy built artifacts and node_modules
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/packages/ghosthands/dist ./packages/ghosthands/dist
 COPY --from=build /app/packages/ghosthands/package.json ./packages/ghosthands/
@@ -258,38 +211,77 @@ COPY --from=build /app/packages/magnitude-core/package.json ./packages/magnitude
 COPY --from=build /app/packages/magnitude-extract/dist ./packages/magnitude-extract/dist
 COPY --from=build /app/packages/magnitude-extract/package.json ./packages/magnitude-extract/
 
-# Copy source for bun direct execution (bun can run .ts files directly)
 COPY --from=build /app/packages/ghosthands/src ./packages/ghosthands/src
 
-# Install Patchright browser binaries
 RUN cd packages/magnitude-core && npx patchright install chromium
 
-# Create non-root user for security
 RUN groupadd -r ghosthands && useradd -r -g ghosthands -m ghosthands
 USER ghosthands
 
-# Default: start API server
-# Override with CMD ["bun", "packages/ghosthands/src/workers/main.ts"] for worker
 EXPOSE 3100
 CMD ["bun", "packages/ghosthands/src/api/server.ts"]
 ```
 
-### 3.2 docker-compose.yml (Local Development)
+### 3.2 docker-compose.prod.yml
 
 ```yaml
-# docker-compose.yml
-# Local development environment for GhostHands API + Worker
-#
-# Usage:
-#   cp .env.example .env   # Fill in real values
-#   docker compose up      # Start all services
-#   docker compose up api  # Start API only
-#   docker compose up worker  # Start worker only
-
-version: "3.8"
+# Production Docker Compose — run on each EC2 instance
+# VALET triggers deploys via scripts/deploy.sh
 
 services:
-  # ── GhostHands API Server ──────────────────────────────
+  api:
+    image: ${ECR_IMAGE:-ghosthands:latest}
+    command: ["bun", "packages/ghosthands/src/api/server.ts"]
+    ports:
+      - "127.0.0.1:3100:3100"
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - GH_API_PORT=3100
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3100/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  worker:
+    image: ${ECR_IMAGE:-ghosthands:latest}
+    command: ["bun", "packages/ghosthands/src/workers/main.ts"]
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - MAX_CONCURRENT_JOBS=2
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+```
+
+### 3.3 docker-compose.yml (Local Development)
+
+```yaml
+services:
   api:
     build:
       context: .
@@ -302,7 +294,6 @@ services:
       - NODE_ENV=development
       - GH_API_PORT=3100
     volumes:
-      # Mount source for hot-reload with bun --watch
       - ./packages/ghosthands/src:/app/packages/ghosthands/src:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3100/health"]
@@ -312,7 +303,6 @@ services:
       start_period: 5s
     restart: unless-stopped
 
-  # ── GhostHands Worker ──────────────────────────────────
   worker:
     build:
       context: .
@@ -327,7 +317,6 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    # Workers need more memory for Chromium
     deploy:
       resources:
         limits:
@@ -336,433 +325,251 @@ services:
     restart: unless-stopped
 ```
 
-### 3.3 .env.example
+---
 
-```bash
-# ─── Supabase ───────────────────────────────────────────
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_KEY=eyJ...                    # service_role key (bypasses RLS)
-SUPABASE_ANON_KEY=eyJ...                       # anon key (for frontend/RLS)
-SUPABASE_DIRECT_URL=postgresql://postgres:password@db.your-project.supabase.co:5432/postgres
+## 4. CI/CD Pipeline
 
-# ─── GhostHands API ────────────────────────────────────
-GH_API_PORT=3100
-GH_SERVICE_SECRET=your-secret-key-min-32-chars  # Service-to-service auth
-CORS_ORIGIN=http://localhost:3000               # VALET frontend URL
+### 4.1 Pipeline Overview
 
-# ─── LLM Providers ─────────────────────────────────────
-GOOGLE_API_KEY=AIza...                          # Gemini (default/free tier)
-OPENAI_API_KEY=sk-...                           # GPT-4o-mini (starter tier)
-ANTHROPIC_API_KEY=sk-ant-...                    # Claude Sonnet (premium tier)
-GH_DEFAULT_MODEL=gpt-4o-mini
+GhostHands CI/CD builds and tests the code, pushes Docker images to ECR,
+and **notifies VALET** when a new image is ready. GhostHands does **not**
+deploy directly — VALET controls the EC2 fleet.
 
-# ─── Security ──────────────────────────────────────────
-GH_ENCRYPTION_KEY=base64-encoded-32-byte-key    # AES-256-GCM for credentials
-
-# ─── Worker ────────────────────────────────────────────
-MAX_CONCURRENT_JOBS=2
-NODE_ENV=development
 ```
+Push to main:
+  typecheck ──┐
+              ├── docker build + ECR push ──► notify-valet (webhook)
+  test-unit ──┘            │                       │
+                           │                       ▼
+  test-integration ────────┘               VALET triggers rolling
+                                           update on EC2 fleet
+PR opened:
+  typecheck ──► (no deploy)
+  test-unit ──► (no deploy)
+  test-integration ──► (no deploy)
+```
+
+### 4.2 GitHub Actions Workflow
+
+**File:** `.github/workflows/ci.yml`
+
+| Job | Trigger | Purpose |
+|-----|---------|---------|
+| `typecheck` | push + PR | TypeScript compilation check |
+| `test-unit` | push + PR | Unit tests |
+| `test-integration` | push + PR | Integration tests (needs Supabase secrets) |
+| `docker` | main push only | Build Docker image, push to ECR with commit SHA + `latest` tags |
+| `notify-valet` | main push only | POST webhook to VALET with image tag, SHA, and run metadata |
+
+### 4.3 Webhook Payload
+
+When CI/CD completes successfully on `main`, it sends a webhook to VALET:
+
+```json
+{
+  "event": "ghosthands.deploy_ready",
+  "image": "123456789.dkr.ecr.us-east-1.amazonaws.com/ghosthands:abc123def",
+  "image_tag": "abc123def",
+  "image_latest": "123456789.dkr.ecr.us-east-1.amazonaws.com/ghosthands:latest",
+  "commit_sha": "abc123def456789",
+  "commit_message": "fix: resolve form filling timeout on Workday",
+  "branch": "main",
+  "repository": "WeKruit/GHOST-HANDS",
+  "run_id": "12345678",
+  "run_url": "https://github.com/WeKruit/GHOST-HANDS/actions/runs/12345678",
+  "timestamp": "2026-02-15T04:28:03Z"
+}
+```
+
+**Headers:**
+```
+Content-Type: application/json
+X-GH-Webhook-Signature: sha256=<HMAC-SHA256 of body using VALET_DEPLOY_WEBHOOK_SECRET>
+X-GH-Event: deploy_ready
+```
+
+### 4.4 Required GitHub Secrets
+
+| Secret | Purpose |
+|--------|---------|
+| `AWS_ROLE_ARN` | IAM role for ECR push (OIDC) |
+| `AWS_REGION` | AWS region (default: `us-east-1`) |
+| `ECR_REGISTRY` | ECR registry URL (e.g., `123456789.dkr.ecr.us-east-1.amazonaws.com`) |
+| `ECR_REPOSITORY` | ECR repository name (e.g., `ghosthands`) |
+| `VALET_DEPLOY_WEBHOOK_URL` | VALET's endpoint for deploy notifications |
+| `VALET_DEPLOY_WEBHOOK_SECRET` | Shared secret for HMAC webhook signatures |
+| `SUPABASE_URL` | For integration tests |
+| `SUPABASE_SERVICE_KEY` | For integration tests |
+| `SUPABASE_DIRECT_URL` | For integration tests |
+| `GH_SERVICE_SECRET` | For integration tests |
+| `GH_ENCRYPTION_KEY` | For integration tests |
 
 ---
 
-## 4. Platform Deployment (Fly.io)
+## 5. VALET-Controlled Deployment
 
-### 4.1 fly.toml -- API Server
+### 5.1 How It Works
 
-```toml
-# fly.toml -- GhostHands API Server
-app = "ghosthands-api"
-primary_region = "iad"  # US East (closest to Supabase)
+GhostHands does **not** deploy itself. The deployment flow is:
 
-[build]
-  dockerfile = "Dockerfile"
+1. **GhostHands CI/CD** pushes a new Docker image to ECR
+2. **GhostHands CI/CD** sends a `deploy_ready` webhook to VALET
+3. **VALET** validates the webhook signature (HMAC-SHA256)
+4. **VALET** triggers a rolling update across its EC2 fleet
+5. On each EC2 instance, VALET runs `scripts/deploy.sh deploy <image-tag>`
+6. The deploy script pulls the new image, drains the worker, restarts, and health checks
+7. VALET waits for health confirmation before proceeding to the next instance
 
-[env]
-  NODE_ENV = "production"
-  GH_API_PORT = "3100"
+### 5.2 Rolling Update Strategy
 
-[http_service]
-  internal_port = 3100
-  force_https = true
-  auto_stop_machines = "suspend"
-  auto_start_machines = true
-  min_machines_running = 1
-  processes = ["app"]
+VALET controls the rollout pace:
 
-[[http_service.checks]]
-  grace_period = "10s"
-  interval = "15s"
-  method = "GET"
-  path = "/health"
-  timeout = "3s"
-
-[[vm]]
-  size = "shared-cpu-1x"
-  memory = "256mb"
-  cpus = 1
+```
+Instance 1:  drain → pull → restart → health ✓ → serving
+Instance 2:         drain → pull → restart → health ✓ → serving
+Instance 3:                drain → pull → restart → health ✓ → serving
 ```
 
-### 4.2 fly.toml -- Worker
+**Rules for VALET's deploy controller:**
 
-```toml
-# fly.worker.toml -- GhostHands Worker
-app = "ghosthands-worker"
-primary_region = "iad"
+1. **One instance at a time** (configurable by VALET)
+2. **Drain worker first** — `deploy.sh` stops the worker with a 35s timeout, letting active browser sessions complete
+3. **Health check gate** — don't proceed to next instance until `GET /health` returns 200
+4. **Auto-rollback** — if health check fails, `deploy.sh` automatically rolls back to `latest` tag
+5. **Abort on failure** — if rollback also fails on any instance, VALET should halt the rollout
 
-[build]
-  dockerfile = "Dockerfile"
+### 5.3 Deploy Script Reference
 
-[env]
-  NODE_ENV = "production"
-  MAX_CONCURRENT_JOBS = "2"
+**Location:** `scripts/deploy.sh`
+**Called by:** VALET (via SSH or local execution on each EC2 instance)
 
-[processes]
-  worker = "bun packages/ghosthands/src/workers/main.ts"
+| Command | Description |
+|---------|-------------|
+| `./scripts/deploy.sh deploy <tag>` | Pull image, drain worker, restart all, health check |
+| `./scripts/deploy.sh deploy` | Same as above, using `latest` tag |
+| `./scripts/deploy.sh rollback` | Roll back to `latest` tag |
+| `./scripts/deploy.sh drain` | Stop worker only (for maintenance) |
+| `./scripts/deploy.sh status` | Show running containers and health |
+| `./scripts/deploy.sh health` | Exit 0 if healthy, exit 1 if not |
 
-# Workers don't serve HTTP but need a health endpoint
-# Use a lightweight TCP check on stdout or a sidecar
-# For now, rely on Fly's process monitoring
-
-[[vm]]
-  size = "performance-2x"  # 2 vCPU, 4GB RAM
-  memory = "4096mb"
-  cpus = 2
-
-[checks]
-  [checks.worker_alive]
-    type = "tcp"
-    port = 9090         # Optional: expose a minimal health port
-    interval = "30s"
-    timeout = "5s"
-    grace_period = "30s"
-```
-
-### 4.3 Deployment Commands
-
+**Required environment variables on EC2:**
 ```bash
-# ─── First-time setup ──────────────────────────────────
-# 1. Install Fly CLI
-curl -L https://fly.io/install.sh | sh
-
-# 2. Login
-fly auth login
-
-# 3. Create apps
-fly apps create ghosthands-api
-fly apps create ghosthands-worker
-
-# 4. Set secrets (same secrets for both apps)
-fly secrets set \
-  SUPABASE_URL="https://your-project.supabase.co" \
-  SUPABASE_SERVICE_KEY="eyJ..." \
-  SUPABASE_DIRECT_URL="postgresql://..." \
-  GH_SERVICE_SECRET="$(openssl rand -hex 32)" \
-  GH_ENCRYPTION_KEY="$(openssl rand -base64 32)" \
-  GOOGLE_API_KEY="AIza..." \
-  OPENAI_API_KEY="sk-..." \
-  ANTHROPIC_API_KEY="sk-ant-..." \
-  --app ghosthands-api
-
-fly secrets set \
-  SUPABASE_URL="https://your-project.supabase.co" \
-  SUPABASE_SERVICE_KEY="eyJ..." \
-  SUPABASE_DIRECT_URL="postgresql://..." \
-  GH_ENCRYPTION_KEY="$(openssl rand -base64 32)" \
-  GOOGLE_API_KEY="AIza..." \
-  OPENAI_API_KEY="sk-..." \
-  ANTHROPIC_API_KEY="sk-ant-..." \
-  --app ghosthands-worker
-
-# ─── Deploy ─────────────────────────────────────────────
-# Deploy API
-fly deploy --config fly.toml --app ghosthands-api
-
-# Deploy Worker
-fly deploy --config fly.worker.toml --app ghosthands-worker
-
-# ─── Verify ─────────────────────────────────────────────
-# Check API health
-curl https://ghosthands-api.fly.dev/health
-
-# Check logs
-fly logs --app ghosthands-api
-fly logs --app ghosthands-worker
-
-# Scale workers
-fly scale count 2 --app ghosthands-worker
+ECR_REGISTRY=123456789.dkr.ecr.us-east-1.amazonaws.com
+ECR_REPOSITORY=ghosthands
+AWS_REGION=us-east-1
+GHOSTHANDS_DIR=/opt/ghosthands   # optional, defaults to /opt/ghosthands
 ```
 
-### 4.4 Environment Matrix
-
-| Variable | Development | Staging | Production |
-|----------|-------------|---------|------------|
-| `NODE_ENV` | `development` | `staging` | `production` |
-| `SUPABASE_URL` | Local or dev project | Staging project | Production project |
-| `GH_API_PORT` | `3100` | `3100` | `3100` |
-| `MAX_CONCURRENT_JOBS` | `1` | `2` | `2-4` |
-| `CORS_ORIGIN` | `http://localhost:3000` | `https://staging.wekruit.com` | `https://app.wekruit.com` |
-| `GH_DEFAULT_MODEL` | `gemini-2.5-pro-preview-05-06` | `gpt-4o-mini` | `gpt-4o-mini` |
-| Browser headless | `false` | `true` | `true` |
-| Log level | `debug` | `info` | `warn` |
-
----
-
-## 5. VALET Integration Guide
-
-### 5.1 Integration Overview
-
-VALET interacts with GhostHands through two channels:
-
-1. **Channel 1 (DB Queue):** VALET backend inserts directly into
-   `gh_automation_jobs` via the Supabase service-role client. Workers pick up
-   jobs via `LISTEN/NOTIFY` + polling. This is the lowest-latency path.
-
-2. **Channel 2 (REST API):** VALET backend calls `POST /api/v1/gh/jobs` on the
-   GhostHands API. The API validates the request and inserts into the same table.
-   This provides validation, rate limiting, and a clean HTTP interface.
-
-Both channels produce the same result: a row in `gh_automation_jobs` that
-workers process identically.
-
-### 5.2 Installing the Client
-
-The `GhostHandsClient` class is exported from the `ghosthands` package.
-In the VALET Next.js app, install it as a workspace dependency or copy the
-client files.
-
-```typescript
-// valet/lib/ghosthands.ts
-import { GhostHandsClient } from 'ghosthands/client';
-
-// ── Option A: REST API mode (recommended for production) ──────────
-export const gh = new GhostHandsClient(
-  process.env.GHOSTHANDS_API_URL!,   // e.g., https://ghosthands-api.fly.dev/api/v1/gh
-  process.env.GH_SERVICE_SECRET!,     // Service-to-service API key
-);
-
-// ── Option B: Direct DB mode (lowest latency, no API dependency) ──
-export const ghDirect = new GhostHandsClient({
-  mode: 'db',
-  supabaseUrl: process.env.SUPABASE_URL!,
-  supabaseKey: process.env.SUPABASE_SERVICE_KEY!,
-});
+**Output parsing:** The deploy script outputs machine-readable status lines that VALET can parse:
+```
+DEPLOY_STATUS=success
+DEPLOY_TAG=abc123def
+DEPLOY_IMAGE=123456789.dkr.ecr.us-east-1.amazonaws.com/ghosthands:abc123def
 ```
 
-### 5.3 Creating a Job from VALET
+### 5.4 VALET Webhook Handler (Reference Implementation)
 
 ```typescript
-// valet/app/api/apply/route.ts
-import { NextRequest, NextResponse } from 'next/server';
-import { createRouteHandlerClient } from '@supabase/auth-helpers-nextjs';
-import { cookies } from 'next/headers';
-import { gh } from '@/lib/ghosthands';
+// In VALET's backend — webhook handler for GhostHands deploy notifications
 
-export async function POST(request: NextRequest) {
-  // 1. Authenticate the user via Supabase Auth
-  const supabase = createRouteHandlerClient({ cookies });
-  const { data: { user }, error: authError } = await supabase.auth.getUser();
-  if (authError || !user) {
-    return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
+import crypto from 'crypto';
+
+const WEBHOOK_SECRET = process.env.GH_DEPLOY_WEBHOOK_SECRET;
+
+export async function handleGhostHandsDeployWebhook(req: Request) {
+  const body = await req.text();
+  const signature = req.headers.get('X-GH-Webhook-Signature');
+
+  // Verify HMAC signature
+  const expected = 'sha256=' + crypto
+    .createHmac('sha256', WEBHOOK_SECRET)
+    .update(body)
+    .digest('hex');
+
+  if (signature !== expected) {
+    return new Response('Invalid signature', { status: 401 });
   }
 
-  // 2. Parse the request body
-  const body = await request.json();
+  const payload = JSON.parse(body);
 
-  // 3. Create the GhostHands automation job
-  try {
-    const job = await gh.createJob(user.id, {
-      jobType: 'apply',
-      targetUrl: body.jobUrl,
-      taskDescription: `Apply to ${body.jobTitle} at ${body.company}`,
-      inputData: {
-        resumePath: body.resumePath,
-        resumeId: body.resumeId,
-        userData: {
-          first_name: body.firstName,
-          last_name: body.lastName,
-          email: body.email,
-          phone: body.phone,
-          linkedin_url: body.linkedinUrl,
-        },
-        tier: body.subscriptionTier || 'starter',
-        platform: body.platform,
-        qaOverrides: body.qaOverrides || {},
-      },
-      priority: body.priority || 5,
-      maxRetries: 3,
-      timeoutSeconds: 300,
-      tags: [body.platform, body.company?.toLowerCase()].filter(Boolean),
-      idempotencyKey: `valet-apply-${user.id}-${body.jobUrl}`,
-      metadata: {
-        valet_task_id: body.valetTaskId,
-        subscription_tier: body.subscriptionTier,
-      },
-    });
-
-    return NextResponse.json(
-      { jobId: job.id, status: job.status },
-      { status: 201 },
-    );
-  } catch (err: any) {
-    // Handle duplicate idempotency key (job already exists)
-    if (err.code === 'duplicate_idempotency_key') {
-      return NextResponse.json({
-        error: 'duplicate',
-        existingJobId: err.existingJobId,
-        existingStatus: err.existingStatus,
-      }, { status: 409 });
-    }
-    throw err;
+  if (payload.event !== 'ghosthands.deploy_ready') {
+    return new Response('Unknown event', { status: 400 });
   }
-}
-```
 
-### 5.4 Subscribing to Job Status (Frontend)
-
-```typescript
-// valet/components/JobTracker.tsx
-'use client';
-import { useEffect, useState } from 'react';
-import { createClientComponentClient } from '@supabase/auth-helpers-nextjs';
-
-interface JobStatus {
-  id: string;
-  status: string;
-  status_message: string | null;
-  started_at: string | null;
-  completed_at: string | null;
-  result_summary: string | null;
-}
-
-export function JobTracker({ jobId }: { jobId: string }) {
-  const [job, setJob] = useState<JobStatus | null>(null);
-  const supabase = createClientComponentClient();
-
-  useEffect(() => {
-    // Initial fetch
-    supabase
-      .from('gh_automation_jobs')
-      .select('id, status, status_message, started_at, completed_at, result_summary')
-      .eq('id', jobId)
-      .single()
-      .then(({ data }) => { if (data) setJob(data); });
-
-    // Real-time subscription
-    const channel = supabase
-      .channel(`job-${jobId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'gh_automation_jobs',
-          filter: `id=eq.${jobId}`,
-        },
-        (payload) => {
-          setJob(payload.new as JobStatus);
-        },
-      )
-      .subscribe();
-
-    return () => { supabase.removeChannel(channel); };
-  }, [jobId, supabase]);
-
-  if (!job) return <div>Loading...</div>;
-
-  return (
-    <div>
-      <p>Status: {job.status}</p>
-      {job.status_message && <p>{job.status_message}</p>}
-      {job.result_summary && <p>Result: {job.result_summary}</p>}
-    </div>
-  );
-}
-```
-
-### 5.5 Polling Fallback (Server-Side)
-
-For server-side code (API routes, background jobs) where WebSocket connections
-are impractical:
-
-```typescript
-// valet/lib/ghosthands-poll.ts
-import { gh } from '@/lib/ghosthands';
-
-export async function waitForJobResult(jobId: string, timeoutMs = 300_000) {
-  const result = await gh.pollForCompletion(jobId, {
-    intervalMs: 2000,
-    timeoutMs,
+  // Trigger rolling update across EC2 fleet
+  await triggerRollingUpdate({
+    imageTag: payload.image_tag,
+    commitSha: payload.commit_sha,
+    commitMessage: payload.commit_message,
   });
-  return result;
+
+  return new Response(JSON.stringify({ status: 'deploy_initiated' }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+async function triggerRollingUpdate(params: {
+  imageTag: string;
+  commitSha: string;
+  commitMessage: string;
+}) {
+  const instances = await getEC2Instances(); // VALET's instance list
+
+  for (const instance of instances) {
+    console.log(`Deploying to ${instance.id} (${instance.ip})...`);
+
+    // SSH into instance and run deploy script
+    const result = await sshExec(instance.ip, [
+      `cd /opt/ghosthands`,
+      `ECR_REGISTRY=${process.env.ECR_REGISTRY}`,
+      `ECR_REPOSITORY=${process.env.ECR_REPOSITORY}`,
+      `AWS_REGION=${process.env.AWS_REGION}`,
+      `./scripts/deploy.sh deploy ${params.imageTag}`,
+    ].join(' && '));
+
+    if (!result.success) {
+      console.error(`Deploy failed on ${instance.id}. Halting rollout.`);
+      // Alert ops team
+      break;
+    }
+
+    console.log(`${instance.id} updated successfully.`);
+  }
 }
 ```
 
-### 5.6 Batch Job Creation
+### 5.5 Manual Deployment
 
-```typescript
-// valet/app/api/apply-batch/route.ts
-import { gh } from '@/lib/ghosthands';
+For emergency or manual deploys (bypassing VALET):
 
-export async function POST(request: NextRequest) {
-  const { user } = await authenticateUser(request);
-  const { applications } = await request.json();
+```bash
+# SSH into EC2 instance
+ssh ubuntu@<ec2-ip>
 
-  const result = await gh.createBatch(user.id, applications.map((app: any) => ({
-    jobType: 'apply' as const,
-    targetUrl: app.jobUrl,
-    taskDescription: `Apply to ${app.jobTitle} at ${app.company}`,
-    inputData: {
-      userData: app.userData,
-      tier: app.tier,
-      qaOverrides: app.qaOverrides,
-    },
-    tags: ['batch', app.platform],
-    idempotencyKey: `batch-${user.id}-${app.jobUrl}`,
-  })));
+# Login to ECR
+aws ecr get-login-password --region us-east-1 | \
+  docker login --username AWS --password-stdin 123456789.dkr.ecr.us-east-1.amazonaws.com
 
-  return NextResponse.json({
-    created: result.created.length,
-    jobIds: result.created.map(j => j.id),
-    errors: result.errors,
-  }, { status: 201 });
-}
+# Deploy specific tag
+cd /opt/ghosthands
+ECR_REGISTRY=123456789.dkr.ecr.us-east-1.amazonaws.com \
+ECR_REPOSITORY=ghosthands \
+./scripts/deploy.sh deploy abc123def
+
+# Or deploy latest
+ECR_REGISTRY=123456789.dkr.ecr.us-east-1.amazonaws.com \
+ECR_REPOSITORY=ghosthands \
+./scripts/deploy.sh deploy
+
+# Check status
+./scripts/deploy.sh status
+
+# Rollback
+ECR_REGISTRY=123456789.dkr.ecr.us-east-1.amazonaws.com \
+ECR_REPOSITORY=ghosthands \
+./scripts/deploy.sh rollback
 ```
-
-### 5.7 Authentication Flow
-
-```
-VALET Frontend          VALET Backend             GhostHands API
-     │                       │                         │
-     │── Login ──────────────│                         │
-     │                       │                         │
-     │◄─ Supabase JWT ───────│                         │
-     │                       │                         │
-     │── "Apply to job" ────►│                         │
-     │   (JWT in cookie)     │                         │
-     │                       │── POST /api/v1/gh/jobs ─│
-     │                       │   X-GH-Service-Key: ... │
-     │                       │   body: { user_id, ... }│
-     │                       │                         │
-     │                       │◄─ 201 { jobId } ────────│
-     │                       │                         │
-     │◄─ { jobId } ──────────│                         │
-     │                       │                         │
-     │── Subscribe Realtime ─┼─────────────────────────│
-     │   (Supabase WS)      │                         │
-     │                       │                         │
-     │◄─ status: running ────┼─────────────── (DB triggers Realtime)
-     │◄─ status: completed ──┼─────────────── (DB triggers Realtime)
-```
-
-**Auth tokens used:**
-
-| Path | Token | Header |
-|------|-------|--------|
-| Frontend -> VALET Backend | Supabase user JWT | Cookie (httpOnly) |
-| VALET Backend -> GH API | `GH_SERVICE_SECRET` | `X-GH-Service-Key` |
-| Frontend -> Supabase Realtime | Supabase anon key + JWT | WebSocket auth |
-| Worker -> Supabase DB | Service role key | `SUPABASE_SERVICE_KEY` |
 
 ---
 
@@ -770,23 +577,9 @@ VALET Frontend          VALET Backend             GhostHands API
 
 ### 6.1 Secrets Management
 
-All secrets are managed via Fly.io's encrypted secrets store. Never store
-secrets in source code, Dockerfiles, or `fly.toml`.
-
-```bash
-# Set secrets for API
-fly secrets set SUPABASE_SERVICE_KEY="eyJ..." --app ghosthands-api
-
-# Set secrets for Worker
-fly secrets set SUPABASE_SERVICE_KEY="eyJ..." --app ghosthands-worker
-
-# List current secrets (shows names, not values)
-fly secrets list --app ghosthands-api
-
-# Rotate a secret
-fly secrets set GH_SERVICE_SECRET="$(openssl rand -hex 32)" --app ghosthands-api
-# Then update VALET's copy of the secret
-```
+Secrets are stored as environment variables on each EC2 instance (in the `.env`
+file at `/opt/ghosthands/.env`). VALET manages these via its own secret
+management system.
 
 ### 6.2 Required Environment Variables
 
@@ -794,8 +587,8 @@ fly secrets set GH_SERVICE_SECRET="$(openssl rand -hex 32)" --app ghosthands-api
 |----------|-----|--------|-------------|
 | `SUPABASE_URL` | Yes | Yes | Supabase project URL |
 | `SUPABASE_SERVICE_KEY` | Yes | Yes | Service role key (full DB access) |
-| `SUPABASE_DIRECT_URL` | No | Yes | Direct Postgres URL for LISTEN/NOTIFY |
-| `GH_SERVICE_SECRET` | Yes | No | Shared secret for VALET -> GH auth |
+| `DATABASE_URL` | No | Yes | Postgres URL for queries + LISTEN/NOTIFY |
+| `GH_SERVICE_SECRET` | Yes | No | Shared secret for VALET → GH auth |
 | `GH_ENCRYPTION_KEY` | No | Yes | AES-256-GCM key for credential encryption |
 | `GH_API_PORT` | Yes | No | API listen port (default: 3100) |
 | `MAX_CONCURRENT_JOBS` | No | Yes | Max parallel browser sessions (default: 2) |
@@ -803,223 +596,62 @@ fly secrets set GH_SERVICE_SECRET="$(openssl rand -hex 32)" --app ghosthands-api
 | `OPENAI_API_KEY` | No | Yes | OpenAI key (starter/pro tier) |
 | `ANTHROPIC_API_KEY` | No | Yes | Anthropic key (premium tier) |
 | `CORS_ORIGIN` | Yes | No | Allowed CORS origin |
-| `NODE_ENV` | Yes | Yes | `development`, `staging`, or `production` |
+| `NODE_ENV` | Yes | Yes | `production` |
 
-### 6.3 Secret Rotation Procedure
+### 6.3 Environment Matrix
 
-1. Generate new secret value
-2. Set it on Fly.io: `fly secrets set KEY="new-value" --app <app>`
-3. Fly.io automatically restarts the machines with the new secret
-4. Update any dependent services (VALET) with the new value
-5. Verify health check passes: `curl https://ghosthands-api.fly.dev/health`
-
----
-
-## 7. CI/CD Pipeline
-
-### 7.1 GitHub Actions Workflow
-
-```yaml
-# .github/workflows/ghosthands-ci.yml
-name: GhostHands CI/CD
-
-on:
-  push:
-    branches: [main]
-    paths:
-      - 'packages/ghosthands/**'
-      - 'packages/magnitude-core/**'
-      - 'Dockerfile'
-      - '.github/workflows/ghosthands-ci.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'packages/ghosthands/**'
-      - 'packages/magnitude-core/**'
-
-env:
-  FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-
-jobs:
-  # ── Lint & Type Check ─────────────────────────────────
-  lint:
-    name: Lint & Type Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.2.8
-      - run: bun install --frozen-lockfile
-      - run: bun run check-types
-      - run: bun run lint
-
-  # ── Unit Tests ────────────────────────────────────────
-  test-unit:
-    name: Unit Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.2.8
-      - run: bun install --frozen-lockfile
-      - run: bun run build
-      - run: cd packages/ghosthands && bun run test:unit
-
-  # ── Integration Tests ─────────────────────────────────
-  test-integration:
-    name: Integration Tests
-    runs-on: ubuntu-latest
-    needs: [lint, test-unit]
-    # Only run on main branch (needs real Supabase)
-    if: github.ref == 'refs/heads/main'
-    env:
-      SUPABASE_URL: ${{ secrets.STAGING_SUPABASE_URL }}
-      SUPABASE_SERVICE_KEY: ${{ secrets.STAGING_SUPABASE_SERVICE_KEY }}
-      SUPABASE_DIRECT_URL: ${{ secrets.STAGING_SUPABASE_DIRECT_URL }}
-      GH_SERVICE_SECRET: ${{ secrets.STAGING_GH_SERVICE_SECRET }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.2.8
-      - run: bun install --frozen-lockfile
-      - run: bun run build
-      - run: cd packages/ghosthands && bun run test:integration
-
-  # ── Build Docker Image ────────────────────────────────
-  build:
-    name: Build Docker Image
-    runs-on: ubuntu-latest
-    needs: [lint, test-unit]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: false
-          tags: ghosthands:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # ── Deploy to Staging ─────────────────────────────────
-  deploy-staging:
-    name: Deploy to Staging
-    runs-on: ubuntu-latest
-    needs: [build, test-integration]
-    if: github.ref == 'refs/heads/main'
-    environment: staging
-    steps:
-      - uses: actions/checkout@v4
-      - uses: superfly/flyctl-actions/setup-flyctl@master
-
-      # Deploy API
-      - run: flyctl deploy --config fly.toml --app ghosthands-api-staging
-
-      # Deploy Worker
-      - run: flyctl deploy --config fly.worker.toml --app ghosthands-worker-staging
-
-      # Verify health
-      - run: |
-          sleep 10
-          curl -f https://ghosthands-api-staging.fly.dev/health || exit 1
-
-  # ── Deploy to Production ──────────────────────────────
-  deploy-production:
-    name: Deploy to Production
-    runs-on: ubuntu-latest
-    needs: [deploy-staging]
-    if: github.ref == 'refs/heads/main'
-    environment: production
-    steps:
-      - uses: actions/checkout@v4
-      - uses: superfly/flyctl-actions/setup-flyctl@master
-
-      # Deploy API
-      - run: flyctl deploy --config fly.toml --app ghosthands-api
-
-      # Deploy Worker (rolling restart to drain active jobs)
-      - run: flyctl deploy --config fly.worker.toml --app ghosthands-worker --strategy rolling
-
-      # Verify health
-      - run: |
-          sleep 15
-          curl -f https://ghosthands-api.fly.dev/health || exit 1
-          curl -f https://ghosthands-api.fly.dev/monitoring/health | jq '.status'
-```
-
-### 7.2 Pipeline Flow
-
-```
-PR opened:
-  lint ──► test-unit ──► build (no push)
-
-Push to main:
-  lint ──► test-unit ──► test-integration ──► build ──► deploy-staging ──► deploy-production
-                                                            │
-                                                            └── Manual approval gate
-                                                                (GitHub environment protection)
-```
+| Variable | Development | Production |
+|----------|-------------|------------|
+| `NODE_ENV` | `development` | `production` |
+| `SUPABASE_URL` | Local or dev project | Production project |
+| `GH_API_PORT` | `3100` | `3100` |
+| `MAX_CONCURRENT_JOBS` | `1` | `2` |
+| `CORS_ORIGIN` | `http://localhost:3000` | `https://app.wekruit.com` |
+| `GH_DEFAULT_MODEL` | `qwen-72b` | `qwen-72b` |
+| Browser headless | `false` | `true` |
 
 ---
 
-## 8. Scaling Strategy
+## 7. Scaling Strategy
 
-### 8.1 Scaling Dimensions
+### 7.1 Scaling Dimensions
 
 ```
                 Low Load          Medium Load        High Load
                 (< 10 jobs/hr)    (10-50 jobs/hr)    (50+ jobs/hr)
                 ──────────────    ───────────────    ──────────────
-API instances:  1                 1                  2 (auto-scale)
-Worker          1 (2 concurrent)  2 (4 concurrent)   4 (8 concurrent)
-instances:
-Worker RAM:     2GB each          4GB each           4GB each
-Supabase:       Free/Pro plan     Pro plan           Pro plan +
-                                                     read replicas
+EC2 instances:  1                 2                  3-4
+Workers/inst:   1 (2 concurrent)  1 (2 concurrent)   1 (2 concurrent)
+Total capacity: 2 concurrent      4 concurrent       6-8 concurrent
+Worker RAM:     2GB each          2GB each           2GB each
 ```
 
-### 8.2 Worker Scaling
+### 7.2 Scaling Model
 
-Workers scale based on queue depth. Each worker handles `MAX_CONCURRENT_JOBS`
-(default: 2) browser sessions simultaneously.
+VALET manages the EC2 fleet size. When demand increases, VALET can:
+1. Launch additional EC2 instances with GhostHands pre-installed
+2. Each instance runs its own API + Worker via Docker Compose
+3. All instances share the same Supabase database
+4. Workers compete for jobs via `FOR UPDATE SKIP LOCKED` — no coordination needed
 
-```bash
-# Scale workers manually
-fly scale count 3 --app ghosthands-worker
+### 7.3 Database Connection Management
 
-# Scale worker VM size
-fly scale vm performance-4x --app ghosthands-worker  # 4 vCPU, 8GB RAM
-```
+Supabase Pro plan provides 60 connections. Allocation per instance:
 
-**Auto-scaling strategy** (future): Monitor the `gh_automation_jobs` table for
-pending job count. When pending > 2 * total_worker_capacity, scale up.
-When pending = 0 for 10 minutes, scale down to minimum (1).
+| Consumer | Connection Type | Per Instance |
+|----------|----------------|-------------|
+| API Server | Pooled (pgbouncer) | 5 |
+| Worker | Pooled (pgbouncer) | 5 |
+| Worker | Direct (LISTEN/NOTIFY) | 1 |
+| **Total per instance** | | **11** |
 
-### 8.3 Database Connection Management
-
-Supabase Pro plan provides 60 connections. Allocate them:
-
-| Consumer | Connection Type | Pool Size | Notes |
-|----------|----------------|-----------|-------|
-| API Server (x1) | Pooled (pgbouncer) | 5 | Via `SUPABASE_URL` |
-| Worker (x1) | Pooled (pgbouncer) | 5 | Via `SUPABASE_URL` |
-| Worker (x1) | Direct | 1 | LISTEN/NOTIFY only |
-| VALET Backend | Pooled | 10 | Shared Supabase client |
-| VALET Frontend | Pooled (anon) | 10 | Via Supabase JS client |
-| Supabase Realtime | Internal | ~5 | Managed by Supabase |
-| **Total** | | **~36** | Well within 60 limit |
-
-When scaling to 4 workers: 4 * (5 pooled + 1 direct) = 24 connections for
-workers alone, still within limits.
+With 4 instances: 44 connections. VALET uses the remaining ~16 connections.
 
 ---
 
-## 9. Monitoring & Observability
+## 8. Monitoring & Observability
 
-### 9.1 Health Endpoints
+### 8.1 Health Endpoints
 
 | Endpoint | Purpose | Auth Required |
 |----------|---------|---------------|
@@ -1027,86 +659,75 @@ workers alone, still within limits.
 | `GET /monitoring/health` | Deep health check (DB, storage, LLM, workers) | No |
 | `GET /monitoring/metrics` | Prometheus-style metrics | No |
 
-### 9.2 Key Metrics to Monitor
+### 8.2 Key Metrics to Monitor
 
 | Metric | Source | Alert Threshold |
 |--------|--------|-----------------|
 | Queue depth (pending jobs) | DB query | > 20 for > 5 min |
 | Job completion rate | `gh_job_events` | < 70% over 1 hour |
 | Job execution time (p95) | `started_at` to `completed_at` | > 300s |
-| Worker heartbeat staleness | `last_heartbeat` column | > 120s for any running job |
+| Worker heartbeat staleness | `last_heartbeat` column | > 120s |
 | API response time (p99) | Metrics middleware | > 2s |
-| LLM cost per job | `llm_cost_cents` column | > 50 cents per job |
+| LLM cost per job | `llm_cost_cents` column | > 50 cents |
 | Error rate by code | `error_code` column | > 30% any single code |
 
-### 9.3 Log Aggregation
+### 8.3 Logging
 
-Both API and worker use structured logging (pino). On Fly.io, logs are
-automatically captured and available via:
+Both API and worker output JSON-structured logs. On EC2, logs are captured by
+Docker's `json-file` driver (max 50MB, 5 files rotated).
 
-```bash
-# Real-time logs
-fly logs --app ghosthands-api
-fly logs --app ghosthands-worker
-
-# Search logs (via Fly.io dashboard or log drain)
-# Configure a log drain to ship to Datadog, Grafana Cloud, or Axiom:
-fly logs ship --app ghosthands-api --destination axiom
-```
+VALET can ship these to CloudWatch, Datadog, or Grafana Cloud using a log
+aggregation agent on each EC2 instance.
 
 ---
 
-## 10. Runbooks
+## 9. Runbooks
 
-### 10.1 Deploy a New Version
+### 9.1 Deploy a New Version
 
-```bash
-# 1. Ensure tests pass locally
-cd packages/ghosthands && bun run test
-
-# 2. Commit and push to main
-git push origin main
-
-# 3. CI/CD pipeline runs automatically
-# 4. Monitor deploy in GitHub Actions
-# 5. Verify health:
-curl https://ghosthands-api.fly.dev/health
-curl https://ghosthands-api.fly.dev/monitoring/health
+Automatic (normal flow):
+```
+1. Push to main
+2. CI/CD runs tests + builds Docker image → pushes to ECR
+3. CI/CD sends webhook to VALET
+4. VALET triggers rolling update across EC2 fleet
+5. Verify: curl http://<ec2-ip>:3100/health
 ```
 
-### 10.2 Restart a Stuck Worker
+### 9.2 Manual Deploy (Emergency)
 
 ```bash
-# Check worker status
-fly status --app ghosthands-worker
+ssh ubuntu@<ec2-ip>
+cd /opt/ghosthands
 
-# Restart all machines (graceful -- drains active jobs)
-fly machines restart --app ghosthands-worker
+# Set ECR vars
+export ECR_REGISTRY=123456789.dkr.ecr.us-east-1.amazonaws.com
+export ECR_REPOSITORY=ghosthands
+export AWS_REGION=us-east-1
 
-# Force restart a specific machine
-fly machines restart <machine-id> --app ghosthands-worker --force
+# Deploy specific commit
+./scripts/deploy.sh deploy <commit-sha>
+
+# Or latest
+./scripts/deploy.sh deploy
 ```
 
-### 10.3 Scale Workers Up/Down
+### 9.3 Rollback
 
 ```bash
-# Scale to 3 worker instances
-fly scale count 3 --app ghosthands-worker
-
-# Scale down to 1
-fly scale count 1 --app ghosthands-worker
-
-# Check current scale
-fly scale show --app ghosthands-worker
+ssh ubuntu@<ec2-ip>
+cd /opt/ghosthands
+export ECR_REGISTRY=... ECR_REPOSITORY=... AWS_REGION=...
+./scripts/deploy.sh rollback
 ```
 
-### 10.4 Recover Stuck Jobs
+### 9.4 Recover Stuck Jobs
 
-Jobs with stale heartbeats are automatically recovered by the worker's
-`recoverStuckJobs()` method on startup. To manually recover:
+Jobs with stale heartbeats are automatically recovered by the worker on startup.
+To manually recover:
 
 ```sql
--- Find stuck jobs (no heartbeat for 2+ minutes)
+-- Find stuck jobs
 SELECT id, worker_id, last_heartbeat, status
 FROM gh_automation_jobs
 WHERE status IN ('queued', 'running')
@@ -1121,43 +742,24 @@ WHERE status IN ('queued', 'running')
   AND last_heartbeat < NOW() - INTERVAL '2 minutes';
 ```
 
-### 10.5 Rotate Secrets
+### 9.5 Stop All Processing
 
 ```bash
-# Generate new secret
-NEW_SECRET=$(openssl rand -hex 32)
+# Drain worker on a specific instance
+ssh ubuntu@<ec2-ip>
+cd /opt/ghosthands
+./scripts/deploy.sh drain
 
-# Update on Fly.io (triggers machine restart)
-fly secrets set GH_SERVICE_SECRET="$NEW_SECRET" --app ghosthands-api
-
-# Update VALET's environment with the same secret
-# (in Vercel dashboard or via vercel CLI)
-vercel env add GH_SERVICE_SECRET production
-# Paste the same $NEW_SECRET value
-
-# Verify
-curl -H "X-GH-Service-Key: $NEW_SECRET" https://ghosthands-api.fly.dev/api/v1/gh/jobs
+# Jobs in the queue remain 'pending' and will be picked up
+# when the worker restarts or by other instances
 ```
 
-### 10.6 View Job Execution Logs
+### 9.6 Check Instance Status
 
 ```bash
-# View all logs for a specific job (search in worker logs)
-fly logs --app ghosthands-worker | grep "job-id-here"
-
-# Or query job events from the database
-# SELECT * FROM gh_job_events WHERE job_id = 'uuid' ORDER BY created_at;
-```
-
-### 10.7 Emergency: Stop All Processing
-
-```bash
-# Stop all worker machines immediately
-fly scale count 0 --app ghosthands-worker
-
-# Jobs in the queue will remain in 'pending' status
-# Resume when ready:
-fly scale count 1 --app ghosthands-worker
+ssh ubuntu@<ec2-ip>
+cd /opt/ghosthands
+./scripts/deploy.sh status
 ```
 
 ---
@@ -1165,8 +767,8 @@ fly scale count 1 --app ghosthands-worker
 *Last updated: 2026-02-14*
 
 *Depends on:*
-- [12-valet-ghosthands-integration.md](./12-valet-ghosthands-integration.md) -- DB schema, API spec
-- [13-integration-architecture-decision.md](./13-integration-architecture-decision.md) -- Architecture decision
-- [ARCHITECTURE.md](./ARCHITECTURE.md) -- Package structure
+- [12-valet-ghosthands-integration.md](./12-valet-ghosthands-integration.md) — DB schema, API spec
+- [API-INTEGRATION.md](./API-INTEGRATION.md) — API endpoints reference
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — Package structure
 
-*Consumed by: DevOps, VALET backend team, on-call engineers*
+*Consumed by: VALET backend team, DevOps, on-call engineers*

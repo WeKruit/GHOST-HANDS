@@ -1,6 +1,6 @@
-.turbo
-dist
-node_modules
+**/.turbo
+**/dist
+**/node_modules
 
 # sst
 .sst

@@ -9,6 +9,7 @@ import { strictCSP } from './middleware/csp.js';
 import { JobController } from './controllers/jobs.js';
 import { health } from './routes/health.js';
 import { createJobRoutes } from './routes/jobs.js';
+import { createValetRoutes } from './routes/valet.js';
 import { createUsageRoutes } from './routes/usage.js';
 import { requestLoggingMiddleware } from '../monitoring/logger.js';
 import { metricsMiddleware } from './middleware/metrics.js';
@@ -67,6 +68,7 @@ export function createApp() {
   const jobController = new JobController({ pool: pgPool });
 
   api.route('/jobs', createJobRoutes(jobController));
+  api.route('/valet', createValetRoutes(pgPool));
   api.route('/', createUsageRoutes());
 
   // Mount under versioned prefix

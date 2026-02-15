@@ -4,7 +4,7 @@ import { z } from 'zod';
 
 export const CreateJobSchema = z.object({
   user_id: z.string().uuid().optional(),
-  job_type: z.enum(['apply', 'scrape', 'fill_form', 'custom']),
+  job_type: z.string().min(1).max(50),
   target_url: z.string().url().max(2048),
   task_description: z.string().min(1).max(1000),
   input_data: z.object({
