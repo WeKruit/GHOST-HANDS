@@ -103,19 +103,32 @@ describe('Rate Limiting', () => {
     it('should enforce daily limits independently from hourly limits', () => {
       const userId = 'user-rate-daily-1';
       const tier: UserTier = 'free';
+      const hourlyLimit = RATE_LIMITS.tiers.free.hourly; // 3
       const dailyLimit = RATE_LIMITS.tiers.free.daily; // 5
+      const hourlyWindowMs = RATE_LIMITS.windows.hourly;
 
-      // Need to reset between batches to simulate hourly windows expiring
-      // For this test, just exhaust the daily limit
       resetAllLimits();
 
-      for (let i = 0; i < dailyLimit; i++) {
-        const result = checkUserTierLimit(userId, tier);
-        expect(result.allowed).toBe(true);
+      // Simulate multiple hourly windows to exhaust the daily limit.
+      // Each hourly window allows `hourlyLimit` requests, so we advance
+      // time by hourlyWindowMs between batches so hourly counters expire
+      // while daily counters remain active.
+      let fakeNow = Date.now();
+      let totalSent = 0;
+
+      while (totalSent < dailyLimit) {
+        const batchSize = Math.min(hourlyLimit, dailyLimit - totalSent);
+        for (let i = 0; i < batchSize; i++) {
+          const result = checkUserTierLimit(userId, tier, fakeNow + i);
+          expect(result.allowed).toBe(true);
+        }
+        totalSent += batchSize;
+        // Advance past the hourly window so hourly counters expire
+        fakeNow += hourlyWindowMs + 1;
       }
 
-      // Should be blocked by daily limit
-      const blocked = checkUserTierLimit(userId, tier);
+      // Daily limit is now exhausted; next request should be blocked
+      const blocked = checkUserTierLimit(userId, tier, fakeNow);
       expect(blocked.allowed).toBe(false);
     });
 
