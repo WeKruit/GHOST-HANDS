@@ -16,6 +16,14 @@
 #   ./test-worker.sh --worker-id=adam   # named worker
 #   ./test-worker.sh --keep             # don't kill worker after test
 #
+# While running with --keep, manage jobs from the same terminal:
+#   bun run job list                    # list recent jobs
+#   bun run job status <id>             # job details
+#   bun run job cancel <id>             # cancel a job
+#   bun run job cancel --all            # cancel all active jobs
+#   bun run job retry <id>              # retry a failed job
+#   bun run job logs <id>               # show job events
+#
 
 set -euo pipefail
 
@@ -287,7 +295,15 @@ echo ""
 if [ "$KEEP_WORKER" = true ]; then
   ok "Done! Worker still running (PID $WORKER_PID)"
   ok "Full log: $WORKER_LOG"
-  ok "Kill when done: kill $WORKER_PID"
+  echo ""
+  echo -e "${BOLD}Job CLI commands (run from this terminal):${NC}"
+  echo "  bun run job list              # list recent jobs"
+  echo "  bun run job status ${JOB_ID:0:8}    # this job's details"
+  echo "  bun run job cancel ${JOB_ID:0:8}    # cancel this job"
+  echo "  bun run job logs ${JOB_ID:0:8}      # this job's events"
+  echo "  bun run job cancel --all      # cancel all active jobs"
+  echo ""
+  ok "Kill worker when done: kill $WORKER_PID"
 else
   ok "Done! Cleaning up..."
 fi

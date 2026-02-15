@@ -82,8 +82,8 @@ export function createValetRoutes(pool: pg.Pool) {
       INSERT INTO gh_automation_jobs (
         user_id, created_by, job_type, target_url, task_description,
         input_data, priority, max_retries, timeout_seconds,
-        tags, idempotency_key, metadata
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        tags, idempotency_key, metadata, target_worker_id
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       RETURNING id, status, created_at
     `, [
       body.valet_user_id,
@@ -103,6 +103,7 @@ export function createValetRoutes(pool: pg.Pool) {
       JSON.stringify(['valet', 'apply']),
       body.idempotency_key || null,
       JSON.stringify(metadata),
+      body.target_worker_id || null,
     ]);
 
     const job = result.rows[0];
@@ -147,8 +148,8 @@ export function createValetRoutes(pool: pg.Pool) {
       INSERT INTO gh_automation_jobs (
         user_id, created_by, job_type, target_url, task_description,
         input_data, priority, max_retries, timeout_seconds,
-        tags, idempotency_key, metadata
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        tags, idempotency_key, metadata, target_worker_id
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       RETURNING id, status, created_at
     `, [
       body.valet_user_id,
@@ -163,6 +164,7 @@ export function createValetRoutes(pool: pg.Pool) {
       JSON.stringify(['valet', body.job_type]),
       body.idempotency_key || null,
       JSON.stringify(metadata),
+      body.target_worker_id || null,
     ]);
 
     const job = result.rows[0];
