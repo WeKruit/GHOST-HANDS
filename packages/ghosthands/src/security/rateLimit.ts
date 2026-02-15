@@ -83,9 +83,9 @@ export interface RateLimitResult {
  * Check user tier limits (both hourly and daily).
  * Records the event if allowed. Returns the most restrictive result.
  */
-export function checkUserTierLimit(userId: string, tier: UserTier): RateLimitResult {
+export function checkUserTierLimit(userId: string, tier: UserTier, nowOverride?: number): RateLimitResult {
   const config = RATE_LIMITS.tiers[tier];
-  const now = Date.now();
+  const now = nowOverride ?? Date.now();
 
   // Enterprise tier is unlimited
   if (config.daily === -1 && config.hourly === -1) {
@@ -158,9 +158,9 @@ export function checkUserTierLimit(userId: string, tier: UserTier): RateLimitRes
  * Check platform limits (both hourly and daily).
  * Uses per-user-per-platform keys for fairness.
  */
-export function checkPlatformLimit(userId: string, platform: Platform): RateLimitResult {
+export function checkPlatformLimit(userId: string, platform: Platform, nowOverride?: number): RateLimitResult {
   const config = RATE_LIMITS.platforms[platform];
-  const now = Date.now();
+  const now = nowOverride ?? Date.now();
 
   const hourlyKey = `platform:${userId}:${platform}:hourly`;
   const dailyKey = `platform:${userId}:${platform}:daily`;
