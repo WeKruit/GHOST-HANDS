@@ -101,7 +101,7 @@ export class JobPoller {
     try {
       // Use direct pg query instead of supabase.rpc to avoid JWT issues
       const result = await this.pgDirect.query(
-        'SELECT * FROM gh_pickup_next_job($1)',
+        'SELECT * FROM gh_pickup_next_job($1::TEXT)',
         [this.workerId]
       );
 
@@ -155,7 +155,7 @@ export class JobPoller {
           status = 'pending',
           worker_id = NULL,
           error_details = jsonb_build_object(
-            'recovered_by', $1,
+            'recovered_by', $1::TEXT,
             'reason', 'stuck_job_recovery'
           )
         WHERE status IN ('queued', 'running')
