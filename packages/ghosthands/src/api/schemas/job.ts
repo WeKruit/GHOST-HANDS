@@ -31,6 +31,8 @@ export const CreateJobSchema = z.object({
   tags: z.array(z.string().max(50)).max(20).default([]),
   idempotency_key: z.string().max(255).optional(),
   metadata: z.record(z.unknown()).default({}),
+  /** Route job to a specific worker. NULL = any worker can pick it up. */
+  target_worker_id: z.string().max(100).nullable().optional(),
 });
 
 export type CreateJobInput = z.infer<typeof CreateJobSchema>;

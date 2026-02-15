@@ -105,6 +105,8 @@ export const CreateJobSchema = z.object({
   tags: z.array(z.string().max(50)).max(20).default([]),
   idempotency_key: z.string().max(255).optional(),
   metadata: z.record(z.unknown()).default({}),
+  /** Route job to a specific worker. NULL = any worker can pick it up. */
+  target_worker_id: z.string().max(100).nullable().optional(),
 });
 
 export type CreateJobInput = z.infer<typeof CreateJobSchema>;
@@ -133,6 +135,7 @@ export interface AutomationJob {
   last_heartbeat: string | null;
   worker_id: string | null;
   manual_id: string | null;
+  target_worker_id: string | null;
   engine_type: string | null;
   result_data: Record<string, unknown> | null;
   result_summary: string | null;
@@ -219,6 +222,8 @@ export interface CreateJobParams {
   tags?: string[];
   idempotency_key?: string;
   metadata?: Record<string, unknown>;
+  /** Route to a specific worker. Omit or null = any worker. */
+  target_worker_id?: string | null;
 }
 
 // --------------------------------------------------------------------------
@@ -250,6 +255,8 @@ export interface CreateJobOptions {
   tags?: string[];
   idempotencyKey?: string;
   metadata?: Record<string, unknown>;
+  /** Route to a specific worker. Omit or null = any worker. */
+  targetWorkerId?: string | null;
 }
 
 // --------------------------------------------------------------------------

@@ -58,6 +58,7 @@ function toApiPayload(
       tags: opts.tags ?? [],
       idempotency_key: opts.idempotencyKey ?? null,
       metadata: opts.metadata ?? {},
+      target_worker_id: opts.targetWorkerId ?? null,
     };
   }
 
@@ -76,6 +77,7 @@ function toApiPayload(
     tags: p.tags ?? [],
     idempotency_key: p.idempotency_key ?? null,
     metadata: p.metadata ?? {},
+    target_worker_id: p.target_worker_id ?? null,
   };
 }
 
