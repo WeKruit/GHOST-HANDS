@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
+import pg from 'pg';
 import { getSupabaseClient } from '../db/client.js';
 import { authMiddleware } from './middleware/auth.js';
 import { errorHandler } from './middleware/error-handler.js';
@@ -12,6 +13,8 @@ import { createUsageRoutes } from './routes/usage.js';
 import { requestLoggingMiddleware } from '../monitoring/logger.js';
 import { metricsMiddleware } from './middleware/metrics.js';
 import { createMonitoringRoutes } from './routes/monitoring.js';
+
+const { Pool } = pg;
 
 /**
  * Create and configure the GhostHands Hono API application.
@@ -53,8 +56,15 @@ export function createApp() {
   const api = new Hono();
   api.use('*', authMiddleware);
 
-  // Wire up controllers with Supabase client
-  const jobController = new JobController({ supabase });
+  // Wire up controllers with PostgreSQL pool (bypasses JWT issues)
+  // Prefer transaction-mode pooler (DATABASE_URL, port 6543) for API — handles many concurrent connections.
+  // Fall back to session-mode (SUPABASE_DIRECT_URL, port 5432) if pooler URL not set.
+  const poolUrl = process.env.DATABASE_URL || process.env.SUPABASE_DIRECT_URL || process.env.DATABASE_DIRECT_URL;
+  if (!poolUrl) {
+    throw new Error('Missing DATABASE_URL, SUPABASE_DIRECT_URL, or DATABASE_DIRECT_URL environment variable');
+  }
+  const pgPool = new Pool({ connectionString: poolUrl, max: 5 });
+  const jobController = new JobController({ pool: pgPool });
 
   api.route('/jobs', createJobRoutes(jobController));
   api.route('/', createUsageRoutes());

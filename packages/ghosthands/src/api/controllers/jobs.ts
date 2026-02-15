@@ -1,4 +1,4 @@
-import { SupabaseClient } from '@supabase/supabase-js';
+import pg from 'pg';
 import {
   CreateJobInput,
   BatchCreateJobsInput,
@@ -8,15 +8,17 @@ import {
   RETRYABLE_STATUSES,
 } from '../schemas/index.js';
 
+const { Pool } = pg;
+
 interface JobControllerDeps {
-  supabase: SupabaseClient;
+  pool: pg.Pool;
 }
 
 export class JobController {
-  private supabase: SupabaseClient;
+  private pool: pg.Pool;
 
-  constructor({ supabase }: JobControllerDeps) {
-    this.supabase = supabase;
+  constructor({ pool }: JobControllerDeps) {
+    this.pool = pool;
   }
 
   /**
@@ -26,105 +28,85 @@ export class JobController {
   async createJob(input: CreateJobInput, userId: string, createdBy: string = 'api') {
     // Check idempotency key conflict
     if (input.idempotency_key) {
-      const { data: existing } = await this.supabase
-        .from('gh_automation_jobs')
-        .select('id, status')
-        .eq('idempotency_key', input.idempotency_key)
-        .single();
+      const existing = await this.pool.query(
+        'SELECT id, status FROM gh_automation_jobs WHERE idempotency_key = $1 LIMIT 1',
+        [input.idempotency_key]
+      );
 
-      if (existing) {
+      if (existing.rows.length > 0) {
         return {
           conflict: true as const,
-          existing_job_id: existing.id,
-          existing_status: existing.status,
+          existing_job_id: existing.rows[0].id,
+          existing_status: existing.rows[0].status,
         };
       }
     }
 
-    const { data, error } = await this.supabase
-      .from('gh_automation_jobs')
-      .insert({
-        user_id: userId,
-        created_by: createdBy,
-        job_type: input.job_type,
-        target_url: input.target_url,
-        task_description: input.task_description,
-        input_data: input.input_data,
-        priority: input.priority,
-        scheduled_at: input.scheduled_at || null,
-        max_retries: input.max_retries,
-        timeout_seconds: input.timeout_seconds,
-        tags: input.tags,
-        idempotency_key: input.idempotency_key || null,
-        metadata: input.metadata,
-      })
-      .select('id, status, created_at')
-      .single();
+    try {
+      const result = await this.pool.query(`
+        INSERT INTO gh_automation_jobs (
+          user_id, created_by, job_type, target_url, task_description,
+          input_data, priority, scheduled_at, max_retries,
+          timeout_seconds, tags, idempotency_key, metadata
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        RETURNING id, status, created_at
+      `, [
+        userId, createdBy, input.job_type, input.target_url, input.task_description,
+        JSON.stringify(input.input_data), input.priority, input.scheduled_at || null,
+        input.max_retries, input.timeout_seconds, JSON.stringify(input.tags),
+        input.idempotency_key || null, JSON.stringify(input.metadata),
+      ]);
 
-    if (error) {
+      return { conflict: false as const, job: result.rows[0] };
+    } catch (err: any) {
       // Handle unique constraint violation on idempotency_key (race condition)
-      if (error.code === '23505' && error.message.includes('idempotency_key')) {
-        const { data: existing } = await this.supabase
-          .from('gh_automation_jobs')
-          .select('id, status')
-          .eq('idempotency_key', input.idempotency_key!)
-          .single();
-
-        if (existing) {
+      if (err.code === '23505' && err.message?.includes('idempotency_key')) {
+        const existing = await this.pool.query(
+          'SELECT id, status FROM gh_automation_jobs WHERE idempotency_key = $1 LIMIT 1',
+          [input.idempotency_key]
+        );
+        if (existing.rows.length > 0) {
           return {
             conflict: true as const,
-            existing_job_id: existing.id,
-            existing_status: existing.status,
+            existing_job_id: existing.rows[0].id,
+            existing_status: existing.rows[0].status,
           };
         }
       }
-      throw error;
+      throw err;
     }
-
-    return { conflict: false as const, job: data };
   }
 
   /** Get a full job record by ID. */
   async getJob(jobId: string, userId?: string) {
-    let query = this.supabase
-      .from('gh_automation_jobs')
-      .select('*')
-      .eq('id', jobId);
+    let sql = 'SELECT * FROM gh_automation_jobs WHERE id = $1::UUID';
+    const params: any[] = [jobId];
 
     if (userId) {
-      query = query.eq('user_id', userId);
+      sql += ' AND user_id = $2::TEXT';
+      params.push(userId);
     }
 
-    const { data, error } = await query.single();
-    if (error) {
-      if (error.code === 'PGRST116') return null; // Not found
-      throw error;
-    }
-    return data;
+    const { rows } = await this.pool.query(sql, params);
+    return rows[0] || null;
   }
 
   /** Get lightweight status for a job. */
   async getJobStatus(jobId: string, userId?: string) {
-    let query = this.supabase
-      .from('gh_automation_jobs')
-      .select('id, status, status_message, started_at, last_heartbeat, completed_at')
-      .eq('id', jobId);
+    let sql = 'SELECT id, status, status_message, started_at, last_heartbeat, completed_at FROM gh_automation_jobs WHERE id = $1::UUID';
+    const params: any[] = [jobId];
 
     if (userId) {
-      query = query.eq('user_id', userId);
+      sql += ' AND user_id = $2::TEXT';
+      params.push(userId);
     }
 
-    const { data, error } = await query.single();
-    if (error) {
-      if (error.code === 'PGRST116') return null;
-      throw error;
-    }
-    return data;
+    const { rows } = await this.pool.query(sql, params);
+    return rows[0] || null;
   }
 
   /** Cancel a job. Only works for pending/queued/running/paused jobs. */
   async cancelJob(jobId: string, userId?: string) {
-    // First fetch current status
     const job = await this.getJob(jobId, userId);
     if (!job) return { notFound: true as const };
 
@@ -136,20 +118,15 @@ export class JobController {
       };
     }
 
-    const { data, error } = await this.supabase
-      .from('gh_automation_jobs')
-      .update({
-        status: 'cancelled',
-        completed_at: new Date().toISOString(),
-      })
-      .eq('id', jobId)
-      .in('status', CANCELLABLE_STATUSES)
-      .select('id, status, completed_at')
-      .single();
+    const statusList = CANCELLABLE_STATUSES.map((_, i) => `$${i + 3}`).join(', ');
+    const { rows } = await this.pool.query(`
+      UPDATE gh_automation_jobs
+      SET status = 'cancelled', completed_at = NOW()
+      WHERE id = $1::UUID AND status IN (${statusList})
+      RETURNING id, status, completed_at
+    `, [jobId, ...CANCELLABLE_STATUSES]);
 
-    if (error) throw error;
-    if (!data) {
-      // Race condition: status changed between read and update
+    if (rows.length === 0) {
       return {
         notFound: false as const,
         notCancellable: true as const,
@@ -160,7 +137,7 @@ export class JobController {
     return {
       notFound: false as const,
       notCancellable: false as const,
-      job: { id: data.id, status: data.status, cancelled_at: data.completed_at },
+      job: { id: rows[0].id, status: rows[0].status, cancelled_at: rows[0].completed_at },
     };
   }
 
@@ -168,38 +145,44 @@ export class JobController {
   async listJobs(params: ListJobsQuery, userId?: string) {
     const { status, job_type, limit, offset, sort } = params;
     const effectiveUserId = params.user_id || userId;
-
-    let query = this.supabase
-      .from('gh_automation_jobs')
-      .select('*', { count: 'exact' });
+    const conditions: string[] = [];
+    const values: any[] = [];
+    let paramIdx = 1;
 
     if (effectiveUserId) {
-      query = query.eq('user_id', effectiveUserId);
+      conditions.push(`user_id = $${paramIdx++}::TEXT`);
+      values.push(effectiveUserId);
     }
 
     if (status) {
       const statuses = status.split(',').map((s) => s.trim());
-      query = query.in('status', statuses);
+      conditions.push(`status = ANY($${paramIdx++}::TEXT[])`);
+      values.push(statuses);
     }
 
     if (job_type) {
-      query = query.eq('job_type', job_type);
+      conditions.push(`job_type = $${paramIdx++}::TEXT`);
+      values.push(job_type);
     }
 
-    // Parse sort param: "field:direction"
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
     const [sortField, sortDir] = sort.split(':');
-    query = query.order(sortField || 'created_at', {
-      ascending: sortDir === 'asc',
-    });
+    const orderField = sortField || 'created_at';
+    const orderDir = sortDir === 'asc' ? 'ASC' : 'DESC';
 
-    query = query.range(offset, offset + limit - 1);
+    const countResult = await this.pool.query(
+      `SELECT COUNT(*) as total FROM gh_automation_jobs ${where}`,
+      values
+    );
 
-    const { data, error, count } = await query;
-    if (error) throw error;
+    const dataResult = await this.pool.query(
+      `SELECT * FROM gh_automation_jobs ${where} ORDER BY ${orderField} ${orderDir} LIMIT $${paramIdx++} OFFSET $${paramIdx++}`,
+      [...values, limit, offset]
+    );
 
     return {
-      jobs: data || [],
-      total: count || 0,
+      jobs: dataResult.rows,
+      total: parseInt(countResult.rows[0].total, 10),
       limit,
       offset,
     };
@@ -207,24 +190,24 @@ export class JobController {
 
   /** Get job events for debugging/audit. */
   async getJobEvents(jobId: string, params: GetEventsQuery, userId?: string) {
-    // Verify job exists and user has access
     const job = await this.getJob(jobId, userId);
     if (!job) return null;
 
     const { limit, offset } = params;
 
-    const { data, error, count } = await this.supabase
-      .from('gh_job_events')
-      .select('*', { count: 'exact' })
-      .eq('job_id', jobId)
-      .order('created_at', { ascending: true })
-      .range(offset, offset + limit - 1);
+    const countResult = await this.pool.query(
+      'SELECT COUNT(*) as total FROM gh_job_events WHERE job_id = $1::UUID',
+      [jobId]
+    );
 
-    if (error) throw error;
+    const dataResult = await this.pool.query(
+      'SELECT * FROM gh_job_events WHERE job_id = $1::UUID ORDER BY created_at ASC LIMIT $2 OFFSET $3',
+      [jobId, limit, offset]
+    );
 
     return {
-      events: data || [],
-      total: count || 0,
+      events: dataResult.rows,
+      total: parseInt(countResult.rows[0].total, 10),
     };
   }
 
@@ -241,25 +224,17 @@ export class JobController {
       };
     }
 
-    const { data, error } = await this.supabase
-      .from('gh_automation_jobs')
-      .update({
-        status: 'pending',
-        retry_count: job.retry_count + 1,
-        worker_id: null,
-        error_code: null,
-        error_details: null,
-        started_at: null,
-        completed_at: null,
-        last_heartbeat: null,
-      })
-      .eq('id', jobId)
-      .in('status', RETRYABLE_STATUSES)
-      .select('id, status, retry_count')
-      .single();
+    const statusList = RETRYABLE_STATUSES.map((_, i) => `$${i + 3}`).join(', ');
+    const { rows } = await this.pool.query(`
+      UPDATE gh_automation_jobs
+      SET status = 'pending', retry_count = retry_count + 1,
+          worker_id = NULL, error_code = NULL, error_details = NULL,
+          started_at = NULL, completed_at = NULL, last_heartbeat = NULL
+      WHERE id = $1::UUID AND status IN (${statusList})
+      RETURNING id, status, retry_count
+    `, [jobId, ...RETRYABLE_STATUSES]);
 
-    if (error) throw error;
-    if (!data) {
+    if (rows.length === 0) {
       return {
         notFound: false as const,
         notRetryable: true as const,
@@ -267,39 +242,47 @@ export class JobController {
       };
     }
 
-    return { notFound: false as const, notRetryable: false as const, job: data };
+    return { notFound: false as const, notRetryable: false as const, job: rows[0] };
   }
 
   /** Batch create multiple jobs. */
   async batchCreateJobs(input: BatchCreateJobsInput, userId: string, createdBy: string = 'api') {
     const defaults = input.defaults || {};
+    const client = await this.pool.connect();
 
-    const rows = input.jobs.map((job) => ({
-      user_id: userId,
-      created_by: createdBy,
-      job_type: job.job_type,
-      target_url: job.target_url,
-      task_description: job.task_description,
-      input_data: job.input_data,
-      priority: job.priority ?? defaults.priority ?? 5,
-      scheduled_at: job.scheduled_at || null,
-      max_retries: job.max_retries ?? defaults.max_retries ?? 3,
-      timeout_seconds: job.timeout_seconds ?? defaults.timeout_seconds ?? 300,
-      tags: job.tags.length > 0 ? job.tags : (defaults.tags || []),
-      idempotency_key: job.idempotency_key || null,
-      metadata: { ...defaults.metadata, ...job.metadata },
-    }));
+    try {
+      await client.query('BEGIN');
 
-    const { data, error } = await this.supabase
-      .from('gh_automation_jobs')
-      .insert(rows)
-      .select('id');
+      const jobIds: string[] = [];
+      for (const job of input.jobs) {
+        const result = await client.query(`
+          INSERT INTO gh_automation_jobs (
+            user_id, created_by, job_type, target_url, task_description,
+            input_data, priority, scheduled_at, max_retries,
+            timeout_seconds, tags, idempotency_key, metadata
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+          RETURNING id
+        `, [
+          userId, createdBy, job.job_type, job.target_url, job.task_description,
+          JSON.stringify(job.input_data),
+          job.priority ?? defaults.priority ?? 5,
+          job.scheduled_at || null,
+          job.max_retries ?? defaults.max_retries ?? 3,
+          job.timeout_seconds ?? defaults.timeout_seconds ?? 300,
+          JSON.stringify(job.tags.length > 0 ? job.tags : (defaults.tags || [])),
+          job.idempotency_key || null,
+          JSON.stringify({ ...defaults.metadata, ...job.metadata }),
+        ]);
+        jobIds.push(result.rows[0].id);
+      }
 
-    if (error) throw error;
-
-    return {
-      created: data?.length || 0,
-      job_ids: (data || []).map((row: { id: string }) => row.id),
-    };
+      await client.query('COMMIT');
+      return { created: jobIds.length, job_ids: jobIds };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 }
