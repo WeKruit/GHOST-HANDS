@@ -68,6 +68,7 @@ export const ValetApplySchema = z.object({
   timeout_seconds: z.number().int().min(30).max(1800).default(300),
   idempotency_key: z.string().max(255).optional(),
   metadata: z.record(z.unknown()).default({}),
+  target_worker_id: z.string().max(100).nullable().optional(),
 });
 
 export type ValetApplyInput = z.infer<typeof ValetApplySchema>;
@@ -87,6 +88,7 @@ export const ValetTaskSchema = z.object({
   timeout_seconds: z.number().int().min(30).max(1800).default(300),
   idempotency_key: z.string().max(255).optional(),
   metadata: z.record(z.unknown()).default({}),
+  target_worker_id: z.string().max(100).nullable().optional(),
 });
 
 export type ValetTaskInput = z.infer<typeof ValetTaskSchema>;

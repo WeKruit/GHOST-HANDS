@@ -24,7 +24,8 @@
         "submit-test-job": "bun src/scripts/submit-test-job.ts",
         "test-google": "bun src/scripts/submit-test-job.ts",
         "kill-workers": "bun src/scripts/kill-workers.ts",
-        "test:worker": "./test-worker.sh"
+        "test:worker": "./test-worker.sh",
+        "job": "bun src/scripts/job.ts"
     },
     "dependencies": {
         "magnitude-core": "^0.3.1",
