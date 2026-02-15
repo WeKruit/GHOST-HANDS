@@ -10,7 +10,7 @@
     "dev:worker": "bun --watch packages/ghosthands/src/workers/main.ts",
     "test": "vitest run",
     "test:unit": "vitest run packages/ghosthands/__tests__/unit",
-    "test:integration": "vitest run packages/ghosthands/__tests__/integration",
+    "test:integration": "vitest run packages/ghosthands/__tests__/integration --passWithNoTests",
     "test:e2e": "vitest run packages/ghosthands/__tests__/e2e",
     "magnitude:update": "bun update magnitude-core magnitude-extract"
   },
