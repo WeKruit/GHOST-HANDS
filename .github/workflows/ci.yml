@@ -107,6 +107,12 @@ jobs:
           ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
+          if [ -z "$VALET_DEPLOY_WEBHOOK_URL" ]; then
+            echo "::warning::VALET_DEPLOY_WEBHOOK_URL not configured. Skipping webhook notification."
+            echo "Image pushed to ECR: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+            exit 0
+          fi
+
           PAYLOAD=$(cat <<EOF
           {
             "event": "ghosthands.deploy_ready",
