@@ -47,14 +47,16 @@ export class JobController {
         INSERT INTO gh_automation_jobs (
           user_id, created_by, job_type, target_url, task_description,
           input_data, priority, scheduled_at, max_retries,
-          timeout_seconds, tags, idempotency_key, metadata
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+          timeout_seconds, tags, idempotency_key, metadata,
+          target_worker_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         RETURNING id, status, created_at
       `, [
         userId, createdBy, input.job_type, input.target_url, input.task_description,
         JSON.stringify(input.input_data), input.priority, input.scheduled_at || null,
         input.max_retries, input.timeout_seconds, JSON.stringify(input.tags),
         input.idempotency_key || null, JSON.stringify(input.metadata),
+        input.target_worker_id || null,
       ]);
 
       return { conflict: false as const, job: result.rows[0] };
@@ -259,8 +261,9 @@ export class JobController {
           INSERT INTO gh_automation_jobs (
             user_id, created_by, job_type, target_url, task_description,
             input_data, priority, scheduled_at, max_retries,
-            timeout_seconds, tags, idempotency_key, metadata
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            timeout_seconds, tags, idempotency_key, metadata,
+            target_worker_id
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
           RETURNING id
         `, [
           userId, createdBy, job.job_type, job.target_url, job.task_description,
@@ -272,6 +275,7 @@ export class JobController {
           JSON.stringify(job.tags.length > 0 ? job.tags : (defaults.tags || [])),
           job.idempotency_key || null,
           JSON.stringify({ ...defaults.metadata, ...job.metadata }),
+          job.target_worker_id || null,
         ]);
         jobIds.push(result.rows[0].id);
       }

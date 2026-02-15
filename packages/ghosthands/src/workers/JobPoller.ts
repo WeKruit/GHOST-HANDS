@@ -89,8 +89,9 @@ export class JobPoller {
     /**
      * Release all jobs claimed by this worker back to the queue.
      * Called during shutdown if jobs haven't completed in time.
+     * Public so main.ts can call it directly during force shutdown.
      */
-    private async releaseClaimedJobs(): Promise<void> {
+    async releaseClaimedJobs(): Promise<void> {
         try {
             const result = await this.pgDirect.query(
                 `

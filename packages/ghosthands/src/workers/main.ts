@@ -16,7 +16,19 @@ import { registerBuiltinHandlers } from './taskHandlers/index.js';
  * 6. Sends heartbeats every 30s during execution
  */
 
-const WORKER_ID = `worker-${process.env.FLY_REGION || process.env.NODE_ENV || 'local'}-${Date.now()}`;
+function parseWorkerId(): string {
+  const arg = process.argv.find((a) => a.startsWith('--worker-id='));
+  if (arg) {
+    const id = arg.split('=')[1];
+    if (!id) {
+      throw new Error('--worker-id requires a value (e.g. --worker-id=adam)');
+    }
+    return id;
+  }
+  return `worker-${process.env.FLY_REGION || process.env.NODE_ENV || 'local'}-${Date.now()}`;
+}
+
+const WORKER_ID = parseWorkerId();
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -27,7 +39,7 @@ function requireEnv(name: string): string {
 }
 
 async function main(): Promise<void> {
-  console.log(`[Worker] Starting ${WORKER_ID}...`);
+  console.log(`[Worker] Starting with ID: ${WORKER_ID}`);
 
   // Register all built-in task handlers
   registerBuiltinHandlers();
@@ -69,13 +81,32 @@ async function main(): Promise<void> {
     maxConcurrent,
   });
 
-  // Graceful shutdown handler
+  // Two-phase shutdown handler:
+  // - First signal: graceful shutdown (drain active jobs, release claimed jobs)
+  // - Second signal: force release jobs and exit immediately
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
-    if (shuttingDown) return;
-    shuttingDown = true;
+    if (shuttingDown) {
+      // Second signal -- force shutdown
+      console.log(`[Worker] Received second ${signal}, forcing shutdown...`);
+      console.log(`[Worker] Force-releasing claimed jobs...`);
+      try {
+        await poller.releaseClaimedJobs();
+      } catch (err) {
+        console.error(`[Worker] Force release failed:`, err);
+      }
+      try {
+        await pgDirect.end();
+      } catch {
+        // Connection may already be closed
+      }
+      console.log(`[Worker] ${WORKER_ID} force-killed`);
+      process.exit(1);
+    }
 
+    shuttingDown = true;
     console.log(`[Worker] Received ${signal}, starting graceful shutdown...`);
+    console.log(`[Worker] Press Ctrl-C again to force-kill immediately`);
     console.log(`[Worker] Draining ${poller.activeJobCount} active job(s)...`);
 
     await poller.stop();

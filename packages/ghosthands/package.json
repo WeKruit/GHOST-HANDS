@@ -15,12 +15,16 @@
         "api:dev": "bun --watch src/api/server.ts",
         "worker": "bun src/workers/main.ts",
         "worker:dev": "bun --watch src/workers/main.ts",
+        "worker:named": "bun src/workers/main.ts --worker-id=my-name",
         "apply:simple": "bun src/scripts/apply-simple.ts",
         "apply:workday": "bun src/scripts/apply-workday.ts",
         "release-stuck-jobs": "bun src/scripts/release-stuck-jobs.ts",
         "test-shutdown": "bun src/scripts/test-shutdown-cleanup.ts",
         "delete-jobs": "bun src/scripts/delete-all-jobs.ts",
-        "submit-test-job": "bun src/scripts/submit-test-job.ts"
+        "submit-test-job": "bun src/scripts/submit-test-job.ts",
+        "test-google": "bun src/scripts/submit-test-job.ts",
+        "kill-workers": "bun src/scripts/kill-workers.ts",
+        "test:worker": "./test-worker.sh"
     },
     "dependencies": {
         "magnitude-core": "^0.3.1",
