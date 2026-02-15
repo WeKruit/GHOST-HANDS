@@ -99,18 +99,17 @@ export class JobPoller {
 
     this.pickupInFlight = true;
     try {
-      const { data: jobs, error } = await this.supabase.rpc(
-        'gh_pickup_next_job',
-        { p_worker_id: this.workerId }
+      // Use direct pg query instead of supabase.rpc to avoid JWT issues
+      const result = await this.pgDirect.query(
+        'SELECT * FROM gh_pickup_next_job($1)',
+        [this.workerId]
       );
 
-      if (error) {
-        console.error(`[JobPoller] Pickup error:`, error.message);
-        return;
+      if (!result.rows || result.rows.length === 0) {
+        return; // No jobs available
       }
 
-      // gh_pickup_next_job returns SETOF, so data is an array
-      const job = Array.isArray(jobs) ? jobs[0] : jobs;
+      const job = result.rows[0];
       if (!job) return; // No jobs available
 
       this.activeJobs++;
@@ -149,24 +148,23 @@ export class JobPoller {
     const STUCK_THRESHOLD_SECONDS = 120;
 
     try {
-      const { data, error } = await this.supabase
-        .from('gh_automation_jobs')
-        .update({
-          status: 'pending',
-          worker_id: null,
-          error_details: { recovered_by: this.workerId, reason: 'stuck_job_recovery' },
-        })
-        .in('status', ['queued', 'running'])
-        .lt('last_heartbeat', new Date(Date.now() - STUCK_THRESHOLD_SECONDS * 1000).toISOString())
-        .select('id');
+      // Use direct pg query instead of supabase to avoid JWT issues
+      const result = await this.pgDirect.query(`
+        UPDATE gh_automation_jobs
+        SET
+          status = 'pending',
+          worker_id = NULL,
+          error_details = jsonb_build_object(
+            'recovered_by', $1,
+            'reason', 'stuck_job_recovery'
+          )
+        WHERE status IN ('queued', 'running')
+          AND last_heartbeat < NOW() - INTERVAL '${STUCK_THRESHOLD_SECONDS} seconds'
+        RETURNING id
+      `, [this.workerId]);
 
-      if (error) {
-        console.error('[JobPoller] Stuck job recovery error:', error.message);
-        return;
-      }
-
-      if (data && data.length > 0) {
-        console.log(`[JobPoller] Recovered ${data.length} stuck job(s): ${data.map((j: { id: string }) => j.id).join(', ')}`);
+      if (result.rows && result.rows.length > 0) {
+        console.log(`[JobPoller] Recovered ${result.rows.length} stuck job(s): ${result.rows.map((j: { id: string }) => j.id).join(', ')}`);
       }
     } catch (err) {
       console.error('[JobPoller] Stuck job recovery failed:', err);
