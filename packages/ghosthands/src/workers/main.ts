@@ -31,21 +31,23 @@ async function main(): Promise<void> {
   // Validate required environment variables
   const supabaseUrl = requireEnv('SUPABASE_URL');
   const supabaseServiceKey = requireEnv('SUPABASE_SERVICE_KEY');
-  const directUrl = requireEnv('SUPABASE_DIRECT_URL');
+  // Prefer transaction-mode pooler (port 6543) to avoid session pool limits.
+  // LISTEN/NOTIFY won't work through transaction pooler, but fallback polling handles it.
+  const dbUrl = process.env.DATABASE_URL || process.env.SUPABASE_DIRECT_URL || requireEnv('DATABASE_DIRECT_URL');
 
   // Pooled connection for normal queries (goes through pgbouncer)
   const supabase = createClient(supabaseUrl, supabaseServiceKey, {
     auth: { persistSession: false },
   });
 
-  // Direct connection for LISTEN/NOTIFY (must bypass pgbouncer)
+  // PostgreSQL connection for job pickup queries and LISTEN/NOTIFY (if session mode)
   const pgDirect = new PgClient({
-    connectionString: directUrl,
+    connectionString: dbUrl,
   });
 
-  console.log(`[Worker] Connecting to Postgres (direct)...`);
+  console.log(`[Worker] Connecting to Postgres...`);
   await pgDirect.connect();
-  console.log(`[Worker] Postgres direct connection established`);
+  console.log(`[Worker] Postgres connection established`);
 
   const maxConcurrent = parseInt(process.env.MAX_CONCURRENT_JOBS || '2', 10);
 
