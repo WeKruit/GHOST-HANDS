@@ -15,7 +15,8 @@ env:
   NODE_VERSION: "20"
 
 jobs:
-  # Type checking
+  # ─── Checks (run on every push & PR) ─────────────────────────
+
   typecheck:
     name: Type Check
     runs-on: ubuntu-latest
@@ -27,7 +28,6 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run build
 
-  # Unit tests
   test-unit:
     name: Unit Tests
     runs-on: ubuntu-latest
@@ -39,7 +39,6 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run test:unit
 
-  # Integration tests
   test-integration:
     name: Integration Tests
     runs-on: ubuntu-latest
@@ -58,7 +57,8 @@ jobs:
           GH_SERVICE_SECRET: ${{ secrets.GH_SERVICE_SECRET }}
           GH_ENCRYPTION_KEY: ${{ secrets.GH_ENCRYPTION_KEY }}
 
-  # Docker build + push to ECR
+  # ─── Docker build (main branch only) ─────────────────────────
+
   docker:
     name: Docker Build & Push
     runs-on: ubuntu-latest
@@ -66,7 +66,6 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     outputs:
       image_tag: ${{ github.sha }}
-      ecr_image: ${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
 
@@ -87,59 +86,62 @@ jobs:
           ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          docker build \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-  # Notify VALET that a new image is ready for deployment
-  # VALET controls the EC2 fleet and triggers rolling updates
-  notify-valet:
-    name: Notify VALET
+  # ─── Deploy: Staging ──────────────────────────────────────────
+
+  deploy-staging:
+    name: Deploy Staging
     runs-on: ubuntu-latest
     needs: [docker, test-integration]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: staging
     steps:
-      - name: Send deploy-ready webhook to VALET
+      - name: Notify VALET (staging)
         env:
           VALET_DEPLOY_WEBHOOK_URL: ${{ secrets.VALET_DEPLOY_WEBHOOK_URL }}
           VALET_DEPLOY_WEBHOOK_SECRET: ${{ secrets.VALET_DEPLOY_WEBHOOK_SECRET }}
           ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
           ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
+          DEPLOY_ENV: staging
         run: |
           if [ -z "$VALET_DEPLOY_WEBHOOK_URL" ]; then
-            echo "::warning::VALET_DEPLOY_WEBHOOK_URL not configured. Skipping webhook notification."
-            echo "Image pushed to ECR: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+            echo "::warning::VALET_DEPLOY_WEBHOOK_URL not configured for staging. Skipping."
+            echo "Image ready: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
             exit 0
           fi
 
-          PAYLOAD=$(cat <<EOF
-          {
-            "event": "ghosthands.deploy_ready",
-            "image": "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}",
-            "image_tag": "${IMAGE_TAG}",
-            "image_latest": "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest",
-            "commit_sha": "${GITHUB_SHA}",
-            "commit_message": $(echo "${{ github.event.head_commit.message }}" | head -1 | jq -Rs .),
-            "branch": "main",
-            "repository": "${{ github.repository }}",
-            "run_id": "${{ github.run_id }}",
-            "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          }
-          EOF
-          )
+          PAYLOAD=$(jq -n \
+            --arg event "ghosthands.deploy_ready" \
+            --arg image "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" \
+            --arg image_tag "${IMAGE_TAG}" \
+            --arg image_latest "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest" \
+            --arg commit_sha "${{ github.sha }}" \
+            --arg commit_message "$(echo "${{ github.event.head_commit.message }}" | head -1)" \
+            --arg branch "main" \
+            --arg environment "staging" \
+            --arg repository "${{ github.repository }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{event: $event, image: $image, image_tag: $image_tag, image_latest: $image_latest, commit_sha: $commit_sha, commit_message: $commit_message, branch: $branch, environment: $environment, repository: $repository, run_id: $run_id, run_url: $run_url, timestamp: $timestamp}')
 
-          # Generate HMAC signature for webhook verification
           SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$VALET_DEPLOY_WEBHOOK_SECRET" | awk '{print $2}')
 
-          echo "Notifying VALET of new GhostHands image: ${IMAGE_TAG}"
+          echo "Notifying VALET staging: ${IMAGE_TAG}"
 
           HTTP_STATUS=$(curl -s -o /tmp/webhook_response.txt -w "%{http_code}" \
             -X POST "$VALET_DEPLOY_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -H "X-GH-Webhook-Signature: sha256=${SIGNATURE}" \
             -H "X-GH-Event: deploy_ready" \
+            -H "X-GH-Environment: staging" \
             --max-time 30 \
             -d "$PAYLOAD")
 
@@ -147,9 +149,68 @@ jobs:
           cat /tmp/webhook_response.txt
 
           if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
-            echo "VALET notified successfully. Deployment will be managed by VALET."
+            echo "Staging deploy notification sent."
           else
-            echo "::warning::VALET webhook returned HTTP ${HTTP_STATUS}. VALET may not have received the deploy notification."
-            echo "Manual deploy may be required: ECR_IMAGE=${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
-            # Don't fail the pipeline — the image is in ECR and can be deployed manually
+            echo "::warning::VALET staging webhook returned HTTP ${HTTP_STATUS}."
+          fi
+
+  # ─── Deploy: Production ───────────────────────────────────────
+
+  deploy-production:
+    name: Deploy Production
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - name: Notify VALET (production)
+        env:
+          VALET_DEPLOY_WEBHOOK_URL: ${{ secrets.VALET_DEPLOY_WEBHOOK_URL }}
+          VALET_DEPLOY_WEBHOOK_SECRET: ${{ secrets.VALET_DEPLOY_WEBHOOK_SECRET }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+          DEPLOY_ENV: production
+        run: |
+          if [ -z "$VALET_DEPLOY_WEBHOOK_URL" ]; then
+            echo "::warning::VALET_DEPLOY_WEBHOOK_URL not configured for production. Skipping."
+            echo "Image ready: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+            exit 0
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg event "ghosthands.deploy_ready" \
+            --arg image "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" \
+            --arg image_tag "${IMAGE_TAG}" \
+            --arg image_latest "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest" \
+            --arg commit_sha "${{ github.sha }}" \
+            --arg commit_message "$(echo "${{ github.event.head_commit.message }}" | head -1)" \
+            --arg branch "main" \
+            --arg environment "production" \
+            --arg repository "${{ github.repository }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{event: $event, image: $image, image_tag: $image_tag, image_latest: $image_latest, commit_sha: $commit_sha, commit_message: $commit_message, branch: $branch, environment: $environment, repository: $repository, run_id: $run_id, run_url: $run_url, timestamp: $timestamp}')
+
+          SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$VALET_DEPLOY_WEBHOOK_SECRET" | awk '{print $2}')
+
+          echo "Notifying VALET production: ${IMAGE_TAG}"
+
+          HTTP_STATUS=$(curl -s -o /tmp/webhook_response.txt -w "%{http_code}" \
+            -X POST "$VALET_DEPLOY_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-GH-Webhook-Signature: sha256=${SIGNATURE}" \
+            -H "X-GH-Event: deploy_ready" \
+            -H "X-GH-Environment: production" \
+            --max-time 30 \
+            -d "$PAYLOAD")
+
+          echo "VALET responded with HTTP ${HTTP_STATUS}"
+          cat /tmp/webhook_response.txt
+
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "Production deploy notification sent."
+          else
+            echo "::warning::VALET production webhook returned HTTP ${HTTP_STATUS}."
           fi
