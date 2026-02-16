@@ -58,6 +58,7 @@ const RETRYABLE_ERRORS = new Set([
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const DEFAULT_HITL_TIMEOUT_SECONDS = 300; // 5 minutes
+const MAX_CRASH_RECOVERIES = 2;
 
 /** Error codes that should trigger HITL instead of immediate retry */
 const HITL_ELIGIBLE_ERRORS = new Set([
@@ -275,23 +276,95 @@ export class JobExecutor {
         }); // throws BudgetExceededError if over budget
       });
 
-      // 10. Build TaskContext and delegate to handler
-      const ctx: TaskContext = {
-        job,
-        adapter,
-        costTracker,
-        progress,
-        credentials,
-        dataPrompt,
-      };
-
+      // 10. Build TaskContext and delegate to handler (with crash recovery)
       const timeoutMs = job.timeout_seconds * 1000;
       await this.updateJobStatus(job.id, 'running', `Executing ${handler.type} handler`);
 
-      const taskResult: TaskResult = await Promise.race([
-        handler.execute(ctx),
-        this.createTimeout(timeoutMs),
-      ]);
+      let taskResult: TaskResult | undefined;
+      let crashRecoveryAttempts = 0;
+
+      while (crashRecoveryAttempts <= MAX_CRASH_RECOVERIES) {
+        const ctx: TaskContext = {
+          job,
+          adapter: adapter!,
+          costTracker,
+          progress,
+          credentials,
+          dataPrompt,
+        };
+
+        try {
+          taskResult = await Promise.race([
+            handler.execute(ctx),
+            this.createTimeout(timeoutMs),
+          ]);
+          break; // Success -- exit retry loop
+        } catch (execError) {
+          const execMsg = execError instanceof Error ? execError.message : String(execError);
+          const isCrash = this.classifyError(execMsg) === 'browser_crashed'
+            || !this.isBrowserAlive(adapter!);
+
+          if (!isCrash || crashRecoveryAttempts >= MAX_CRASH_RECOVERIES) {
+            throw execError; // Not a crash, or exhausted recovery attempts
+          }
+
+          crashRecoveryAttempts++;
+          console.warn(
+            `[JobExecutor] Browser crash detected for job ${job.id}, recovery attempt ${crashRecoveryAttempts}/${MAX_CRASH_RECOVERIES}`,
+          );
+
+          await this.logJobEvent(job.id, 'browser_crash_detected', {
+            attempt: crashRecoveryAttempts,
+            error_message: execMsg,
+          });
+
+          const recovered = await this.recoverFromCrash(job, adapter!, llmClient, credentials);
+          if (!recovered) {
+            throw new Error(
+              `Browser crashed and recovery failed after ${crashRecoveryAttempts} attempt(s): ${execMsg}`,
+            );
+          }
+
+          adapter = recovered;
+
+          // Re-wire event handlers on the new adapter
+          adapter.on('thought', (thought: string) => {
+            progress.recordThought(thought);
+          });
+          adapter.on('actionStarted', (action: { variant: string }) => {
+            costTracker.recordAction();
+            progress.onActionStarted(action.variant);
+            this.logJobEvent(job.id, 'step_started', {
+              action: action.variant,
+              action_count: costTracker.getSnapshot().actionCount,
+            });
+          });
+          adapter.on('actionDone', (action: { variant: string }) => {
+            progress.onActionDone(action.variant);
+            this.logJobEvent(job.id, 'step_completed', {
+              action: action.variant,
+              action_count: costTracker.getSnapshot().actionCount,
+            });
+          });
+          adapter.on('tokensUsed', (usage: TokenUsage) => {
+            costTracker.recordTokenUsage({
+              inputTokens: usage.inputTokens,
+              outputTokens: usage.outputTokens,
+              inputCost: usage.inputCost,
+              outputCost: usage.outputCost,
+            });
+          });
+
+          await this.logJobEvent(job.id, 'browser_crash_recovered', {
+            attempt: crashRecoveryAttempts,
+          });
+          await this.updateJobStatus(job.id, 'running', `Recovered from crash, retrying handler`);
+        }
+      }
+
+      if (!taskResult) {
+        throw new Error('Task handler did not produce a result');
+      }
 
       if (!taskResult.success) {
         throw new Error(taskResult.error || `Task handler '${handler.type}' returned failure`);
@@ -852,6 +925,65 @@ export class JobExecutor {
       if (pattern.test(message)) return code;
     }
     return 'internal_error';
+  }
+
+  // --- Browser crash detection & recovery ---
+
+  /**
+   * Check whether the browser is still alive.
+   * Returns true if connected, false if crashed/disconnected.
+   */
+  private isBrowserAlive(adapter: BrowserAutomationAdapter): boolean {
+    try {
+      return adapter.isConnected();
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Attempt to recover from a browser crash by stopping the dead adapter,
+   * creating a fresh one, and restoring session state.
+   *
+   * Returns the new adapter if recovery succeeds, or null if it fails.
+   */
+  private async recoverFromCrash(
+    job: AutomationJob,
+    deadAdapter: BrowserAutomationAdapter,
+    llmClient: LLMConfig,
+    credentials: Record<string, string> | null,
+  ): Promise<BrowserAutomationAdapter | null> {
+    // Stop the dead adapter (ignore errors -- it's already dead)
+    try { await deadAdapter.stop(); } catch { /* noop */ }
+
+    // Try to load session state for seamless recovery
+    let storedSession: Record<string, unknown> | null = null;
+    if (this.sessionManager) {
+      try {
+        storedSession = await this.sessionManager.loadSession(job.user_id, job.target_url);
+      } catch {
+        // No session available -- will start fresh
+      }
+    }
+
+    try {
+      const adapterType = (process.env.GH_BROWSER_ENGINE || 'magnitude') as AdapterType;
+      const newAdapter = createAdapter(adapterType);
+      await newAdapter.start({
+        url: job.target_url,
+        llm: llmClient,
+        ...(storedSession ? { storageState: storedSession } : {}),
+      });
+
+      if (credentials) {
+        newAdapter.registerCredentials(credentials);
+      }
+
+      return newAdapter;
+    } catch (err) {
+      console.error(`[JobExecutor] Crash recovery failed for job ${job.id}:`, err);
+      return null;
+    }
   }
 
   // --- Timeout ---

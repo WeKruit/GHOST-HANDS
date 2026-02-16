@@ -22,6 +22,13 @@ export interface BrowserAutomationAdapter {
   /** Whether the adapter is currently active */
   isActive(): boolean;
 
+  /**
+   * Check if the underlying browser connection is still alive.
+   * Returns false if the browser process has exited, the CDP connection
+   * dropped, or all pages have been closed.
+   */
+  isConnected(): boolean;
+
   // -- Core Actions --
 
   /** Execute a natural-language action on the current page */
