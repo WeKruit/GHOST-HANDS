@@ -249,6 +249,135 @@ bun run job cancel <job_id>    # Kill it
 
 ---
 
+## Human-in-the-Loop (HITL) — Coming in Phase 2
+
+### Overview
+
+When GhostHands encounters a blocker it can't solve (CAPTCHA, 2FA, bot check, login required), it will:
+1. **Pause** the automation and take a screenshot
+2. **Notify VALET** via the existing callback URL with `status: 'needs_human'`
+3. **Wait** for VALET to call a resume endpoint (or timeout after 5 minutes)
+
+VALET is responsible for showing the notification to the user and providing a way to resolve the blocker.
+
+### Callback: `needs_human` (GhostHands → VALET)
+
+When a blocker is detected, GhostHands POSTs to the job's `callback_url`:
+
+```jsonc
+{
+  "job_id": "abc-123",
+  "valet_task_id": "valet-456",
+  "status": "needs_human",
+  "interaction": {
+    "reason": "captcha",                // "captcha" | "2fa" | "login" | "bot_check" | "screening_question"
+    "description": "reCAPTCHA v2 detected on application page",
+    "screenshot_url": "https://storage.../blocker-screenshot.png",
+    "current_url": "https://company.workday.com/apply",
+    "paused_at": "2026-02-16T06:30:00Z",
+    "expires_at": "2026-02-16T06:35:00Z",
+    "timeout_seconds": 300
+  },
+  "progress": {
+    "step": "filling_form",
+    "progress_pct": 45,
+    "actions_completed": 7
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | `"needs_human"` | New callback status (in addition to `"completed"` and `"failed"`) |
+| `interaction.reason` | `string` | What blocker was detected |
+| `interaction.screenshot_url` | `string` | Screenshot showing the blocker |
+| `interaction.expires_at` | `string` | When the interaction times out (job will fail) |
+| `interaction.timeout_seconds` | `number` | Seconds until timeout |
+
+### Resume Endpoint (VALET → GhostHands)
+
+After the user resolves the blocker, VALET calls:
+
+```
+POST /api/v1/gh/valet/resume/:jobId
+```
+
+**Request:**
+```jsonc
+{
+  "action": "resume",        // "resume" or "cancel"
+  "resolution": "solved",    // what the human did
+  "notes": "Solved CAPTCHA"  // optional
+}
+```
+
+**Response (success):**
+```jsonc
+{
+  "job_id": "abc-123",
+  "status": "running",
+  "resumed_at": "2026-02-16T06:32:00Z"
+}
+```
+
+**Response (job not paused):**
+```jsonc
+// 409 Conflict
+{
+  "error": "not_paused",
+  "message": "Job is running, not paused"
+}
+```
+
+### Status Response (Updated)
+
+`GET /api/v1/gh/valet/status/:jobId` now includes interaction info when paused:
+
+```jsonc
+{
+  "job_id": "abc-123",
+  "status": "paused",
+  "status_message": "Waiting for human: reCAPTCHA detected",
+  "interaction": {
+    "reason": "captcha",
+    "description": "reCAPTCHA v2 detected",
+    "screenshot_url": "https://...",
+    "current_url": "https://company.workday.com/apply",
+    "paused_at": "2026-02-16T06:30:00Z",
+    "expires_at": "2026-02-16T06:35:00Z",
+    "timeout_seconds": 300
+  },
+  "progress": { ... },
+  "timestamps": { ... }
+}
+```
+
+### New Error Codes
+
+| Error Code | Description | Human Action |
+|------------|-------------|------------|
+| `captcha_blocked` | CAPTCHA/reCAPTCHA detected | Solve the CAPTCHA |
+| `2fa_required` | Two-factor authentication prompt | Enter verification code |
+| `login_required` | Login page detected | Enter credentials |
+| `bot_check` | Bot detection interstitial | Verify humanity |
+| `human_timeout` | Human didn't respond in time | Job failed — retry |
+| `human_cancelled` | Human chose to cancel | Job cancelled |
+
+### VALET Action Items (Phase 2)
+
+- [ ] Handle `needs_human` callback — show notification to user
+- [ ] Build UI to display blocker screenshot and resolution buttons
+- [ ] Implement "I'm done" button → `POST /valet/resume/:jobId` with `action: "resume"`
+- [ ] Implement "Cancel" button → `POST /valet/resume/:jobId` with `action: "cancel"`
+- [ ] Handle `human_timeout` — show "automation timed out" message
+- [ ] (Future) Live browser viewer via CDP WebSocket for real-time takeover
+
+### Backward Compatibility
+
+This feature is **fully opt-in**. Jobs without `callback_url` will never trigger HITL — they'll continue to retry and fail as today. VALET only needs to implement HITL handling when ready.
+
+---
+
 ## Backward Compatibility
 
 | Scenario | Before | After |

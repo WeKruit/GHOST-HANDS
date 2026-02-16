@@ -432,13 +432,349 @@ The observation step is free (pure DOM, no LLM). It tells us what platform we're
 
 ---
 
+## Human-in-the-Loop (HITL) Interaction System
+
+### The Problem
+
+Some situations can't be solved by AI or cookbooks:
+- **CAPTCHA / reCAPTCHA** — bot detection challenges
+- **2FA / MFA** — SMS codes, authenticator apps, email verification
+- **"Are you human?"** — bot check interstitials
+- **Complex screening questions** — ambiguous or subjective answers the user should decide
+- **Login required** — platform needs the user's real credentials
+- **Payment / legal** — terms acceptance, payment info
+
+Today these all result in `failed` status with error codes like `captcha_blocked` or `login_required`. The job retries and fails again.
+
+### The Solution: Pause + Notify + Handoff + Resume
+
+```
+Agent encounters blocker (CAPTCHA, 2FA, etc.)
+  │
+  ▼
+┌─────────────────────────────────────────────────┐
+│  1. DETECT                                       │
+│     Agent or PageObserver detects blocker type    │
+│     via DOM patterns, error classification,       │
+│     or AI reasoning ("I see a CAPTCHA")          │
+│                                                   │
+│  2. PAUSE                                        │
+│     agent.pause() — halts the action loop         │
+│     Job status → 'paused'                        │
+│     Take screenshot of blocker                    │
+│                                                   │
+│  3. NOTIFY VALET                                 │
+│     POST callback_url with:                       │
+│       status: 'needs_human'                       │
+│       reason: 'captcha_detected'                  │
+│       screenshot_url: '...'                       │
+│       interaction_url: 'ws://cdp-endpoint'        │
+│       interaction_expires_at: '+5 minutes'        │
+│                                                   │
+│  4. HUMAN TAKES OVER                             │
+│     VALET shows notification to user              │
+│     User connects to browser (CDP or VNC)         │
+│     User solves CAPTCHA / enters 2FA code         │
+│     User signals "done" via VALET UI              │
+│                                                   │
+│  5. RESUME                                       │
+│     VALET calls POST /valet/resume/:jobId         │
+│     agent.resume() — continues from paused state  │
+│     Job status → 'running'                        │
+│                                                   │
+│  6. TIMEOUT (if human doesn't respond)            │
+│     After interaction_timeout (default 5 min):    │
+│     Job fails with 'human_timeout'                │
+│     Browser cleaned up                            │
+└─────────────────────────────────────────────────┘
+```
+
+### Blocker Detection
+
+Blockers are detected at multiple levels:
+
+**Level 1: Error classification (existing)**
+The `ERROR_CLASSIFICATIONS` in JobExecutor already catches `captcha_blocked` and `login_required`. Instead of retrying, these now trigger the HITL flow.
+
+**Level 2: PageObserver DOM patterns (Phase 2)**
+```typescript
+interface BlockerDetection {
+  type: 'captcha' | '2fa' | 'login' | 'bot_check' | 'unknown';
+  confidence: number;        // 0-1
+  screenshot?: string;       // URL to screenshot of the blocker
+  description: string;       // human-readable: "reCAPTCHA v2 detected"
+  selectors?: string[];      // relevant DOM selectors
+}
+
+// DOM pattern matching (no LLM needed)
+const BLOCKER_PATTERNS = [
+  { type: 'captcha', selectors: ['iframe[src*="recaptcha"]', '.h-captcha', '#captcha'] },
+  { type: '2fa', selectors: ['input[name*="otp"]', 'input[name*="code"]', '[data-automation-id*="verification"]'] },
+  { type: 'login', selectors: ['input[type="password"]', 'form[action*="login"]', '#login-form'] },
+  { type: 'bot_check', selectors: ['.challenge-running', '#challenge-stage', '.cf-browser-verification'] },
+];
+```
+
+**Level 3: AI reasoning (during explore mode)**
+The agent's `thought` events may contain phrases like "I see a CAPTCHA" or "It's asking for a verification code". These are pattern-matched to trigger HITL.
+
+```typescript
+const THOUGHT_BLOCKERS = [
+  { pattern: /captcha|recaptcha|hcaptcha/i, type: 'captcha' },
+  { pattern: /verification code|2fa|two.factor|authenticator/i, type: '2fa' },
+  { pattern: /sign.?in|log.?in|password/i, type: 'login' },
+  { pattern: /are you (a )?human|bot.?(check|detect)/i, type: 'bot_check' },
+];
+```
+
+### Callback Payload (VALET Notification)
+
+When a blocker is detected, GhostHands sends a callback to VALET:
+
+```typescript
+interface HumanInteractionCallback {
+  job_id: string;
+  valet_task_id: string | null;
+  status: 'needs_human';
+  interaction: {
+    reason: 'captcha' | '2fa' | 'login' | 'bot_check' | 'screening_question';
+    description: string;           // "reCAPTCHA detected on Workday application page"
+    screenshot_url: string;        // screenshot of the blocker
+    current_url: string;           // where the browser is stuck
+    // Browser access for human takeover
+    cdp_url?: string;              // ws://... for Chrome DevTools Protocol
+    vnc_url?: string;              // VNC viewer URL (for cloud browsers)
+    viewer_url?: string;           // web-based browser viewer
+    // Timing
+    paused_at: string;             // ISO timestamp
+    expires_at: string;            // when the interaction times out
+    timeout_seconds: number;       // how long to wait (default: 300)
+  };
+  progress: {
+    step: string;
+    progress_pct: number;
+    actions_completed: number;
+  };
+}
+```
+
+### VALET Resume Endpoint
+
+New endpoint for VALET to signal "human is done":
+
+```
+POST /api/v1/gh/valet/resume/:jobId
+```
+
+**Request:**
+```jsonc
+{
+  "action": "resume",        // or "cancel" if user gives up
+  "resolution": "solved",    // what the human did
+  "notes": "Solved CAPTCHA"  // optional human notes
+}
+```
+
+**Response:**
+```jsonc
+{
+  "job_id": "abc-123",
+  "status": "running",       // resumed
+  "resumed_at": "2026-02-16T..."
+}
+```
+
+**Implementation:**
+```typescript
+valet.post('/resume/:jobId', async (c) => {
+  const jobId = c.req.param('jobId');
+  const body = await c.req.json();
+
+  // Verify job is actually paused
+  const { rows } = await pool.query(
+    'SELECT id, status, worker_id FROM gh_automation_jobs WHERE id = $1::UUID',
+    [jobId]
+  );
+
+  if (rows.length === 0) return c.json({ error: 'not_found' }, 404);
+  if (rows[0].status !== 'paused') {
+    return c.json({ error: 'not_paused', message: `Job is ${rows[0].status}, not paused` }, 409);
+  }
+
+  if (body.action === 'cancel') {
+    // User gave up — cancel the job
+    await pool.query(
+      `UPDATE gh_automation_jobs SET status = 'cancelled', completed_at = NOW() WHERE id = $1`,
+      [jobId]
+    );
+    return c.json({ job_id: jobId, status: 'cancelled' });
+  }
+
+  // Signal the worker to resume via Postgres NOTIFY
+  await pool.query(`NOTIFY gh_job_resume, '${jobId}'`);
+
+  // Log the interaction
+  await pool.query(
+    `INSERT INTO gh_job_events (job_id, event_type, message, metadata)
+     VALUES ($1, 'human_resumed', $2, $3)`,
+    [jobId, body.notes || 'Human resolved blocker', JSON.stringify({ resolution: body.resolution })]
+  );
+
+  return c.json({ job_id: jobId, status: 'running', resumed_at: new Date().toISOString() });
+});
+```
+
+### Worker-Side: Pause + Wait + Resume
+
+In `JobExecutor`, the HITL flow hooks into the existing error handling:
+
+```typescript
+// In JobExecutor.execute(), when a blocker is detected:
+
+private async requestHumanIntervention(
+  job: AutomationJob,
+  adapter: BrowserAutomationAdapter,
+  blocker: BlockerDetection,
+  progress: ProgressTracker,
+): Promise<'resumed' | 'cancelled' | 'timeout'> {
+  // 1. Pause the agent
+  // (Magnitude's agent.pause() stops the action loop but keeps browser alive)
+
+  // 2. Take screenshot
+  const screenshot = await adapter.screenshot();
+  const screenshotUrl = await this.uploadScreenshot(job.id, 'blocker', screenshot);
+
+  // 3. Update job status to 'paused'
+  await this.supabase
+    .from('gh_automation_jobs')
+    .update({
+      status: 'paused',
+      status_message: `Waiting for human: ${blocker.description}`,
+    })
+    .eq('id', job.id);
+
+  await this.logJobEvent(job.id, 'human_intervention_requested', {
+    blocker_type: blocker.type,
+    description: blocker.description,
+    screenshot_url: screenshotUrl,
+  });
+
+  // 4. Notify VALET via callback
+  if (job.callback_url) {
+    await callbackNotifier.notifyInteraction(job.callback_url, {
+      job_id: job.id,
+      valet_task_id: job.valet_task_id || null,
+      status: 'needs_human',
+      interaction: {
+        reason: blocker.type,
+        description: blocker.description,
+        screenshot_url: screenshotUrl,
+        current_url: await adapter.getCurrentUrl(),
+        paused_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 300_000).toISOString(),
+        timeout_seconds: 300,
+      },
+    });
+  }
+
+  // 5. Wait for resume signal (Postgres LISTEN) or timeout
+  const timeoutMs = 300_000; // 5 minutes
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve('timeout'), timeoutMs);
+
+    // Listen for resume notification from VALET
+    this.listenForResume(job.id, (action) => {
+      clearTimeout(timeout);
+      resolve(action === 'cancel' ? 'cancelled' : 'resumed');
+    });
+  });
+}
+```
+
+### VALET Status Response (Updated)
+
+The `/valet/status/:jobId` response now includes interaction info when paused:
+
+```jsonc
+{
+  "job_id": "abc-123",
+  "status": "paused",
+  "status_message": "Waiting for human: reCAPTCHA detected",
+  "interaction": {                        // NEW — only present when status=paused
+    "reason": "captcha",
+    "description": "reCAPTCHA v2 detected on application page",
+    "screenshot_url": "https://...",
+    "current_url": "https://company.workday.com/apply",
+    "paused_at": "2026-02-16T06:30:00Z",
+    "expires_at": "2026-02-16T06:35:00Z",
+    "timeout_seconds": 300
+  },
+  "progress": { "step": "filling_form", "progress_pct": 45 },
+  "timestamps": { ... }
+}
+```
+
+### Integration with Execution Modes
+
+| Mode | HITL Behavior |
+|------|---------------|
+| **Pure AI** | On blocker detection in agent thoughts → pause + notify |
+| **Cookbook** | On step failure matching blocker patterns → pause + notify |
+| **Hybrid** | Cookbook fails → AI tries → AI detects blocker → pause + notify |
+
+### Error Codes Updated
+
+| Error Code | Before | After |
+|------------|--------|-------|
+| `captcha_blocked` | Retry → fail | Pause → notify VALET → wait for human |
+| `login_required` | Retry → fail | Pause → notify VALET → wait for human |
+| `2fa_required` | N/A (new) | Pause → notify VALET → wait for human |
+| `bot_check` | N/A (new) | Pause → notify VALET → wait for human |
+| `human_timeout` | N/A (new) | Human didn't respond within timeout → fail |
+| `human_cancelled` | N/A (new) | Human chose to cancel → cancel |
+
+### Database Changes
+
+```sql
+-- New columns for interaction tracking
+ALTER TABLE gh_automation_jobs
+  ADD COLUMN IF NOT EXISTS interaction_type TEXT DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS interaction_data JSONB DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ DEFAULT NULL;
+```
+
+### Implementation Order
+
+This feature spans Phase 2b and 2c:
+
+1. **Blocker detection** (DOM patterns + thought patterns) — Phase 2b
+2. **Pause + screenshot** — Phase 2b
+3. **Callback notification** (extend `CallbackNotifier`) — Phase 2b
+4. **Resume endpoint** (`POST /valet/resume/:jobId`) — Phase 2b
+5. **VALET status response** (include interaction info) — Phase 2b
+6. **Postgres LISTEN for resume signal** — Phase 2c
+7. **Timeout handling** — Phase 2c
+8. **CDP/VNC URL generation** (for browser handoff) — Phase 2d
+
+### VALET Action Items
+
+- [ ] Handle `needs_human` callback — show notification to user
+- [ ] Build browser viewer UI (connect to CDP or show screenshot)
+- [ ] Add "I'm done" / "Cancel" buttons → call `POST /valet/resume/:jobId`
+- [ ] Handle `human_timeout` → show "automation timed out waiting" message
+- [ ] (Optional) Show live browser via CDP WebSocket or VNC
+
+---
+
 ## Open Questions
 
 1. **Selector stability:** How often do ATS platforms change their DOM?
 2. **Multi-page forms:** Workday has 3-5 page applications. How do cookbooks handle page navigation?
 3. **Dynamic content:** Conditional fields (e.g., visa sponsorship → extra fields). How do cookbooks handle branching?
 4. **Cookbook sharing:** Per-user, per-org, or global? Global = fastest learning but privacy concerns.
-5. **Human-in-the-loop:** When should we escalate to a human? CAPTCHA? Complex screening questions?
+5. **Browser handoff:** CDP vs VNC vs web viewer? CDP is most powerful but requires WebSocket proxy. VNC is simpler but lower fidelity.
+6. **Interaction timeout:** 5 minutes default — is this enough? Should it be configurable per job?
+7. **Multi-blocker:** What if human solves CAPTCHA but then hits 2FA? Do we pause again?
 
 ---
 
