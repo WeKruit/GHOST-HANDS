@@ -18,6 +18,8 @@ export interface MockAdapterConfig {
   failWithError?: Error;
   extractResult?: any;
   actionDelayMs?: number;
+  /** Start in a disconnected/crashed state (default: false) */
+  startDisconnected?: boolean;
 }
 
 /**
@@ -31,6 +33,7 @@ export class MockAdapter implements BrowserAutomationAdapter {
   private config: Required<MockAdapterConfig>;
   private active = false;
   private _paused = false;
+  private _connected = true;
   private _currentUrl = 'about:blank';
 
   constructor(config: MockAdapterConfig = {}) {
@@ -42,12 +45,14 @@ export class MockAdapter implements BrowserAutomationAdapter {
       failWithError: config.failWithError ?? new Error('Mock failure'),
       extractResult: config.extractResult ?? { submitted: true },
       actionDelayMs: config.actionDelayMs ?? 1,
+      startDisconnected: config.startDisconnected ?? false,
     };
   }
 
   async start(options: AdapterStartOptions): Promise<void> {
     this._currentUrl = options.url ?? 'about:blank';
     this.active = true;
+    this._connected = !this.config.startDisconnected;
   }
 
   async act(instruction: string, _context?: ActionContext): Promise<ActionResult> {
@@ -156,7 +161,20 @@ export class MockAdapter implements BrowserAutomationAdapter {
     return this.active;
   }
 
+  isConnected(): boolean {
+    return this.active && this._connected;
+  }
+
+  /**
+   * Simulate a browser crash for testing.
+   * After calling this, isConnected() returns false.
+   */
+  simulateCrash(): void {
+    this._connected = false;
+  }
+
   async stop(): Promise<void> {
     this.active = false;
+    this._connected = false;
   }
 }

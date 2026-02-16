@@ -10,7 +10,10 @@ import type {
   ActionContext,
   ActionResult,
   TokenUsage,
+  ObservedElement,
 } from './types';
+import type { StagehandObserver } from '../engine/StagehandObserver';
+import type { ObservedElement as EngineObservedElement } from '../engine/types';
 import type { Page } from 'playwright';
 import type { ZodSchema } from 'zod';
 import EventEmitter from 'eventemitter3';
@@ -21,6 +24,7 @@ export class MagnitudeAdapter implements BrowserAutomationAdapter {
   private emitter = new EventEmitter();
   private active = false;
   private _credentials: Record<string, string> = {};
+  private _observer: StagehandObserver | null = null;
 
   async start(options: AdapterStartOptions): Promise<void> {
     this.agent = await startBrowserAgent({
@@ -90,7 +94,23 @@ export class MagnitudeAdapter implements BrowserAutomationAdapter {
     return this.requireAgent().extract(instruction, schema);
   }
 
-  // observe() is NOT implemented for Magnitude (vision-based, no DOM discovery)
+  /** Attach a StagehandObserver to enable observe() support. */
+  setObserver(observer: StagehandObserver): void {
+    this._observer = observer;
+  }
+
+  /** Discover interactive elements via StagehandObserver. Returns undefined if no observer set. */
+  async observe(instruction: string): Promise<ObservedElement[] | undefined> {
+    if (!this._observer || !this._observer.isInitialized()) return undefined;
+
+    const engineElements: EngineObservedElement[] = await this._observer.observe(instruction);
+    return engineElements.map((el) => ({
+      selector: el.selector,
+      description: el.description,
+      method: el.action === 'unknown' ? 'click' : el.action,
+      arguments: [],
+    }));
+  }
 
   async navigate(url: string): Promise<void> {
     await this.requireAgent().page.goto(url);
@@ -148,6 +168,22 @@ export class MagnitudeAdapter implements BrowserAutomationAdapter {
 
   isActive(): boolean {
     return this.active;
+  }
+
+  isConnected(): boolean {
+    if (!this.agent || !this.active) return false;
+    try {
+      const page = this.agent.page;
+      const context = page.context();
+      const browser = context.browser();
+      // browser() returns null if the browser has been disconnected
+      if (!browser || !browser.isConnected()) return false;
+      // Verify at least one page is open in the context
+      return context.pages().length > 0;
+    } catch {
+      // Any access failure means the browser is gone
+      return false;
+    }
   }
 
   async stop(): Promise<void> {
