@@ -647,6 +647,87 @@ bun scripts/experiment.ts
 
 ---
 
+## Handling File Uploads
+
+Browser agents can't interact with OS-level file picker dialogs. Playwright solves this natively.
+
+### Method 1: Direct `setInputFiles` (simplest)
+
+Works when the upload trigger is an `<input type="file">` element:
+
+```typescript
+// Set file directly — no dialog opens
+await page.setInputFiles('input[type="file"]', '/path/to/resume.pdf');
+
+// Or with a buffer (for files from cloud storage)
+await page.setInputFiles('input[type="file"]', {
+  name: 'resume.pdf',
+  mimeType: 'application/pdf',
+  buffer: Buffer.from(fileContents),
+});
+```
+
+### Method 2: Intercept file chooser (works for any trigger)
+
+Works when a button or custom UI triggers the file picker:
+
+```typescript
+// Wait for file chooser event BEFORE clicking the trigger
+const [fileChooser] = await Promise.all([
+  page.waitForEvent('filechooser'),
+  page.click('#upload-resume-button'),  // this would normally open OS dialog
+]);
+
+// Set the file — OS dialog is suppressed
+await fileChooser.setFiles('/path/to/resume.pdf');
+```
+
+### Method 3: Drag-and-drop zones
+
+For sites that use drag-and-drop upload areas:
+
+```typescript
+// Read file and create a DataTransfer-like payload
+const buffer = fs.readFileSync('/path/to/resume.pdf');
+
+await page.dispatchEvent('.dropzone', 'drop', {
+  dataTransfer: {
+    files: [{ name: 'resume.pdf', mimeType: 'application/pdf', buffer }],
+  },
+});
+```
+
+### In a connector
+
+```typescript
+createAction({
+  name: 'ats:upload-resume',
+  description: 'Upload a resume file to the current page',
+  schema: z.object({
+    selector: z.string().describe('CSS selector of the upload button or input'),
+    resumePath: z.string().describe('Path to the resume file'),
+  }),
+  resolver: async ({ input, agent }) => {
+    const page = (agent as any).page;
+    const [fileChooser] = await Promise.all([
+      page.waitForEvent('filechooser'),
+      page.click(input.selector),
+    ]);
+    await fileChooser.setFiles(input.resumePath);
+  },
+  render: (a) => `Upload resume to ${a.selector}`,
+});
+```
+
+### Key points
+
+- `page.waitForEvent('filechooser')` intercepts at the CDP level — the OS dialog never opens
+- Works in both headless and headed mode
+- Works over CDP (Browser Operator mode) — no extension needed for the upload itself
+- The extension IS needed to read files from the user's disk in Operator mode
+
+---
+
 ## Debugging Tips
 
 ### See the browser

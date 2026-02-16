@@ -90,6 +90,16 @@ New optional field in request body:
 
 Same field available per-job in the `jobs` array.
 
+### Fields Coming in Future Phases
+
+These fields are **not yet implemented** but documented here for VALET planning:
+
+| Field | Phase | Type | Default | Description |
+|-------|-------|------|---------|-------------|
+| `browser_mode` | 3 | `"server" \| "operator"` | `"server"` | Use server browser or user's local browser |
+| `execution_mode` | 2 | `"auto" \| "ai_only" \| "cookbook_only"` | `"auto"` | Force specific execution strategy |
+| `resume_path` | 2 | `string \| null` | `null` | Path/URL to resume file for upload |
+
 ### GET `/api/v1/gh/jobs/:id` (Get Job)
 
 Response now includes `target_worker_id` in the job object:
