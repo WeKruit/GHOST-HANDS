@@ -107,57 +107,125 @@ Valid values: `"auto"` (default, hybrid), `"ai_only"`, `"cookbook_only"`
 
 ## Architecture Overview
 
+### Core Insight: Connector-Based Intelligence
+
+Instead of building a separate "orchestration engine" that sits between TaskHandler and adapter, we make the **Magnitude agent itself intelligent** about cookbooks by giving it a `CookbookConnector`. The agent's LLM decides when to use cookbooks vs explore with AI — no separate decision layer needed.
+
+For the **fast path** (healthy cookbook exists), we short-circuit the agent entirely with a `CookbookExecutor` that replays steps without any LLM calls. The agent is only invoked when the cookbook fails or doesn't exist.
+
 ```
 Job arrives (e.g., "Apply to Workday posting")
   │
   ▼
-┌─────────────────────────────────────────────────┐
-│              ExecutionEngine (NEW)                │
-│                                                   │
-│  Step 1: PAGE OBSERVATION                         │
-│  ├─ DOM analysis (Stagehand-style)                │
-│  ├─ Identify: forms, buttons, nav, page type      │
-│  └─ Build page fingerprint (platform + structure)  │
-│                                                   │
-│  Step 2: MODE SELECTION                           │
-│  ├─ Check execution_mode override                 │
-│  ├─ If "ai_only" → skip to AI explore             │
-│  ├─ If "cookbook_only" → fail if no cookbook        │
-│  └─ If "auto" → lookup cookbook, decide            │
-│                                                   │
-│  Step 3: COOKBOOK LOOKUP                           │
-│  ├─ Query gh_action_manuals by url_pattern        │
-│  ├─ Filter by health_score > 70                   │
-│  └─ Match task_pattern to job description          │
-│                                                   │
-│  Step 4: EXECUTION                                │
-│  ├─ COOKBOOK FOUND (health > 70)                   │
-│  │   → CookbookExecutor: replay steps             │
-│  │   → Template substitution: {{first_name}}      │
-│  │   → Verify each step succeeded                 │
-│  │   → On step failure → FALLBACK to AI           │
-│  │                                                │
-│  └─ NO COOKBOOK (or ai_only mode)                  │
-│      → AI Explorer: full Magnitude agent          │
-│      → TraceRecorder captures every action         │
-│      → On success → save as new cookbook           │
-│                                                   │
-│  Step 5: RESULT & LEARN                           │
-│  ├─ Update cookbook health_score (success/failure)  │
-│  ├─ Save new cookbook from successful AI trace      │
-│  └─ Report cost savings vs full AI                │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│              ExecutionEngine                              │
+│                                                           │
+│  Step 1: OBSERVE (free — pure DOM, no LLM)               │
+│  ├─ PageObserver: Stagehand-style DOM analysis            │
+│  │   Uses adapter.page (Playwright) directly              │
+│  │   Returns: platform, page type, forms, fingerprint     │
+│  └─ No Stagehand dependency — just Playwright DOM APIs    │
+│                                                           │
+│  Step 2: DECIDE (free — no LLM)                          │
+│  ├─ execution_mode override? → respect it                │
+│  ├─ Cookbook exists + health > 70? → FAST PATH            │
+│  └─ No cookbook or unhealthy? → AGENT PATH                │
+│                                                           │
+│  Step 3a: FAST PATH (cookbook replay, $0, ~0.5s)          │
+│  ├─ CookbookExecutor replays steps via CSS selectors      │
+│  ├─ Template substitution: {{first_name}} → "John"       │
+│  ├─ Verify each step (element exists, action worked)      │
+│  ├─ On step failure → fall through to AGENT PATH         │
+│  └─ On success → update health_score, done               │
+│                                                           │
+│  Step 3b: AGENT PATH (AI + connectors, ~$0.003, ~8s)     │
+│  ├─ Magnitude agent with CookbookConnector:               │
+│  │   ├─ collectObservations() → injects DOM state,        │
+│  │   │   cookbook availability, current step info          │
+│  │   ├─ getActionSpace() → adds custom actions:           │
+│  │   │   • cookbook:try-step  (replay a specific step)     │
+│  │   │   • cookbook:skip-step (skip and use AI instead)    │
+│  │   │   • hitl:request      (pause for human help)       │
+│  │   │   • file:upload       (handle file picker)         │
+│  │   └─ getInstructions() → tells agent about available   │
+│  │       cookbooks and when to use them                   │
+│  ├─ TraceRecorder captures every action for learning      │
+│  └─ On success → save trace as new/updated cookbook        │
+│                                                           │
+│  Step 4: LEARN (free)                                    │
+│  ├─ Record success/failure → update health_score          │
+│  ├─ If AI explored: save trace → new cookbook              │
+│  ├─ Template detection: "John" → {{first_name}}          │
+│  └─ Report cost savings vs full AI                       │
+└─────────────────────────────────────────────────────────┘
 ```
+
+### Why This Design
+
+**Why connector-based, not a separate engine?**
+- The agent ALREADY has intelligence (LLM reasoning). Adding a separate decision layer duplicates logic.
+- Connectors inject knowledge (cookbook steps, DOM state) INTO the agent's context.
+- The agent decides organically: "I see a cookbook step for this field. I'll use cookbook:try-step. Oh it failed — I'll type the value myself."
+- For the fast path (healthy cookbook), we bypass the agent entirely — no LLM needed.
+
+**Why Stagehand-style observation without Stagehand?**
+- Stagehand can't run alongside Magnitude (different agent lifecycle, would need its own LLM session).
+- But we don't need Stagehand itself — just its PATTERN: DOM analysis via Playwright APIs.
+- `PageObserver` uses `page.$$eval()`, `page.locator()`, attribute analysis — all free, all fast.
+- This gives us the same output: platform detection, form field discovery, CSS selectors.
+
+**Why not make the agent decide EVERYTHING?**
+- Cookbook replay is deterministic. Using LLM to decide "should I click this button at selector X with value Y" is wasteful.
+- Fast path: CookbookExecutor handles the obvious case (healthy cookbook → replay).
+- Agent path: only invoked when cookbook doesn't exist, is unhealthy, or fails mid-replay.
+- This is the 95% cost reduction: most repeat jobs never invoke the LLM.
+
+### Adapter Composition (Single Page, Multiple Capabilities)
+
+The key insight from the adapter research: we don't need multiple adapter instances. ONE MagnitudeAdapter provides the page, and everything else operates on that same page:
+
+```
+┌──────────────────────────────────────────────────────┐
+│                    TaskHandler                        │
+│  (ApplyHandler, ScrapeHandler, etc.)                 │
+│                                                       │
+│  ┌────────────────────────────────────────────────┐  │
+│  │              ExecutionEngine                    │  │
+│  │                                                 │  │
+│  │  ┌──────────────┐   ┌───────────────────────┐  │  │
+│  │  │ PageObserver  │   │  CookbookExecutor     │  │  │
+│  │  │ (DOM analysis)│   │  (step replay)        │  │  │
+│  │  └──────┬───────┘   └──────────┬────────────┘  │  │
+│  │         │                       │               │  │
+│  │         │    ┌──────────────────┤               │  │
+│  │         ▼    ▼                  ▼               │  │
+│  │  ┌──────────────────────────────────────────┐  │  │
+│  │  │        adapter.page (Playwright Page)     │  │  │
+│  │  │                                           │  │  │
+│  │  │  Shared across ALL capabilities:          │  │  │
+│  │  │  • MagnitudeAdapter.act() (AI vision)     │  │  │
+│  │  │  • CookbookExecutor (CSS selector replay) │  │  │
+│  │  │  • PageObserver (DOM analysis)            │  │  │
+│  │  │  • FileUploadHelper (filechooser event)   │  │  │
+│  │  │  • TraceRecorder (event capture)          │  │  │
+│  │  └──────────────────────────────────────────┘  │  │
+│  └────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────┘
+```
+
+Everything shares `adapter.page`. No separate browser instances, no adapter switching.
 
 ---
 
 ## Components to Build
 
-### 1. PageObserver — Understand the page before acting
+### 1. PageObserver — Stagehand-style DOM analysis (no LLM)
 
-**Purpose:** Analyze the DOM to identify page type, form fields, buttons, and structure. This is the "eyes" — the agent's first look at the page BEFORE deciding what to do.
+**Purpose:** Analyze the DOM to identify page type, form fields, buttons, and structure. Uses the same Playwright page exposed by MagnitudeAdapter — no separate browser, no Stagehand dependency.
 
-**Implementation:** Uses Playwright's DOM APIs directly (no LLM needed).
+**Why not use Stagehand directly?** Stagehand runs its own agent lifecycle with its own LLM session. It can't share a page with Magnitude. But we don't need Stagehand — we just need its PATTERN: structured DOM analysis via Playwright APIs.
+
+**Implementation:** Pure Playwright DOM traversal. Free, fast, no LLM calls.
 
 ```typescript
 interface PageObservation {
@@ -254,13 +322,166 @@ interface ManualStep {
 **Purpose:** When the AI agent runs in explore mode, record every action to save as a cookbook.
 
 Hooks into Magnitude's events:
-- `actionStarted` → record action variant
-- `actionDone` → query DOM for what was acted on, extract CSS selector
+- `actionStarted` → record action variant, timestamp
+- `actionDone` → query DOM for what was acted on, extract CSS selector + value
 - `thought` → capture reasoning for debugging
 
-### 5. ExecutionEngine — The decision maker
+**Selector extraction:** After each action, TraceRecorder queries the page to find what element was acted on and extracts a stable CSS selector. Priority: `[data-testid]` > `[data-automation-id]` > `[aria-label]` > `[name]` > `[id]` > text content.
 
-**Purpose:** Orchestrates the full flow: observe → lookup → execute (cookbook or AI) → learn.
+### 5. CookbookConnector — Make the agent cookbook-aware (AgentConnector)
+
+**Purpose:** When the agent IS running (AI path), give it awareness of available cookbooks so it can choose to replay known steps rather than exploring blindly.
+
+This is the key connector that makes the agent INTELLIGENT about cookbooks. It implements Magnitude's `AgentConnector` interface:
+
+```typescript
+// src/connectors/cookbookConnector.ts
+
+export class CookbookConnector implements AgentConnector {
+  id = 'cookbook';
+
+  constructor(
+    private manualStore: ManualStore,
+    private cookbookExecutor: CookbookExecutor,
+    private pageObserver: PageObserver,
+    private currentManual: ActionManual | null,
+    private userData: Record<string, any>,
+  ) {}
+
+  // Inject cookbook awareness into agent's context each turn
+  async collectObservations(): Promise<string> {
+    const observation = await this.pageObserver.observe(this.page);
+    const cookbook = this.currentManual;
+
+    if (!cookbook) {
+      return `Page: ${observation.platform} (${observation.pageType}). No cookbook available — explore freely.`;
+    }
+
+    const nextStep = cookbook.steps[this.currentStepIndex];
+    return `
+Page: ${observation.platform} (${observation.pageType}).
+Cookbook available (health: ${cookbook.health_score}/100, ${cookbook.steps.length} steps).
+Next cookbook step: ${nextStep.description} → ${nextStep.action} on "${nextStep.selector}"
+You can use cookbook:try-step to replay it, or act normally to explore.
+    `.trim();
+  }
+
+  // Give the agent cookbook actions
+  getActionSpace(): ActionDefinition<any>[] {
+    return [
+      createAction({
+        name: 'cookbook:try-step',
+        description: 'Replay the next cookbook step using CSS selectors (fast, no LLM)',
+        schema: z.object({}),
+        resolver: async ({ agent }) => {
+          const step = this.currentManual!.steps[this.currentStepIndex];
+          const result = await this.cookbookExecutor.executeStep(
+            (agent as any).page, step, this.userData
+          );
+          if (result.success) this.currentStepIndex++;
+          return result;
+        },
+      }),
+      createAction({
+        name: 'cookbook:skip-step',
+        description: 'Skip the current cookbook step and let AI handle it',
+        schema: z.object({ reason: z.string() }),
+        resolver: async ({ input }) => {
+          this.currentStepIndex++;
+          // Agent will handle this step with its own AI
+        },
+      }),
+      createAction({
+        name: 'file:upload',
+        description: 'Upload a file to a file input (handles OS file picker automatically)',
+        schema: z.object({
+          selector: z.string().describe('CSS selector of the upload button/input'),
+        }),
+        resolver: async ({ input, agent }) => {
+          const page = (agent as any).page;
+          await this.fileUploadHelper.uploadFile(page, input.selector, this.resumePath);
+        },
+      }),
+    ];
+  }
+
+  // Tell the agent how to use cookbooks
+  async getInstructions(): Promise<string> {
+    if (!this.currentManual) {
+      return 'No cookbook available. Explore the page normally.';
+    }
+    return `
+A cookbook is available for this page (${this.currentManual.steps.length} recorded steps).
+PREFER using cookbook:try-step for each step — it's faster and cheaper.
+If a cookbook step fails or looks wrong, use cookbook:skip-step and handle it yourself.
+For file upload fields, use file:upload instead of clicking the upload button.
+    `.trim();
+  }
+}
+```
+
+**This is the bridge between ActionBook ideology and Magnitude's agent.** The agent sees cookbook steps as available tools and decides organically whether to use them or explore. When cookbooks work, the agent calls `cookbook:try-step` repeatedly (fast, free). When something fails, it falls back to its own AI reasoning (slower, costs tokens).
+
+### 6. ExecutionEngine — Orchestrator with fast path
+
+**Purpose:** Orchestrates the full flow: observe → decide → execute (fast path or agent path) → learn.
+
+The engine does NOT use LLM for decision-making. It handles the obvious case (healthy cookbook → replay all steps without agent) and only invokes the Magnitude agent when the cookbook is missing, unhealthy, or fails.
+
+```typescript
+// src/engine/ExecutionEngine.ts
+
+export class ExecutionEngine {
+  async execute(ctx: TaskContext): Promise<TaskResult> {
+    const { adapter, job } = ctx;
+    const page = adapter.page;
+
+    // 1. OBSERVE (free)
+    const observation = await this.pageObserver.observe(page);
+
+    // 2. LOOKUP COOKBOOK (free)
+    const manual = await this.manualStore.lookup(
+      observation.urlPattern, job.task_description, observation.platform
+    );
+
+    // 3a. FAST PATH — healthy cookbook, no LLM needed
+    if (manual && manual.health_score >= 70 && ctx.executionMode !== 'ai_only') {
+      const result = await this.cookbookExecutor.executeAll(page, manual, ctx.userData);
+      if (result.success) {
+        await this.manualStore.recordSuccess(manual.id);
+        return { success: true, data: { mode: 'cookbook', cost: 0 } };
+      }
+      // Cookbook failed — fall through to agent path
+      await this.manualStore.recordFailure(manual.id);
+    }
+
+    // 3b. AGENT PATH — Magnitude with CookbookConnector
+    const connector = new CookbookConnector(
+      this.manualStore, this.cookbookExecutor, this.pageObserver,
+      manual, ctx.userData
+    );
+    const recorder = new TraceRecorder();
+
+    // Attach connector and recorder to the adapter/agent
+    const result = await adapter.act(job.task_description, {
+      prompt: ctx.dataPrompt,
+      data: ctx.userData,
+      connectors: [connector],    // agent sees cookbook actions
+    });
+
+    // 4. LEARN — save successful AI trace as new cookbook
+    if (result.success && recorder.hasTrace()) {
+      await this.manualStore.saveFromTrace(recorder.getTrace(), {
+        url: observation.urlPattern,
+        platform: observation.platform,
+        taskType: job.job_type,
+      });
+    }
+
+    return result;
+  }
+}
+```
 
 The engine respects `execution_mode` overrides, making it possible to force pure AI mode even when a cookbook exists.
 
@@ -506,23 +727,29 @@ The `gh_action_manuals` table is already defined in `supabase-migration.sql`. Ne
 
 ## Key Design Decisions
 
-### 1. Pure AI mode must always be available
+### 1. Connector-based intelligence over separate decision engine
+Instead of building a separate orchestration layer with if/else logic, we give the Magnitude agent cookbook-awareness via `CookbookConnector`. The agent's LLM decides organically when to use cookbooks vs explore. The fast path (healthy cookbook) bypasses the agent entirely.
+
+### 2. Stagehand patterns without Stagehand dependency
+Stagehand can't share a page with Magnitude (different agent lifecycle). Instead, PageObserver implements Stagehand-STYLE DOM analysis using Playwright APIs directly on `adapter.page`. Same output, no extra dependency.
+
+### 3. Single page, multiple capabilities
+Everything operates on the same Playwright Page exposed by MagnitudeAdapter: DOM observation, cookbook replay, AI vision, file uploads, trace recording. No adapter switching, no separate browser instances.
+
+### 4. Pure AI mode must always be available
 Developers need unrestricted access to Magnitude's raw capabilities for testing, POC, and extending platform support. The engine layer is opt-in, never forced.
 
-### 2. CSS selectors over XPath
-CSS selectors are more stable across page renders. XPath breaks when DOM structure changes.
+### 5. CSS selectors over XPath
+CSS selectors are more stable across page renders. XPath breaks when DOM structure changes. Selector priority: `[data-testid]` > `[data-automation-id]` > `[aria-label]` > `[name]` > `[id]`.
 
-### 3. Health scores over binary success/failure
+### 6. Health scores over binary success/failure
 Gradual degradation allows cookbooks to survive occasional flakiness. A single failure shouldn't invalidate a cookbook that's worked 50 times.
 
-### 4. Template detection for reusability
+### 7. Template detection for reusability
 If we just save literal values ("John"), the cookbook only works for one user. Template detection (`{{first_name}}`) makes cookbooks reusable across all users.
 
-### 5. Never modify Magnitude core
-Per CLAUDE.md: all extensions via connectors/adapters. The ExecutionEngine wraps the adapter, never patches it.
-
-### 6. Observe before acting
-The observation step is free (pure DOM, no LLM). It tells us what platform we're on, whether the cookbook is still valid, and what fields exist.
+### 8. Never modify Magnitude core
+Per CLAUDE.md: all extensions via connectors/adapters. CookbookConnector implements AgentConnector. ExecutionEngine wraps the adapter, never patches it.
 
 ---
 
@@ -535,7 +762,8 @@ The observation step is free (pure DOM, no LLM). It tells us what platform we're
 | `src/engine/CookbookExecutor.ts` | **NEW** | Deterministic step replay |
 | `src/engine/FileUploadHelper.ts` | **NEW** | File chooser interception, buffer upload, drag-drop |
 | `src/engine/TraceRecorder.ts` | **NEW** | Capture AI actions as traces |
-| `src/engine/ExecutionEngine.ts` | **NEW** | Decision logic + orchestration |
+| `src/engine/ExecutionEngine.ts` | **NEW** | Fast-path + agent-path orchestration |
+| `src/connectors/cookbookConnector.ts` | **NEW** | AgentConnector: cookbook awareness + actions |
 | `src/engine/templateResolver.ts` | **NEW** | `{{var}}` substitution |
 | `src/engine/types.ts` | **NEW** | Shared interfaces |
 | `src/engine/index.ts` | **NEW** | Exports |
