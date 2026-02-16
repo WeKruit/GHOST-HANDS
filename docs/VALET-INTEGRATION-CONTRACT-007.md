@@ -378,6 +378,111 @@ This feature is **fully opt-in**. Jobs without `callback_url` will never trigger
 
 ---
 
+## Browser Operator Mode — Coming in Phase 3
+
+### Overview
+
+Instead of GhostHands launching a new server-side browser, VALET users can connect their **own browser** (Chrome/Edge) via a browser extension. GhostHands then operates within the user's existing browser sessions — with their cookies, logins, and IP address.
+
+This eliminates most CAPTCHA, 2FA, and bot detection issues since the activity originates from the user's trusted device.
+
+Inspired by [Manus Browser Operator](https://manus.im/blog/manus-browser-operator).
+
+### How VALET Integrates
+
+#### 1. Extension Setup
+
+User installs the GhostHands browser extension from Chrome Web Store. Extension connects to GhostHands via WebSocket using a token linked to their VALET account.
+
+#### 2. Job Creation with `browser_mode`
+
+New optional field in `/valet/apply` and `/valet/task`:
+
+```jsonc
+{
+  "valet_task_id": "valet-789",
+  "valet_user_id": "uuid-here",
+  "target_url": "https://company.workday.com/apply",
+  "profile": { /* ... */ },
+
+  // NEW — optional, defaults to "server"
+  "browser_mode": "operator"
+}
+```
+
+| Field | Type | Required | Default | Values |
+|-------|------|----------|---------|--------|
+| `browser_mode` | `string` | No | `"server"` | `"server"` \| `"operator"` |
+
+**`"server"` (default):** GhostHands launches its own browser (current behavior).
+**`"operator"`:** GhostHands connects to the user's browser via their extension.
+
+#### 3. Connection Status
+
+New endpoint to check if a user's browser is connected:
+
+```
+GET /api/v1/gh/valet/operator/status/:valetUserId
+```
+
+**Response (connected):**
+```jsonc
+{
+  "connected": true,
+  "browser": "Chrome 133",
+  "connected_since": "2026-02-16T05:00:00Z",
+  "active_tasks": 0
+}
+```
+
+**Response (not connected):**
+```jsonc
+{
+  "connected": false,
+  "last_seen": "2026-02-16T04:30:00Z"
+}
+```
+
+#### 4. Job Status (Updated)
+
+The status response includes browser mode info:
+
+```jsonc
+{
+  "job_id": "abc-123",
+  "status": "running",
+  "browser_mode": "operator",     // NEW
+  "status_message": "Filling application form in user's browser",
+  "progress": { ... }
+}
+```
+
+### Benefits for VALET Users
+
+| Problem | Server Mode | Operator Mode |
+|---------|------------|---------------|
+| CAPTCHA on login | Blocks, needs HITL | Doesn't appear |
+| 2FA prompt | Blocks, needs HITL | Doesn't trigger |
+| "New device" warning | Blocks, needs HITL | Not triggered |
+| Bot detection | Frequent | Rare |
+| User monitoring | No visibility | Watches live |
+
+### VALET Action Items (Phase 3)
+
+- [ ] Add "My Browser" toggle in user settings
+- [ ] Build extension onboarding flow (install link, token generation)
+- [ ] Add `browser_mode` field to job creation forms
+- [ ] Show browser connection status in UI
+- [ ] Show live task activity when operator mode is active
+- [ ] Add "Stop automation" button (closes task tab)
+- [ ] Handle `browser_mode: "operator"` with disconnected browser → fallback to server or error
+
+### Backward Compatibility
+
+**Fully optional.** If `browser_mode` is omitted, defaults to `"server"` (current behavior). No changes needed in VALET until operator mode is implemented.
+
+---
+
 ## Backward Compatibility
 
 | Scenario | Before | After |

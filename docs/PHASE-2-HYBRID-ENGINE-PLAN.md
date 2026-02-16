@@ -766,6 +766,255 @@ This feature spans Phase 2b and 2c:
 
 ---
 
+## Phase 3: Browser Operator Mode (Local Browser Connection)
+
+> Inspired by [Manus Browser Operator](https://manus.im/features/manus-browser-operator) — instead of launching a new browser, connect to the user's **existing browser** and operate within their authenticated sessions.
+
+### The Problem with Server-Side Browsers
+
+Today, GhostHands launches a fresh Patchright (Chromium) browser for every job. This causes:
+
+1. **No existing sessions** — user isn't logged into any ATS platforms
+2. **Bot detection** — new browser fingerprint triggers CAPTCHAs and blocks
+3. **IP mismatch** — server IP differs from user's usual login location
+4. **Credential management** — we must store and inject user passwords
+5. **No user visibility** — user can't see what's happening in real-time
+6. **2FA walls** — every login triggers 2FA because it's an unrecognized device
+
+These problems are the root cause of most HITL pauses. The Browser Operator approach eliminates them at the source.
+
+### The Solution: Two Browser Modes
+
+GhostHands will support **two browser modes**, selectable per job:
+
+#### Mode A: Server Browser (Current — Default)
+
+```
+VALET → GhostHands API → Worker → launches Patchright browser → executes task
+```
+
+- Worker owns the browser lifecycle
+- Browser runs on the server (headless or headed)
+- Good for: batch jobs, scraping, non-authenticated tasks
+- No user interaction needed (unless HITL triggers)
+
+#### Mode B: Browser Operator (New — User's Browser)
+
+```
+User's Browser ← WebSocket → GhostHands Worker → executes task in user's tabs
+```
+
+- Worker connects to user's existing browser via Chrome DevTools Protocol (CDP)
+- Browser stays on user's machine with their cookies, logins, IP
+- Good for: authenticated tasks, sites with strong bot detection, user-supervised work
+- User watches actions in real-time
+
+### Architecture
+
+```
+┌─────────────────────┐       ┌──────────────────────────┐
+│   User's Machine    │       │    GhostHands Server     │
+│                     │       │                          │
+│  ┌───────────────┐  │       │  ┌────────────────────┐  │
+│  │ Chrome/Edge   │  │  WSS  │  │  Worker             │  │
+│  │  + Extension  │◄─┼──────►│  │                    │  │
+│  │               │  │       │  │  BrowserOperator-  │  │
+│  │  CDP access   │  │       │  │  Adapter            │  │
+│  │  to all tabs  │  │       │  │  (extends           │  │
+│  └───────────────┘  │       │  │   BrowserAutomation │  │
+│                     │       │  │   Adapter)          │  │
+│  User sees every    │       │  └────────────────────┘  │
+│  action live        │       │                          │
+└─────────────────────┘       └──────────────────────────┘
+```
+
+### How It Works
+
+1. **User installs GhostHands Browser Extension** (Chrome/Edge)
+   - Extension requests: `debugger`, `cookies`, `tabs`, `scripting` permissions
+   - On install, generates a unique `operator_token`
+
+2. **User links their browser to VALET**
+   - Toggle "My Browser" in VALET settings
+   - Extension connects via WebSocket to `wss://api.ghosthands.com/operator`
+   - Reports: browser fingerprint, active sessions, available tabs
+
+3. **Job routing with `browser_mode`**
+   ```jsonc
+   POST /api/v1/gh/valet/apply
+   {
+     "valet_task_id": "...",
+     "target_url": "https://company.workday.com/apply",
+     "profile": { ... },
+     "browser_mode": "operator",        // NEW — "server" (default) or "operator"
+     "target_worker_id": "user-adam"     // route to user's connected browser
+   }
+   ```
+
+4. **Worker receives job, connects to user's browser**
+   - Instead of `startBrowserAgent()` with new browser, creates `BrowserOperatorAdapter`
+   - Adapter uses CDP over WebSocket to the extension
+   - Extension opens a dedicated tab, worker controls it
+   - Same Magnitude action loop, just different browser source
+
+5. **Task executes in user's browser**
+   - User's existing cookies, sessions, IP = no bot detection
+   - User watches in real-time (tab is visible)
+   - If blocker appears, user can solve it immediately (no HITL pause needed)
+
+6. **Task completes, browser stays open**
+   - Unlike server mode, browser is NOT closed after task
+   - Tab closes, but browser + sessions persist
+   - Next task reuses same authenticated state
+
+### BrowserOperatorAdapter
+
+New adapter that implements the existing `BrowserAutomationAdapter` interface:
+
+```typescript
+// src/adapters/browserOperator.ts
+
+export class BrowserOperatorAdapter implements BrowserAutomationAdapter {
+  type: AdapterType = 'browser-operator';
+
+  constructor(
+    private wsConnection: WebSocket,   // CDP over WebSocket to extension
+    private operatorToken: string,
+  ) {}
+
+  async start(options: BrowserLaunchOptions): Promise<void> {
+    // DON'T launch a browser — connect to existing one via CDP
+    // Request extension to open a new tab
+    // Attach Playwright CDP session to that tab
+  }
+
+  async stop(): Promise<void> {
+    // DON'T close the browser — just close the task tab
+    // Disconnect CDP session
+  }
+
+  // act(), extract(), navigate(), screenshot() — same as MagnitudeAdapter
+  // but operating on the user's browser tab via CDP
+}
+```
+
+### CDP Connection Flow
+
+```typescript
+// Extension side (content script / background worker)
+chrome.debugger.attach({ tabId }, '1.3', () => {
+  // Forward CDP events to GhostHands server via WebSocket
+});
+
+// Worker side
+import { chromium } from 'playwright';
+
+// Connect to browser via CDP endpoint exposed by extension
+const browser = await chromium.connectOverCDP(cdpEndpoint);
+const context = browser.contexts()[0];  // user's existing context
+const page = await context.newPage();   // new tab in user's browser
+```
+
+### Comparison: Server vs Operator Mode
+
+| Aspect | Server Browser | Browser Operator |
+|--------|---------------|-----------------|
+| **Browser lifecycle** | Worker launches + kills | User's browser persists |
+| **Sessions/cookies** | Fresh (no logins) | User's existing sessions |
+| **IP address** | Server IP | User's IP |
+| **Bot detection** | High risk | Low risk (trusted device) |
+| **CAPTCHA frequency** | Frequent | Rare |
+| **2FA triggers** | Every login | None (recognized device) |
+| **User visibility** | None (unless CDP viewer) | Full real-time |
+| **HITL needed** | Often | Rarely |
+| **Latency** | Low (same machine) | Higher (WebSocket hop) |
+| **Batch capability** | Excellent | Limited (one browser) |
+| **Requires user online** | No | Yes |
+| **Credential storage** | Required | Not needed |
+| **Best for** | Bulk jobs, scraping | Authenticated ATS, supervised |
+
+### Synergy with HITL
+
+Browser Operator mode **dramatically reduces** the need for HITL pauses:
+
+| Blocker | Server Mode | Operator Mode |
+|---------|------------|---------------|
+| CAPTCHA | Pause → notify → wait | Rarely appears (trusted device) |
+| 2FA | Pause → notify → wait | Doesn't trigger (recognized device) |
+| Login required | Pause → notify → wait | Already logged in |
+| Bot check | Pause → notify → wait | Passes automatically |
+| Screening question | Pause → notify → wait | User sees it live, answers inline |
+
+When HITL IS needed in operator mode, it's instant — user is already watching.
+
+### Synergy with Hybrid Engine
+
+Browser Operator works with all execution modes:
+
+| Mode | Server Browser | Browser Operator |
+|------|---------------|-----------------|
+| **Pure AI** | AI drives server browser | AI drives user's browser tab |
+| **Cookbook** | RPA on server browser | RPA on user's browser tab |
+| **Hybrid** | Cookbook → AI fallback | Cookbook → AI fallback (in user's browser) |
+
+### Extension Capabilities
+
+The browser extension provides:
+
+1. **CDP access** — Chrome Debugger API for full tab control
+2. **Session reporting** — which sites user is logged into
+3. **Cookie access** — read (never write/modify) for session detection
+4. **Content extraction** — HTML → Markdown via Readability.js + Turndown.js
+5. **Screenshot capture** — via `chrome.tabs.captureVisibleTab()`
+6. **Tab management** — open/close task-specific tabs
+7. **Live status** — show task progress in extension popup
+
+### Security Considerations
+
+- Extension NEVER sends cookies or passwords to server — CDP stays local
+- Worker sends commands (click, type, navigate), extension executes them
+- All WebSocket traffic is encrypted (WSS)
+- Operator token is per-user, revocable from VALET settings
+- Extension shows clear indicator when GhostHands is controlling a tab
+- User can close tab at any time to immediately stop automation
+- No `<all_urls>` permission — scoped to job's `target_url` domain only
+
+### Implementation Roadmap
+
+#### Phase 3a: CDP Connection Prototype
+- `BrowserOperatorAdapter` — connect Playwright to existing browser via CDP
+- Test with manual `--remote-debugging-port` launch
+- Verify all Magnitude actions work over CDP
+
+#### Phase 3b: Browser Extension (MVP)
+- Chrome extension: WebSocket connection to GhostHands server
+- Tab management: open/close task tabs
+- CDP bridge: forward debugger commands
+- Extension popup: connection status + active task display
+
+#### Phase 3c: VALET Integration
+- "My Browser" toggle in VALET settings
+- `browser_mode` field in job creation API
+- Job routing: operator jobs → user's connected browser
+- Status reporting: show live task activity in VALET UI
+
+#### Phase 3d: Production Hardening
+- Reconnection handling (WebSocket drops)
+- Multi-tab isolation (concurrent tasks)
+- Domain scoping (limit CDP access per job)
+- Extension auto-update mechanism
+- Metrics: operator mode success rates vs server mode
+
+### VALET Action Items (Phase 3)
+
+- [ ] Build extension settings UI ("My Browser" toggle)
+- [ ] Handle `browser_mode: "operator"` in job creation
+- [ ] Show connection status (browser online/offline)
+- [ ] Display live task progress when operator mode active
+- [ ] "Stop automation" button → closes task tab
+
+---
+
 ## Open Questions
 
 1. **Selector stability:** How often do ATS platforms change their DOM?
@@ -775,6 +1024,10 @@ This feature spans Phase 2b and 2c:
 5. **Browser handoff:** CDP vs VNC vs web viewer? CDP is most powerful but requires WebSocket proxy. VNC is simpler but lower fidelity.
 6. **Interaction timeout:** 5 minutes default — is this enough? Should it be configurable per job?
 7. **Multi-blocker:** What if human solves CAPTCHA but then hits 2FA? Do we pause again?
+8. **Operator mode latency:** WebSocket hop adds ~50-100ms per command. Is this acceptable for real-time automation?
+9. **Extension store approval:** Chrome Web Store review for `debugger` permission is strict. What's the approval timeline?
+10. **Concurrent operator tasks:** Can one browser handle multiple task tabs simultaneously?
+11. **Browser compatibility:** Start with Chrome + Edge. Firefox CDP support is limited — defer or skip?
 
 ---
 
@@ -785,4 +1038,6 @@ This feature spans Phase 2b and 2c:
 - [Team 3 Prompt](archive/Prompt%20for%20Team%203_%20The%20Brain%20(Self-Learning%20Core).md) — Original self-learning system design
 - [supabase-migration.sql](../supabase-migration.sql) — gh_action_manuals table schema
 - [Manus Browser Operator](https://manus.im/features/manus-browser-operator) — Hybrid cloud+local approach inspiration
+- [Manus Browser Operator Blog](https://manus.im/blog/manus-browser-operator) — "Using Existing Browser Without Closing After Tasks"
+- [Manus Architecture Analysis](https://mindgard.ai/blog/manus-rubra-full-browser-remote-control) — CDP + WebSocket architecture deep dive
 - [Magnitude Docs](https://docs.magnitude.run) — Upstream BrowserAgent API
