@@ -30,6 +30,7 @@ export class MockAdapter implements BrowserAutomationAdapter {
   private emitter = new EventEmitter();
   private config: Required<MockAdapterConfig>;
   private active = false;
+  private _paused = false;
   private _currentUrl = 'about:blank';
 
   constructor(config: MockAdapterConfig = {}) {
@@ -110,6 +111,13 @@ export class MockAdapter implements BrowserAutomationAdapter {
     return Buffer.from('fake-png-data');
   }
 
+  async getBrowserSession(): Promise<string | null> {
+    return JSON.stringify({
+      cookies: [{ name: 'mock_session', value: 'abc123', domain: 'example.com', path: '/' }],
+      origins: [],
+    });
+  }
+
   registerCredentials(_creds: Record<string, string>): void {
     // No-op in mock
   }
@@ -130,6 +138,18 @@ export class MockAdapter implements BrowserAutomationAdapter {
       goto: async () => null,
       url: () => this._currentUrl,
     } as unknown as Page;
+  }
+
+  async pause(): Promise<void> {
+    this._paused = true;
+  }
+
+  async resume(): Promise<void> {
+    this._paused = false;
+  }
+
+  isPaused(): boolean {
+    return this._paused;
   }
 
   isActive(): boolean {

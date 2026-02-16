@@ -2,7 +2,43 @@
 
 **For:** Claude AI, Developers, Contributors
 **Purpose:** Standards and conventions for the GhostHands project
-**Last Updated:** 2026-02-14
+**Last Updated:** 2026-02-16
+
+---
+
+## 🏗️ Team Process — Mandatory for All New Work
+
+### Swarm a Senior Team for Every Sprint/Feature
+
+**Every time we start implementing something new (sprint, feature, epic), we MUST:**
+
+1. **Swarm a comprehensive team** with specialized roles:
+   - PM/Architect — designs interfaces, reviews patterns, ensures CLAUDE.md compliance
+   - Developer(s) — implements features (parallelized by stream)
+   - Test Engineer — writes tests (TDD), validates coverage >80%
+   - Integration Reviewer — tracks cross-team impact (VALET, shared DB, API contracts)
+   - Safety/Reliability — reviews error handling, security (RLS, encryption, no secret leaks), edge cases
+
+2. **Produce a VALET-CHANGES document** (or equivalent cross-team change doc):
+   - Any new API endpoints VALET should call
+   - Any schema changes to shared tables
+   - Any new callback payloads VALET should handle
+   - Any new env vars or config VALET needs
+   - Any breaking changes to existing contracts
+
+3. **Update tracking ONLY after deployment + user verification:**
+   - Do NOT mark tickets as done until Adam explicitly verifies
+   - Do NOT update Linear/roadmap until deployment is confirmed
+   - Keep `docs/ROADMAP-TICKETS.md` as the source of truth during development
+
+### Cross-Team Change Communication
+
+When implementing features that touch shared systems:
+- **Shared DB (Supabase):** Document any new `gh_` tables or column changes
+- **API endpoints:** Document new/changed endpoints in VALET contract
+- **Callback payloads:** Document new status types VALET must handle (e.g., `needs_human`)
+- **Environment variables:** Document any new env vars other teams need
+- **Browser behavior:** Document changes to session lifecycle, persistence, or browser modes
 
 ---
 

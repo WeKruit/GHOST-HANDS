@@ -6,15 +6,23 @@
  * Callback failures are logged but never fail the job.
  */
 
+export interface InteractionInfo {
+  type: string;
+  screenshot_url?: string;
+  page_url?: string;
+  timeout_seconds?: number;
+}
+
 export interface CallbackPayload {
   job_id: string;
   valet_task_id: string | null;
-  status: 'completed' | 'failed';
+  status: 'completed' | 'failed' | 'needs_human' | 'resumed';
   result_data?: Record<string, any>;
   result_summary?: string;
   screenshot_url?: string;
   error_code?: string;
   error_message?: string;
+  interaction?: InteractionInfo;
   cost?: {
     total_cost_usd: number;
     action_count: number;
@@ -81,6 +89,42 @@ export class CallbackNotifier {
     }
 
     return this.sendWithRetry(job.callback_url, payload);
+  }
+
+  /**
+   * Notify VALET that a job needs human intervention.
+   */
+  async notifyHumanNeeded(
+    jobId: string,
+    callbackUrl: string,
+    interactionData: InteractionInfo,
+    valetTaskId?: string | null,
+  ): Promise<boolean> {
+    const payload: CallbackPayload = {
+      job_id: jobId,
+      valet_task_id: valetTaskId || null,
+      status: 'needs_human',
+      interaction: interactionData,
+      completed_at: new Date().toISOString(),
+    };
+    return this.sendWithRetry(callbackUrl, payload);
+  }
+
+  /**
+   * Notify VALET that a paused job has resumed.
+   */
+  async notifyResumed(
+    jobId: string,
+    callbackUrl: string,
+    valetTaskId?: string | null,
+  ): Promise<boolean> {
+    const payload: CallbackPayload = {
+      job_id: jobId,
+      valet_task_id: valetTaskId || null,
+      status: 'resumed',
+      completed_at: new Date().toISOString(),
+    };
+    return this.sendWithRetry(callbackUrl, payload);
   }
 
   private async sendWithRetry(url: string, payload: CallbackPayload): Promise<boolean> {
