@@ -25,6 +25,10 @@ function parseWorkerId(): string {
     }
     return id;
   }
+  // Environment variable for Docker/EC2 deployments (set via .env)
+  if (process.env.GH_WORKER_ID) {
+    return process.env.GH_WORKER_ID;
+  }
   return `worker-${process.env.FLY_REGION || process.env.NODE_ENV || 'local'}-${Date.now()}`;
 }
 

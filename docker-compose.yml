@@ -42,6 +42,9 @@ services:
     environment:
       - NODE_ENV=development
       - MAX_CONCURRENT_JOBS=1
+      # For headed mode on a host with Xvfb, add DISPLAY=:99
+      # and mount: /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # For targeted routing, pass GH_WORKER_ID=<uuid> at docker run time
     volumes:
       - ./packages/ghosthands/src:/app/packages/ghosthands/src:ro
     depends_on:
