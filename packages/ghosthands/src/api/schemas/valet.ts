@@ -92,3 +92,20 @@ export const ValetTaskSchema = z.object({
 });
 
 export type ValetTaskInput = z.infer<typeof ValetTaskSchema>;
+
+// --- VALET Resume Request ---
+
+export const ValetResumeSchema = z.object({
+  resolved_by: z.enum(['human', 'system']).default('human'),
+  resolution_notes: z.string().max(500).optional(),
+});
+
+export type ValetResumeInput = z.infer<typeof ValetResumeSchema>;
+
+// --- VALET Session Management ---
+
+export const ValetSessionDeleteSchema = z.object({
+  domain: z.string().max(255).optional(),
+});
+
+export type ValetSessionDeleteInput = z.infer<typeof ValetSessionDeleteSchema>;

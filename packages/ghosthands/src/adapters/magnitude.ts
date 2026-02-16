@@ -109,6 +109,16 @@ export class MagnitudeAdapter implements BrowserAutomationAdapter {
     return this.requireAgent().page;
   }
 
+  async getBrowserSession(): Promise<string | null> {
+    try {
+      const context = this.requireAgent().page.context();
+      const state = await context.storageState();
+      return JSON.stringify(state);
+    } catch {
+      return null;
+    }
+  }
+
   registerCredentials(creds: Record<string, string>): void {
     this._credentials = { ...this._credentials, ...creds };
     // magnitude-core 0.3.1 does not expose registerCredentials on BrowserAgent.
@@ -122,6 +132,18 @@ export class MagnitudeAdapter implements BrowserAutomationAdapter {
 
   off(event: AdapterEvent, handler: (...args: any[]) => void): void {
     this.emitter.off(event, handler);
+  }
+
+  async pause(): Promise<void> {
+    this.requireAgent().pause();
+  }
+
+  async resume(): Promise<void> {
+    this.requireAgent().resume();
+  }
+
+  isPaused(): boolean {
+    return this.agent ? this.agent.paused : false;
   }
 
   isActive(): boolean {

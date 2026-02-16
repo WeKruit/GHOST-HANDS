@@ -2,8 +2,8 @@ import { Hono } from 'hono';
 import pg from 'pg';
 import { validateBody } from '../middleware/index.js';
 import { rateLimitMiddleware } from '../../security/rateLimit.js';
-import { ValetApplySchema, ValetTaskSchema } from '../schemas/valet.js';
-import type { ValetApplyInput, ValetTaskInput } from '../schemas/valet.js';
+import { ValetApplySchema, ValetTaskSchema, ValetResumeSchema } from '../schemas/valet.js';
+import type { ValetApplyInput, ValetTaskInput, ValetResumeInput } from '../schemas/valet.js';
 
 type AppVariables = {
   validatedBody: unknown;
@@ -177,6 +177,108 @@ export function createValetRoutes(pool: pg.Pool) {
     }, 201);
   });
 
+  // ─── POST /valet/resume/:jobId — Resume a paused job ─────────
+
+  valet.post('/resume/:jobId', rateLimitMiddleware(), validateBody(ValetResumeSchema), async (c) => {
+    const jobId = c.req.param('jobId');
+    const body = c.get('validatedBody') as ValetResumeInput;
+
+    // Verify job exists and is paused
+    const { rows } = await pool.query(
+      'SELECT id, status FROM gh_automation_jobs WHERE id = $1::UUID',
+      [jobId]
+    );
+
+    if (rows.length === 0) {
+      return c.json({ error: 'not_found', message: 'Job not found' }, 404);
+    }
+
+    if (rows[0].status !== 'paused') {
+      return c.json({
+        error: 'invalid_state',
+        message: `Job is not paused (current status: ${rows[0].status})`,
+      }, 409);
+    }
+
+    // Fire NOTIFY so the listening JobExecutor picks up the resume signal
+    await pool.query("SELECT pg_notify('gh_job_resume', $1)", [jobId]);
+
+    // Update job status back to running
+    await pool.query(`
+      UPDATE gh_automation_jobs
+      SET status = 'running',
+          paused_at = NULL,
+          status_message = $2,
+          updated_at = NOW()
+      WHERE id = $1::UUID
+    `, [jobId, `Resumed by ${body.resolved_by}${body.resolution_notes ? ': ' + body.resolution_notes : ''}`]);
+
+    return c.json({
+      job_id: jobId,
+      status: 'running',
+      resolved_by: body.resolved_by,
+    });
+  });
+
+  // ─── GET /valet/sessions/:userId — List stored sessions ───────
+
+  valet.get('/sessions/:userId', async (c) => {
+    const userId = c.req.param('userId');
+
+    const { rows } = await pool.query(`
+      SELECT domain, last_used_at, created_at, updated_at, expires_at
+      FROM gh_browser_sessions
+      WHERE user_id = $1::UUID
+      ORDER BY last_used_at DESC
+    `, [userId]);
+
+    return c.json({
+      user_id: userId,
+      sessions: rows.map((r) => ({
+        domain: r.domain,
+        last_used_at: r.last_used_at,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+        expires_at: r.expires_at,
+      })),
+      count: rows.length,
+    });
+  });
+
+  // ─── DELETE /valet/sessions/:userId/:domain — Clear one session ──
+
+  valet.delete('/sessions/:userId/:domain', async (c) => {
+    const userId = c.req.param('userId');
+    const domain = decodeURIComponent(c.req.param('domain'));
+
+    const { rowCount } = await pool.query(`
+      DELETE FROM gh_browser_sessions
+      WHERE user_id = $1::UUID AND domain = $2
+    `, [userId, domain]);
+
+    if (rowCount === 0) {
+      return c.json({ error: 'not_found', message: 'No session found for this user/domain' }, 404);
+    }
+
+    return c.json({ user_id: userId, domain, deleted: true });
+  });
+
+  // ─── DELETE /valet/sessions/:userId — Clear all sessions ────────
+
+  valet.delete('/sessions/:userId', async (c) => {
+    const userId = c.req.param('userId');
+
+    const { rowCount } = await pool.query(`
+      DELETE FROM gh_browser_sessions
+      WHERE user_id = $1::UUID
+    `, [userId]);
+
+    return c.json({
+      user_id: userId,
+      deleted_count: rowCount ?? 0,
+    });
+  });
+
   // ─── GET /valet/status/:jobId — VALET-compatible status ───────
 
   valet.get('/status/:jobId', async (c) => {
@@ -185,6 +287,7 @@ export function createValetRoutes(pool: pg.Pool) {
     const { rows } = await pool.query(`
       SELECT id, status, status_message, result_data, result_summary,
              error_code, error_details, screenshot_urls,
+             interaction_type, interaction_data, paused_at,
              started_at, completed_at, created_at,
              metadata
       FROM gh_automation_jobs WHERE id = $1::UUID
@@ -196,6 +299,8 @@ export function createValetRoutes(pool: pg.Pool) {
 
     const job = rows[0];
     const meta = typeof job.metadata === 'string' ? JSON.parse(job.metadata) : (job.metadata || {});
+
+    const interactionInfo = job.interaction_data as Record<string, any> | null;
 
     return c.json({
       job_id: job.id,
@@ -211,6 +316,13 @@ export function createValetRoutes(pool: pg.Pool) {
       error: job.status === 'failed' ? {
         code: job.error_code,
         details: job.error_details,
+      } : null,
+      interaction: job.status === 'paused' && interactionInfo ? {
+        type: job.interaction_type,
+        screenshot_url: interactionInfo.screenshot_url || null,
+        page_url: interactionInfo.page_url || null,
+        paused_at: job.paused_at,
+        timeout_seconds: 300,
       } : null,
       timestamps: {
         created_at: job.created_at,

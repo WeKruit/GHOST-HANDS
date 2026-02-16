@@ -1,4 +1,5 @@
 import { SupabaseClient } from '@supabase/supabase-js';
+import pg from 'pg';
 import { createAdapter, type BrowserAutomationAdapter, type TokenUsage, type AdapterType, type LLMConfig } from '../adapters';
 import {
   CostTracker,
@@ -12,6 +13,8 @@ import { loadModelConfig } from '../config/models.js';
 import { taskHandlerRegistry } from './taskHandlers/registry.js';
 import { callbackNotifier } from './callbackNotifier.js';
 import type { TaskContext, TaskResult } from './taskHandlers/types.js';
+import { SessionManager } from '../sessions/SessionManager.js';
+import { BlockerDetector, type BlockerResult } from '../detection/BlockerDetector.js';
 
 // Re-export AutomationJob from the canonical location for backward compat
 export type { AutomationJob } from './taskHandlers/types.js';
@@ -22,6 +25,11 @@ import type { AutomationJob } from './taskHandlers/types.js';
 export interface JobExecutorOptions {
   supabase: SupabaseClient;
   workerId: string;
+  sessionManager?: SessionManager;
+  /** Postgres pool for LISTEN/NOTIFY (HITL resume signals) */
+  pgPool?: pg.Pool;
+  /** Timeout in seconds for human intervention (default: 300 = 5 minutes) */
+  hitlTimeoutSeconds?: number;
 }
 
 // --- Error classification ---
@@ -49,6 +57,13 @@ const RETRYABLE_ERRORS = new Set([
 ]);
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
+const DEFAULT_HITL_TIMEOUT_SECONDS = 300; // 5 minutes
+
+/** Error codes that should trigger HITL instead of immediate retry */
+const HITL_ELIGIBLE_ERRORS = new Set([
+  'captcha_blocked',
+  'login_required',
+]);
 
 // --- Platform detection ---
 
@@ -94,10 +109,17 @@ function buildDataPrompt(inputData: Record<string, any>): string {
 export class JobExecutor {
   private supabase: SupabaseClient;
   private workerId: string;
+  private sessionManager: SessionManager | null;
+  private pgPool: pg.Pool | null;
+  private hitlTimeoutSeconds: number;
+  private blockerDetector = new BlockerDetector();
 
   constructor(opts: JobExecutorOptions) {
     this.supabase = opts.supabase;
     this.workerId = opts.workerId;
+    this.sessionManager = opts.sessionManager ?? null;
+    this.pgPool = opts.pgPool ?? null;
+    this.hitlTimeoutSeconds = opts.hitlTimeoutSeconds ?? DEFAULT_HITL_TIMEOUT_SECONDS;
   }
 
   async execute(job: AutomationJob): Promise<void> {
@@ -191,12 +213,28 @@ export class JobExecutor {
       // 6. Build LLM client config
       const llmClient = this.buildLLMClient(job);
 
+      // 6.5. Load existing browser session if available
+      let storedSession: Record<string, unknown> | null = null;
+      if (this.sessionManager) {
+        try {
+          storedSession = await this.sessionManager.loadSession(job.user_id, job.target_url);
+          if (storedSession) {
+            await this.logJobEvent(job.id, 'session_restored', {
+              domain: new URL(job.target_url).hostname,
+            });
+          }
+        } catch (err) {
+          console.warn(`[JobExecutor] Session load failed for job ${job.id}:`, err);
+        }
+      }
+
       // 7. Create and start adapter
       const adapterType = (process.env.GH_BROWSER_ENGINE || 'magnitude') as AdapterType;
       adapter = createAdapter(adapterType);
       await adapter.start({
         url: job.target_url,
         llm: llmClient,
+        ...(storedSession ? { storageState: storedSession } : {}),
       });
 
       // 8. Register credentials if available
@@ -276,6 +314,22 @@ export class JobExecutor {
         console.warn(`[JobExecutor] Screenshot failed for job ${job.id}:`, err);
       }
 
+      // 11.5. Save browser session for future reuse
+      if (this.sessionManager && adapter.getBrowserSession) {
+        try {
+          const sessionJson = await adapter.getBrowserSession();
+          if (sessionJson) {
+            const sessionState = JSON.parse(sessionJson);
+            await this.sessionManager.saveSession(job.user_id, job.target_url, sessionState);
+            await this.logJobEvent(job.id, 'session_saved', {
+              domain: new URL(job.target_url).hostname,
+            });
+          }
+        } catch (err) {
+          console.warn(`[JobExecutor] Session save failed for job ${job.id}:`, err);
+        }
+      }
+
       // 12. Get final cost snapshot
       const finalCost = costTracker.getSnapshot();
 
@@ -345,6 +399,32 @@ export class JobExecutor {
 
       console.log(`[JobExecutor] Job ${job.id} completed via ${handler.type} handler (actions=${finalCost.actionCount}, tokens=${finalCost.inputTokens + finalCost.outputTokens}, cost=$${finalCost.totalCost.toFixed(4)})`);
     } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorCode = this.classifyError(errorMessage);
+
+      // Attempt HITL pause for eligible errors (captcha/login) when adapter is available
+      if (adapter && HITL_ELIGIBLE_ERRORS.has(errorCode)) {
+        try {
+          const resumed = await this.requestHumanIntervention(job, adapter, {
+            type: errorCode === 'captcha_blocked' ? 'captcha' : 'login',
+            confidence: 0.9,
+            details: errorMessage,
+          });
+          if (resumed) {
+            // Human resolved the blocker -- re-throw is NOT needed; the job
+            // will naturally resume in the adapter and the outer flow continues
+            // on next iteration. But since we are in the catch block the task
+            // already threw, so we cannot "continue" easily. Mark the error as
+            // handled and return so the finally-block stops the adapter normally.
+            console.log(`[JobExecutor] Job ${job.id} resumed after HITL intervention`);
+            return;
+          }
+        } catch (hitlErr) {
+          console.warn(`[JobExecutor] HITL intervention failed for job ${job.id}:`, hitlErr);
+          // Fall through to normal error handling
+        }
+      }
+
       await progress.setStep(ProgressStep.FAILED);
       await progress.flush();
       const snapshot = costTracker.getSnapshot();
@@ -359,13 +439,12 @@ export class JobExecutor {
 
       // Fire VALET callback on failure too
       if (job.callback_url) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
         callbackNotifier.notifyFromJob({
           id: job.id,
           valet_task_id: job.valet_task_id,
           callback_url: job.callback_url,
           status: 'failed',
-          error_code: this.classifyError(errorMessage),
+          error_code: errorCode,
           error_details: { message: errorMessage },
           llm_cost_cents: Math.round(snapshot.totalCost * 100),
           action_count: snapshot.actionCount,
@@ -448,6 +527,192 @@ export class JobExecutor {
         })
         .eq('id', job.id);
     }
+  }
+
+  // --- HITL (Human-in-the-Loop) ---
+
+  /**
+   * Pause execution, notify VALET, and wait for a human to resolve the blocker.
+   * Returns true if the job was resumed, false if it timed out.
+   */
+  private async requestHumanIntervention(
+    job: AutomationJob,
+    adapter: BrowserAutomationAdapter,
+    blockerResult: BlockerResult,
+  ): Promise<boolean> {
+    const timeoutSeconds = this.hitlTimeoutSeconds;
+
+    // 1. Take a screenshot of the blocked page
+    let screenshotUrl: string | undefined;
+    try {
+      const screenshotBuffer = await adapter.screenshot();
+      screenshotUrl = await this.uploadScreenshot(job.id, 'blocker', screenshotBuffer);
+    } catch (err) {
+      console.warn(`[JobExecutor] HITL screenshot failed for job ${job.id}:`, err);
+    }
+
+    const pageUrl = await adapter.getCurrentUrl();
+
+    // 2. Update job to paused with interaction data
+    const interactionData = {
+      type: blockerResult.type,
+      confidence: blockerResult.confidence,
+      selector: blockerResult.selector,
+      details: blockerResult.details,
+      screenshot_url: screenshotUrl,
+      page_url: pageUrl,
+      detected_at: new Date().toISOString(),
+    };
+
+    await this.supabase
+      .from('gh_automation_jobs')
+      .update({
+        status: 'paused',
+        interaction_type: blockerResult.type,
+        interaction_data: interactionData,
+        paused_at: new Date().toISOString(),
+        status_message: `Waiting for human: ${blockerResult.type}`,
+      })
+      .eq('id', job.id);
+
+    // 3. Pause the adapter
+    if (adapter.pause) {
+      await adapter.pause();
+    }
+
+    await this.logJobEvent(job.id, 'hitl_paused', {
+      blocker_type: blockerResult.type,
+      confidence: blockerResult.confidence,
+      page_url: pageUrl,
+    });
+
+    // 4. Notify VALET via callback
+    if (job.callback_url) {
+      callbackNotifier.notifyHumanNeeded(
+        job.id,
+        job.callback_url,
+        {
+          type: blockerResult.type,
+          screenshot_url: screenshotUrl,
+          page_url: pageUrl,
+          timeout_seconds: timeoutSeconds,
+        },
+        job.valet_task_id,
+      ).catch((err) => {
+        console.warn(`[JobExecutor] HITL callback failed for job ${job.id}:`, err);
+      });
+    }
+
+    // 5. Wait for NOTIFY or timeout
+    const resumed = await this.waitForResume(job.id, timeoutSeconds);
+
+    if (resumed) {
+      // 6. Resume the adapter
+      if (adapter.resume) {
+        await adapter.resume();
+      }
+      await this.supabase
+        .from('gh_automation_jobs')
+        .update({
+          status: 'running',
+          paused_at: null,
+          status_message: 'Resumed after human intervention',
+        })
+        .eq('id', job.id);
+
+      await this.logJobEvent(job.id, 'hitl_resumed', {});
+
+      if (job.callback_url) {
+        callbackNotifier.notifyResumed(job.id, job.callback_url, job.valet_task_id).catch((err) => {
+          console.warn(`[JobExecutor] Resume callback failed for job ${job.id}:`, err);
+        });
+      }
+      return true;
+    }
+
+    // 7. Timeout — fail the job
+    await this.logJobEvent(job.id, 'hitl_timeout', { timeout_seconds: timeoutSeconds });
+    await this.supabase
+      .from('gh_automation_jobs')
+      .update({
+        status: 'failed',
+        completed_at: new Date().toISOString(),
+        error_code: 'hitl_timeout',
+        error_details: {
+          message: `Human intervention timed out after ${timeoutSeconds}s`,
+          blocker_type: blockerResult.type,
+        },
+      })
+      .eq('id', job.id);
+
+    return false;
+  }
+
+  /**
+   * Listen on the Postgres NOTIFY channel for a resume signal.
+   * Falls back to polling if no pg pool is available.
+   */
+  private async waitForResume(jobId: string, timeoutSeconds: number): Promise<boolean> {
+    if (this.pgPool) {
+      return this.waitForResumeViaPg(jobId, timeoutSeconds);
+    }
+    // Fallback: poll the job status
+    return this.waitForResumeViaPolling(jobId, timeoutSeconds);
+  }
+
+  private async waitForResumeViaPg(jobId: string, timeoutSeconds: number): Promise<boolean> {
+    const client = await this.pgPool!.connect();
+    try {
+      await client.query('LISTEN gh_job_resume');
+
+      return await new Promise<boolean>((resolve) => {
+        const timeout = setTimeout(() => {
+          cleanup();
+          resolve(false);
+        }, timeoutSeconds * 1000);
+
+        const onNotification = (msg: pg.Notification) => {
+          if (msg.channel === 'gh_job_resume' && msg.payload === jobId) {
+            cleanup();
+            resolve(true);
+          }
+        };
+
+        const cleanup = () => {
+          clearTimeout(timeout);
+          client.removeListener('notification', onNotification);
+          client.query('UNLISTEN gh_job_resume').catch(() => {});
+          client.release();
+        };
+
+        client.on('notification', onNotification);
+      });
+    } catch (err) {
+      client.release();
+      console.warn(`[JobExecutor] PG LISTEN failed for job ${jobId}, falling back to polling:`, err);
+      return this.waitForResumeViaPolling(jobId, timeoutSeconds);
+    }
+  }
+
+  private async waitForResumeViaPolling(jobId: string, timeoutSeconds: number): Promise<boolean> {
+    const pollIntervalMs = 3000;
+    const deadline = Date.now() + timeoutSeconds * 1000;
+
+    while (Date.now() < deadline) {
+      const { data } = await this.supabase
+        .from('gh_automation_jobs')
+        .select('status')
+        .eq('id', jobId)
+        .single();
+
+      if (data?.status === 'running') {
+        return true;
+      }
+
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+    }
+
+    return false;
   }
 
   // --- Heartbeat ---

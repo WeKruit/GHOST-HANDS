@@ -55,10 +55,28 @@ export interface BrowserAutomationAdapter {
   /** Access the underlying browser page for escape-hatch operations */
   get page(): Page;
 
+  /**
+   * Export the current browser session state (cookies + localStorage)
+   * as a JSON string from Playwright's context.storageState().
+   * Returns null if the browser context is unavailable.
+   */
+  getBrowserSession?(): Promise<string | null>;
+
   // -- Credentials --
 
   /** Register sensitive values that should not be sent to LLMs */
   registerCredentials(creds: Record<string, string>): void;
+
+  // -- Pause / Resume (HITL) --
+
+  /** Pause the automation agent (e.g. for human intervention) */
+  pause?(): Promise<void>;
+
+  /** Resume a paused automation agent */
+  resume?(): Promise<void>;
+
+  /** Whether the agent is currently paused */
+  isPaused?(): boolean;
 
   // -- Events --
 
@@ -94,6 +112,8 @@ export interface AdapterStartOptions {
   systemPrompt?: string;
   /** Per-application budget limit in USD */
   budgetLimit?: number;
+  /** Pre-loaded browser session state (cookies + localStorage) from a previous run */
+  storageState?: Record<string, unknown>;
 }
 
 export interface ActionContext {
