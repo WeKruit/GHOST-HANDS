@@ -1,8 +1,16 @@
-# Phase 2: Hybrid Execution Engine (Cookbook + AI Agent)
+# GhostHands Product Roadmap
 
-**Date:** 2026-02-15
+**Date:** 2026-02-16
 **Status:** Planning
-**Goal:** 95% cost reduction on repeated tasks via self-learning cookbook system
+**Scope:** Phase 2 (Hybrid Engine + HITL) → Phase 3 (Browser Operator + Extension)
+
+### Phases at a Glance
+
+| Phase | What | Key Outcome |
+|-------|------|-------------|
+| **1 (Complete)** | TaskHandler architecture, VALET integration, worker routing | Jobs execute via AI agent |
+| **2a-d** | Hybrid engine: cookbook + AI + HITL + file uploads | 95% cost reduction, human handoff |
+| **3a-d** | Browser Operator: extension, CDP, mode switching | No CAPTCHAs, no 2FA, live view |
 
 ---
 
@@ -256,7 +264,107 @@ Hooks into Magnitude's events:
 
 The engine respects `execution_mode` overrides, making it possible to force pure AI mode even when a cookbook exists.
 
-### 6. Error Recovery — Strategy switching mid-execution
+### 6. FileUploadHelper — Handle OS-level file pickers
+
+**The Problem:** When the agent clicks "Upload Resume", the browser opens an OS-level file picker dialog. The AI agent can't see or interact with it — it's outside the browser DOM.
+
+**The Solution:** Playwright's `page.on('filechooser')` event intercepts the dialog before it opens. No OS interaction needed.
+
+```typescript
+// src/engine/FileUploadHelper.ts
+
+export class FileUploadHelper {
+  /**
+   * Upload a file to any file input — works for all upload patterns:
+   * - <input type="file"> elements
+   * - Custom drag-and-drop zones
+   * - Buttons that trigger file pickers
+   */
+  async uploadFile(
+    page: Page,
+    triggerSelector: string,      // button/input that opens the picker
+    filePath: string,             // local path to the file
+  ): Promise<void> {
+    // Method 1: Direct input (fastest, works for <input type="file">)
+    const input = await page.$(triggerSelector);
+    if (input && await input.getAttribute('type') === 'file') {
+      await input.setInputFiles(filePath);
+      return;
+    }
+
+    // Method 2: Intercept file chooser (works for any trigger)
+    const [fileChooser] = await Promise.all([
+      page.waitForEvent('filechooser'),
+      page.click(triggerSelector),
+    ]);
+    await fileChooser.setFiles(filePath);
+  }
+
+  /**
+   * Upload from buffer (for files stored in cloud storage / DB)
+   */
+  async uploadBuffer(
+    page: Page,
+    triggerSelector: string,
+    buffer: Buffer,
+    filename: string,
+  ): Promise<void> {
+    const [fileChooser] = await Promise.all([
+      page.waitForEvent('filechooser'),
+      page.click(triggerSelector),
+    ]);
+    await fileChooser.setFiles({
+      name: filename,
+      mimeType: 'application/pdf',
+      buffer,
+    });
+  }
+
+  /**
+   * Handle drag-and-drop upload zones
+   */
+  async uploadViaDragDrop(
+    page: Page,
+    dropZoneSelector: string,
+    filePath: string,
+  ): Promise<void> {
+    const buffer = await readFile(filePath);
+    await page.dispatchEvent(dropZoneSelector, 'drop', {
+      dataTransfer: { files: [{ name: basename(filePath), buffer }] },
+    });
+  }
+}
+```
+
+**Key insight:** `page.on('filechooser')` is a Playwright-native feature that works in both server and operator mode because it hooks at the CDP level, not the OS level. The file picker dialog is suppressed — it never actually opens.
+
+**How files reach the worker:**
+
+| Browser Mode | File Source | How |
+|-------------|------------|-----|
+| **Server** | Cloud storage (Supabase, S3) | Worker downloads file to temp dir before upload |
+| **Operator** | User's local filesystem | Extension reads file, sends buffer via WebSocket |
+
+**In Server mode:**
+```typescript
+// Worker downloads resume from Supabase storage
+const resumeBuffer = await supabase.storage
+  .from('resumes')
+  .download(job.input_data.resume_path);
+
+// Intercept file chooser and upload
+await fileUploadHelper.uploadBuffer(page, '[data-testid="upload-resume"]', resumeBuffer, 'resume.pdf');
+```
+
+**In Operator mode (Phase 3):**
+```typescript
+// Extension reads file from user's machine
+// Worker sends: { command: 'readFile', path: '/Users/adam/resume.pdf' }
+// Extension responds with file buffer
+// Worker uses same uploadBuffer() method
+```
+
+### 7. Error Recovery — Strategy switching mid-execution
 
 | Scenario | Current Behavior | Phase 2 Behavior |
 |----------|-----------------|-------------------|
@@ -321,25 +429,31 @@ taskHandlerRegistry.register(new MyNewHandler());
 1. **PageObserver** — DOM analysis, platform detection, field discovery
 2. **ManualStore** — CRUD operations against `gh_action_manuals`
 3. **CookbookExecutor** — Step replay with template substitution
-4. **Unit tests** for all three (TDD per CLAUDE.md)
+4. **FileUploadHelper** — file chooser interception, buffer uploads, drag-drop
+5. **Unit tests** for all four (TDD per CLAUDE.md)
 
-### Phase 2b: Intelligence (Week 3-4)
-5. **TraceRecorder** — Hook into Magnitude events, capture traces
-6. **Trace-to-Cookbook converter** — Convert AI traces to replayable ManualSteps
-7. **ExecutionEngine** — Decision logic + fallback orchestration
-8. **Integration into TaskHandlers** — Wire engine into ApplyHandler (keep CustomHandler as pure AI)
+### Phase 2b: Intelligence + HITL (Week 3-4)
+6. **TraceRecorder** — Hook into Magnitude events, capture traces
+7. **Trace-to-Cookbook converter** — Convert AI traces to replayable ManualSteps
+8. **ExecutionEngine** — Decision logic + fallback orchestration
+9. **Blocker detection** — DOM patterns + thought patterns → HITL trigger
+10. **Pause + screenshot + callback** — extend CallbackNotifier for `needs_human`
+11. **Resume endpoint** — `POST /valet/resume/:jobId`
+12. **Integration into TaskHandlers** — Wire engine into ApplyHandler (keep CustomHandler as pure AI)
 
 ### Phase 2c: Learning Loop (Week 5-6)
-9. **Template detection** — Auto-detect which values should be `{{templates}}`
-10. **Health score system** — Degradation, re-exploration triggers
-11. **Cookbook versioning** — Handle ATS platform updates
-12. **API endpoints** — Manual CRUD for debugging and manual management
+13. **Template detection** — Auto-detect which values should be `{{templates}}`
+14. **Health score system** — Degradation, re-exploration triggers
+15. **Cookbook versioning** — Handle ATS platform updates
+16. **Postgres LISTEN for resume** — Worker listens for HITL resume signals
+17. **Timeout handling** — Auto-fail after interaction timeout
 
 ### Phase 2d: Optimization (Week 7-8)
-13. **Platform-specific cookbooks** — Pre-built for Workday, Greenhouse, Lever
-14. **Multi-step form handling** — Navigate multi-page applications
-15. **Metrics & reporting** — Cost savings dashboard, cookbook hit rates
-16. **E2E tests** — Full loop: AI explore → save cookbook → replay cookbook
+18. **Platform-specific cookbooks** — Pre-built for Workday, Greenhouse, Lever
+19. **Multi-step form handling** — Navigate multi-page applications
+20. **File upload in cookbooks** — Record/replay file upload steps with template paths
+21. **Metrics & reporting** — Cost savings dashboard, cookbook hit rates
+22. **E2E tests** — Full loop: AI explore → save cookbook → replay cookbook
 
 ---
 
@@ -419,6 +533,7 @@ The observation step is free (pure DOM, no LLM). It tells us what platform we're
 | `src/engine/PageObserver.ts` | **NEW** | DOM analysis and page fingerprinting |
 | `src/engine/ManualStore.ts` | **NEW** | CRUD for gh_action_manuals |
 | `src/engine/CookbookExecutor.ts` | **NEW** | Deterministic step replay |
+| `src/engine/FileUploadHelper.ts` | **NEW** | File chooser interception, buffer upload, drag-drop |
 | `src/engine/TraceRecorder.ts` | **NEW** | Capture AI actions as traces |
 | `src/engine/ExecutionEngine.ts` | **NEW** | Decision logic + orchestration |
 | `src/engine/templateResolver.ts` | **NEW** | `{{var}}` substitution |
@@ -426,8 +541,11 @@ The observation step is free (pure DOM, no LLM). It tells us what platform we're
 | `src/engine/index.ts` | **NEW** | Exports |
 | `src/workers/taskHandlers/applyHandler.ts` | **MODIFY** | Use ExecutionEngine |
 | `src/workers/taskHandlers/types.ts` | **MODIFY** | Add engine to TaskContext |
-| `src/workers/JobExecutor.ts` | **MODIFY** | Initialize engine components |
+| `src/workers/JobExecutor.ts` | **MODIFY** | Initialize engine + HITL flow |
+| `src/workers/callbackNotifier.ts` | **MODIFY** | Add `notifyInteraction()` for HITL |
+| `src/api/routes/valet.ts` | **MODIFY** | Add `POST /valet/resume/:jobId` |
 | `src/db/migrations/008_verify_manuals_table.sql` | **NEW** | Ensure table + indexes exist |
+| `src/db/migrations/009_add_interaction_columns.sql` | **NEW** | interaction_type, interaction_data, paused_at |
 | `__tests__/unit/engine/` | **NEW** | Full test suite (TDD) |
 
 ---
@@ -957,17 +1075,86 @@ Browser Operator works with all execution modes:
 | **Cookbook** | RPA on server browser | RPA on user's browser tab |
 | **Hybrid** | Cookbook → AI fallback | Cookbook → AI fallback (in user's browser) |
 
-### Extension Capabilities
+### Extension Capabilities & Invocation Patterns
 
-The browser extension provides:
+The extension is not just a CDP bridge — it's an **active assistant** that handles things the browser agent can't do alone.
 
-1. **CDP access** — Chrome Debugger API for full tab control
-2. **Session reporting** — which sites user is logged into
-3. **Cookie access** — read (never write/modify) for session detection
-4. **Content extraction** — HTML → Markdown via Readability.js + Turndown.js
-5. **Screenshot capture** — via `chrome.tabs.captureVisibleTab()`
-6. **Tab management** — open/close task-specific tabs
-7. **Live status** — show task progress in extension popup
+#### Core Capabilities
+
+| Capability | Chrome API | When Invoked |
+|-----------|-----------|--------------|
+| **CDP tab control** | `chrome.debugger` | Every task — primary control channel |
+| **Tab management** | `chrome.tabs` | Open/close task tabs, detect active tabs |
+| **Session detection** | `chrome.cookies` | Pre-task: check if user is logged into target ATS |
+| **File access** | `chrome.fileSystem` (MV2) or native messaging | Resume/cover letter uploads |
+| **Screenshot** | `chrome.tabs.captureVisibleTab()` | Progress snapshots, blocker detection |
+| **Content extraction** | Content script + Readability.js | Page-to-markdown for AI context |
+| **Notifications** | `chrome.notifications` | Task started, needs attention, completed |
+| **Download management** | `chrome.downloads` | Intercept application confirmations |
+| **Clipboard** | `document.execCommand` via content script | Paste operations that need OS clipboard |
+
+#### Invocation Protocol
+
+The worker sends commands to the extension via WebSocket. The extension processes them and returns results.
+
+```typescript
+// Worker → Extension commands
+interface ExtensionCommand {
+  id: string;                    // correlation ID
+  command: string;
+  params: Record<string, any>;
+}
+
+// Key commands:
+{ command: 'openTab',     params: { url: 'https://...' } }
+{ command: 'closeTab',    params: { tabId: 123 } }
+{ command: 'screenshot',  params: { tabId: 123 } }
+{ command: 'readFile',    params: { path: '/Users/adam/resume.pdf' } }
+{ command: 'checkSession', params: { domain: 'myworkdayjobs.com' } }
+{ command: 'getClipboard', params: {} }
+{ command: 'setClipboard', params: { text: '...' } }
+{ command: 'notify',      params: { title: 'GhostHands', message: 'Task complete' } }
+```
+
+#### File Upload in Operator Mode
+
+This is the key extension invocation that solves the file picker problem:
+
+```
+Worker: "Upload resume to the file input at selector X"
+  │
+  ▼
+Worker → Extension: { command: 'readFile', path: job.input_data.resume_path }
+  │
+  ▼
+Extension: reads file from user's disk → sends buffer back via WebSocket
+  │
+  ▼
+Worker: uses FileUploadHelper.uploadBuffer(page, selector, buffer, 'resume.pdf')
+  │
+  ▼
+Playwright: intercepts file chooser at CDP level → file uploaded without OS dialog
+```
+
+The user's resume never leaves their machine — the extension reads it locally and the CDP filechooser API handles the upload within the browser process.
+
+#### When Extension is Invoked vs When CDP Handles It
+
+| Action | CDP (Playwright) | Extension Needed |
+|--------|-----------------|-----------------|
+| Click, type, scroll | Yes | No |
+| Navigate | Yes | No |
+| Screenshot | Yes | No |
+| File upload (input) | Yes (`setInputFiles`) | No |
+| File upload (drag-drop) | Yes (dispatch event) | No |
+| File from user's disk | No | **Yes** (readFile) |
+| Check login status | No | **Yes** (cookies) |
+| OS notification | No | **Yes** (notifications) |
+| Clipboard paste | Partial | **Yes** for OS clipboard |
+| Download intercept | Partial | **Yes** (downloads API) |
+| Popup/OAuth window | Tricky | **Yes** (tabs + debugger) |
+
+**Design principle:** Use CDP (Playwright) for everything it can handle. Only invoke the extension for capabilities that require Chrome APIs.
 
 ### Security Considerations
 
@@ -981,37 +1168,72 @@ The browser extension provides:
 
 ### Implementation Roadmap
 
-#### Phase 3a: CDP Connection Prototype
-- `BrowserOperatorAdapter` — connect Playwright to existing browser via CDP
-- Test with manual `--remote-debugging-port` launch
-- Verify all Magnitude actions work over CDP
+#### Phase 3a: CDP Connection + Adapter Factory (Week 9-10)
+1. **BrowserOperatorAdapter** — connect Playwright to existing browser via CDP
+2. **AdapterFactory** — create the right adapter based on job config (`browser_mode`)
+3. **Test with manual `--remote-debugging-port`** — verify all Magnitude actions work over CDP
+4. **Mode fallback** — operator requested but disconnected → error with clear message
 
-#### Phase 3b: Browser Extension (MVP)
-- Chrome extension: WebSocket connection to GhostHands server
-- Tab management: open/close task tabs
-- CDP bridge: forward debugger commands
-- Extension popup: connection status + active task display
+```typescript
+// src/adapters/factory.ts — new
+export function createAdapter(job: AutomationJob): BrowserAutomationAdapter {
+  if (job.browser_mode === 'operator') {
+    return new BrowserOperatorAdapter(job.operator_cdp_url);
+  }
+  return new MagnitudeAdapter(); // default: server mode
+}
+```
 
-#### Phase 3c: VALET Integration
-- "My Browser" toggle in VALET settings
-- `browser_mode` field in job creation API
-- Job routing: operator jobs → user's connected browser
-- Status reporting: show live task activity in VALET UI
+**Key discovery:** `AdapterStartOptions` already has `cdpUrl` support, and `MagnitudeAdapter.start()` already passes it to `startBrowserAgent({ browser: { cdp: url } })`. The BrowserOperatorAdapter may just manage the WebSocket-to-CDP bridge and delegate to MagnitudeAdapter.
 
-#### Phase 3d: Production Hardening
-- Reconnection handling (WebSocket drops)
-- Multi-tab isolation (concurrent tasks)
-- Domain scoping (limit CDP access per job)
-- Extension auto-update mechanism
-- Metrics: operator mode success rates vs server mode
+#### Phase 3b: Browser Extension MVP (Week 11-12)
+5. **Chrome extension manifest** (Manifest V3)
+6. **Background service worker** — WebSocket to GhostHands server, command handler
+7. **Tab management** — open/close task tabs on command
+8. **CDP bridge** — `chrome.debugger.attach()` + forward to server
+9. **File access** — `readFile` command for resume/document uploads
+10. **Session detection** — `checkSession` command (read cookies for target domain)
+11. **Extension popup** — connection status, active task, "stop" button
+12. **Notifications** — task started/completed/needs attention
+
+#### Phase 3c: VALET Integration (Week 13-14)
+13. **`browser_mode` field** in VALET schemas and job creation API
+14. **"My Browser" toggle** — extension linking flow
+15. **Operator status endpoint** — `GET /valet/operator/status/:userId`
+16. **Job routing** — operator jobs → user's connected browser
+17. **Live task view** — show real-time progress when operator mode active
+
+#### Phase 3d: Production Hardening (Week 15-16)
+18. **Reconnection handling** — WebSocket drops → auto-reconnect with state recovery
+19. **Multi-tab isolation** — concurrent tasks in separate tab groups
+20. **Domain scoping** — limit CDP access per job to target domain only
+21. **Clipboard + download commands** — remaining extension invocations
+22. **Extension auto-update** — version check + migration support
+23. **Metrics** — operator mode success rates vs server mode, HITL reduction stats
+
+### Files to Create (Phase 3)
+
+| File | Action | Description |
+|------|--------|-------------|
+| `src/adapters/browserOperator.ts` | **NEW** | BrowserOperatorAdapter — CDP over WebSocket |
+| `src/adapters/factory.ts` | **NEW** | AdapterFactory — create adapter based on job config |
+| `src/api/routes/operator.ts` | **NEW** | WebSocket endpoint for extension connections |
+| `src/api/schemas/valet.ts` | **MODIFY** | Add `browser_mode` to schemas |
+| `extension/manifest.json` | **NEW** | Chrome extension manifest (MV3) |
+| `extension/background.ts` | **NEW** | Service worker: WebSocket + command handler |
+| `extension/content.ts` | **NEW** | Content script: page extraction |
+| `extension/popup/` | **NEW** | Extension popup UI |
+| `__tests__/unit/adapters/browserOperator.test.ts` | **NEW** | Adapter tests |
 
 ### VALET Action Items (Phase 3)
 
 - [ ] Build extension settings UI ("My Browser" toggle)
-- [ ] Handle `browser_mode: "operator"` in job creation
+- [ ] Extension onboarding flow (install link, token generation)
+- [ ] Handle `browser_mode: "operator"` in job creation forms
 - [ ] Show connection status (browser online/offline)
 - [ ] Display live task progress when operator mode active
 - [ ] "Stop automation" button → closes task tab
+- [ ] Handle disconnected browser → show "browser offline" error
 
 ---
 
