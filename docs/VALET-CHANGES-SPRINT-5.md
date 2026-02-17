@@ -9,18 +9,31 @@
 ## Summary
 
 Sprint 5 is a **model + events mega-update**:
-- 7 new models (including frontier Qwen3.5-Plus, GPT-5.2, Claude Opus, Gemini family)
-- Accuracy-focused preset rebalancing
+- 13 new models (including Qwen3-VL Thinking, Qwen3-Coder-480B, GPT-5.2, Claude Opus, Gemini family)
+- Accuracy-focused preset rebalancing (quality → VL-235B-Thinking with chain-of-thought)
 - Unified event system — ALL events now flow to `gh_job_events`
-- 672 tests passing, 0 failures
+- All new Qwen3 models run via existing SiliconFlow API key — no new API keys needed
+- 678 tests passing, 0 failures
 
 ---
 
 ## 1. New Models
 
+### Accuracy-First Models (SiliconFlow)
+
+| Alias | Model ID | Vision | Input $/M | Output $/M | Notes |
+|-------|----------|--------|-----------|------------|-------|
+| **qwen3-vl-235b-thinking** | Qwen3-VL-235B-A22B-Thinking | Yes | $0.45 | $3.50 | Frontier VL reasoning. Chain-of-thought + vision. Best for complex GUI. |
+| **qwen3-vl-30b-thinking** | Qwen3-VL-30B-A3B-Thinking | Yes | $0.29 | $1.00 | MoE 30B/3B. Vision + thinking at fraction of 235B cost. |
+| **qwen3-vl-30b** | Qwen3-VL-30B-A3B-Instruct | Yes | $0.29 | $1.00 | Fast vision without thinking overhead. |
+| **qwen3-235b-thinking** | Qwen3-235B-A22B-Thinking-2507 | No | $0.35 | $1.42 | Text-only reasoning. 256K context. |
+| **qwen3-coder-480b** | Qwen3-Coder-480B-A35B-Instruct | No | $0.25 | $1.00 | 480B code model. Best for form-fill scripting. |
+| **qwen3-next-80b** | Qwen3-Next-80B-A3B-Thinking | No | $0.14 | $0.57 | Ultra-fast reasoning. 10x throughput. |
+
+### Premium Models (External Providers)
+
 | Alias | Provider | Vision | Input $/M | Output $/M | Notes |
 |-------|----------|--------|-----------|------------|-------|
-| **qwen3.5-plus** | Alibaba Cloud | Yes | $0.40 | $2.40 | Frontier accuracy, native GUI automation, 1M context. Released Feb 16 2026. |
 | **gpt-5.2** | OpenAI | Yes | $1.75 | $14.00 | Frontier reasoning, multimodal |
 | **gpt-4.1** | OpenAI | Yes | $2.00 | $8.00 | Good vision (OCR, VQA), 1M context |
 | **claude-opus** | Anthropic | Yes | $5.00 | $25.00 | #1 on intelligence leaderboards. Best for complex flows. |
@@ -31,7 +44,7 @@ Sprint 5 is a **model + events mega-update**:
 **Updated pricing:**
 - `deepseek-chat`: output $1.10 → $0.42 (V3.2 price cut)
 
-**Total models available: 25** (was 18)
+**Total models available: 31** (was 18)
 
 ---
 
@@ -41,7 +54,7 @@ Sprint 5 is a **model + events mega-update**:
 |--------|---------------|-----------|-----|
 | `speed` | qwen-7b | qwen-7b (unchanged) | Still cheapest |
 | `balanced` | qwen-72b | **qwen3-235b** | Better accuracy, similar cost |
-| `quality` | qwen3-235b | **qwen3.5-plus** | Frontier accuracy, native GUI agent |
+| `quality` | qwen3-235b | **qwen3-vl-235b-thinking** | Frontier VL reasoning with chain-of-thought |
 | `premium` | gpt-4o | **gpt-5.2** | Newer, better, cheaper input |
 
 **Default** remains `qwen-72b` (safest choice for existing VALET integrations).
@@ -113,14 +126,13 @@ case 'cookbook_step_failed':
 
 ---
 
-## 4. New Environment Variables
+## 4. Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `DASHSCOPE_API_KEY` | For qwen3.5-plus | Alibaba Cloud DashScope API key |
 | `GOOGLE_API_KEY` | For Gemini models | Google AI API key |
 
-These are only needed if you want to use the corresponding models. All existing models continue to work without new env vars.
+**No new API keys needed for Qwen3 models** — all 6 new Qwen3 models (VL-Thinking, Coder-480B, Next-80B) run via SiliconFlow using your existing `SILICONFLOW_API_KEY`. The `DASHSCOPE_API_KEY` is optional (only if you want to use the Alibaba DashScope endpoint directly).
 
 ---
 
@@ -128,10 +140,10 @@ These are only needed if you want to use the corresponding models. All existing 
 
 | Suite | Tests | Failures |
 |-------|-------|----------|
-| Unit | 479 | 0 |
+| Unit | 485 | 0 |
 | Integration | 87 | 0 |
 | E2E | 106 | 0 |
-| **Total** | **672** | **0** |
+| **Total** | **678** | **0** |
 
 ---
 

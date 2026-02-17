@@ -70,45 +70,72 @@ describe('models.config.json structure', () => {
 });
 
 // ---------------------------------------------------------------------------
-// New provider: qwen-alibaba
+// Qwen3 VL thinking models (SiliconFlow-hosted)
 // ---------------------------------------------------------------------------
 
-describe('qwen-alibaba provider', () => {
-  test('exists in providers', () => {
-    expect(config.providers['qwen-alibaba']).toBeDefined();
-  });
-
-  test('has correct baseUrl for DashScope', () => {
-    expect(config.providers['qwen-alibaba'].baseUrl).toBe(
-      'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
-    );
-  });
-
-  test('uses DASHSCOPE_API_KEY env key', () => {
-    expect(config.providers['qwen-alibaba'].envKey).toBe('DASHSCOPE_API_KEY');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// New models: qwen3.5-plus, gpt-4.1, gpt-5.2
-// ---------------------------------------------------------------------------
-
-describe('qwen3.5-plus model', () => {
+describe('qwen3-vl-235b-thinking model', () => {
   test('exists in models', () => {
-    expect(config.models['qwen3.5-plus']).toBeDefined();
+    expect(config.models['qwen3-vl-235b-thinking']).toBeDefined();
   });
 
-  test('uses qwen-alibaba provider', () => {
-    expect(config.models['qwen3.5-plus'].provider).toBe('qwen-alibaba');
+  test('uses siliconflow provider', () => {
+    expect(config.models['qwen3-vl-235b-thinking'].provider).toBe('siliconflow');
   });
 
   test('has vision support', () => {
-    expect(config.models['qwen3.5-plus'].vision).toBe(true);
+    expect(config.models['qwen3-vl-235b-thinking'].vision).toBe(true);
   });
 
   test('has correct pricing', () => {
-    expect(config.models['qwen3.5-plus'].cost.input).toBe(0.40);
-    expect(config.models['qwen3.5-plus'].cost.output).toBe(2.40);
+    expect(config.models['qwen3-vl-235b-thinking'].cost.input).toBe(0.45);
+    expect(config.models['qwen3-vl-235b-thinking'].cost.output).toBe(3.50);
+  });
+});
+
+describe('qwen3-vl-30b-thinking model', () => {
+  test('exists in models', () => {
+    expect(config.models['qwen3-vl-30b-thinking']).toBeDefined();
+  });
+
+  test('uses siliconflow provider with vision', () => {
+    expect(config.models['qwen3-vl-30b-thinking'].provider).toBe('siliconflow');
+    expect(config.models['qwen3-vl-30b-thinking'].vision).toBe(true);
+  });
+
+  test('has correct pricing', () => {
+    expect(config.models['qwen3-vl-30b-thinking'].cost.input).toBe(0.29);
+    expect(config.models['qwen3-vl-30b-thinking'].cost.output).toBe(1.00);
+  });
+});
+
+describe('qwen3-coder-480b model', () => {
+  test('exists in models', () => {
+    expect(config.models['qwen3-coder-480b']).toBeDefined();
+  });
+
+  test('is text-only (no vision)', () => {
+    expect(config.models['qwen3-coder-480b'].vision).toBe(false);
+  });
+
+  test('has correct pricing', () => {
+    expect(config.models['qwen3-coder-480b'].cost.input).toBe(0.25);
+    expect(config.models['qwen3-coder-480b'].cost.output).toBe(1.00);
+  });
+});
+
+describe('qwen3-next-80b model', () => {
+  test('exists in models', () => {
+    expect(config.models['qwen3-next-80b']).toBeDefined();
+  });
+
+  test('is text-only ultra-fast reasoning', () => {
+    expect(config.models['qwen3-next-80b'].vision).toBe(false);
+    expect(config.models['qwen3-next-80b'].provider).toBe('siliconflow');
+  });
+
+  test('has correct pricing', () => {
+    expect(config.models['qwen3-next-80b'].cost.input).toBe(0.14);
+    expect(config.models['qwen3-next-80b'].cost.output).toBe(0.57);
   });
 });
 
@@ -179,8 +206,8 @@ describe('updated presets', () => {
     expect(config.presets.balanced.model).toBe('qwen3-235b');
   });
 
-  test('quality preset is qwen3.5-plus', () => {
-    expect(config.presets.quality.model).toBe('qwen3.5-plus');
+  test('quality preset is qwen3-vl-235b-thinking', () => {
+    expect(config.presets.quality.model).toBe('qwen3-vl-235b-thinking');
   });
 
   test('premium preset is gpt-5.2', () => {
@@ -222,21 +249,21 @@ describe('loadModelConfig resolution', () => {
     }
   });
 
-  test('resolves qwen3.5-plus by direct alias', () => {
-    const resolved = loadModelConfig('qwen3.5-plus');
-    expect(resolved.alias).toBe('qwen3.5-plus');
-    expect(resolved.model).toBe('qwen3.5-plus');
-    expect(resolved.providerKey).toBe('qwen-alibaba');
-    expect(resolved.providerName).toBe('Alibaba Cloud (Qwen)');
-    expect(resolved.baseUrl).toBe('https://dashscope-intl.aliyuncs.com/compatible-mode/v1');
+  test('resolves qwen3-vl-235b-thinking by direct alias', () => {
+    const resolved = loadModelConfig('qwen3-vl-235b-thinking');
+    expect(resolved.alias).toBe('qwen3-vl-235b-thinking');
+    expect(resolved.model).toBe('Qwen/Qwen3-VL-235B-A22B-Thinking');
+    expect(resolved.providerKey).toBe('siliconflow');
+    expect(resolved.providerName).toBe('SiliconFlow');
+    expect(resolved.baseUrl).toBe('https://api.siliconflow.cn/v1');
     expect(resolved.vision).toBe(true);
   });
 
-  test('qwen3.5-plus resolves to openai-generic provider', () => {
-    const resolved = loadModelConfig('qwen3.5-plus');
+  test('qwen3-vl-235b-thinking resolves to openai-generic provider', () => {
+    const resolved = loadModelConfig('qwen3-vl-235b-thinking');
     expect(resolved.llmClient.provider).toBe('openai-generic');
     expect(resolved.llmClient.options.baseUrl).toBe(
-      'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
+      'https://api.siliconflow.cn/v1'
     );
   });
 
@@ -256,10 +283,10 @@ describe('loadModelConfig resolution', () => {
     expect(resolved.llmClient.provider).toBe('openai');
   });
 
-  test('quality preset resolves to qwen3.5-plus', () => {
+  test('quality preset resolves to qwen3-vl-235b-thinking', () => {
     const resolved = loadModelConfig('quality');
-    expect(resolved.alias).toBe('qwen3.5-plus');
-    expect(resolved.providerKey).toBe('qwen-alibaba');
+    expect(resolved.alias).toBe('qwen3-vl-235b-thinking');
+    expect(resolved.providerKey).toBe('siliconflow');
   });
 
   test('balanced preset resolves to qwen3-235b', () => {
