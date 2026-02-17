@@ -442,11 +442,40 @@ Returns stored browser sessions for a user (metadata only, no credentials).
 }
 ```
 
-### 4.6 Clear Session — `DELETE /valet/sessions/:userId/:domain`
+### 4.6 List Models — `GET /api/v1/gh/models`
+
+Returns the full model catalog (no auth required). Use this to populate VALET's model selector dynamically instead of hardcoding.
+
+**Response:**
+
+```json
+{
+  "models": [
+    {
+      "alias": "qwen3-vl-235b-thinking",
+      "model": "Qwen/Qwen3-VL-235B-A22B-Thinking",
+      "provider": "siliconflow",
+      "provider_name": "SiliconFlow",
+      "vision": true,
+      "cost": { "input": 0.45, "output": 3.50, "unit": "$/M tokens" },
+      "note": "Frontier VL reasoning. Chain-of-thought + vision."
+    }
+  ],
+  "presets": [
+    { "name": "quality", "description": "Frontier accuracy...", "model": "qwen3-vl-235b-thinking" }
+  ],
+  "default": "qwen-72b",
+  "total": 30
+}
+```
+
+VALET can call this on startup or periodically to keep the model list in sync without redeploying.
+
+### 4.7 Clear Session — `DELETE /valet/sessions/:userId/:domain`
 
 Delete stored session for a specific domain.
 
-### 4.7 Clear All Sessions — `DELETE /valet/sessions/:userId`
+### 4.8 Clear All Sessions — `DELETE /valet/sessions/:userId`
 
 Delete all stored sessions for a user ("log out everywhere").
 
