@@ -70,7 +70,10 @@ async function main(): Promise<void> {
   await pgDirect.connect();
   console.log(`[Worker] Postgres connection established`);
 
-  const maxConcurrent = parseInt(process.env.MAX_CONCURRENT_JOBS || '1', 10);
+  // CONVENTION: Single-task-per-worker. Each worker processes one job at a time.
+  // This simplifies concurrency, avoids browser session conflicts, and makes
+  // cost tracking + HITL deterministic. Scale horizontally by adding workers.
+  const maxConcurrent = 1;
 
   const executor = new JobExecutor({
     supabase,

@@ -1,7 +1,7 @@
 # VALET Integration Contract — Comprehensive Reference
 
-**Date:** 2026-02-16
-**Covers:** Sprints 1-3 (all GhostHands capabilities)
+**Date:** 2026-02-17
+**Covers:** Sprints 1-4 (all GhostHands capabilities)
 **Status:** Active
 **Breaking Changes:** None (all additive, backward compatible)
 
@@ -164,9 +164,13 @@ Rich application request with full profile data.
     "How many years of React experience?": "6"
   },
   "quality": "balanced",
+  "model": "qwen-72b",
+  "image_model": "qwen-7b",
+  "execution_mode": "auto",
   "priority": 5,
   "timeout_seconds": 300,
   "idempotency_key": "valet-456-apply-v1",
+  "target_worker_id": null,
   "metadata": {}
 }
 ```
@@ -181,11 +185,59 @@ Rich application request with full profile data.
 | `profile` | object | Yes | - | User profile data |
 | `resume` | object | No | - | Resume file reference |
 | `qa_answers` | Record | No | {} | Pre-answered screening questions |
-| `quality` | enum | No | balanced | speed, balanced, quality |
+| `quality` | enum | No | balanced | speed, balanced, quality (maps to budget tier) |
+| `model` | string | No | qwen-72b | LLM model alias for reasoning (see Model Reference) |
+| `image_model` | string | No | same as model | Separate vision model for screenshots (must have vision support) |
+| `execution_mode` | enum | No | auto | auto, ai_only, cookbook_only |
 | `priority` | 1-10 | No | 5 | Higher = processed sooner |
 | `timeout_seconds` | 30-1800 | No | 300 | Max execution time |
 | `idempotency_key` | string | No | - | Prevents duplicate submissions |
+| `target_worker_id` | string | No | null | Route to specific worker (null = any available) |
 | `metadata` | object | No | {} | Arbitrary key-value pairs |
+
+### 4.1.1 Model Reference
+
+| Alias | Provider | Vision | Input $/M | Output $/M | Best For |
+|-------|----------|--------|-----------|------------|----------|
+| **qwen-7b** | SiliconFlow | Yes | $0.05 | $0.15 | Cheapest — speed preset, testing |
+| **qwen-72b** | SiliconFlow | Yes | $0.25 | $0.75 | **Default** — best value |
+| **qwen3-235b** | SiliconFlow | Yes | $0.34 | $1.37 | Quality preset — complex pages |
+| deepseek-chat | DeepSeek | No | $0.27 | $1.10 | Text-only reasoning |
+| gpt-4o | OpenAI | Yes | $2.50 | $10.00 | Premium preset |
+| gpt-4o-mini | OpenAI | Yes | $0.15 | $0.60 | Budget OpenAI |
+| claude-sonnet | Anthropic | Yes | $3.00 | $15.00 | Forced for premium tier |
+| claude-haiku | Anthropic | Yes | $0.80 | $4.00 | Budget Claude |
+
+**Cost per job (typical 8K input + 2K output tokens):**
+
+| Setup | Models | Cost/Job | Savings |
+|-------|--------|----------|---------|
+| Speed | qwen-7b | $0.0007 | 98% vs premium |
+| **Balanced** | **qwen-72b** | **$0.0035** | **90% vs premium** |
+| Quality | qwen3-235b | $0.0055 | 86% vs premium |
+| **Dual-model** | **qwen-7b + deepseek-chat** | **$0.0017** | **95% vs premium** |
+| Premium | gpt-4o | $0.04 | baseline |
+
+**Dual-model saves 87% vs single gpt-4o** by routing screenshots to cheap vision model.
+
+### 4.1.2 Execution Modes
+
+| Mode | Behavior |
+|------|----------|
+| `auto` | Check ManualStore for cookbook → replay if healthy → fallback to Magnitude AI |
+| `ai_only` | Skip cookbook lookup, always use Magnitude LLM exploration |
+| `cookbook_only` | Use cookbook only — fail if no manual exists or health < 30% |
+
+### 4.1.3 Worker Selection
+
+**Convention: Single-task-per-worker.** Each worker processes one job at a time. Scale horizontally.
+
+| Scenario | `target_worker_id` | Behavior |
+|----------|-------------------|----------|
+| Any worker | `null` (default) | Next available worker picks it up |
+| Specific worker | `"worker-prod-1"` | Only that worker can claim it |
+| Worker busy | `"worker-prod-1"` | Job waits in queue until worker is free |
+| Worker offline | `"worker-prod-1"` | Job stays pending (monitor with stuck job alerts) |
 
 **Response (201):**
 
@@ -261,7 +313,9 @@ Returns full job status with mode tracking, cost breakdown, and interaction data
     "cookbook_steps": 8,
     "magnitude_steps": 0,
     "cookbook_cost_usd": 0.0005,
-    "magnitude_cost_usd": 0.0
+    "magnitude_cost_usd": 0.0,
+    "image_cost_usd": 0.0003,
+    "reasoning_cost_usd": 0.0002
   },
 
   "progress": {
@@ -441,7 +495,9 @@ Sent when the worker starts executing the job. Tells VALET the job is no longer 
     "cookbook_steps": 8,
     "magnitude_steps": 0,
     "cookbook_cost_usd": 0.0005,
-    "magnitude_cost_usd": 0.0
+    "magnitude_cost_usd": 0.0,
+    "image_cost_usd": 0.0003,
+    "reasoning_cost_usd": 0.0002
   },
   "completed_at": "2026-02-16T12:00:04Z"
 }
@@ -738,10 +794,24 @@ The `cost_breakdown` object appears in both status responses and callback payloa
     "cookbook_steps": 8,
     "magnitude_steps": 0,
     "cookbook_cost_usd": 0.0005,
-    "magnitude_cost_usd": 0.0
+    "magnitude_cost_usd": 0.0,
+    "image_cost_usd": 0.0003,
+    "reasoning_cost_usd": 0.0002
   }
 }
 ```
+
+| Field | Description |
+|-------|-------------|
+| `total_cost_usd` | Total cost across all modes |
+| `action_count` | Total actions executed |
+| `total_tokens` | Total LLM tokens used |
+| `cookbook_steps` | Steps replayed from saved manual |
+| `magnitude_steps` | Steps driven by AI agent |
+| `cookbook_cost_usd` | Cost from cookbook steps |
+| `magnitude_cost_usd` | Cost from AI agent steps |
+| `image_cost_usd` | Cost attributed to image/vision model (dual-model only) |
+| `reasoning_cost_usd` | Cost attributed to reasoning model (dual-model only) |
 
 **Savings calculation:**
 
@@ -1216,7 +1286,6 @@ Jobs can get stuck if a worker crashes without cleanup. The system handles this 
 | `ECR_REPOSITORY` | Yes | ECR repository name |
 | `AWS_REGION` | Yes | AWS region for ECR login |
 | `GH_WORKER_ID` | Per-worker | Worker identifier (set in compose or start-worker) |
-| `MAX_CONCURRENT_JOBS` | No | Concurrent job limit (default: 1 compose, 2 targeted) |
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
 | `SUPABASE_URL` | Yes | Supabase API URL |
 | `SUPABASE_KEY` | Yes | Supabase service role key |
@@ -1299,7 +1368,8 @@ Apply these migrations **in order** on Supabase:
 | `GH_CREDENTIAL_KEY` | Yes | AES-256 encryption key (64 hex chars) for session encryption |
 | `GH_CREDENTIAL_KEY_ID` | No | Key version ID (default: "1") |
 | `GH_SERVICE_KEY` | Yes | Service key for X-GH-Service-Key authentication |
-| `GH_MODEL` | No | Default LLM model override |
+| `GH_MODEL` or `GH_DEFAULT_MODEL` | No | Default LLM model alias (default: qwen-72b) |
+| `GH_IMAGE_MODEL` | No | Default vision model for dual-model mode |
 
 ### VALET Code Changes
 
@@ -1338,6 +1408,28 @@ curl -X POST https://gh.example.com/api/v1/gh/valet/apply \
     "valet_user_id": "00000000-0000-0000-0000-000000000001",
     "target_url": "https://boards.greenhouse.io/acme/jobs/123",
     "callback_url": "https://valet.example.com/webhook/gh",
+    "profile": {
+      "first_name": "Alice",
+      "last_name": "Smith",
+      "email": "alice@example.com"
+    }
+  }'
+```
+
+### Create a dual-model job (cheap vision + smart reasoning)
+
+```bash
+curl -X POST https://gh.example.com/api/v1/gh/valet/apply \
+  -H "Content-Type: application/json" \
+  -H "X-GH-Service-Key: $GH_SERVICE_KEY" \
+  -d '{
+    "valet_task_id": "task-002",
+    "valet_user_id": "00000000-0000-0000-0000-000000000001",
+    "target_url": "https://boards.greenhouse.io/acme/jobs/123",
+    "callback_url": "https://valet.example.com/webhook/gh",
+    "model": "deepseek-chat",
+    "image_model": "qwen-7b",
+    "execution_mode": "ai_only",
     "profile": {
       "first_name": "Alice",
       "last_name": "Smith",
@@ -1398,3 +1490,11 @@ curl https://gh.example.com/api/v1/gh/valet/sessions/$USER_ID \
 5. **Cookbook is per-platform, not per-company:** A Greenhouse manual works across all Greenhouse jobs, but a company's custom application portal has no manual until the first successful run.
 
 6. **`completed_at` field in callback payloads:** For `running` and `needs_human` callbacks, `completed_at` is actually the event timestamp (not a true completion time). This will be renamed to `timestamp` in a future version.
+
+7. **Single-task-per-worker (Sprint 4):** Workers are hardcoded to process one job at a time. Scale horizontally by adding workers. This simplifies browser session management, cost tracking, and HITL pause/resume.
+
+8. **Dual-model requires vision:** The `image_model` field is only used if the specified model has `vision: true` in the model registry. Non-vision models passed as `image_model` are silently ignored (single-model fallback).
+
+9. **No worker registry/discovery API:** There is no endpoint to list active workers or their status. VALET must track workers via EC2 instance management + `deploy.sh status`. A worker registry is planned for Sprint 5.
+
+10. **Thinking/reasoning not fully unified:** Magnitude emits `current_action` in progress updates (visible via Realtime). Stagehand observe() calls and cookbook step-level thoughts are not yet emitted as events. A unified thinking interface is planned for Sprint 5.
