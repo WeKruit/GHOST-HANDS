@@ -1,127 +1,98 @@
 # Failing Tests — Fix in Sprint 4
 
 **Recorded:** 2026-02-16
-**Total Failures:** 55 tests across 5 e2e test files
-**Root Cause:** All require live Supabase connection (`getTestSupabase()` → `createClient()` throws "supabaseUrl is required")
-**Impact:** Zero impact on production. All unit/integration tests pass (543/543). These are e2e tests that were written against a live Supabase instance.
+**Updated:** 2026-02-17
+**Total Failures:** 7 tests across 4 e2e files + 1 error (session persistence)
+**Previous:** 55 failures — fixed 48 by adding `bunfig.toml` env preload + switching to `bun test`
 
 ---
 
-## Root Cause
+## What Was Fixed
 
-All 5 files use `getTestSupabase()` from `__tests__/e2e/helpers.ts` which calls `createClient(process.env.SUPABASE_URL, ...)`. Without `SUPABASE_URL` set, every test in the suite fails immediately with:
+**Root cause (48 tests):** `bun test` from project root didn't load `packages/ghosthands/.env`. Vitest (`vitest run`) loaded it via `vitest.config.ts` `envFile` but ran under Node.js v24, which has fetch issues with Supabase.
 
-```
-Error: supabaseUrl is required.
-  at validateSupabaseUrl (node_modules/@supabase/supabase-js/dist/index.mjs:150:29)
-```
+**Fix applied:**
+1. Created `bunfig.toml` at repo root with preload script
+2. Created `packages/ghosthands/test-env.ts` — loads package `.env` when CWD is repo root
+3. Switched root `package.json` test scripts from `vitest run` to `bun test`
 
-## Fix Strategy (Sprint 4)
-
-**Option A (Recommended):** Add `SUPABASE_URL` and `SUPABASE_KEY` to CI test environment pointing to a dedicated test project. Tests run against real Supabase.
-
-**Option B:** Refactor e2e tests to use a local Postgres (via `pg` pool) instead of Supabase client. Cheaper, no external dependency, but loses Supabase-specific features (RLS, Realtime).
-
-**Option C:** Skip these tests in CI with `describe.skipIf(!process.env.SUPABASE_URL)` and run them manually before deploy.
+**Result:** 566 pass, 7 fail, 1 error (was 543 pass, 55 fail)
 
 ---
 
-## Failing Files (5)
+## Remaining 7 Failures (Real Logic Issues)
 
-### 1. `__tests__/e2e/jobLifecycle.test.ts` — 13 failures
+These are genuine test bugs — the Supabase connection works, but the test assertions or helper functions have issues.
 
-| Test | Description |
-|------|-------------|
-| should create a job in pending status | Basic job INSERT |
-| should pick up a pending job and claim it | Worker pickup flow |
-| should not pick up jobs that are already claimed | Concurrency guard |
-| should transition through running to completed | Full status flow |
-| full lifecycle: create → pickup → run → complete → verify | End-to-end happy path |
-| should pick jobs in priority order (highest first) | Priority queue |
-| should cancel a pending job | Cancel flow |
-| should not cancel an already-completed job | Cancel guard |
-| should store result_data for VALET to retrieve | Completion data |
-| should store screenshot URLs in the completed job record | Screenshot storage |
-| should record job events throughout the lifecycle | Event audit trail |
-| should respect idempotency keys (no duplicate creation) | Idempotency |
-| should store input_data and metadata correctly | Data integrity |
-| should filter jobs by status | Status filtering |
+### 1. `__tests__/e2e/concurrency.test.ts` — 3 failures
 
-### 2. `__tests__/e2e/errorHandling.test.ts` — 10 failures
+| Test | Root Cause |
+|------|------------|
+| should not allow two workers to pick up the same job | `simulateWorkerPickup` doesn't use `FOR UPDATE SKIP LOCKED` — concurrent updates succeed |
+| should handle 5 workers competing for 3 jobs correctly | Same — 5 pickups succeed when only 3 should (got 5, expected <=3) |
+| should respect maxConcurrent by not picking up when at capacity | Worker capacity not enforced in mock helper |
 
-| Test | Description |
-|------|-------------|
-| should mark a job as failed with error code and details | Failure recording |
-| should log a job_failed event on failure | Event logging |
-| should re-queue a job for retry on retryable errors | Retry queue |
-| should increment retry_count on each retry | Retry counter |
-| should fail permanently when max retries exceeded | Max retry guard |
-| should allow retrying a failed job | Manual retry |
-| should not allow retrying a completed job | Retry guard |
-| should store different error codes for different failure types | Error code mapping |
-| should record partial cost data even on job failure | Partial cost |
-| should detect and recover stuck jobs with stale heartbeats | Stuck job recovery |
+**Fix:** Update `simulateWorkerPickup()` in `helpers.ts` to use a proper `SELECT ... FOR UPDATE SKIP LOCKED` query via raw SQL, matching the real `JobPoller.pickupJob()` implementation.
 
-### 3. `__tests__/e2e/concurrency.test.ts` — 13 failures
+### 2. `__tests__/e2e/errorHandling.test.ts` — 2 failures
 
-| Test | Description |
-|------|-------------|
-| should not allow two workers to pick up the same job | Double-pickup prevention |
-| should distribute multiple jobs across workers | Job distribution |
-| should handle 5 workers competing for 3 jobs correctly | Contention handling |
-| should not pick up jobs that are already in non-pending status | Status guard |
-| should execute multiple jobs in parallel without interference | Parallel isolation |
-| should isolate events between concurrently executed jobs | Event isolation |
-| should serve higher priority jobs first when multiple are pending | Priority under contention |
-| should use FIFO within the same priority level | FIFO ordering |
-| should handle cancel during job execution gracefully | Cancel race condition |
-| should handle simultaneous status updates without data corruption | Status race condition |
-| should respect maxConcurrent by not picking up when at capacity | Capacity limit |
-| should pick up new jobs after completing existing ones | Job cycling |
-| should handle batch insertion of 20 jobs efficiently | Bulk operations |
+| Test | Root Cause |
+|------|------------|
+| should store different error codes for different failure types | Test inserts multiple error types but query returns wrong order (missing `ORDER BY`) |
+| should record partial cost data even on job failure | `llm_cost_cents` column not set by test helper on failure path |
 
-### 4. `__tests__/e2e/costControl.test.ts` — 6 failures
+**Fix:** Add `ORDER BY created_at` to error code query. Set `llm_cost_cents` in failure simulation.
 
-| Test | Description |
-|------|-------------|
-| should record job cost against user monthly usage | Cost recording |
-| should accumulate costs across multiple jobs | Cost accumulation |
-| should log a cost_recorded event in gh_job_events | Cost event logging |
-| should deny a job when user budget is exhausted | Budget enforcement |
-| CostControlService - Preflight Budget Check | Budget preflight |
-| should record partial cost when job is killed mid-execution | Partial cost on kill |
+### 3. `__tests__/e2e/progressUpdates.test.ts` — 1 failure
 
-### 5. `__tests__/e2e/progressUpdates.test.ts` — 13 failures
+| Test | Root Cause |
+|------|------------|
+| should update heartbeat timestamp on each beat | Heartbeat update uses `updated_at` but test checks `last_heartbeat` column — timing race between two rapid updates |
 
-| Test | Description |
-|------|-------------|
-| should record events with correct structure | Event structure |
-| should record multiple events in chronological order | Event ordering |
-| should support different event types throughout job lifecycle | Event type variety |
-| should update heartbeat timestamp on each beat | Heartbeat updates |
-| should detect stale heartbeats (used for stuck job recovery) | Stale heartbeat detection |
-| should track status changes from pending through running to completed | Status transitions |
-| should record status_message updates | Status message tracking |
-| should include cost data in completion events | Cost in events |
-| should track action counts in event metadata | Action count tracking |
-| should provide a complete audit trail for a job | Full audit trail |
-| should isolate events between different jobs | Event isolation |
-| should record events from different actors | Multi-actor events |
+**Fix:** Add small delay between heartbeat calls or compare with tolerance.
+
+### 4. `__tests__/e2e/costControl.test.ts` — 1 failure
+
+| Test | Root Cause |
+|------|------------|
+| should log a cost_recorded event in gh_job_events | Test expects `cost_recorded` event type but the event is logged as `cost_update` |
+
+**Fix:** Align event type constant — either update test or update the event logger.
 
 ---
 
-## Additional Context
+## 1 Error (Not a Failure)
 
-- These tests were created in Sprint 1 against a live Supabase test project
-- They validate the full database layer (RLS policies, indexes, triggers)
-- The `helpers.ts` file provides `MockValetClient`, `simulateWorkerPickup`, etc.
-- All use the `vitest` import (compatibility shim) but run under `bun:test`
-- Session persistence integration test (`__tests__/integration/sessions/sessionPersistence.test.ts`) has the same issue (1 error, not counted in the 55)
+### `__tests__/integration/sessions/sessionPersistence.test.ts`
 
-## Sprint 4 Ticket
+**Error:** `supabaseUrl is required` — this integration test creates its own Supabase client directly (doesn't use the e2e helpers). Needs the same env loading fix or to use `getTestSupabase()`.
 
-**GH-SPRINT4-001: Fix 55 e2e tests requiring live Supabase**
+---
+
+## Sprint 4 Tickets
+
+**GH-SPRINT4-001: Fix simulateWorkerPickup concurrency (3 tests)**
 - Priority: P1
-- Estimate: 1-2 hours
-- Approach: Option A (add Supabase test credentials to CI) or Option C (conditional skip)
-- Acceptance: `bun test` shows 0 failures in CI
+- File: `__tests__/e2e/helpers.ts` — `simulateWorkerPickup()`
+- Fix: Use raw SQL with `FOR UPDATE SKIP LOCKED` instead of Supabase `.update()`
+- Tests: concurrency double-pickup, 5-worker contention, maxConcurrent
+
+**GH-SPRINT4-002: Fix error handling test assertions (2 tests)**
+- Priority: P2
+- File: `__tests__/e2e/errorHandling.test.ts`
+- Fix: Add ORDER BY, set llm_cost_cents on failure path
+
+**GH-SPRINT4-003: Fix heartbeat timing race (1 test)**
+- Priority: P2
+- File: `__tests__/e2e/progressUpdates.test.ts`
+- Fix: Add delay or tolerance to heartbeat comparison
+
+**GH-SPRINT4-004: Fix cost event type mismatch (1 test)**
+- Priority: P2
+- File: `__tests__/e2e/costControl.test.ts`
+- Fix: Align `cost_recorded` vs `cost_update` event type
+
+**GH-SPRINT4-005: Fix session persistence test env loading (1 error)**
+- Priority: P2
+- File: `__tests__/integration/sessions/sessionPersistence.test.ts`
+- Fix: Use `getTestSupabase()` from e2e helpers or load env explicitly
