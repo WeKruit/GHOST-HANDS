@@ -164,7 +164,17 @@ describe('Error Handling', () => {
       const [job] = await insertTestJobs(supabase, {});
       const jobId = job.id as string;
 
-      await simulateWorkerPickup(supabase);
+      // Claim directly by ID to avoid picking up a stale job from another iteration
+      await supabase
+        .from('gh_automation_jobs')
+        .update({
+          status: 'queued',
+          worker_id: TEST_WORKER_ID,
+          last_heartbeat: new Date().toISOString(),
+        })
+        .eq('id', jobId)
+        .eq('status', 'pending');
+
       await simulateJobExecution(supabase, jobId, 'failed', {
         error_code: scenario.code,
         error_details: { message: scenario.details },
@@ -270,7 +280,7 @@ describe('Error Handling', () => {
     const failed = await valet.getJob(jobId);
     expect(failed!.action_count).toBe(3);
     expect(failed!.total_tokens).toBe(500);
-    expect(failed!.llm_cost_cents).toBe(0); // llm_cost_cents not in failed update path unless set
+    expect(failed!.llm_cost_cents).toBe(1); // partial cost should be recorded even on failure
   });
 
   // ─── Heartbeat timeout (stuck job recovery) ─────────────────────

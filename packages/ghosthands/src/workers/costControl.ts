@@ -21,6 +21,9 @@ export interface CostSnapshot {
   mode?: 'cookbook' | 'magnitude' | 'hybrid';
   cookbookSteps: number;
   magnitudeSteps: number;
+  // Dual-model cost breakdown (Sprint 4)
+  imageCost: number;
+  reasoningCost: number;
 }
 
 export interface UserUsage {
@@ -108,6 +111,8 @@ export class CostTracker {
   private cookbookSteps = 0;
   private magnitudeSteps = 0;
   private currentMode: CostSnapshot['mode'] = undefined;
+  private _imageCost = 0;
+  private _reasoningCost = 0;
 
   private readonly jobId: string;
   private readonly taskBudget: number;
@@ -133,11 +138,21 @@ export class CostTracker {
     outputTokens: number;
     inputCost?: number;
     outputCost?: number;
+    /** Which model role produced this usage: 'image' or 'reasoning' */
+    role?: 'image' | 'reasoning';
   }): void {
     this.inputTokens += usage.inputTokens;
     this.outputTokens += usage.outputTokens;
     this.inputCost += usage.inputCost ?? 0;
     this.outputCost += usage.outputCost ?? 0;
+
+    // Track per-role cost breakdown
+    const callCost = (usage.inputCost ?? 0) + (usage.outputCost ?? 0);
+    if (usage.role === 'image') {
+      this._imageCost += callCost;
+    } else {
+      this._reasoningCost += callCost;
+    }
 
     const totalCost = this.inputCost + this.outputCost;
     if (totalCost > this.taskBudget) {
@@ -174,6 +189,8 @@ export class CostTracker {
       mode: this.currentMode,
       cookbookSteps: this.cookbookSteps,
       magnitudeSteps: this.magnitudeSteps,
+      imageCost: this._imageCost,
+      reasoningCost: this._reasoningCost,
     };
   }
 

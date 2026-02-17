@@ -1,5 +1,6 @@
 import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
 import { CallbackNotifier } from '../../../src/workers/callbackNotifier.js';
+import { ValetApplySchema, ValetTaskSchema } from '../../../src/api/schemas/valet.js';
 
 describe('VALET Status API — mode/cost fields', () => {
   const originalFetch = globalThis.fetch;
@@ -161,6 +162,128 @@ describe('VALET Status API — mode/cost fields', () => {
       });
 
       expect(capturedPayload.manual).toBeUndefined();
+    });
+  });
+});
+
+describe('VALET Schema — model + execution_mode fields', () => {
+  const baseApplyBody = {
+    valet_task_id: 'task-001',
+    valet_user_id: '11111111-1111-1111-1111-111111111111',
+    target_url: 'https://boards.greenhouse.io/example/jobs/123',
+    profile: {
+      first_name: 'Jane',
+      last_name: 'Doe',
+      email: 'jane@example.com',
+    },
+  };
+
+  const baseTaskBody = {
+    valet_task_id: 'task-002',
+    valet_user_id: '22222222-2222-2222-2222-222222222222',
+    job_type: 'apply',
+    target_url: 'https://boards.greenhouse.io/example/jobs/456',
+    task_description: 'Apply to this job',
+  };
+
+  describe('ValetApplySchema', () => {
+    test('accepts model, image_model, execution_mode', () => {
+      const result = ValetApplySchema.safeParse({
+        ...baseApplyBody,
+        model: 'deepseek-chat',
+        image_model: 'qwen-72b',
+        execution_mode: 'ai_only',
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.model).toBe('deepseek-chat');
+        expect(result.data.image_model).toBe('qwen-72b');
+        expect(result.data.execution_mode).toBe('ai_only');
+      }
+    });
+
+    test('defaults execution_mode to "auto" when omitted', () => {
+      const result = ValetApplySchema.safeParse(baseApplyBody);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.execution_mode).toBe('auto');
+        expect(result.data.model).toBeUndefined();
+        expect(result.data.image_model).toBeUndefined();
+      }
+    });
+
+    test('rejects invalid execution_mode values', () => {
+      const result = ValetApplySchema.safeParse({
+        ...baseApplyBody,
+        execution_mode: 'turbo',
+      });
+      expect(result.success).toBe(false);
+    });
+
+    test('accepts any string for model (validated at executor level)', () => {
+      const result = ValetApplySchema.safeParse({
+        ...baseApplyBody,
+        model: 'some-unknown-model',
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.model).toBe('some-unknown-model');
+      }
+    });
+
+    test('rejects model string exceeding 100 chars', () => {
+      const result = ValetApplySchema.safeParse({
+        ...baseApplyBody,
+        model: 'x'.repeat(101),
+      });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe('ValetTaskSchema', () => {
+    test('accepts model, image_model, execution_mode', () => {
+      const result = ValetTaskSchema.safeParse({
+        ...baseTaskBody,
+        model: 'claude-sonnet',
+        image_model: 'qwen-72b',
+        execution_mode: 'cookbook_only',
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.model).toBe('claude-sonnet');
+        expect(result.data.image_model).toBe('qwen-72b');
+        expect(result.data.execution_mode).toBe('cookbook_only');
+      }
+    });
+
+    test('defaults execution_mode to "auto" when omitted', () => {
+      const result = ValetTaskSchema.safeParse(baseTaskBody);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.execution_mode).toBe('auto');
+        expect(result.data.model).toBeUndefined();
+        expect(result.data.image_model).toBeUndefined();
+      }
+    });
+
+    test('rejects invalid execution_mode values', () => {
+      const result = ValetTaskSchema.safeParse({
+        ...baseTaskBody,
+        execution_mode: 'manual',
+      });
+      expect(result.success).toBe(false);
+    });
+
+    test('model and image_model fields are independent', () => {
+      const result = ValetTaskSchema.safeParse({
+        ...baseTaskBody,
+        model: 'deepseek-chat',
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.model).toBe('deepseek-chat');
+        expect(result.data.image_model).toBeUndefined();
+      }
     });
   });
 });

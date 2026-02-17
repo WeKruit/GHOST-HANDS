@@ -226,8 +226,8 @@ export class JobExecutor {
       // 5. Build data prompt from input_data
       const dataPrompt = buildDataPrompt(job.input_data);
 
-      // 6. Build LLM client config
-      const llmClient = this.buildLLMClient(job);
+      // 6. Build LLM client config (may include separate image model)
+      const llmSetup = this.buildLLMClient(job);
 
       // 6.5. Load existing browser session if available
       let storedSession: Record<string, unknown> | null = null;
@@ -249,7 +249,8 @@ export class JobExecutor {
       adapter = createAdapter(adapterType);
       await adapter.start({
         url: job.target_url,
-        llm: llmClient,
+        llm: llmSetup.llm,
+        ...(llmSetup.imageLlm && { imageLlm: llmSetup.imageLlm }),
         ...(storedSession ? { storageState: storedSession } : {}),
       });
 
@@ -295,6 +296,8 @@ export class JobExecutor {
                 magnitude_steps: 0,
                 cookbook_cost_usd: costTracker.getSnapshot().totalCost,
                 magnitude_cost_usd: 0,
+                image_cost_usd: costTracker.getSnapshot().imageCost,
+                reasoning_cost_usd: costTracker.getSnapshot().reasoningCost,
               },
             },
           })
@@ -466,7 +469,7 @@ export class JobExecutor {
             error_message: execMsg,
           });
 
-          const recovered = await this.recoverFromCrash(job, adapter!, llmClient, credentials);
+          const recovered = await this.recoverFromCrash(job, adapter!, llmSetup, credentials);
           if (!recovered) {
             throw new Error(
               `Browser crashed and recovery failed after ${crashRecoveryAttempts} attempt(s): ${execMsg}`,
@@ -561,6 +564,8 @@ export class JobExecutor {
               magnitude_steps: costTracker.getSnapshot().actionCount,
               cookbook_cost_usd: 0,
               magnitude_cost_usd: costTracker.getSnapshot().totalCost,
+              image_cost_usd: costTracker.getSnapshot().imageCost,
+              reasoning_cost_usd: costTracker.getSnapshot().reasoningCost,
             },
           },
         })
@@ -1073,21 +1078,41 @@ export class JobExecutor {
 
   // --- LLM client configuration ---
 
-  private buildLLMClient(job: AutomationJob): LLMConfig {
+  private buildLLMClient(job: AutomationJob): { llm: LLMConfig; imageLlm?: LLMConfig } {
     const tier = job.input_data.tier || 'starter';
 
     // Premium tier forces Claude Sonnet
     if (tier === 'premium') {
       const resolved = loadModelConfig('claude-sonnet');
-      return resolved.llmClient as LLMConfig;
+      return { llm: resolved.llmClient as LLMConfig };
     }
 
-    // Use job-level model override, GH_MODEL env var, or config default
-    const modelOverride = job.metadata?.model
+    // Priority: input_data.model → metadata.model → GH_MODEL env → default
+    const modelOverride = job.input_data?.model
+      || job.metadata?.model
       || process.env.GH_MODEL
       || process.env.GH_DEFAULT_MODEL;
     const resolved = loadModelConfig(modelOverride);
-    return resolved.llmClient as LLMConfig;
+    const result: { llm: LLMConfig; imageLlm?: LLMConfig } = {
+      llm: resolved.llmClient as LLMConfig,
+    };
+
+    // Dual-model: if image_model is specified, use it for vision tasks
+    const imageModelOverride = job.input_data?.image_model
+      || job.metadata?.image_model
+      || process.env.GH_IMAGE_MODEL;
+    if (imageModelOverride) {
+      try {
+        const imageResolved = loadModelConfig(imageModelOverride);
+        if (imageResolved.vision) {
+          result.imageLlm = imageResolved.llmClient as LLMConfig;
+        }
+      } catch {
+        // Unknown image model -- skip dual-model setup
+      }
+    }
+
+    return result;
   }
 
   // --- Screenshot upload ---
@@ -1149,7 +1174,7 @@ export class JobExecutor {
   private async recoverFromCrash(
     job: AutomationJob,
     deadAdapter: BrowserAutomationAdapter,
-    llmClient: LLMConfig,
+    llmSetup: { llm: LLMConfig; imageLlm?: LLMConfig },
     credentials: Record<string, string> | null,
   ): Promise<BrowserAutomationAdapter | null> {
     // Stop the dead adapter (ignore errors -- it's already dead)
@@ -1170,7 +1195,8 @@ export class JobExecutor {
       const newAdapter = createAdapter(adapterType);
       await newAdapter.start({
         url: job.target_url,
-        llm: llmClient,
+        llm: llmSetup.llm,
+        ...(llmSetup.imageLlm && { imageLlm: llmSetup.imageLlm }),
         ...(storedSession ? { storageState: storedSession } : {}),
       });
 

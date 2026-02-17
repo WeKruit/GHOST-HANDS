@@ -107,8 +107,10 @@ export type AdapterEvent =
 export interface AdapterStartOptions {
   /** Initial URL to navigate to */
   url?: string;
-  /** LLM configuration */
+  /** LLM configuration (used for all roles unless imageLlm is also provided) */
   llm: LLMConfig;
+  /** Optional separate LLM for vision/screenshot tasks (must have vision: true) */
+  imageLlm?: LLMConfig;
   /** CDP WebSocket URL for connecting to existing browser */
   cdpUrl?: string;
   /** Browser launch options (ignored if cdpUrl provided) */

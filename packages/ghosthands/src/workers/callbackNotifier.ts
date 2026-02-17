@@ -45,6 +45,8 @@ export interface CallbackPayload {
     magnitude_steps: number;
     cookbook_cost_usd: number;
     magnitude_cost_usd: number;
+    image_cost_usd: number;
+    reasoning_cost_usd: number;
   } | null;
   completed_at: string;
 }

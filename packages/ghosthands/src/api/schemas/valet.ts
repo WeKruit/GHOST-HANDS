@@ -69,6 +69,9 @@ export const ValetApplySchema = z.object({
   idempotency_key: z.string().max(255).optional(),
   metadata: z.record(z.unknown()).default({}),
   target_worker_id: z.string().max(100).nullable().optional(),
+  model: z.string().max(100).optional().describe('LLM model alias (e.g. "qwen-72b", "deepseek-chat", "claude-sonnet")'),
+  image_model: z.string().max(100).optional().describe('Separate model for vision/screenshot analysis'),
+  execution_mode: z.enum(['auto', 'ai_only', 'cookbook_only']).default('auto'),
 });
 
 export type ValetApplyInput = z.infer<typeof ValetApplySchema>;
@@ -89,6 +92,9 @@ export const ValetTaskSchema = z.object({
   idempotency_key: z.string().max(255).optional(),
   metadata: z.record(z.unknown()).default({}),
   target_worker_id: z.string().max(100).nullable().optional(),
+  model: z.string().max(100).optional().describe('LLM model alias (e.g. "qwen-72b", "deepseek-chat", "claude-sonnet")'),
+  image_model: z.string().max(100).optional().describe('Separate model for vision/screenshot analysis'),
+  execution_mode: z.enum(['auto', 'ai_only', 'cookbook_only']).default('auto'),
 });
 
 export type ValetTaskInput = z.infer<typeof ValetTaskSchema>;

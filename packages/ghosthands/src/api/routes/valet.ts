@@ -77,13 +77,14 @@ export function createValetRoutes(pool: pg.Pool) {
 
     // Insert job — includes VALET-specific columns (callback_url, valet_task_id)
     // added in migration 005. Also stored in metadata as backup.
+    // execution_mode column added in migration 011.
     const result = await pool.query(`
       INSERT INTO gh_automation_jobs (
         user_id, created_by, job_type, target_url, task_description,
         input_data, priority, max_retries, timeout_seconds,
         tags, idempotency_key, metadata, target_worker_id,
-        callback_url, valet_task_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        callback_url, valet_task_id, execution_mode
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
       RETURNING id, status, created_at
     `, [
       body.valet_user_id,
@@ -96,6 +97,8 @@ export function createValetRoutes(pool: pg.Pool) {
         qa_overrides: body.qa_answers || {},
         tier: body.quality === 'quality' ? 'pro' : body.quality === 'speed' ? 'free' : 'starter',
         platform: body.platform || 'other',
+        ...(body.model ? { model: body.model } : {}),
+        ...(body.image_model ? { image_model: body.image_model } : {}),
       }),
       body.priority,
       3,
@@ -106,6 +109,7 @@ export function createValetRoutes(pool: pg.Pool) {
       body.target_worker_id || null,
       body.callback_url || null,
       body.valet_task_id,
+      body.execution_mode,
     ]);
 
     const job = result.rows[0];
@@ -146,13 +150,20 @@ export function createValetRoutes(pool: pg.Pool) {
       callback_url: body.callback_url || null,
     };
 
+    // Store model/image_model in input_data so JobExecutor reads them
+    const inputData = {
+      ...body.input_data,
+      ...(body.model ? { model: body.model } : {}),
+      ...(body.image_model ? { image_model: body.image_model } : {}),
+    };
+
     const result = await pool.query(`
       INSERT INTO gh_automation_jobs (
         user_id, created_by, job_type, target_url, task_description,
         input_data, priority, max_retries, timeout_seconds,
         tags, idempotency_key, metadata, target_worker_id,
-        callback_url, valet_task_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        callback_url, valet_task_id, execution_mode
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
       RETURNING id, status, created_at
     `, [
       body.valet_user_id,
@@ -160,7 +171,7 @@ export function createValetRoutes(pool: pg.Pool) {
       body.job_type,
       body.target_url,
       body.task_description,
-      JSON.stringify(body.input_data),
+      JSON.stringify(inputData),
       body.priority,
       3,
       body.timeout_seconds,
@@ -170,6 +181,7 @@ export function createValetRoutes(pool: pg.Pool) {
       body.target_worker_id || null,
       body.callback_url || null,
       body.valet_task_id,
+      body.execution_mode,
     ]);
 
     const job = result.rows[0];
