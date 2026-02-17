@@ -170,11 +170,47 @@
       "cost": { "input": 0.50, "output": 0.50, "unit": "$/M tokens" },
       "note": "Zhipu AI GLM-5, supports vision via OpenAI-compatible API"
     },
-    "qwen3.5-plus": {
-      "provider": "qwen-alibaba",
-      "model": "qwen3.5-plus",
+    "qwen3-vl-235b-thinking": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen3-VL-235B-A22B-Thinking",
       "vision": true,
-      "cost": { "input": 0.40, "output": 2.40, "unit": "$/M tokens" }
+      "cost": { "input": 0.45, "output": 3.50, "unit": "$/M tokens" },
+      "note": "Frontier VL reasoning. Chain-of-thought + vision. Best accuracy for complex GUI automation."
+    },
+    "qwen3-vl-30b-thinking": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Thinking",
+      "vision": true,
+      "cost": { "input": 0.29, "output": 1.00, "unit": "$/M tokens" },
+      "note": "MoE 30B/3B active. Vision + thinking at fraction of 235B cost."
+    },
+    "qwen3-vl-30b": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+      "vision": true,
+      "cost": { "input": 0.29, "output": 1.00, "unit": "$/M tokens" },
+      "note": "MoE 30B/3B active. Fast vision without thinking overhead."
+    },
+    "qwen3-235b-thinking": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen3-235B-A22B-Thinking-2507",
+      "vision": false,
+      "cost": { "input": 0.35, "output": 1.42, "unit": "$/M tokens" },
+      "note": "Text-only reasoning. Use when vision not needed. 256K context."
+    },
+    "qwen3-coder-480b": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+      "vision": false,
+      "cost": { "input": 0.25, "output": 1.00, "unit": "$/M tokens" },
+      "note": "480B code model. Best for form-fill code generation and browser agent scripting."
+    },
+    "qwen3-next-80b": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen3-Next-80B-A3B-Thinking",
+      "vision": false,
+      "cost": { "input": 0.14, "output": 0.57, "unit": "$/M tokens" },
+      "note": "Ultra-fast reasoning. 10x throughput vs Qwen3-32B. MoE 80B/3B active."
     },
     "gpt-4.1": {
       "provider": "openai",
@@ -228,8 +264,8 @@
       "model": "qwen3-235b"
     },
     "quality": {
-      "description": "Frontier accuracy -- native GUI automation, 1M context",
-      "model": "qwen3.5-plus"
+      "description": "Frontier accuracy -- VL thinking model, chain-of-thought GUI reasoning",
+      "model": "qwen3-vl-235b-thinking"
     },
     "premium": {
       "description": "OpenAI GPT-5.2 -- frontier reasoning, multimodal",
