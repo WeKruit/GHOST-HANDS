@@ -195,14 +195,19 @@ Rich application request with full profile data.
 | `target_worker_id` | string | No | null | Route to specific worker (null = any available) |
 | `metadata` | object | No | {} | Arbitrary key-value pairs |
 
-### 4.1.1 Model Reference
+### 4.1.1 Model Reference (31 models)
 
-**Accuracy-focused models (recommended):**
+**Accuracy-focused models (recommended for production):**
 
 | Alias | Provider | Vision | Input $/M | Output $/M | Best For |
 |-------|----------|--------|-----------|------------|----------|
-| **qwen3.5-plus** | Alibaba Cloud | Yes | $0.40 | $2.40 | **Quality preset** — frontier accuracy, native GUI automation, 1M context |
+| **qwen3-vl-235b-thinking** | SiliconFlow | Yes | $0.45 | $3.50 | **Quality preset** — frontier VL reasoning, chain-of-thought + vision |
 | **qwen3-235b** | SiliconFlow | Yes | $0.34 | $1.37 | **Balanced preset** — best accuracy-per-dollar |
+| **qwen3-vl-30b-thinking** | SiliconFlow | Yes | $0.29 | $1.00 | Vision + thinking at fraction of 235B cost |
+| **qwen3-vl-30b** | SiliconFlow | Yes | $0.29 | $1.00 | Fast vision without thinking overhead |
+| **qwen3-235b-thinking** | SiliconFlow | No | $0.35 | $1.42 | Text-only reasoning, 256K context |
+| **qwen3-coder-480b** | SiliconFlow | No | $0.25 | $1.00 | 480B code model, best for form-fill scripting |
+| **qwen3-next-80b** | SiliconFlow | No | $0.14 | $0.57 | Ultra-fast reasoning, 10x throughput |
 | **gpt-5.2** | OpenAI | Yes | $1.75 | $14.00 | **Premium preset** — frontier reasoning |
 | claude-opus | Anthropic | Yes | $5.00 | $25.00 | Best overall intelligence, adaptive reasoning |
 | gemini-2.5-pro | Google | Yes | $1.25 | $10.00 | Strong vision and reasoning, 1M context |
@@ -214,6 +219,8 @@ Rich application request with full profile data.
 |-------|----------|--------|-----------|------------|----------|
 | **qwen-7b** | SiliconFlow | Yes | $0.05 | $0.15 | **Speed preset** — cheapest, testing |
 | **qwen-72b** | SiliconFlow | Yes | $0.25 | $0.75 | **Default** — proven for browser automation |
+| qwen3-8b | SiliconFlow | Yes | $0.07 | $0.27 | Cheap Qwen3 with vision |
+| qwen3-32b | SiliconFlow | Yes | $0.14 | $0.55 | Mid-range Qwen3 with vision |
 | gemini-2.5-flash | Google | Yes | $0.15 | $0.60 | Fast, cheap, decent accuracy |
 | gemini-2.0-flash | Google | Yes | $0.10 | $0.40 | Ultra-fast Gemini |
 | deepseek-chat | DeepSeek | No | $0.28 | $0.42 | Text-only reasoning (pair with vision model) |
@@ -228,12 +235,14 @@ Rich application request with full profile data.
 |-------|--------|----------|-------------------|
 | Speed | qwen-7b | $0.0007 | 98% |
 | Balanced | qwen3-235b | $0.0055 | 86% |
-| **Quality** | **qwen3.5-plus** | **$0.008** | **80%** |
+| **Quality** | **qwen3-vl-235b-thinking** | **$0.011** | **73%** |
 | **Dual-model** | **qwen-7b + deepseek-chat** | **$0.0012** | **97%** |
 | Premium | gpt-5.2 | $0.042 | — |
 | Ultra-premium | claude-opus | $0.09 | — |
 
 **Dual-model** routes screenshots to cheap vision model (`qwen-7b`) and reasoning to `deepseek-chat`.
+
+All SiliconFlow-hosted models (qwen*) use your existing `SILICONFLOW_API_KEY` — no additional API keys needed.
 
 ### 4.1.2 Execution Modes
 
@@ -1396,7 +1405,6 @@ Apply these migrations **in order** on Supabase:
 | `GH_SERVICE_KEY` | Yes | Service key for X-GH-Service-Key authentication |
 | `GH_MODEL` or `GH_DEFAULT_MODEL` | No | Default LLM model alias (default: qwen-72b) |
 | `GH_IMAGE_MODEL` | No | Default vision model for dual-model mode |
-| `DASHSCOPE_API_KEY` | For qwen3.5-plus | Alibaba Cloud API key for Qwen3.5-Plus |
 | `GOOGLE_API_KEY` | For Gemini models | Google AI API key for Gemini models |
 
 ### VALET Code Changes

@@ -66,7 +66,7 @@ To use the new presets, pass the preset name as the `model` field:
 
 Or specify the alias directly:
 ```json
-{ "model": "qwen3.5-plus" }
+{ "model": "qwen3-vl-235b-thinking" }
 ```
 
 ---
@@ -179,7 +179,7 @@ All changes are additive:
 See `docs/VALET-INTEGRATION-CONTRACT.md` (18 sections, Sprints 1-5).
 
 Key sections updated:
-- **4.1.1** — Model Reference (25 models, accuracy + budget tiers)
+- **4.1.1** — Model Reference (31 models, accuracy + budget tiers)
 - **6.4** — Event Types Reference (10 new event types)
 - **16** — Migration Checklist (new env vars)
 - **18** — Known Limitations (updated #10)
