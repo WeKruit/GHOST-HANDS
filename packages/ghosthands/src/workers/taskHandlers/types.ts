@@ -19,6 +19,8 @@ export interface AutomationJob {
   callback_url?: string | null;
   valet_task_id?: string | null;
   resume_ref?: Record<string, any> | null;
+  execution_mode?: string;
+  image_model?: string;
 }
 
 export interface TaskHandler {

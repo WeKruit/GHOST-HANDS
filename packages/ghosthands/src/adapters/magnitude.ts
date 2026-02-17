@@ -17,6 +17,7 @@ import type { ObservedElement as EngineObservedElement } from '../engine/types';
 import type { Page } from 'playwright';
 import type { ZodSchema } from 'zod';
 import EventEmitter from 'eventemitter3';
+import { loadModelConfig, type ResolvedModel } from '../config/models';
 
 export class MagnitudeAdapter implements BrowserAutomationAdapter {
   readonly type = 'magnitude' as const;
@@ -25,20 +26,58 @@ export class MagnitudeAdapter implements BrowserAutomationAdapter {
   private active = false;
   private _credentials: Record<string, string> = {};
   private _observer: StagehandObserver | null = null;
+  private _resolvedModel: ResolvedModel | null = null;
+  private _resolvedImageModel: ResolvedModel | null = null;
+  /** Map from full model identifier to resolved pricing for cost lookup */
+  private _modelPricingMap = new Map<string, { input: number; output: number }>();
 
   async start(options: AdapterStartOptions): Promise<void> {
+    // Resolve model configs to get pricing info for cost calculation
+    try {
+      this._resolvedModel = loadModelConfig(options.llm.options.model);
+      this._modelPricingMap.set(this._resolvedModel.model, this._resolvedModel.cost);
+    } catch {
+      this._resolvedModel = null;
+    }
+
+    if (options.imageLlm) {
+      try {
+        this._resolvedImageModel = loadModelConfig(options.imageLlm.options.model);
+        this._modelPricingMap.set(this._resolvedImageModel.model, this._resolvedImageModel.cost);
+      } catch {
+        this._resolvedImageModel = null;
+      }
+    }
+
+    // Build LLM config(s) for Magnitude
+    // Magnitude v0.3.1 supports LLMClient[] with roles
+    const buildLlmConfig = (llm: typeof options.llm, roles?: string[]) => ({
+      provider: llm.provider,
+      options: {
+        model: llm.options.model,
+        apiKey: llm.options.apiKey,
+        ...(llm.options.baseUrl && { baseUrl: llm.options.baseUrl }),
+        ...(llm.options.temperature !== undefined && { temperature: llm.options.temperature }),
+        ...(llm.options.headers && { headers: llm.options.headers }),
+      },
+      ...(roles && { roles }),
+    });
+
+    let llmConfig: any;
+    if (options.imageLlm) {
+      // Dual-model: image model handles 'act' (screenshot analysis),
+      // reasoning model handles 'extract' and 'query'
+      llmConfig = [
+        buildLlmConfig(options.imageLlm, ['act']),
+        buildLlmConfig(options.llm, ['extract', 'query']),
+      ];
+    } else {
+      llmConfig = buildLlmConfig(options.llm);
+    }
+
     this.agent = await startBrowserAgent({
       url: options.url,
-      llm: {
-        provider: options.llm.provider,
-        options: {
-          model: options.llm.options.model,
-          apiKey: options.llm.options.apiKey,
-          ...(options.llm.options.baseUrl && { baseUrl: options.llm.options.baseUrl }),
-          ...(options.llm.options.temperature !== undefined && { temperature: options.llm.options.temperature }),
-          ...(options.llm.options.headers && { headers: options.llm.options.headers }),
-        },
-      } as any,
+      llm: llmConfig,
       connectors: options.connectors,
       prompt: options.systemPrompt,
       browser: options.cdpUrl
@@ -54,11 +93,28 @@ export class MagnitudeAdapter implements BrowserAutomationAdapter {
       this.emitter.emit('actionDone', { variant: action.variant });
     });
     this.agent.events.on('tokensUsed', (usage: ModelUsage) => {
+      // Magnitude emits token counts but NOT costs.
+      // Calculate costs from our pricing registry using the model identifier
+      // from the event (supports multi-model setups).
+      let inputCost = usage.inputCost ?? 0;
+      let outputCost = usage.outputCost ?? 0;
+
+      if (inputCost === 0 && outputCost === 0) {
+        // Look up pricing by the model identifier Magnitude reports
+        const pricing = this._modelPricingMap.get(usage.llm?.model ?? '')
+          ?? (this._resolvedModel ? this._resolvedModel.cost : null);
+
+        if (pricing) {
+          inputCost = usage.inputTokens * (pricing.input / 1_000_000);
+          outputCost = usage.outputTokens * (pricing.output / 1_000_000);
+        }
+      }
+
       const tokenUsage: TokenUsage = {
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
-        inputCost: usage.inputCost ?? 0,
-        outputCost: usage.outputCost ?? 0,
+        inputCost,
+        outputCost,
       };
       this.emitter.emit('tokensUsed', tokenUsage);
     });
@@ -110,6 +166,21 @@ export class MagnitudeAdapter implements BrowserAutomationAdapter {
       method: el.action === 'unknown' ? 'click' : el.action,
       arguments: [],
     }));
+  }
+
+  /** The resolved reasoning model configuration (for cost calculation and diagnostics). */
+  getResolvedModel(): ResolvedModel | null {
+    return this._resolvedModel;
+  }
+
+  /** The resolved image/vision model configuration (null if single-model mode). */
+  getResolvedImageModel(): ResolvedModel | null {
+    return this._resolvedImageModel;
+  }
+
+  /** Whether this adapter is running in dual-model mode. */
+  isDualModel(): boolean {
+    return this._resolvedImageModel !== null;
   }
 
   async navigate(url: string): Promise<void> {

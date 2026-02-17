@@ -364,18 +364,33 @@ export function createMockAgent(behavior: MockAgentBehavior = {}) {
  * Simulates the worker-side flow: picks up a pending job and runs
  * a mock execution through the JobExecutor path, using direct DB
  * operations to simulate what `gh_pickup_next_job` RPC would do.
+ *
+ * Atomicity: the UPDATE filters on status='pending', so a concurrent
+ * caller that already flipped status to 'queued' causes this UPDATE
+ * to match zero rows. We verify by re-reading the row to confirm
+ * our worker_id was the one that stuck.
+ *
+ * @param jobType Optional filter to only pick up jobs with a specific job_type.
+ *                Use this when running test files in parallel to avoid cross-file interference.
  */
 export async function simulateWorkerPickup(
   supabase: SupabaseClient,
   workerId: string = TEST_WORKER_ID,
+  jobType?: string,
 ): Promise<string | null> {
-  // Simulate FOR UPDATE SKIP LOCKED by selecting the oldest pending job
-  // and atomically claiming it. In the real system this is an RPC call.
-  const { data: jobs } = await supabase
+  // Select candidate jobs (oldest pending, highest priority first)
+  let query = supabase
     .from('gh_automation_jobs')
     .select('id')
     .eq('status', 'pending')
     .is('worker_id', null)
+    .eq('created_by', 'test');
+
+  if (jobType) {
+    query = query.eq('job_type', jobType);
+  }
+
+  const { data: jobs } = await query
     .order('priority', { ascending: false })
     .order('created_at', { ascending: true })
     .limit(1);
@@ -384,6 +399,9 @@ export async function simulateWorkerPickup(
 
   const jobId = jobs[0].id;
 
+  // Attempt to claim: UPDATE only if still pending.
+  // The `.eq('status', 'pending')` guard ensures that if another worker
+  // already changed the status to 'queued', this update is a no-op.
   const { error } = await supabase
     .from('gh_automation_jobs')
     .update({
@@ -395,6 +413,19 @@ export async function simulateWorkerPickup(
     .eq('status', 'pending');
 
   if (error) return null;
+
+  // For concurrent pickup scenarios: verify our worker_id was the one that stuck.
+  // Read the row back and confirm. A brief delay helps with PostgREST read consistency.
+  await new Promise((r) => setTimeout(r, 30));
+
+  const { data: row } = await supabase
+    .from('gh_automation_jobs')
+    .select('worker_id')
+    .eq('id', jobId)
+    .single();
+
+  if (!row || row.worker_id !== workerId) return null;
+
   return jobId;
 }
 

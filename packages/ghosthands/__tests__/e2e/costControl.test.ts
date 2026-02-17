@@ -16,6 +16,7 @@ import {
 import {
   getTestSupabase,
   cleanupTestData,
+  insertTestJobs,
   ensureTestUsage,
   ensureTestProfile,
   TEST_USER_ID,
@@ -354,8 +355,12 @@ describe('Cost Controls', () => {
         total_cost_usd: 0,
       });
 
+      // Create a real job so the FK constraint on gh_job_events.job_id is satisfied
+      const [job] = await insertTestJobs(supabase, {});
+      const jobId = job.id as string;
+
       const service = new CostControlService(supabase);
-      await service.recordJobCost(TEST_USER_ID, 'fake-job-event-1', {
+      await service.recordJobCost(TEST_USER_ID, jobId, {
         inputTokens: 1000, outputTokens: 500,
         inputCost: 0.01, outputCost: 0.005,
         totalCost: 0.015, actionCount: 5,
@@ -364,7 +369,7 @@ describe('Cost Controls', () => {
       const { data: events } = await supabase
         .from('gh_job_events')
         .select('*')
-        .eq('job_id', 'fake-job-event-1')
+        .eq('job_id', jobId)
         .eq('event_type', 'cost_recorded');
 
       expect(events).not.toBeNull();

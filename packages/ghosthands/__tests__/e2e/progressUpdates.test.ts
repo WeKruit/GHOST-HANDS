@@ -219,19 +219,22 @@ describe('Progress Updates', () => {
 
       const timestamps: string[] = [];
 
-      // Simulate 3 heartbeats
+      // Simulate 3 heartbeats with sufficient delay to avoid timing races
       for (let i = 0; i < 3; i++) {
+        await new Promise((r) => setTimeout(r, 100));
         const now = new Date().toISOString();
         await supabase
           .from('gh_automation_jobs')
           .update({ last_heartbeat: now })
           .eq('id', jobId);
         timestamps.push(now);
-        await new Promise((r) => setTimeout(r, 10));
       }
 
       const finalJob = await valet.getJob(jobId);
-      expect(finalJob!.last_heartbeat).toBe(timestamps[timestamps.length - 1]);
+      // Compare as timestamps — Supabase returns +00:00 offset while JS uses Z suffix
+      const received = new Date(finalJob!.last_heartbeat as string).getTime();
+      const expected = new Date(timestamps[timestamps.length - 1]).getTime();
+      expect(received).toBe(expected);
     });
 
     it('should detect stale heartbeats (used for stuck job recovery)', async () => {
