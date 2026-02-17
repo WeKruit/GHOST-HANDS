@@ -38,3 +38,4 @@ export { resolveTemplate, resolveOptionalTemplate } from './templateResolver';
 export { ManualStore, type SaveFromTraceMetadata, type SaveFromActionBookMetadata } from './ManualStore';
 export { PageObserver, detectPlatform, generateUrlPattern, detectPageType } from './PageObserver';
 export { seedFromActionBook, type SeedOptions } from './actionBookSeeder';
+export { ExecutionEngine, type ExecutionEngineOptions, type ExecutionResult, type ExecutionParams } from './ExecutionEngine';

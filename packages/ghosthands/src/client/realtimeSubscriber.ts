@@ -9,6 +9,7 @@ import type { ProgressEventData } from '../workers/progressTracker.js';
 export type JobUpdateCallback = (job: AutomationJob) => void;
 export type JobErrorCallback = (error: Error) => void;
 export type ProgressCallback = (progress: ProgressEventData) => void;
+export type JobEventCallback = (event: JobEvent) => void;
 
 // --------------------------------------------------------------------------
 // Subscription handle returned to the caller
@@ -200,6 +201,103 @@ export class RealtimeSubscriber {
 
     return {
       unsubscribe: () => this.removeChannel(channelName),
+    };
+  }
+
+  /**
+   * Subscribe to the real-time event stream for a single job.
+   *
+   * Listens for INSERT events on gh_job_events, delivering each new event as
+   * it is written. This powers live UI features like:
+   *  - Mode switching indicators (mode_selected, mode_switched)
+   *  - Action timeline (step_started, step_completed, cookbook_step_completed)
+   *  - Thinking/reasoning feed (current_action in progress_update events)
+   *  - Manual discovery (manual_found, manual_created)
+   *
+   * Requires migration 012_gh_job_events_realtime.sql (adds gh_job_events
+   * to supabase_realtime publication).
+   *
+   * Optionally filter by event types to reduce noise:
+   *   subscribeToJobEvents(jobId, {
+   *     onEvent: (e) => console.log(e),
+   *     eventTypes: ['mode_selected', 'mode_switched', 'manual_found'],
+   *   })
+   */
+  subscribeToJobEvents(
+    jobId: string,
+    options: {
+      onEvent: JobEventCallback;
+      onError?: JobErrorCallback;
+      /** Only deliver events matching these types. Omit for all events. */
+      eventTypes?: string[];
+      autoUnsubscribe?: boolean;
+    },
+  ): JobSubscription {
+    const { onEvent, onError, eventTypes, autoUnsubscribe = true } = options;
+    const channelName = `gh-job-events-${jobId}`;
+
+    const channel = this.supabase
+      .channel(channelName)
+      .on(
+        'postgres_changes' as any,
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'gh_job_events',
+          filter: `job_id=eq.${jobId}`,
+        },
+        (payload: { new: JobEvent }) => {
+          const event = payload.new;
+
+          // Client-side filter by event type (if specified)
+          if (eventTypes && !eventTypes.includes(event.event_type)) {
+            return;
+          }
+
+          onEvent(event);
+        },
+      )
+      .subscribe((status: string) => {
+        if (status === 'CHANNEL_ERROR' && onError) {
+          onError(new Error(`Realtime event channel error for job ${jobId}`));
+        }
+      });
+
+    this.channels.set(channelName, channel);
+
+    // If autoUnsubscribe, also listen for job completion via the job row
+    if (autoUnsubscribe) {
+      const jobChannelName = `gh-job-events-status-${jobId}`;
+      const jobChannel = this.supabase
+        .channel(jobChannelName)
+        .on(
+          'postgres_changes' as any,
+          {
+            event: 'UPDATE',
+            schema: 'public',
+            table: 'gh_automation_jobs',
+            filter: `id=eq.${jobId}`,
+          },
+          (payload: { new: AutomationJob }) => {
+            if (TERMINAL_STATUSES.has(payload.new.status)) {
+              // Small delay to let final events arrive before unsubscribing
+              setTimeout(() => {
+                this.removeChannel(channelName);
+                this.removeChannel(jobChannelName);
+              }, 2000);
+            }
+          },
+        )
+        .subscribe();
+
+      this.channels.set(jobChannelName, jobChannel);
+    }
+
+    return {
+      unsubscribe: async () => {
+        await this.removeChannel(channelName);
+        await this.removeChannel(`gh-job-events-status-${jobId}`);
+      },
     };
   }
 
