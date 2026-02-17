@@ -46,6 +46,10 @@ export interface TaskResult {
   data?: Record<string, any>;
   error?: string;
   screenshotUrl?: string;
+  /** When true, the browser stays open after handler completes (for manual takeover). */
+  keepBrowserOpen?: boolean;
+  /** When true, the job is paused at the review page awaiting user submission. */
+  awaitingUserReview?: boolean;
 }
 
 export interface ValidationResult {

@@ -15,6 +15,7 @@ export const ProgressStep = {
   REVIEWING: 'reviewing',
   SUBMITTING: 'submitting',
   EXTRACTING_RESULTS: 'extracting_results',
+  AWAITING_USER_REVIEW: 'awaiting_user_review',
   COMPLETED: 'completed',
   FAILED: 'failed',
 } as const;
@@ -33,6 +34,7 @@ const STEP_ORDER: ProgressStep[] = [
   ProgressStep.REVIEWING,
   ProgressStep.SUBMITTING,
   ProgressStep.EXTRACTING_RESULTS,
+  ProgressStep.AWAITING_USER_REVIEW,
   ProgressStep.COMPLETED,
 ];
 
@@ -48,6 +50,7 @@ const STEP_DESCRIPTIONS: Record<ProgressStep, string> = {
   [ProgressStep.REVIEWING]: 'Reviewing submission',
   [ProgressStep.SUBMITTING]: 'Submitting application',
   [ProgressStep.EXTRACTING_RESULTS]: 'Extracting confirmation details',
+  [ProgressStep.AWAITING_USER_REVIEW]: 'Waiting for user to review and submit',
   [ProgressStep.COMPLETED]: 'Application complete',
   [ProgressStep.FAILED]: 'Job failed',
 };
