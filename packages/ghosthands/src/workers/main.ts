@@ -70,7 +70,7 @@ async function main(): Promise<void> {
   await pgDirect.connect();
   console.log(`[Worker] Postgres connection established`);
 
-  const maxConcurrent = parseInt(process.env.MAX_CONCURRENT_JOBS || '2', 10);
+  const maxConcurrent = parseInt(process.env.MAX_CONCURRENT_JOBS || '1', 10);
 
   const executor = new JobExecutor({
     supabase,

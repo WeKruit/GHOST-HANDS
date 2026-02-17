@@ -16,7 +16,7 @@ export interface InteractionInfo {
 export interface CallbackPayload {
   job_id: string;
   valet_task_id: string | null;
-  status: 'completed' | 'failed' | 'needs_human' | 'resumed';
+  status: 'completed' | 'failed' | 'needs_human' | 'resumed' | 'running';
   result_data?: Record<string, any>;
   result_summary?: string;
   screenshot_url?: string;
@@ -28,6 +28,24 @@ export interface CallbackPayload {
     action_count: number;
     total_tokens: number;
   };
+  execution_mode?: string;
+  browser_mode?: string;
+  final_mode?: string;
+  manual?: {
+    id: string | null;
+    status: string;
+    health_score: number | null;
+    fallback_reason: string | null;
+  } | null;
+  cost_breakdown?: {
+    total_cost_usd: number;
+    action_count: number;
+    total_tokens: number;
+    cookbook_steps: number;
+    magnitude_steps: number;
+    cookbook_cost_usd: number;
+    magnitude_cost_usd: number;
+  } | null;
   completed_at: string;
 }
 
@@ -61,6 +79,10 @@ export class CallbackNotifier {
     llm_cost_cents?: number;
     action_count?: number;
     total_tokens?: number;
+    execution_mode?: string;
+    browser_mode?: string;
+    final_mode?: string;
+    metadata?: Record<string, any>;
   }): Promise<boolean> {
     if (!job.callback_url) return false;
 
@@ -88,7 +110,48 @@ export class CallbackNotifier {
       };
     }
 
+    // Sprint 3: Mode tracking fields
+    const jobMeta = typeof job.metadata === 'object' ? (job.metadata || {}) : {};
+    if (job.execution_mode) {
+      payload.execution_mode = job.execution_mode;
+    }
+    if (job.browser_mode) {
+      payload.browser_mode = job.browser_mode;
+    }
+    if (job.final_mode) {
+      payload.final_mode = job.final_mode;
+    }
+
+    const engineMeta = jobMeta?.engine || {};
+    if (engineMeta.manual_id) {
+      payload.manual = {
+        id: engineMeta.manual_id,
+        status: engineMeta.manual_status || 'ai_only',
+        health_score: engineMeta.health_score ?? null,
+        fallback_reason: engineMeta.fallback_reason ?? null,
+      };
+    }
+
     return this.sendWithRetry(job.callback_url, payload);
+  }
+
+  /**
+   * Notify VALET that a job has started executing.
+   */
+  async notifyRunning(
+    jobId: string,
+    callbackUrl: string,
+    valetTaskId?: string | null,
+    metadata?: { execution_mode?: string; manual_id?: string | null },
+  ): Promise<boolean> {
+    const payload: CallbackPayload = {
+      job_id: jobId,
+      valet_task_id: valetTaskId || null,
+      status: 'running',
+      completed_at: new Date().toISOString(),
+      ...(metadata?.execution_mode && { execution_mode: metadata.execution_mode }),
+    };
+    return this.sendWithRetry(callbackUrl, payload);
   }
 
   /**

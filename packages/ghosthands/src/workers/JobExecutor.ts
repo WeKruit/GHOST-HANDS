@@ -15,6 +15,10 @@ import { callbackNotifier } from './callbackNotifier.js';
 import type { TaskContext, TaskResult } from './taskHandlers/types.js';
 import { SessionManager } from '../sessions/SessionManager.js';
 import { BlockerDetector, type BlockerResult } from '../detection/BlockerDetector.js';
+import { ExecutionEngine } from '../engine/ExecutionEngine.js';
+import { ManualStore } from '../engine/ManualStore.js';
+import { CookbookExecutor } from '../engine/CookbookExecutor.js';
+import { TraceRecorder } from '../engine/TraceRecorder.js';
 
 // Re-export AutomationJob from the canonical location for backward compat
 export type { AutomationJob } from './taskHandlers/types.js';
@@ -182,6 +186,17 @@ export class JobExecutor {
         action_limit: costTracker.getActionLimit(),
       });
 
+      // 1a. Notify VALET that the job is now running
+      if (job.callback_url) {
+        callbackNotifier.notifyRunning(
+          job.id,
+          job.callback_url,
+          job.valet_task_id,
+        ).catch((err) => {
+          console.warn(`[JobExecutor] Running callback failed for job ${job.id}:`, err);
+        });
+      }
+
       // 2. Resolve task handler
       const handler = taskHandlerRegistry.getOrThrow(job.job_type);
 
@@ -243,15 +258,148 @@ export class JobExecutor {
         adapter.registerCredentials(credentials);
       }
 
-      // 9. Wire up event tracking with cost control + progress
+      // 9. Try ExecutionEngine (cookbook replay) before Magnitude handler
       await progress.setStep(ProgressStep.NAVIGATING);
 
+      const executionEngine = new ExecutionEngine({
+        manualStore: new ManualStore(this.supabase),
+        cookbookExecutor: new CookbookExecutor(),
+      });
+
+      const engineResult = await executionEngine.execute({
+        job,
+        adapter,
+        costTracker,
+        progress,
+        logEvent: (eventType, metadata) => this.logJobEvent(job.id, eventType, metadata),
+      });
+
+      // Track TraceRecorder for Magnitude path (manual training)
+      let traceRecorder: TraceRecorder | null = null;
+
+      if (engineResult.success) {
+        // Cookbook succeeded — update mode and skip to success handling
+        await this.supabase
+          .from('gh_automation_jobs')
+          .update({
+            final_mode: engineResult.mode,
+            metadata: {
+              ...(job.metadata || {}),
+              engine: {
+                manual_id: engineResult.manualId,
+                manual_status: 'cookbook_success',
+                health_score: engineResult.cookbookSteps > 0 ? 95 : null,
+              },
+              cost_breakdown: {
+                cookbook_steps: engineResult.cookbookSteps,
+                magnitude_steps: 0,
+                cookbook_cost_usd: costTracker.getSnapshot().totalCost,
+                magnitude_cost_usd: 0,
+              },
+            },
+          })
+          .eq('id', job.id);
+
+        // Take final screenshot and upload
+        const screenshotUrls: string[] = [];
+        try {
+          const screenshotBuffer = await adapter.screenshot();
+          const screenshotUrl = await this.uploadScreenshot(job.id, 'final', screenshotBuffer);
+          screenshotUrls.push(screenshotUrl);
+        } catch (err) {
+          console.warn(`[JobExecutor] Screenshot failed for job ${job.id}:`, err);
+        }
+
+        // Save browser session
+        if (this.sessionManager && adapter.getBrowserSession) {
+          try {
+            const sessionJson = await adapter.getBrowserSession();
+            if (sessionJson) {
+              const sessionState = JSON.parse(sessionJson);
+              await this.sessionManager.saveSession(job.user_id, job.target_url, sessionState);
+            }
+          } catch (err) {
+            console.warn(`[JobExecutor] Session save failed for job ${job.id}:`, err);
+          }
+        }
+
+        // Get final cost and mark complete
+        const finalCost = costTracker.getSnapshot();
+        await progress.setStep(ProgressStep.COMPLETED);
+        await progress.flush();
+
+        const resultData = {
+          success_message: 'Task completed via cookbook replay',
+          cost: {
+            input_tokens: finalCost.inputTokens,
+            output_tokens: finalCost.outputTokens,
+            total_cost_usd: finalCost.totalCost,
+            action_count: finalCost.actionCount,
+          },
+        };
+
+        await this.supabase
+          .from('gh_automation_jobs')
+          .update({
+            status: 'completed',
+            completed_at: new Date().toISOString(),
+            result_data: resultData,
+            result_summary: 'Task completed via cookbook replay',
+            screenshot_urls: screenshotUrls,
+            llm_cost_cents: Math.round(finalCost.totalCost * 100),
+            action_count: finalCost.actionCount,
+            total_tokens: finalCost.inputTokens + finalCost.outputTokens,
+          })
+          .eq('id', job.id);
+
+        await this.logJobEvent(job.id, 'job_completed', {
+          handler: 'cookbook',
+          result_summary: 'Task completed via cookbook replay',
+          action_count: finalCost.actionCount,
+          cost_cents: Math.round(finalCost.totalCost * 100),
+          final_mode: 'cookbook',
+          cookbook_steps: engineResult.cookbookSteps,
+        });
+
+        await costService.recordJobCost(job.user_id, job.id, finalCost);
+
+        if (job.callback_url) {
+          callbackNotifier.notifyFromJob({
+            id: job.id,
+            valet_task_id: job.valet_task_id,
+            callback_url: job.callback_url,
+            status: 'completed',
+            result_data: resultData,
+            result_summary: 'Task completed via cookbook replay',
+            screenshot_urls: screenshotUrls,
+            llm_cost_cents: Math.round(finalCost.totalCost * 100),
+            action_count: finalCost.actionCount,
+            total_tokens: finalCost.inputTokens + finalCost.outputTokens,
+          }).catch((err) => {
+            console.warn(`[JobExecutor] Callback notification failed for job ${job.id}:`, err);
+          });
+        }
+
+        console.log(`[JobExecutor] Job ${job.id} completed via cookbook (steps=${engineResult.cookbookSteps}, cost=$${finalCost.totalCost.toFixed(4)})`);
+        return;
+      }
+
+      // Engine returned failure — fall back to Magnitude handler
+      // Start trace recording so we can create a manual from this run
+      traceRecorder = new TraceRecorder({
+        adapter,
+        userData: (job.input_data?.user_data as Record<string, string>) || {},
+      });
+      traceRecorder.start();
+
+      // 9a. Wire up event tracking with cost control + progress for Magnitude path
       adapter.on('thought', (thought: string) => {
         progress.recordThought(thought);
       });
 
       adapter.on('actionStarted', (action: { variant: string }) => {
         costTracker.recordAction(); // throws ActionLimitExceededError if over limit
+        costTracker.recordModeStep('magnitude');
         progress.onActionStarted(action.variant);
         this.logJobEvent(job.id, 'step_started', {
           action: action.variant,
@@ -278,7 +426,7 @@ export class JobExecutor {
 
       // 10. Build TaskContext and delegate to handler (with crash recovery)
       const timeoutMs = job.timeout_seconds * 1000;
-      await this.updateJobStatus(job.id, 'running', `Executing ${handler.type} handler`);
+      await this.updateJobStatus(job.id, 'running', `Executing ${handler.type} handler (Magnitude mode)`);
 
       let taskResult: TaskResult | undefined;
       let crashRecoveryAttempts = 0;
@@ -370,6 +518,54 @@ export class JobExecutor {
         throw new Error(taskResult.error || `Task handler '${handler.type}' returned failure`);
       }
 
+      // 10a. Save trace as manual for future cookbook replay
+      if (traceRecorder && traceRecorder.isRecording()) {
+        traceRecorder.stopRecording();
+        const trace = traceRecorder.getTrace();
+        if (trace.length > 0) {
+          try {
+            const manualStore = new ManualStore(this.supabase);
+            const platform = detectPlatform(job.target_url);
+            await manualStore.saveFromTrace(trace, {
+              url: job.target_url,
+              taskType: job.job_type,
+              platform,
+            });
+            await this.logJobEvent(job.id, 'manual_created', {
+              steps: trace.length,
+              url_pattern: ManualStore.urlToPattern(job.target_url),
+            });
+          } catch (err) {
+            console.warn(`[JobExecutor] Manual save failed for job ${job.id}:`, err);
+          }
+        }
+      }
+
+      // Determine final mode based on engine result
+      const finalMode = engineResult.cookbookSteps > 0 ? 'hybrid' : 'magnitude';
+
+      // Update final_mode and engine metadata
+      await this.supabase
+        .from('gh_automation_jobs')
+        .update({
+          final_mode: finalMode,
+          metadata: {
+            ...(job.metadata || {}),
+            engine: {
+              manual_id: engineResult.manualId || null,
+              manual_status: engineResult.manualId ? 'cookbook_failed_fallback' : 'no_manual_available',
+              fallback_reason: engineResult.error || null,
+            },
+            cost_breakdown: {
+              cookbook_steps: engineResult.cookbookSteps,
+              magnitude_steps: costTracker.getSnapshot().actionCount,
+              cookbook_cost_usd: 0,
+              magnitude_cost_usd: costTracker.getSnapshot().totalCost,
+            },
+          },
+        })
+        .eq('id', job.id);
+
       // 11. Take final screenshot and upload
       const screenshotUrls: string[] = [];
       if (taskResult.screenshotUrl) {
@@ -446,6 +642,9 @@ export class JobExecutor {
         action_count: finalCost.actionCount,
         total_tokens: finalCost.inputTokens + finalCost.outputTokens,
         cost_cents: Math.round(finalCost.totalCost * 100),
+        final_mode: finalMode,
+        cookbook_steps: engineResult.cookbookSteps,
+        magnitude_steps: finalCost.actionCount,
       });
 
       // 14. Record cost against user's monthly usage
