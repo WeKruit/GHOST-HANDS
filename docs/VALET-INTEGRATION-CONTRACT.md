@@ -1,7 +1,7 @@
 # VALET Integration Contract — Comprehensive Reference
 
 **Date:** 2026-02-17
-**Covers:** Sprints 1-4 (all GhostHands capabilities)
+**Covers:** Sprints 1-5 (all GhostHands capabilities)
 **Status:** Active
 **Breaking Changes:** None (all additive, backward compatible)
 
@@ -197,28 +197,43 @@ Rich application request with full profile data.
 
 ### 4.1.1 Model Reference
 
+**Accuracy-focused models (recommended):**
+
 | Alias | Provider | Vision | Input $/M | Output $/M | Best For |
 |-------|----------|--------|-----------|------------|----------|
-| **qwen-7b** | SiliconFlow | Yes | $0.05 | $0.15 | Cheapest — speed preset, testing |
-| **qwen-72b** | SiliconFlow | Yes | $0.25 | $0.75 | **Default** — best value |
-| **qwen3-235b** | SiliconFlow | Yes | $0.34 | $1.37 | Quality preset — complex pages |
-| deepseek-chat | DeepSeek | No | $0.27 | $1.10 | Text-only reasoning |
-| gpt-4o | OpenAI | Yes | $2.50 | $10.00 | Premium preset |
+| **qwen3.5-plus** | Alibaba Cloud | Yes | $0.40 | $2.40 | **Quality preset** — frontier accuracy, native GUI automation, 1M context |
+| **qwen3-235b** | SiliconFlow | Yes | $0.34 | $1.37 | **Balanced preset** — best accuracy-per-dollar |
+| **gpt-5.2** | OpenAI | Yes | $1.75 | $14.00 | **Premium preset** — frontier reasoning |
+| claude-opus | Anthropic | Yes | $5.00 | $25.00 | Best overall intelligence, adaptive reasoning |
+| gemini-2.5-pro | Google | Yes | $1.25 | $10.00 | Strong vision and reasoning, 1M context |
+| gpt-4.1 | OpenAI | Yes | $2.00 | $8.00 | Good vision (OCR, VQA), 1M context |
+
+**Budget-friendly models:**
+
+| Alias | Provider | Vision | Input $/M | Output $/M | Best For |
+|-------|----------|--------|-----------|------------|----------|
+| **qwen-7b** | SiliconFlow | Yes | $0.05 | $0.15 | **Speed preset** — cheapest, testing |
+| **qwen-72b** | SiliconFlow | Yes | $0.25 | $0.75 | **Default** — proven for browser automation |
+| gemini-2.5-flash | Google | Yes | $0.15 | $0.60 | Fast, cheap, decent accuracy |
+| gemini-2.0-flash | Google | Yes | $0.10 | $0.40 | Ultra-fast Gemini |
+| deepseek-chat | DeepSeek | No | $0.28 | $0.42 | Text-only reasoning (pair with vision model) |
 | gpt-4o-mini | OpenAI | Yes | $0.15 | $0.60 | Budget OpenAI |
-| claude-sonnet | Anthropic | Yes | $3.00 | $15.00 | Forced for premium tier |
-| claude-haiku | Anthropic | Yes | $0.80 | $4.00 | Budget Claude |
+| claude-haiku | Anthropic | Yes | $0.80 | $4.00 | Budget Claude with vision |
+| claude-sonnet | Anthropic | Yes | $3.00 | $15.00 | Strong Claude reasoning |
+| gpt-4o | OpenAI | Yes | $2.50 | $10.00 | Proven multimodal |
 
 **Cost per job (typical 8K input + 2K output tokens):**
 
-| Setup | Models | Cost/Job | Savings |
-|-------|--------|----------|---------|
-| Speed | qwen-7b | $0.0007 | 98% vs premium |
-| **Balanced** | **qwen-72b** | **$0.0035** | **90% vs premium** |
-| Quality | qwen3-235b | $0.0055 | 86% vs premium |
-| **Dual-model** | **qwen-7b + deepseek-chat** | **$0.0017** | **95% vs premium** |
-| Premium | gpt-4o | $0.04 | baseline |
+| Setup | Models | Cost/Job | Savings vs gpt-4o |
+|-------|--------|----------|-------------------|
+| Speed | qwen-7b | $0.0007 | 98% |
+| Balanced | qwen3-235b | $0.0055 | 86% |
+| **Quality** | **qwen3.5-plus** | **$0.008** | **80%** |
+| **Dual-model** | **qwen-7b + deepseek-chat** | **$0.0012** | **97%** |
+| Premium | gpt-5.2 | $0.042 | — |
+| Ultra-premium | claude-opus | $0.09 | — |
 
-**Dual-model saves 87% vs single gpt-4o** by routing screenshots to cheap vision model.
+**Dual-model** routes screenshots to cheap vision model (`qwen-7b`) and reasoning to `deepseek-chat`.
 
 ### 4.1.2 Execution Modes
 
@@ -698,6 +713,15 @@ const eventChannel = supabase
 | `mode_switched` | Fallback from cookbook to magnitude | `from_mode`, `to_mode`, `reason` |
 | `step_started` | An action is being executed | `action`, `action_count` |
 | `step_completed` | An action finished | `action`, `action_count` |
+| `thought` | AI agent reasoning/thinking *(Sprint 5)* | `content` (truncated to 500 chars) |
+| `tokens_used` | LLM token usage per step *(Sprint 5)* | `model`, `input_tokens`, `output_tokens`, `cost_usd` |
+| `observation_started` | Stagehand observe() call *(Sprint 5)* | `instruction` |
+| `observation_completed` | Stagehand observe() returned *(Sprint 5)* | `instruction`, `elements_found` |
+| `cookbook_step_started` | Cookbook step executing *(Sprint 5)* | `step_index`, `action`, `selector` |
+| `cookbook_step_completed` | Cookbook step succeeded *(Sprint 5)* | `step_index`, `action` |
+| `cookbook_step_failed` | Cookbook step failed *(Sprint 5)* | `step_index`, `action`, `error` |
+| `trace_recording_started` | TraceRecorder started *(Sprint 5)* | — |
+| `trace_recording_completed` | TraceRecorder finished *(Sprint 5)* | `steps` |
 | `manual_created` | New cookbook saved from trace | `steps`, `url_pattern` |
 | `hitl_paused` | Job paused for human intervention | `blocker_type`, `confidence`, `page_url` |
 | `hitl_resumed` | Job resumed after intervention | — |
@@ -709,6 +733,8 @@ const eventChannel = supabase
 | `budget_preflight_failed` | User over budget | `reason`, `remaining_budget` |
 | `job_completed` | Job finished successfully | `handler`, `result_summary`, `action_count`, `cost_cents`, `final_mode` |
 | `job_failed` | Job failed | `error_code`, `error_message`, `action_count` |
+
+**Thought events** are throttled to max 1 per 2 seconds to avoid DB spam. Use them to show AI reasoning in real-time on the VALET UI.
 
 ---
 
@@ -1370,6 +1396,8 @@ Apply these migrations **in order** on Supabase:
 | `GH_SERVICE_KEY` | Yes | Service key for X-GH-Service-Key authentication |
 | `GH_MODEL` or `GH_DEFAULT_MODEL` | No | Default LLM model alias (default: qwen-72b) |
 | `GH_IMAGE_MODEL` | No | Default vision model for dual-model mode |
+| `DASHSCOPE_API_KEY` | For qwen3.5-plus | Alibaba Cloud API key for Qwen3.5-Plus |
+| `GOOGLE_API_KEY` | For Gemini models | Google AI API key for Gemini models |
 
 ### VALET Code Changes
 
@@ -1497,4 +1525,4 @@ curl https://gh.example.com/api/v1/gh/valet/sessions/$USER_ID \
 
 9. **No worker registry/discovery API:** There is no endpoint to list active workers or their status. VALET must track workers via EC2 instance management + `deploy.sh status`. A worker registry is planned for Sprint 5.
 
-10. **Thinking/reasoning not fully unified:** Magnitude emits `current_action` in progress updates (visible via Realtime). Stagehand observe() calls and cookbook step-level thoughts are not yet emitted as events. A unified thinking interface is planned for Sprint 5.
+10. **Thought events are throttled:** AI thinking events (`thought`) are limited to max 1 per 2 seconds to avoid excessive DB writes. For higher-resolution thinking, use `progress.current_action` from Realtime job updates.

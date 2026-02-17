@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import {
   getTestSupabase,
-  cleanupTestData,
+  cleanupByJobType,
   insertTestJobs,
   MockValetClient,
   simulateWorkerPickup,
@@ -21,17 +21,20 @@ import {
 const supabase = getTestSupabase();
 const valet = new MockValetClient(supabase);
 
+// Unique job_type to isolate from other parallel test files sharing the same DB
+const JOB_TYPE = 'lifecycle_test';
+
 describe('Job Lifecycle (Happy Path)', () => {
   beforeAll(async () => {
-    await cleanupTestData(supabase);
+    await cleanupByJobType(supabase, JOB_TYPE);
   });
 
   afterAll(async () => {
-    await cleanupTestData(supabase);
+    await cleanupByJobType(supabase, JOB_TYPE);
   });
 
   beforeEach(async () => {
-    await cleanupTestData(supabase);
+    await cleanupByJobType(supabase, JOB_TYPE);
   });
 
   // ─── Create ──────────────────────────────────────────────────────
@@ -40,12 +43,13 @@ describe('Job Lifecycle (Happy Path)', () => {
     const job = await valet.createJob({
       target_url: 'https://boards.greenhouse.io/testco/jobs/111',
       task_description: 'Apply to engineer role',
+      job_type: JOB_TYPE,
     });
 
     expect(job.id).toBeDefined();
     expect(job.status).toBe('pending');
     expect(job.user_id).toBe(TEST_USER_ID);
-    expect(job.job_type).toBe('apply');
+    expect(job.job_type).toBe(JOB_TYPE);
     expect(job.worker_id).toBeNull();
     expect(job.retry_count).toBe(0);
   });
@@ -62,6 +66,7 @@ describe('Job Lifecycle (Happy Path)', () => {
     const job = await valet.createJob({
       input_data: inputData,
       metadata,
+      job_type: JOB_TYPE,
     });
 
     const fetched = await valet.getJob(job.id as string);
@@ -76,22 +81,22 @@ describe('Job Lifecycle (Happy Path)', () => {
   it('should respect idempotency keys (no duplicate creation)', async () => {
     const key = `idem-${Date.now()}`;
 
-    const job1 = await valet.createJob({ idempotency_key: key });
+    const job1 = await valet.createJob({ idempotency_key: key, job_type: JOB_TYPE });
     expect(job1.id).toBeDefined();
 
     // Attempting to insert the same idempotency_key should fail at DB level
     // (unique constraint). In the real API this returns 409.
     await expect(
-      insertTestJobs(supabase, { idempotency_key: key }),
+      insertTestJobs(supabase, { idempotency_key: key, job_type: JOB_TYPE }),
     ).rejects.toThrow();
   });
 
   // ─── Pickup ──────────────────────────────────────────────────────
 
   it('should pick up a pending job and claim it', async () => {
-    await valet.createJob();
+    await valet.createJob({ job_type: JOB_TYPE });
 
-    const pickedUpId = await simulateWorkerPickup(supabase);
+    const pickedUpId = await simulateWorkerPickup(supabase, TEST_WORKER_ID, JOB_TYPE);
     expect(pickedUpId).toBeDefined();
 
     const job = await valet.getJob(pickedUpId!);
@@ -103,12 +108,12 @@ describe('Job Lifecycle (Happy Path)', () => {
 
   it('should pick jobs in priority order (highest first)', async () => {
     await insertTestJobs(supabase, [
-      { priority: 1, task_description: 'Low priority' },
-      { priority: 10, task_description: 'High priority' },
-      { priority: 5, task_description: 'Medium priority' },
+      { priority: 1, task_description: 'Low priority', job_type: JOB_TYPE },
+      { priority: 10, task_description: 'High priority', job_type: JOB_TYPE },
+      { priority: 5, task_description: 'Medium priority', job_type: JOB_TYPE },
     ]);
 
-    const firstPickup = await simulateWorkerPickup(supabase);
+    const firstPickup = await simulateWorkerPickup(supabase, TEST_WORKER_ID, JOB_TYPE);
     const firstJob = await valet.getJob(firstPickup!);
     expect(firstJob!.task_description).toBe('High priority');
   });
@@ -117,25 +122,27 @@ describe('Job Lifecycle (Happy Path)', () => {
     await insertTestJobs(supabase, {
       status: 'queued',
       worker_id: 'other-worker',
+      job_type: JOB_TYPE,
     });
     await insertTestJobs(supabase, {
       status: 'running',
       worker_id: 'other-worker',
+      job_type: JOB_TYPE,
     });
 
     // No unclaimed pending jobs
-    const pickup = await simulateWorkerPickup(supabase);
+    const pickup = await simulateWorkerPickup(supabase, TEST_WORKER_ID, JOB_TYPE);
     expect(pickup).toBeNull();
   });
 
   // ─── Execute ─────────────────────────────────────────────────────
 
   it('should transition through running to completed', async () => {
-    const job = await valet.createJob();
+    const job = await valet.createJob({ job_type: JOB_TYPE });
     const jobId = job.id as string;
 
     // Simulate full execution
-    const pickedUp = await simulateWorkerPickup(supabase);
+    const pickedUp = await simulateWorkerPickup(supabase, TEST_WORKER_ID, JOB_TYPE);
     expect(pickedUp).toBe(jobId);
 
     await simulateJobExecution(supabase, jobId, 'completed', {
@@ -156,10 +163,10 @@ describe('Job Lifecycle (Happy Path)', () => {
   });
 
   it('should record job events throughout the lifecycle', async () => {
-    const job = await valet.createJob();
+    const job = await valet.createJob({ job_type: JOB_TYPE });
     const jobId = job.id as string;
 
-    await simulateWorkerPickup(supabase);
+    await simulateWorkerPickup(supabase, TEST_WORKER_ID, JOB_TYPE);
     await simulateJobExecution(supabase, jobId, 'completed');
 
     const events = await valet.getJobEvents(jobId);
@@ -182,12 +189,13 @@ describe('Job Lifecycle (Happy Path)', () => {
         tier: 'pro',
       },
       tags: ['e2e', 'lifecycle'],
+      job_type: JOB_TYPE,
     });
 
     expect(created.status).toBe('pending');
 
     // 2. Worker picks up
-    const pickedUpId = await simulateWorkerPickup(supabase);
+    const pickedUpId = await simulateWorkerPickup(supabase, TEST_WORKER_ID, JOB_TYPE);
     expect(pickedUpId).toBe(created.id);
 
     let status = await valet.getJobStatus(pickedUpId!);
@@ -215,10 +223,10 @@ describe('Job Lifecycle (Happy Path)', () => {
   // ─── Screenshots & Result Storage ─────────────────────────────────
 
   it('should store screenshot URLs in the completed job record', async () => {
-    const job = await valet.createJob();
+    const job = await valet.createJob({ job_type: JOB_TYPE });
     const jobId = job.id as string;
 
-    await simulateWorkerPickup(supabase);
+    await simulateWorkerPickup(supabase, TEST_WORKER_ID, JOB_TYPE);
     await simulateJobExecution(supabase, jobId, 'completed', {
       result_data: { submitted: true },
       screenshot_urls: [
@@ -236,10 +244,10 @@ describe('Job Lifecycle (Happy Path)', () => {
   });
 
   it('should store result_data for VALET to retrieve (completion notification)', async () => {
-    const job = await valet.createJob();
+    const job = await valet.createJob({ job_type: JOB_TYPE });
     const jobId = job.id as string;
 
-    await simulateWorkerPickup(supabase);
+    await simulateWorkerPickup(supabase, TEST_WORKER_ID, JOB_TYPE);
     await simulateJobExecution(supabase, jobId, 'completed', {
       result_data: {
         submitted: true,
@@ -263,7 +271,7 @@ describe('Job Lifecycle (Happy Path)', () => {
   // ─── Cancel ──────────────────────────────────────────────────────
 
   it('should cancel a pending job', async () => {
-    const job = await valet.createJob();
+    const job = await valet.createJob({ job_type: JOB_TYPE });
     const jobId = job.id as string;
 
     await valet.cancelJob(jobId);
@@ -274,10 +282,10 @@ describe('Job Lifecycle (Happy Path)', () => {
   });
 
   it('should not cancel an already-completed job', async () => {
-    const job = await valet.createJob();
+    const job = await valet.createJob({ job_type: JOB_TYPE });
     const jobId = job.id as string;
 
-    await simulateWorkerPickup(supabase);
+    await simulateWorkerPickup(supabase, TEST_WORKER_ID, JOB_TYPE);
     await simulateJobExecution(supabase, jobId, 'completed');
 
     // Cancel should have no effect (the .in() filter won't match)
@@ -290,16 +298,16 @@ describe('Job Lifecycle (Happy Path)', () => {
 
   it('should filter jobs by status', async () => {
     await insertTestJobs(supabase, [
-      { status: 'pending' },
-      { status: 'pending' },
-      { status: 'completed', completed_at: new Date().toISOString() },
-      { status: 'failed', completed_at: new Date().toISOString() },
+      { status: 'pending', job_type: JOB_TYPE },
+      { status: 'pending', job_type: JOB_TYPE },
+      { status: 'completed', completed_at: new Date().toISOString(), job_type: JOB_TYPE },
+      { status: 'failed', completed_at: new Date().toISOString(), job_type: JOB_TYPE },
     ]);
 
     const { data: pending } = await supabase
       .from('gh_automation_jobs')
       .select('id')
-      .eq('created_by', 'test')
+      .eq('job_type', JOB_TYPE)
       .eq('status', 'pending');
 
     expect(pending!.length).toBe(2);
@@ -307,7 +315,7 @@ describe('Job Lifecycle (Happy Path)', () => {
     const { data: terminal } = await supabase
       .from('gh_automation_jobs')
       .select('id')
-      .eq('created_by', 'test')
+      .eq('job_type', JOB_TYPE)
       .in('status', ['completed', 'failed']);
 
     expect(terminal!.length).toBe(2);

@@ -43,6 +43,18 @@
       "baseUrl": "https://open.bigmodel.cn/api/paas/v4/",
       "envKey": "ZHIPU_API_KEY",
       "docs": "https://open.bigmodel.cn/dev/api/thirdparty-frame/openai-sdk"
+    },
+    "qwen-alibaba": {
+      "name": "Alibaba Cloud (Qwen)",
+      "baseUrl": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+      "envKey": "DASHSCOPE_API_KEY",
+      "docs": "https://help.aliyun.com/zh/model-studio/developer-reference/compatibility-of-openai-with-dashscope"
+    },
+    "google": {
+      "name": "Google AI",
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "envKey": "GOOGLE_API_KEY",
+      "docs": "https://ai.google.dev/gemini-api/docs"
     }
   },
 
@@ -87,7 +99,7 @@
       "provider": "deepseek",
       "model": "deepseek-chat",
       "vision": false,
-      "cost": { "input": 0.27, "output": 1.10, "unit": "$/M tokens" },
+      "cost": { "input": 0.28, "output": 0.42, "unit": "$/M tokens" },
       "note": "No vision support; works with accessibility tree only"
     },
     "deepseek-reasoner": {
@@ -157,6 +169,52 @@
       "vision": true,
       "cost": { "input": 0.50, "output": 0.50, "unit": "$/M tokens" },
       "note": "Zhipu AI GLM-5, supports vision via OpenAI-compatible API"
+    },
+    "qwen3.5-plus": {
+      "provider": "qwen-alibaba",
+      "model": "qwen3.5-plus",
+      "vision": true,
+      "cost": { "input": 0.40, "output": 2.40, "unit": "$/M tokens" }
+    },
+    "gpt-4.1": {
+      "provider": "openai",
+      "model": "gpt-4.1",
+      "vision": true,
+      "cost": { "input": 2.00, "output": 8.00, "unit": "$/M tokens" }
+    },
+    "gpt-5.2": {
+      "provider": "openai",
+      "model": "gpt-5.2",
+      "vision": true,
+      "cost": { "input": 1.75, "output": 14.00, "unit": "$/M tokens" }
+    },
+    "claude-opus": {
+      "provider": "anthropic",
+      "model": "claude-opus-4-6",
+      "vision": true,
+      "cost": { "input": 5.00, "output": 25.00, "unit": "$/M tokens" },
+      "note": "#1 on intelligence leaderboards. Adaptive reasoning. Best for complex multi-step form flows."
+    },
+    "gemini-2.5-flash": {
+      "provider": "google",
+      "model": "gemini-2.5-flash-preview-04-17",
+      "vision": true,
+      "cost": { "input": 0.15, "output": 0.60, "unit": "$/M tokens" },
+      "note": "Fast, cheap, decent accuracy. Good for high-volume simple forms."
+    },
+    "gemini-2.5-pro": {
+      "provider": "google",
+      "model": "gemini-2.5-pro-preview-05-06",
+      "vision": true,
+      "cost": { "input": 1.25, "output": 10.00, "unit": "$/M tokens" },
+      "note": "Strong vision and reasoning. 1M context window."
+    },
+    "gemini-2.0-flash": {
+      "provider": "google",
+      "model": "gemini-2.0-flash",
+      "vision": true,
+      "cost": { "input": 0.10, "output": 0.40, "unit": "$/M tokens" },
+      "note": "Ultra-fast Gemini. Good for simple vision tasks."
     }
   },
 
@@ -166,16 +224,16 @@
       "model": "qwen-7b"
     },
     "balanced": {
-      "description": "Best value for browser automation -- good vision, very cheap",
-      "model": "qwen-72b"
-    },
-    "quality": {
-      "description": "Most capable model -- best for complex pages and reasoning",
+      "description": "Best accuracy-per-dollar -- MoE 235B with strong vision",
       "model": "qwen3-235b"
     },
+    "quality": {
+      "description": "Frontier accuracy -- native GUI automation, 1M context",
+      "model": "qwen3.5-plus"
+    },
     "premium": {
-      "description": "OpenAI GPT-4o -- high quality but expensive",
-      "model": "gpt-4o"
+      "description": "OpenAI GPT-5.2 -- frontier reasoning, multimodal",
+      "model": "gpt-5.2"
     }
   },
 

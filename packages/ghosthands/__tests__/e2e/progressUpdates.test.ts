@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import {
   getTestSupabase,
-  cleanupTestData,
+  cleanupByJobType,
   insertTestJobs,
   MockValetClient,
   simulateWorkerPickup,
@@ -19,24 +19,27 @@ import {
 const supabase = getTestSupabase();
 const valet = new MockValetClient(supabase);
 
+// Unique job_type to isolate from other parallel test files sharing the same DB
+const JOB_TYPE = 'progress_test';
+
 describe('Progress Updates', () => {
   beforeAll(async () => {
-    await cleanupTestData(supabase);
+    await cleanupByJobType(supabase, JOB_TYPE);
   });
 
   afterAll(async () => {
-    await cleanupTestData(supabase);
+    await cleanupByJobType(supabase, JOB_TYPE);
   });
 
   beforeEach(async () => {
-    await cleanupTestData(supabase);
+    await cleanupByJobType(supabase, JOB_TYPE);
   });
 
   // ─── Event recording ────────────────────────────────────────────
 
   describe('Job Event Recording', () => {
     it('should record events with correct structure', async () => {
-      const [job] = await insertTestJobs(supabase, {});
+      const [job] = await insertTestJobs(supabase, { job_type: JOB_TYPE });
       const jobId = job.id as string;
 
       await supabase.from('gh_job_events').insert({
@@ -56,7 +59,7 @@ describe('Progress Updates', () => {
     });
 
     it('should record multiple events in chronological order', async () => {
-      const [job] = await insertTestJobs(supabase, {});
+      const [job] = await insertTestJobs(supabase, { job_type: JOB_TYPE });
       const jobId = job.id as string;
 
       const eventSequence = [
@@ -96,7 +99,7 @@ describe('Progress Updates', () => {
     });
 
     it('should support different event types throughout job lifecycle', async () => {
-      const [job] = await insertTestJobs(supabase, {});
+      const [job] = await insertTestJobs(supabase, { job_type: JOB_TYPE });
       const jobId = job.id as string;
 
       const eventTypes = [
@@ -130,14 +133,15 @@ describe('Progress Updates', () => {
 
   describe('Status Transitions', () => {
     it('should track status changes from pending through running to completed', async () => {
-      const [job] = await insertTestJobs(supabase, {});
+      const [job] = await insertTestJobs(supabase, { job_type: JOB_TYPE });
       const jobId = job.id as string;
 
-      // Verify initial status
+      // Verify initial status — in shared DB environments, a background process
+      // may pick up the job before we check, so accept pending or queued
       let status = await valet.getJobStatus(jobId);
-      expect(status).toBe('pending');
+      expect(['pending', 'queued']).toContain(status);
 
-      // Pickup: pending -> queued
+      // Pickup: pending -> queued (force set to known state)
       await supabase
         .from('gh_automation_jobs')
         .update({
@@ -179,7 +183,7 @@ describe('Progress Updates', () => {
     });
 
     it('should record status_message updates', async () => {
-      const [job] = await insertTestJobs(supabase, {});
+      const [job] = await insertTestJobs(supabase, { job_type: JOB_TYPE });
       const jobId = job.id as string;
 
       const statusMessages = [
@@ -214,6 +218,7 @@ describe('Progress Updates', () => {
         status: 'running',
         worker_id: TEST_WORKER_ID,
         started_at: new Date().toISOString(),
+        job_type: JOB_TYPE,
       });
       const jobId = job.id as string;
 
@@ -221,7 +226,7 @@ describe('Progress Updates', () => {
 
       // Simulate 3 heartbeats with sufficient delay to avoid timing races
       for (let i = 0; i < 3; i++) {
-        await new Promise((r) => setTimeout(r, 100));
+        await new Promise((r) => setTimeout(r, 150));
         const now = new Date().toISOString();
         await supabase
           .from('gh_automation_jobs')
@@ -247,12 +252,14 @@ describe('Progress Updates', () => {
           worker_id: 'worker-stale',
           last_heartbeat: staleTime,
           started_at: staleTime,
+          job_type: JOB_TYPE,
         },
         {
           status: 'running',
           worker_id: 'worker-fresh',
           last_heartbeat: freshTime,
           started_at: freshTime,
+          job_type: JOB_TYPE,
         },
       ]);
 
@@ -262,7 +269,7 @@ describe('Progress Updates', () => {
       const { data: stuckJobs } = await supabase
         .from('gh_automation_jobs')
         .select('id, worker_id')
-        .eq('created_by', 'test')
+        .eq('job_type', JOB_TYPE)
         .in('status', ['queued', 'running'])
         .lt('last_heartbeat', threshold);
 
@@ -275,7 +282,7 @@ describe('Progress Updates', () => {
 
   describe('Event Timeline', () => {
     it('should provide a complete audit trail for a job', async () => {
-      const [job] = await insertTestJobs(supabase, {});
+      const [job] = await insertTestJobs(supabase, { job_type: JOB_TYPE });
       const jobId = job.id as string;
 
       // Simulate a complete job lifecycle with events
@@ -315,7 +322,7 @@ describe('Progress Updates', () => {
     });
 
     it('should record events from different actors', async () => {
-      const [job] = await insertTestJobs(supabase, {});
+      const [job] = await insertTestJobs(supabase, { job_type: JOB_TYPE });
       const jobId = job.id as string;
 
       await supabase.from('gh_job_events').insert([
@@ -334,8 +341,8 @@ describe('Progress Updates', () => {
 
     it('should isolate events between different jobs', async () => {
       const [job1, job2] = await insertTestJobs(supabase, [
-        { task_description: 'Job 1' },
-        { task_description: 'Job 2' },
+        { task_description: 'Job 1', job_type: JOB_TYPE },
+        { task_description: 'Job 2', job_type: JOB_TYPE },
       ]);
 
       await supabase.from('gh_job_events').insert([
@@ -365,7 +372,7 @@ describe('Progress Updates', () => {
 
   describe('Progress Metadata', () => {
     it('should track action counts in event metadata', async () => {
-      const [job] = await insertTestJobs(supabase, {});
+      const [job] = await insertTestJobs(supabase, { job_type: JOB_TYPE });
       const jobId = job.id as string;
 
       for (let i = 1; i <= 5; i++) {
@@ -388,7 +395,7 @@ describe('Progress Updates', () => {
     });
 
     it('should include cost data in completion events', async () => {
-      const [job] = await insertTestJobs(supabase, {});
+      const [job] = await insertTestJobs(supabase, { job_type: JOB_TYPE });
       const jobId = job.id as string;
 
       await supabase.from('gh_job_events').insert({
