@@ -9,6 +9,7 @@ import type { Page, Locator } from 'playwright';
 import type { ActionManual, ManualStep } from './types';
 import { LocatorResolver, type ResolveResult } from './LocatorResolver';
 import { resolveOptionalTemplate } from './templateResolver';
+import type { LogEventCallback } from '../events/JobEventTypes';
 
 export interface ExecuteAllResult {
   success: boolean;
@@ -28,17 +29,21 @@ export interface CookbookExecutorOptions {
   resolverTimeout?: number;
   /** Default wait after each step in ms if step.waitAfter not set. Default: 0 */
   defaultWaitAfter?: number;
+  /** Optional callback to log events to gh_job_events */
+  logEvent?: LogEventCallback;
 }
 
 export class CookbookExecutor {
   private resolver: LocatorResolver;
   private defaultWaitAfter: number;
+  private logEvent: LogEventCallback | null;
 
   constructor(options?: CookbookExecutorOptions) {
     this.resolver = new LocatorResolver({
       timeout: options?.resolverTimeout ?? 3000,
     });
     this.defaultWaitAfter = options?.defaultWaitAfter ?? 0;
+    this.logEvent = options?.logEvent ?? null;
   }
 
   /**
@@ -54,15 +59,42 @@ export class CookbookExecutor {
 
     for (let i = 0; i < sortedSteps.length; i++) {
       const step = sortedSteps[i];
+
+      if (this.logEvent) {
+        await this.logEvent('cookbook_step_started', {
+          step_index: i,
+          total_steps: sortedSteps.length,
+          action: step.action,
+          description: step.description,
+        }).catch(() => {});
+      }
+
       const result = await this.executeStep(page, step, userData);
 
       if (!result.success) {
+        if (this.logEvent) {
+          await this.logEvent('cookbook_step_failed', {
+            step_index: i,
+            total_steps: sortedSteps.length,
+            action: step.action,
+            error: result.error,
+          }).catch(() => {});
+        }
         return {
           success: false,
           stepsCompleted: i,
           failedStepIndex: i,
           error: result.error,
         };
+      }
+
+      if (this.logEvent) {
+        await this.logEvent('cookbook_step_completed', {
+          step_index: i,
+          total_steps: sortedSteps.length,
+          action: step.action,
+          strategy: result.strategy,
+        }).catch(() => {});
       }
     }
 

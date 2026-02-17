@@ -19,6 +19,7 @@ import { ExecutionEngine } from '../engine/ExecutionEngine.js';
 import { ManualStore } from '../engine/ManualStore.js';
 import { CookbookExecutor } from '../engine/CookbookExecutor.js';
 import { TraceRecorder } from '../engine/TraceRecorder.js';
+import { ThoughtThrottle, JOB_EVENT_TYPES } from '../events/JobEventTypes.js';
 
 // Re-export AutomationJob from the canonical location for backward compat
 export type { AutomationJob } from './taskHandlers/types.js';
@@ -262,9 +263,14 @@ export class JobExecutor {
       // 9. Try ExecutionEngine (cookbook replay) before Magnitude handler
       await progress.setStep(ProgressStep.NAVIGATING);
 
+      const logEventFn = (eventType: string, metadata: Record<string, any>) =>
+        this.logJobEvent(job.id, eventType, metadata);
+
       const executionEngine = new ExecutionEngine({
         manualStore: new ManualStore(this.supabase),
-        cookbookExecutor: new CookbookExecutor(),
+        cookbookExecutor: new CookbookExecutor({
+          logEvent: logEventFn,
+        }),
       });
 
       const engineResult = await executionEngine.execute({
@@ -272,7 +278,7 @@ export class JobExecutor {
         adapter,
         costTracker,
         progress,
-        logEvent: (eventType, metadata) => this.logJobEvent(job.id, eventType, metadata),
+        logEvent: logEventFn,
       });
 
       // Track TraceRecorder for Magnitude path (manual training)
@@ -394,17 +400,25 @@ export class JobExecutor {
         userData: (job.input_data?.user_data as Record<string, string>) || {},
       });
       traceRecorder.start();
+      await this.logJobEvent(job.id, JOB_EVENT_TYPES.TRACE_RECORDING_STARTED, {});
 
       // 9a. Wire up event tracking with cost control + progress for Magnitude path
+      const thoughtThrottle = new ThoughtThrottle(2000);
+
       adapter.on('thought', (thought: string) => {
         progress.recordThought(thought);
+        if (thoughtThrottle.shouldEmit()) {
+          this.logJobEvent(job.id, JOB_EVENT_TYPES.THOUGHT, {
+            content: thought.slice(0, 500),
+          });
+        }
       });
 
       adapter.on('actionStarted', (action: { variant: string }) => {
         costTracker.recordAction(); // throws ActionLimitExceededError if over limit
         costTracker.recordModeStep('magnitude');
         progress.onActionStarted(action.variant);
-        this.logJobEvent(job.id, 'step_started', {
+        this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_STARTED, {
           action: action.variant,
           action_count: costTracker.getSnapshot().actionCount,
         });
@@ -412,7 +426,7 @@ export class JobExecutor {
 
       adapter.on('actionDone', (action: { variant: string }) => {
         progress.onActionDone(action.variant);
-        this.logJobEvent(job.id, 'step_completed', {
+        this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
           action: action.variant,
           action_count: costTracker.getSnapshot().actionCount,
         });
@@ -425,6 +439,12 @@ export class JobExecutor {
           inputCost: usage.inputCost,
           outputCost: usage.outputCost,
         }); // throws BudgetExceededError if over budget
+        this.logJobEvent(job.id, JOB_EVENT_TYPES.TOKENS_USED, {
+          model: (usage as any).model || 'unknown',
+          input_tokens: usage.inputTokens,
+          output_tokens: usage.outputTokens,
+          cost_usd: usage.inputCost + usage.outputCost,
+        });
       });
 
       // 10. Build TaskContext and delegate to handler (with crash recovery)
@@ -479,20 +499,26 @@ export class JobExecutor {
           adapter = recovered;
 
           // Re-wire event handlers on the new adapter
+          thoughtThrottle.reset();
           adapter.on('thought', (thought: string) => {
             progress.recordThought(thought);
+            if (thoughtThrottle.shouldEmit()) {
+              this.logJobEvent(job.id, JOB_EVENT_TYPES.THOUGHT, {
+                content: thought.slice(0, 500),
+              });
+            }
           });
           adapter.on('actionStarted', (action: { variant: string }) => {
             costTracker.recordAction();
             progress.onActionStarted(action.variant);
-            this.logJobEvent(job.id, 'step_started', {
+            this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_STARTED, {
               action: action.variant,
               action_count: costTracker.getSnapshot().actionCount,
             });
           });
           adapter.on('actionDone', (action: { variant: string }) => {
             progress.onActionDone(action.variant);
-            this.logJobEvent(job.id, 'step_completed', {
+            this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
               action: action.variant,
               action_count: costTracker.getSnapshot().actionCount,
             });
@@ -503,6 +529,12 @@ export class JobExecutor {
               outputTokens: usage.outputTokens,
               inputCost: usage.inputCost,
               outputCost: usage.outputCost,
+            });
+            this.logJobEvent(job.id, JOB_EVENT_TYPES.TOKENS_USED, {
+              model: (usage as any).model || 'unknown',
+              input_tokens: usage.inputTokens,
+              output_tokens: usage.outputTokens,
+              cost_usd: usage.inputCost + usage.outputCost,
             });
           });
 
@@ -524,6 +556,9 @@ export class JobExecutor {
       // 10a. Save trace as manual for future cookbook replay
       if (traceRecorder && traceRecorder.isRecording()) {
         traceRecorder.stopRecording();
+        await this.logJobEvent(job.id, JOB_EVENT_TYPES.TRACE_RECORDING_COMPLETED, {
+          steps: traceRecorder.getTrace().length,
+        });
         const trace = traceRecorder.getTrace();
         if (trace.length > 0) {
           try {

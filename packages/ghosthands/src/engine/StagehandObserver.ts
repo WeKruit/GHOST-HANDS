@@ -11,6 +11,7 @@
 import { Stagehand } from '@browserbasehq/stagehand';
 import type { Action, V3Options } from '@browserbasehq/stagehand';
 import type { ObservedElement } from './types';
+import type { LogEventCallback } from '../events/JobEventTypes';
 
 // ── Config ─────────────────────────────────────────────────────────────
 
@@ -21,6 +22,8 @@ export interface StagehandObserverConfig {
   model: string | { modelName: string; apiKey?: string; baseURL?: string };
   /** Stagehand verbosity level (0 = silent, 1 = normal, 2 = debug) */
   verbose?: 0 | 1 | 2;
+  /** Optional callback to log events to gh_job_events */
+  logEvent?: LogEventCallback;
 }
 
 // ── Method mapping ─────────────────────────────────────────────────────
@@ -79,8 +82,22 @@ export class StagehandObserver {
       throw new Error('StagehandObserver: not initialized. Call init() first.');
     }
 
+    const logEvent = this.config.logEvent;
+    if (logEvent) {
+      await logEvent('observation_started', { instruction }).catch(() => {});
+    }
+
     const actions: Action[] = await this.stagehand.observe(instruction);
-    return actions.map(mapAction);
+    const elements = actions.map(mapAction);
+
+    if (logEvent) {
+      await logEvent('observation_completed', {
+        instruction,
+        elements_found: elements.length,
+      }).catch(() => {});
+    }
+
+    return elements;
   }
 
   /**
