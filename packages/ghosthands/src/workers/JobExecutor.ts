@@ -12,6 +12,8 @@ import { loadModelConfig } from '../config/models.js';
 import { taskHandlerRegistry } from './taskHandlers/registry.js';
 import { callbackNotifier } from './callbackNotifier.js';
 import type { TaskContext, TaskResult } from './taskHandlers/types.js';
+import { SessionManager } from '../sessions/SessionManager.js';
+import { createEncryptionFromEnv } from '../db/encryption.js';
 
 // Re-export AutomationJob from the canonical location for backward compat
 export type { AutomationJob } from './taskHandlers/types.js';
@@ -127,6 +129,7 @@ export class JobExecutor {
       const preflight = await costService.preflightBudgetCheck(
         job.user_id,
         qualityPreset,
+        job.job_type,
       );
       if (!preflight.allowed) {
         await this.updateJobStatus(job.id, 'failed', preflight.reason);
@@ -204,6 +207,49 @@ export class JobExecutor {
         adapter.registerCredentials(credentials);
       }
 
+      // 8.5. Inject stored browser session (e.g. Google auth cookies)
+      try {
+        const encryption = createEncryptionFromEnv();
+        const sessionManager = new SessionManager({ supabase: this.supabase, encryption });
+
+        // Load Google session for Sign-in-with-Google flows
+        // Try multiple Google-related domains since the session may be stored under any of them
+        const googleDomains = ['accounts.google.com', 'mail.google.com', 'google.com'];
+        let googleSessionInjected = false;
+        for (const domain of googleDomains) {
+          if (googleSessionInjected) break;
+          const googleSession = await sessionManager.loadSession(job.user_id, domain);
+          if (googleSession) {
+            const cookies = (googleSession as any).cookies || [];
+            if (cookies.length > 0) {
+              await adapter.page.context().addCookies(cookies);
+              console.log(`[JobExecutor] Injected ${cookies.length} Google session cookies (from ${domain}) for user ${job.user_id}`);
+              googleSessionInjected = true;
+            }
+          }
+        }
+
+        // Also try loading session for the target domain
+        const targetDomain = new URL(job.target_url).hostname;
+        const targetSession = await sessionManager.loadSession(job.user_id, targetDomain);
+        if (targetSession) {
+          const cookies = (targetSession as any).cookies || [];
+          if (cookies.length > 0) {
+            await adapter.page.context().addCookies(cookies);
+            console.log(`[JobExecutor] Injected ${cookies.length} ${targetDomain} session cookies`);
+          }
+        }
+        // Reload page after cookie injection so Workday SSO picks up the Google session
+        if (googleSessionInjected) {
+          console.log(`[JobExecutor] Reloading page after session injection...`);
+          await adapter.page.reload({ waitUntil: 'networkidle' }).catch(() => {});
+          await adapter.page.waitForTimeout(2000);
+        }
+      } catch (err) {
+        // Session injection failure is non-fatal — worker can still try fresh login
+        console.warn(`[JobExecutor] Session injection failed (non-fatal):`, err);
+      }
+
       // 9. Wire up event tracking with cost control + progress
       await progress.setStep(ProgressStep.NAVIGATING);
 
@@ -255,7 +301,7 @@ export class JobExecutor {
         this.createTimeout(timeoutMs),
       ]);
 
-      if (!taskResult.success) {
+      if (!taskResult.success && !taskResult.keepBrowserOpen) {
         throw new Error(taskResult.error || `Task handler '${handler.type}' returned failure`);
       }
 
@@ -279,7 +325,81 @@ export class JobExecutor {
       // 12. Get final cost snapshot
       const finalCost = costTracker.getSnapshot();
 
-      // 13. Mark progress complete and flush
+      // 12.5. Save fresh session cookies back to DB after successful auth
+      try {
+        const encryption = createEncryptionFromEnv();
+        const sessionManager = new SessionManager({ supabase: this.supabase, encryption });
+        const freshState = await adapter.page.context().storageState();
+        // Save Google session (use mail.google.com for consistency with session persistence test)
+        await sessionManager.saveSession(
+          job.user_id,
+          'mail.google.com',
+          freshState as unknown as Record<string, unknown>,
+        );
+        // Save target domain session
+        const targetDomain = new URL(job.target_url).hostname;
+        await sessionManager.saveSession(
+          job.user_id,
+          targetDomain,
+          freshState as unknown as Record<string, unknown>,
+        );
+        console.log(`[JobExecutor] Saved fresh session cookies for user ${job.user_id}`);
+      } catch (err) {
+        console.warn(`[JobExecutor] Session save failed (non-fatal):`, err);
+      }
+
+      // 13. Handle awaiting_user_review vs completed
+      if (taskResult.awaitingUserReview) {
+        // Job paused at review page — keep browser open
+        await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
+        await progress.flush();
+
+        const resultData = {
+          ...(taskResult.data || {}),
+          cost: {
+            input_tokens: finalCost.inputTokens,
+            output_tokens: finalCost.outputTokens,
+            total_cost_usd: finalCost.totalCost,
+            action_count: finalCost.actionCount,
+          },
+        };
+
+        await this.supabase
+          .from('gh_automation_jobs')
+          .update({
+            status: 'awaiting_user_review',
+            result_data: resultData,
+            result_summary: 'Application filled — waiting for user to review and submit',
+            screenshot_urls: screenshotUrls,
+            llm_cost_cents: Math.round(finalCost.totalCost * 100),
+            action_count: finalCost.actionCount,
+            total_tokens: finalCost.inputTokens + finalCost.outputTokens,
+          })
+          .eq('id', job.id);
+
+        await this.logJobEvent(job.id, 'awaiting_user_review', {
+          handler: handler.type,
+          action_count: finalCost.actionCount,
+          total_tokens: finalCost.inputTokens + finalCost.outputTokens,
+          cost_cents: Math.round(finalCost.totalCost * 100),
+        });
+
+        await costService.recordJobCost(job.user_id, job.id, finalCost);
+
+        console.log(`[JobExecutor] Job ${job.id} awaiting user review (actions=${finalCost.actionCount}, cost=$${finalCost.totalCost.toFixed(4)})`);
+
+        // Keep heartbeat running and browser open — wait indefinitely
+        // The worker process must stay alive for the browser to remain open
+        console.log(`[JobExecutor] Browser is open for manual review. Heartbeat continues.`);
+        console.log(`[JobExecutor] Press Ctrl+C to shut down the worker when done.`);
+
+        // Block indefinitely — the user will Ctrl+C when done
+        await new Promise<void>(() => {
+          // Never resolves — worker stays alive with browser open
+        });
+      }
+
+      // Normal completion flow
       await progress.setStep(ProgressStep.COMPLETED);
       await progress.flush();
 
