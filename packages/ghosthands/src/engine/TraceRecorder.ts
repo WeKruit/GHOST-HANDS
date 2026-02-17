@@ -195,10 +195,10 @@ export class TraceRecorder {
           const parts: string[] = [];
           let current: Element | null = el;
           while (current && current !== document.documentElement) {
-            const parent = current.parentElement;
+            const parent: Element | null = current.parentElement;
             if (parent) {
               const siblings = Array.from(parent.children).filter(
-                (c) => c.tagName === current!.tagName,
+                (c: Element) => c.tagName === current!.tagName,
               );
               const index = siblings.indexOf(current) + 1;
               parts.unshift(`${current.tagName.toLowerCase()}[${index}]`);
