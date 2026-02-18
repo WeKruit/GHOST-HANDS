@@ -36,6 +36,7 @@ FROM oven/bun:1.2-debian AS runtime
 
 # Install system dependencies for Patchright/Chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     curl \
     libnss3 \
     libnspr4 \
