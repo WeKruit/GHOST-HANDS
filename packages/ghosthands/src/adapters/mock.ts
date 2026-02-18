@@ -1,14 +1,24 @@
 import type {
-  BrowserAutomationAdapter,
+  HitlCapableAdapter,
   AdapterStartOptions,
   AdapterEvent,
   ActionContext,
   ActionResult,
   ObservedElement,
+  ObservationResult,
+  ObservationBlocker,
+  BlockerCategory,
 } from './types';
 import type { Page } from 'playwright';
 import type { ZodSchema } from 'zod';
 import EventEmitter from 'eventemitter3';
+
+export interface MockBlockerConfig {
+  category: BlockerCategory;
+  confidence: number;
+  selector?: string;
+  description: string;
+}
 
 export interface MockAdapterConfig {
   actionCount?: number;
@@ -20,6 +30,10 @@ export interface MockAdapterConfig {
   actionDelayMs?: number;
   /** Start in a disconnected/crashed state (default: false) */
   startDisconnected?: boolean;
+  /** Custom observation results to return from observe() */
+  observationResults?: ObservedElement[];
+  /** Simulated blockers to return from observeWithBlockerDetection() */
+  simulatedBlockers?: MockBlockerConfig[];
 }
 
 /**
@@ -27,14 +41,19 @@ export interface MockAdapterConfig {
  * Does NOT launch a browser -- emits fake events to simulate
  * the same lifecycle as MagnitudeAdapter or StagehandAdapter.
  */
-export class MockAdapter implements BrowserAutomationAdapter {
+export class MockAdapter implements HitlCapableAdapter {
   readonly type = 'mock' as const;
   private emitter = new EventEmitter();
-  private config: Required<MockAdapterConfig>;
+  private config: Required<Omit<MockAdapterConfig, 'observationResults' | 'simulatedBlockers'>> & {
+    observationResults: ObservedElement[] | undefined;
+    simulatedBlockers: MockBlockerConfig[] | undefined;
+  };
   private active = false;
   private _paused = false;
   private _connected = true;
   private _currentUrl = 'about:blank';
+  private _pauseGateResolve: (() => void) | null = null;
+  private _pauseGate: Promise<void> | null = null;
 
   constructor(config: MockAdapterConfig = {}) {
     this.config = {
@@ -46,6 +65,8 @@ export class MockAdapter implements BrowserAutomationAdapter {
       extractResult: config.extractResult ?? { submitted: true },
       actionDelayMs: config.actionDelayMs ?? 1,
       startDisconnected: config.startDisconnected ?? false,
+      observationResults: config.observationResults,
+      simulatedBlockers: config.simulatedBlockers,
     };
   }
 
@@ -98,10 +119,31 @@ export class MockAdapter implements BrowserAutomationAdapter {
   }
 
   async observe(_instruction: string): Promise<ObservedElement[]> {
+    if (this.config.observationResults) {
+      return this.config.observationResults;
+    }
     return [
       { selector: '#mock-input', description: 'Mock input field', method: 'fill', arguments: [] },
       { selector: '#mock-button', description: 'Mock submit button', method: 'click', arguments: [] },
     ];
+  }
+
+  async observeWithBlockerDetection(instruction: string): Promise<ObservationResult> {
+    const elements = await this.observe(instruction);
+    const blockers: ObservationBlocker[] = (this.config.simulatedBlockers ?? []).map((b) => ({
+      category: b.category,
+      confidence: b.confidence,
+      selector: b.selector,
+      description: b.description,
+    }));
+
+    return {
+      elements,
+      blockers,
+      url: this._currentUrl,
+      timestamp: Date.now(),
+      screenshot: Buffer.from('fake-png-data'),
+    };
   }
 
   async navigate(url: string): Promise<void> {
@@ -142,19 +184,46 @@ export class MockAdapter implements BrowserAutomationAdapter {
       unroute: async () => {},
       goto: async () => null,
       url: () => this._currentUrl,
+      evaluate: async (_fn: Function, arg?: any) => {
+        // Support BlockerDetector DOM detection calls:
+        // - Array arg = selector patterns → return empty (no DOM in mock)
+        // - No arg = body text → return empty string
+        if (Array.isArray(arg)) return [];
+        return '';
+      },
     } as unknown as Page;
   }
 
   async pause(): Promise<void> {
+    if (this._paused) return;
     this._paused = true;
+    this._pauseGate = new Promise<void>((resolve) => {
+      this._pauseGateResolve = resolve;
+    });
   }
 
   async resume(): Promise<void> {
+    if (!this._paused) return;
     this._paused = false;
+    if (this._pauseGateResolve) {
+      this._pauseGateResolve();
+      this._pauseGateResolve = null;
+      this._pauseGate = null;
+    }
   }
 
   isPaused(): boolean {
     return this._paused;
+  }
+
+  /**
+   * Await this to block execution while the adapter is paused.
+   * Returns immediately if not paused.
+   */
+  async waitIfPaused(): Promise<void> {
+    if (this._paused && this._pauseGate) {
+      await this._pauseGate;
+    }
   }
 
   isActive(): boolean {

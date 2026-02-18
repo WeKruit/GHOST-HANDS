@@ -1,4 +1,4 @@
-import { describe, expect, test, mock, beforeEach } from 'bun:test';
+import { describe, expect, test, vi, beforeEach } from 'vitest';
 import { CookbookExecutor } from '../../../src/engine/CookbookExecutor';
 import type { ActionManual, ManualStep } from '../../../src/engine/types';
 import type { Page, Locator } from 'playwright';
@@ -7,15 +7,15 @@ import type { Page, Locator } from 'playwright';
 
 function mockLocator(overrides: Partial<Locator> = {}): Locator {
   return {
-    count: mock(() => Promise.resolve(1)),
-    click: mock(() => Promise.resolve()),
-    fill: mock((_v: string) => Promise.resolve()),
-    selectOption: mock((_v: string) => Promise.resolve()),
-    check: mock(() => Promise.resolve()),
-    uncheck: mock(() => Promise.resolve()),
-    hover: mock(() => Promise.resolve()),
-    press: mock((_k: string) => Promise.resolve()),
-    scrollIntoViewIfNeeded: mock(() => Promise.resolve()),
+    count: vi.fn(() => Promise.resolve(1)),
+    click: vi.fn(() => Promise.resolve()),
+    fill: vi.fn((_v: string) => Promise.resolve()),
+    selectOption: vi.fn((_v: string) => Promise.resolve()),
+    check: vi.fn(() => Promise.resolve()),
+    uncheck: vi.fn(() => Promise.resolve()),
+    hover: vi.fn(() => Promise.resolve()),
+    press: vi.fn((_k: string) => Promise.resolve()),
+    scrollIntoViewIfNeeded: vi.fn(() => Promise.resolve()),
     ...overrides,
   } as unknown as Locator;
 }
@@ -23,12 +23,12 @@ function mockLocator(overrides: Partial<Locator> = {}): Locator {
 function createMockPage(locatorOverride?: Locator): Page {
   const loc = locatorOverride ?? mockLocator();
   return {
-    getByTestId: mock((_id: string) => loc),
-    getByRole: mock((_role: string, _opts?: any) => loc),
-    getByLabel: mock((_label: string) => loc),
-    getByText: mock((_text: string) => loc),
-    locator: mock((_sel: string) => loc),
-    goto: mock((_url: string) => Promise.resolve()),
+    getByTestId: vi.fn((_id: string) => loc),
+    getByRole: vi.fn((_role: string, _opts?: any) => loc),
+    getByLabel: vi.fn((_label: string) => loc),
+    getByText: vi.fn((_text: string) => loc),
+    locator: vi.fn((_sel: string) => loc),
+    goto: vi.fn((_url: string) => Promise.resolve()),
   } as unknown as Page;
 }
 
@@ -87,7 +87,7 @@ describe('CookbookExecutor', () => {
 
     test('stops on first failure and reports failed step', async () => {
       const failingLoc = mockLocator({
-        fill: mock(() => Promise.reject(new Error('Element not editable'))),
+        fill: vi.fn(() => Promise.reject(new Error('Element not editable'))),
       });
       const page = createMockPage(failingLoc);
 
@@ -106,7 +106,7 @@ describe('CookbookExecutor', () => {
 
     test('executes steps sorted by order', async () => {
       const callOrder: number[] = [];
-      const clickMock = mock(() => {
+      const clickMock = vi.fn(() => {
         callOrder.push(callOrder.length);
         return Promise.resolve();
       });
@@ -300,7 +300,7 @@ describe('CookbookExecutor', () => {
 
     test('reports navigation failure', async () => {
       const page = createMockPage();
-      (page.goto as any) = mock(() => Promise.reject(new Error('net::ERR_NAME_NOT_RESOLVED')));
+      (page.goto as any) = vi.fn(() => Promise.reject(new Error('net::ERR_NAME_NOT_RESOLVED')));
       const step = makeStep({ action: 'navigate', value: 'https://invalid.example' });
 
       const result = await executor.executeStep(page, step);
@@ -347,7 +347,7 @@ describe('CookbookExecutor', () => {
   describe('element not found', () => {
     test('returns failure when locator resolves to no element', async () => {
       const emptyLoc = mockLocator({
-        count: mock(() => Promise.resolve(0)),
+        count: vi.fn(() => Promise.resolve(0)),
       });
       const page = createMockPage(emptyLoc);
       const step = makeStep({ order: 3, action: 'click', description: 'Submit button' });

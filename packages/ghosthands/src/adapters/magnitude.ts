@@ -4,13 +4,15 @@ import {
 } from 'magnitude-core';
 import type { ModelUsage } from 'magnitude-core';
 import type {
-  BrowserAutomationAdapter,
+  HitlCapableAdapter,
   AdapterStartOptions,
   AdapterEvent,
   ActionContext,
   ActionResult,
   TokenUsage,
   ObservedElement,
+  ObservationResult,
+  ObservationBlocker,
 } from './types';
 import type { StagehandObserver } from '../engine/StagehandObserver';
 import type { ObservedElement as EngineObservedElement } from '../engine/types';
@@ -19,7 +21,7 @@ import type { ZodSchema } from 'zod';
 import EventEmitter from 'eventemitter3';
 import { loadModelConfig, type ResolvedModel } from '../config/models';
 
-export class MagnitudeAdapter implements BrowserAutomationAdapter {
+export class MagnitudeAdapter implements HitlCapableAdapter {
   readonly type = 'magnitude' as const;
   private agent: BrowserAgent | null = null;
   private emitter = new EventEmitter();
@@ -30,6 +32,10 @@ export class MagnitudeAdapter implements BrowserAutomationAdapter {
   private _resolvedImageModel: ResolvedModel | null = null;
   /** Map from full model identifier to resolved pricing for cost lookup */
   private _modelPricingMap = new Map<string, { input: number; output: number }>();
+  /** Promise-based pause gate for HITL */
+  private _paused = false;
+  private _pauseGateResolve: (() => void) | null = null;
+  private _pauseGate: Promise<void> | null = null;
 
   async start(options: AdapterStartOptions): Promise<void> {
     // Resolve model configs to get pricing info for cost calculation
@@ -226,15 +232,99 @@ export class MagnitudeAdapter implements BrowserAutomationAdapter {
   }
 
   async pause(): Promise<void> {
-    this.requireAgent().pause();
+    if (this._paused) return;
+    this._paused = true;
+    this._pauseGate = new Promise<void>((resolve) => {
+      this._pauseGateResolve = resolve;
+    });
+    // Also pause the underlying Magnitude agent if available
+    if (this.agent) {
+      try { this.agent.pause(); } catch { /* best effort */ }
+    }
   }
 
   async resume(): Promise<void> {
-    this.requireAgent().resume();
+    if (!this._paused) return;
+    this._paused = false;
+    // Resume the underlying Magnitude agent if available
+    if (this.agent) {
+      try { this.agent.resume(); } catch { /* best effort */ }
+    }
+    // Resolve the gate to unblock anything awaiting it
+    if (this._pauseGateResolve) {
+      this._pauseGateResolve();
+      this._pauseGateResolve = null;
+      this._pauseGate = null;
+    }
   }
 
   isPaused(): boolean {
-    return this.agent ? this.agent.paused : false;
+    return this._paused;
+  }
+
+  /**
+   * Await this to block execution while the adapter is paused.
+   * Returns immediately if not paused.
+   */
+  async waitIfPaused(): Promise<void> {
+    if (this._paused && this._pauseGate) {
+      await this._pauseGate;
+    }
+  }
+
+  /**
+   * Perform an enriched observation with blocker detection.
+   * Combines observe() results with a screenshot and page URL.
+   */
+  async observeWithBlockerDetection(instruction: string): Promise<ObservationResult> {
+    const url = await this.getCurrentUrl();
+    const elements = await this.observe(instruction) ?? [];
+    const screenshotBuf = await this.screenshot();
+
+    // Classify blockers from observed elements using heuristic patterns
+    const blockers: ObservationBlocker[] = [];
+    for (const el of elements) {
+      const desc = el.description.toLowerCase();
+      const sel = el.selector.toLowerCase();
+
+      if (/captcha|recaptcha|hcaptcha/i.test(desc) || /captcha|recaptcha|hcaptcha/i.test(sel)) {
+        blockers.push({
+          category: 'captcha',
+          confidence: 0.9,
+          selector: el.selector,
+          description: el.description,
+        });
+      } else if (/login|sign.?in|password/i.test(desc) || /login|signin|password/i.test(sel)) {
+        blockers.push({
+          category: 'login',
+          confidence: 0.8,
+          selector: el.selector,
+          description: el.description,
+        });
+      } else if (/two.?factor|2fa|verification code|authenticator/i.test(desc)) {
+        blockers.push({
+          category: '2fa',
+          confidence: 0.85,
+          selector: el.selector,
+          description: el.description,
+        });
+      } else if (/bot.?check|cloudflare|challenge/i.test(desc) || /challenge/i.test(sel)) {
+        blockers.push({
+          category: 'bot_check',
+          confidence: 0.85,
+          selector: el.selector,
+          description: el.description,
+        });
+      }
+    }
+
+    return {
+      elements,
+      blockers,
+      url,
+      timestamp: Date.now(),
+      screenshot: screenshotBuf,
+    };
   }
 
   isActive(): boolean {

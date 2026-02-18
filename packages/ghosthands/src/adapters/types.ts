@@ -154,6 +154,68 @@ export interface ObservedElement {
   arguments: unknown[];
 }
 
+// -- HITL types --
+
+export type BlockerCategory = 'captcha' | 'login' | '2fa' | 'bot_check' | 'unknown';
+
+export interface ObservationBlocker {
+  /** Classification of the blocker */
+  category: BlockerCategory;
+  /** 0-1 confidence that this is actually a blocker */
+  confidence: number;
+  /** CSS selector that matched, if available */
+  selector?: string;
+  /** Human-readable description */
+  description: string;
+}
+
+export interface ObservationResult {
+  /** Observed interactive elements on the page */
+  elements: ObservedElement[];
+  /** Detected blockers (CAPTCHAs, login walls, etc.) */
+  blockers: ObservationBlocker[];
+  /** Current page URL at time of observation */
+  url: string;
+  /** Timestamp of the observation */
+  timestamp: number;
+  /** Screenshot buffer at time of observation, if captured */
+  screenshot?: Buffer;
+}
+
+/**
+ * Adapter interface with required HITL (Human-in-the-Loop) methods.
+ *
+ * Extends BrowserAutomationAdapter by making observe, pause, resume, and
+ * isPaused required rather than optional. All production adapters must
+ * implement this interface to support HITL workflows.
+ */
+export interface HitlCapableAdapter extends BrowserAutomationAdapter {
+  /** Inspect the page for interactive elements and blockers. Always defined. */
+  observe(instruction: string): Promise<ObservedElement[] | undefined>;
+
+  /** Pause execution for human intervention. Always defined. */
+  pause(): Promise<void>;
+
+  /** Resume execution after human intervention. Always defined. */
+  resume(): Promise<void>;
+
+  /** Whether the adapter is currently paused. Always defined. */
+  isPaused(): boolean;
+
+  /** Take a screenshot (already required on base, re-declared for clarity). */
+  screenshot(): Promise<Buffer>;
+
+  /** Get the current page URL (already required on base, re-declared for clarity). */
+  getCurrentUrl(): Promise<string>;
+
+  /**
+   * Perform a full observation that includes structured blocker detection.
+   * This is the HITL-specific enriched observation that returns both elements
+   * and blocker info in a single call.
+   */
+  observeWithBlockerDetection(instruction: string): Promise<ObservationResult>;
+}
+
 export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;

@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, mock } from 'bun:test';
+import { describe, expect, test, beforeEach, vi } from 'vitest';
 import { ValetDeregisterSchema } from '../../../src/api/schemas/valet.js';
 
 // ---------------------------------------------------------------------------
@@ -49,13 +49,13 @@ describe('Worker Registry UPSERT logic', () => {
   function mockPgDirect() {
     queries = [];
     return {
-      query: mock((text: string, values?: any[]) => {
+      query: vi.fn((text: string, values?: any[]) => {
         queries.push({ text, values: values || [] });
         return Promise.resolve({ rows: [], rowCount: 0 });
       }),
-      connect: mock(() => Promise.resolve()),
-      end: mock(() => Promise.resolve()),
-      on: mock(() => {}),
+      connect: vi.fn(() => Promise.resolve()),
+      end: vi.fn(() => Promise.resolve()),
+      on: vi.fn(() => {}),
     };
   }
 
@@ -127,7 +127,7 @@ describe('Worker Registry UPSERT logic', () => {
 
   test('registration failure is non-fatal (logged, not thrown)', async () => {
     const pg = mockPgDirect();
-    pg.query = mock(() => Promise.reject(new Error('relation "gh_worker_registry" does not exist')));
+    pg.query = vi.fn(() => Promise.reject(new Error('relation "gh_worker_registry" does not exist')));
 
     // Simulate the try/catch from main.ts
     let registered = false;
@@ -216,7 +216,7 @@ describe('Worker Registry deregistration', () => {
   test('deregistration query uses correct worker_id parameter', async () => {
     const queries: { text: string; values: any[] }[] = [];
     const pg = {
-      query: mock((text: string, values?: any[]) => {
+      query: vi.fn((text: string, values?: any[]) => {
         queries.push({ text, values: values || [] });
         return Promise.resolve({ rows: [], rowCount: 1 });
       }),

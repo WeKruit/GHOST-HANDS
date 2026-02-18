@@ -14,7 +14,7 @@ import { taskHandlerRegistry } from './taskHandlers/registry.js';
 import { callbackNotifier } from './callbackNotifier.js';
 import type { TaskContext, TaskResult } from './taskHandlers/types.js';
 import { SessionManager } from '../sessions/SessionManager.js';
-import { BlockerDetector, type BlockerResult } from '../detection/BlockerDetector.js';
+import { BlockerDetector, type BlockerResult, type BlockerType } from '../detection/BlockerDetector.js';
 import { ExecutionEngine } from '../engine/ExecutionEngine.js';
 import { ManualStore } from '../engine/ManualStore.js';
 import { CookbookExecutor } from '../engine/CookbookExecutor.js';
@@ -64,6 +64,8 @@ const RETRYABLE_ERRORS = new Set([
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const DEFAULT_HITL_TIMEOUT_SECONDS = 300; // 5 minutes
 const MAX_CRASH_RECOVERIES = 2;
+const BLOCKER_CONFIDENCE_THRESHOLD = 0.6;
+const MAX_POST_RESUME_CHECKS = 3;
 
 /** Error codes that should trigger HITL instead of immediate retry */
 const HITL_ELIGIBLE_ERRORS = new Set([
@@ -170,8 +172,29 @@ export class JobExecutor {
             completed_at: new Date().toISOString(),
             error_code: 'budget_exceeded',
             error_details: { message: preflight.reason },
+            llm_cost_cents: 0,
+            action_count: 0,
+            total_tokens: 0,
           })
           .eq('id', job.id);
+
+        // Report zero cost on preflight failure
+        if (job.callback_url) {
+          callbackNotifier.notifyFromJob({
+            id: job.id,
+            valet_task_id: job.valet_task_id,
+            callback_url: job.callback_url,
+            status: 'failed',
+            worker_id: this.workerId,
+            error_code: 'budget_exceeded',
+            error_details: { message: preflight.reason },
+            llm_cost_cents: 0,
+            action_count: 0,
+            total_tokens: 0,
+          }).catch((err) => {
+            console.warn(`[JobExecutor] Preflight failure callback failed for job ${job.id}:`, err);
+          });
+        }
         return;
       }
 
@@ -216,8 +239,29 @@ export class JobExecutor {
               completed_at: new Date().toISOString(),
               error_code: 'validation_error',
               error_details: { message: msg, errors: validation.errors },
+              llm_cost_cents: 0,
+              action_count: 0,
+              total_tokens: 0,
             })
             .eq('id', job.id);
+
+          // Report zero cost on validation failure
+          if (job.callback_url) {
+            callbackNotifier.notifyFromJob({
+              id: job.id,
+              valet_task_id: job.valet_task_id,
+              callback_url: job.callback_url,
+              status: 'failed',
+              worker_id: this.workerId,
+              error_code: 'validation_error',
+              error_details: { message: msg },
+              llm_cost_cents: 0,
+              action_count: 0,
+              total_tokens: 0,
+            }).catch((err) => {
+              console.warn(`[JobExecutor] Validation failure callback failed for job ${job.id}:`, err);
+            });
+          }
           return;
         }
       }
@@ -260,6 +304,12 @@ export class JobExecutor {
       // 8. Register credentials if available
       if (credentials) {
         adapter.registerCredentials(credentials);
+      }
+
+      // 8.5. Check for blockers after initial page navigation
+      const initiallyBlocked = await this.checkForBlockers(job, adapter);
+      if (initiallyBlocked) {
+        throw new Error('Page blocked after initial navigation and HITL resolution failed');
       }
 
       // 9. Try ExecutionEngine (cookbook replay) before Magnitude handler
@@ -721,19 +771,28 @@ export class JobExecutor {
       // Attempt HITL pause for eligible errors (captcha/login) when adapter is available
       if (adapter && HITL_ELIGIBLE_ERRORS.has(errorCode)) {
         try {
-          const resumed = await this.requestHumanIntervention(job, adapter, {
-            type: errorCode === 'captcha_blocked' ? 'captcha' : 'login',
-            confidence: 0.9,
-            details: errorMessage,
-          });
-          if (resumed) {
-            // Human resolved the blocker -- re-throw is NOT needed; the job
-            // will naturally resume in the adapter and the outer flow continues
-            // on next iteration. But since we are in the catch block the task
-            // already threw, so we cannot "continue" easily. Mark the error as
-            // handled and return so the finally-block stops the adapter normally.
-            console.log(`[JobExecutor] Job ${job.id} resumed after HITL intervention`);
-            return;
+          // Use checkForBlockers for proper detect → pause → verify flow
+          const stillBlocked = await this.checkForBlockers(job, adapter);
+          if (!stillBlocked) {
+            // Blocker resolved (or detection didn't find one after error classification).
+            // Try direct HITL as fallback since the error was classified as captcha/login.
+            const resumed = await this.requestHumanIntervention(job, adapter, {
+              type: errorCode === 'captcha_blocked' ? 'captcha' : 'login',
+              confidence: 0.9,
+              details: errorMessage,
+              source: 'dom',
+            });
+            if (resumed) {
+              const hitlSnapshot = costTracker.getSnapshot();
+              await costService.recordJobCost(job.user_id, job.id, hitlSnapshot).catch((err) => {
+                console.warn(`[JobExecutor] Failed to record HITL partial cost for job ${job.id}:`, err);
+              });
+              console.log(`[JobExecutor] Job ${job.id} resumed after HITL intervention`);
+              return;
+            }
+          } else {
+            // checkForBlockers handled the HITL flow but the blocker couldn't be resolved
+            console.warn(`[JobExecutor] Job ${job.id} blocked and HITL could not resolve`);
           }
         } catch (hitlErr) {
           console.warn(`[JobExecutor] HITL intervention failed for job ${job.id}:`, hitlErr);
@@ -746,12 +805,10 @@ export class JobExecutor {
       const snapshot = costTracker.getSnapshot();
       await this.handleJobError(job, error, snapshot.actionCount, snapshot.inputTokens + snapshot.outputTokens, snapshot.totalCost);
 
-      // Record partial cost even on failure
-      if (snapshot.totalCost > 0) {
-        await costService.recordJobCost(job.user_id, job.id, snapshot).catch((err) => {
-          console.warn(`[JobExecutor] Failed to record partial cost for job ${job.id}:`, err);
-        });
-      }
+      // Always record cost on failure (even zero cost for consistent accounting)
+      await costService.recordJobCost(job.user_id, job.id, snapshot).catch((err) => {
+        console.warn(`[JobExecutor] Failed to record cost for job ${job.id}:`, err);
+      });
 
       // Fire VALET callback on failure too
       if (job.callback_url) {
@@ -844,6 +901,80 @@ export class JobExecutor {
         })
         .eq('id', job.id);
     }
+  }
+
+  // --- Blocker Detection ---
+
+  /**
+   * Check for blockers using the adapter's observe() method and DOM detection.
+   * If a blocker is detected with confidence above threshold:
+   *   - Emits blocker_detected event
+   *   - Triggers HITL flow (pause, screenshot, callback)
+   * Returns true if blocked and paused (job should stop), false if clear.
+   */
+  async checkForBlockers(
+    job: AutomationJob,
+    adapter: BrowserAutomationAdapter,
+  ): Promise<boolean> {
+    let blockerResult: BlockerResult | null = null;
+    try {
+      blockerResult = await this.blockerDetector.detectWithAdapter(adapter);
+    } catch (err) {
+      // Detection failure should not crash the job
+      console.warn(`[JobExecutor] Blocker detection failed for job ${job.id}:`, err);
+      return false;
+    }
+
+    if (!blockerResult || blockerResult.confidence < BLOCKER_CONFIDENCE_THRESHOLD) {
+      return false;
+    }
+
+    // Blocker detected — emit event and trigger HITL
+    await this.logJobEvent(job.id, JOB_EVENT_TYPES.BLOCKER_DETECTED, {
+      blocker_type: blockerResult.type,
+      confidence: blockerResult.confidence,
+      source: blockerResult.source,
+      selector: blockerResult.selector,
+      details: blockerResult.details,
+    });
+
+    const resumed = await this.requestHumanIntervention(job, adapter, blockerResult);
+
+    if (resumed) {
+      // Post-resume verification: re-check for blockers up to MAX_POST_RESUME_CHECKS times
+      for (let attempt = 1; attempt <= MAX_POST_RESUME_CHECKS; attempt++) {
+        let stillBlocked: BlockerResult | null = null;
+        try {
+          stillBlocked = await this.blockerDetector.detectWithAdapter(adapter);
+        } catch {
+          // Detection failed — assume clear
+          break;
+        }
+
+        if (!stillBlocked || stillBlocked.confidence < BLOCKER_CONFIDENCE_THRESHOLD) {
+          // Clear — continue execution
+          return false;
+        }
+
+        console.warn(
+          `[JobExecutor] Job ${job.id} still blocked after resume (attempt ${attempt}/${MAX_POST_RESUME_CHECKS}): ${stillBlocked.type} (${stillBlocked.confidence})`,
+        );
+
+        if (attempt < MAX_POST_RESUME_CHECKS) {
+          // Re-pause and wait for another human intervention
+          const reResumed = await this.requestHumanIntervention(job, adapter, stillBlocked);
+          if (!reResumed) {
+            return true; // Timed out — still blocked
+          }
+        }
+      }
+
+      // Exhausted re-checks but still blocked
+      return true;
+    }
+
+    // HITL timed out — still blocked
+    return true;
   }
 
   // --- HITL (Human-in-the-Loop) ---

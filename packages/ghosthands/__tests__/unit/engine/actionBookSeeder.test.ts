@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, mock } from 'bun:test';
+import { describe, expect, test, beforeEach, vi } from 'vitest';
 import { seedFromActionBook } from '../../../src/engine/actionBookSeeder';
 import { ActionBookConnector } from '../../../src/connectors/actionbookConnector';
 import type { ManualStore, SaveFromActionBookMetadata } from '../../../src/engine/ManualStore';
@@ -35,11 +35,11 @@ function makeActionManual(overrides: Partial<ActionManual> = {}): ActionManual {
 
 function createMockManualStore(overrides: Partial<ManualStore> = {}): ManualStore {
   return {
-    lookup: mock(() => Promise.resolve(null)),
-    saveFromTrace: mock(() => Promise.resolve(makeActionManual())),
-    saveFromActionBook: mock(() => Promise.resolve(makeActionManual())),
-    recordSuccess: mock(() => Promise.resolve()),
-    recordFailure: mock(() => Promise.resolve()),
+    lookup: vi.fn(() => Promise.resolve(null)),
+    saveFromTrace: vi.fn(() => Promise.resolve(makeActionManual())),
+    saveFromActionBook: vi.fn(() => Promise.resolve(makeActionManual())),
+    recordSuccess: vi.fn(() => Promise.resolve()),
+    recordFailure: vi.fn(() => Promise.resolve()),
     ...overrides,
   } as unknown as ManualStore;
 }
@@ -49,7 +49,7 @@ function createMockApiClient(overrides: Partial<{
   getActionById: (id: string) => Promise<ChunkActionDetail>;
 }> = {}): ApiClient {
   return {
-    searchActionsLegacy: mock(
+    searchActionsLegacy: vi.fn(
       overrides.searchActionsLegacy ??
       (() => Promise.resolve({
         success: true,
@@ -65,7 +65,7 @@ function createMockApiClient(overrides: Partial<{
         hasMore: false,
       })),
     ),
-    getActionById: mock(
+    getActionById: vi.fn(
       overrides.getActionById ??
       ((id: string) => Promise.resolve({
         action_id: id,
@@ -94,11 +94,11 @@ function createMockApiClient(overrides: Partial<{
         tokenCount: 100,
       })),
     ),
-    healthCheck: mock(() => Promise.resolve(true)),
-    searchActions: mock(() => Promise.resolve('results')),
-    getActionByAreaId: mock(() => Promise.resolve('details')),
-    listSources: mock(() => Promise.resolve({ success: true, results: [], count: 0 })),
-    searchSources: mock(() => Promise.resolve({ success: true, query: '', results: [], count: 0 })),
+    healthCheck: vi.fn(() => Promise.resolve(true)),
+    searchActions: vi.fn(() => Promise.resolve('results')),
+    getActionByAreaId: vi.fn(() => Promise.resolve('details')),
+    listSources: vi.fn(() => Promise.resolve({ success: true, results: [], count: 0 })),
+    searchSources: vi.fn(() => Promise.resolve({ success: true, query: '', results: [], count: 0 })),
   } as unknown as ApiClient;
 }
 

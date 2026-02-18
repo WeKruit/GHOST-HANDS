@@ -1,4 +1,4 @@
-import { describe, expect, test, mock } from 'bun:test';
+import { describe, expect, test, vi } from 'vitest';
 import { LocatorResolver } from '../../../src/engine/LocatorResolver';
 import type { Page, Locator } from 'playwright';
 import type { LocatorDescriptor } from '../../../src/engine/types';
@@ -7,14 +7,14 @@ import type { LocatorDescriptor } from '../../../src/engine/types';
 
 /** Create a mock Locator that resolves to `count` elements. */
 function mockLocator(count: number): Locator {
-  return { count: mock(() => Promise.resolve(count)) } as unknown as Locator;
+  return { count: vi.fn(() => Promise.resolve(count)) } as unknown as Locator;
 }
 
 /** Create a Locator whose count() throws on first call (stale), then succeeds. */
 function staleLocator(eventualCount: number): Locator {
   let calls = 0;
   return {
-    count: mock(() => {
+    count: vi.fn(() => {
       calls++;
       if (calls === 1) return Promise.reject(new Error('Element is not attached to the DOM'));
       return Promise.resolve(eventualCount);
@@ -24,7 +24,7 @@ function staleLocator(eventualCount: number): Locator {
 
 /** Create a Locator whose count() always throws. */
 function errorLocator(message: string): Locator {
-  return { count: mock(() => Promise.reject(new Error(message))) } as unknown as Locator;
+  return { count: vi.fn(() => Promise.reject(new Error(message))) } as unknown as Locator;
 }
 
 /**
@@ -39,11 +39,11 @@ function createMockPage(locatorMap: {
   locator?: Record<string, Locator>;
 }): Page {
   return {
-    getByTestId: mock((_testId: string) => locatorMap.getByTestId ?? mockLocator(0)),
-    getByRole: mock((_role: string, _opts?: any) => locatorMap.getByRole ?? mockLocator(0)),
-    getByLabel: mock((_label: string) => locatorMap.getByLabel ?? mockLocator(0)),
-    getByText: mock((_text: string) => locatorMap.getByText ?? mockLocator(0)),
-    locator: mock((selector: string) => locatorMap.locator?.[selector] ?? mockLocator(0)),
+    getByTestId: vi.fn((_testId: string) => locatorMap.getByTestId ?? mockLocator(0)),
+    getByRole: vi.fn((_role: string, _opts?: any) => locatorMap.getByRole ?? mockLocator(0)),
+    getByLabel: vi.fn((_label: string) => locatorMap.getByLabel ?? mockLocator(0)),
+    getByText: vi.fn((_text: string) => locatorMap.getByText ?? mockLocator(0)),
+    locator: vi.fn((selector: string) => locatorMap.locator?.[selector] ?? mockLocator(0)),
   } as unknown as Page;
 }
 

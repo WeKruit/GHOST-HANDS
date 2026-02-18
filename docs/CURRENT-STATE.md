@@ -508,7 +508,26 @@ Monthly budgets by tier:
 
 **Adapter types:** `'magnitude'` | `'stagehand'` | `'actionbook'` | `'hybrid'` | `'mock'`
 
-### 5.2 MagnitudeAdapter
+### 5.2 HitlCapableAdapter Interface
+
+`adapters/types.ts` -- Extends `BrowserAutomationAdapter` for adapters that support human-in-the-loop workflows. Makes HITL methods required (not optional) and adds blocker detection.
+
+**Required HITL methods:**
+- `observe(instruction)` -- Discover interactive elements (required, not optional)
+- `pause()` / `resume()` / `isPaused()` -- Promise-based pause gate for HITL takeover
+- `screenshot()` -- Capture current page state (required for HITL evidence)
+- `getCurrentUrl()` -- Report current URL (required for HITL context)
+- `observeWithBlockerDetection(instruction)` -- Run observation and classify any blockers found
+
+**Key types:**
+- `BlockerCategory`: `'captcha'` | `'login'` | `'2fa'` | `'bot_check'` | `'rate_limit'` | `'visual_verification'`
+- `ObservationBlocker`: `{ type: BlockerCategory, confidence: number, description: string, source: DetectionSource }`
+- `DetectionSource`: `'dom'` | `'observe'` | `'combined'`
+- `ObservationResult`: `{ elements: ObservedElement[], blockers: ObservationBlocker[] }`
+
+Both MagnitudeAdapter and MockAdapter implement `HitlCapableAdapter`.
+
+### 5.3 MagnitudeAdapter
 
 `adapters/magnitude.ts` -- Wraps `magnitude-core`'s `BrowserAgent`.
 
@@ -517,16 +536,20 @@ Monthly budgets by tier:
 - StagehandObserver integration for `observe()` support
 - Browser connection health checking via `isConnected()`
 - Event emission: `tokensUsed` (with calculated cost), `thought` (LLM reasoning), `actionDone`
+- **Promise-based pause gate**: `pause()` creates a pending Promise; `resume()` resolves it. Adapter methods await the gate before proceeding, enabling safe HITL takeover.
+- **`observeWithBlockerDetection()`**: Runs `observe()`, then classifies returned elements against regex heuristics to identify blockers (captcha, login walls, 2FA, bot checks, rate limits, visual verification).
 
-### 5.3 MockAdapter
+### 5.4 MockAdapter
 
-`adapters/mock.ts` -- For unit tests.
+`adapters/mock.ts` -- For unit tests. Implements `HitlCapableAdapter`.
 
 - Configurable: action count, tokens per action, failure simulation
 - `simulateCrash()` method for testing crash recovery
+- `simulatedBlockers` config for HITL/blocker detection testing
+- Promise-based pause/resume gate (same pattern as MagnitudeAdapter)
 - No browser required
 
-### 5.4 Factory
+### 5.5 Factory
 
 `adapters/index.ts` -- `createAdapter(type: AdapterType)` factory.
 
@@ -607,7 +630,27 @@ Per-platform limits: 200/hour, 2000/day (shared across all users for a given ATS
 - Returns 429 with `Retry-After` header when exceeded
 - Service-to-service calls (via `X-GH-Service-Key`) bypass rate limits
 
-### 7.3 Domain Lockdown
+### 7.3 Blocker Detection (HITL)
+
+`detection/BlockerDetector.ts` -- Detects CAPTCHAs, login walls, 2FA prompts, and other blockers that require human intervention.
+
+**Dual-mode detection:**
+
+1. **DOM detection** (`detectBlocker(page)`): Fast first pass using `page.evaluate()`. Checks CSS selectors and text patterns for known blocker indicators (reCAPTCHA iframes, hCaptcha divs, Cloudflare challenge wrappers, login form markers, 2FA prompts, rate limit messages).
+
+2. **Adapter-assisted detection** (`detectWithAdapter(adapter)`): Uses `HitlCapableAdapter` for deeper analysis. Runs DOM detection first; if confidence < 0.8, also runs `adapter.observe()` and classifies the observed elements via regex heuristics. Combines both sources for higher confidence.
+
+**Blocker types:** `captcha`, `login`, `2fa`, `bot_check`, `rate_limit`, `visual_verification`
+
+**Detection sources:** `dom` (selector/text match), `observe` (LLM-based observation), `combined` (both sources agree)
+
+**Integration with JobExecutor:**
+- `checkForBlockers()` runs after initial navigation and on HITL-eligible errors
+- Uses `BLOCKER_CONFIDENCE_THRESHOLD = 0.6` to trigger HITL flow
+- On detection: emits `blocker_detected` event, pauses adapter, updates job status to `waiting_for_human`, sends callback to VALET
+- Post-resume verification loop (`MAX_POST_RESUME_CHECKS = 3`) confirms blocker is resolved before continuing
+
+### 7.4 Domain Lockdown
 
 `security/domainLockdown.ts` -- `DomainLockdown` class.
 
@@ -616,7 +659,7 @@ Per-platform limits: 200/hour, 2000/day (shared across all users for a given ATS
 - Enforced via Playwright `page.route()` interception
 - Prevents LLM agent from navigating to attacker-controlled URLs
 
-### 7.4 Input Sanitization
+### 7.5 Input Sanitization
 
 `security/sanitize.ts`
 
@@ -750,26 +793,33 @@ Staging and production deploys notify VALET via webhook:
 
 ## 12. Known Issues and Gaps
 
+### Recently Resolved
+
+- **HITL blocker detection**: BlockerDetector now supports dual-mode detection (DOM + LLM observe). JobExecutor calls `checkForBlockers()` after navigation and on HITL-eligible errors, pausing the adapter and notifying VALET when blockers are found. See Section 7.3.
+- **Cost on failure**: All JobExecutor exit paths (preflight failure, validation failure, error catch) now capture cost snapshots and include them in callbacks. Preflight/validation failures report zero cost. See Section 5.3 (MagnitudeAdapter) and `workers/callbackNotifier.ts`.
+- **HitlCapableAdapter interface**: Unified adapter interface for HITL-capable adapters. Both MagnitudeAdapter and MockAdapter implement it. See Section 5.2.
+
 ### Implemented but Incomplete
 
 1. **Stagehand/Actionbook/Hybrid adapters**: Factory throws "not yet implemented". Only Magnitude and Mock are functional.
 2. **Worker registry counters**: `jobs_completed` and `jobs_failed` columns exist in gh_worker_registry but are not incremented by the current worker code (heartbeat only updates status and current_job_id).
 3. **Rate limit persistence**: Rate limiting is in-memory only. Limits reset on API server restart. No Redis or shared store.
 4. **Scheduled jobs**: The `scheduled_at` column and index exist, but JobPoller's `gh_pickup_next_job()` function already handles `scheduled_at <= NOW()`. The API does not validate or expose scheduling in a first-class way.
+5. **HITL takeover UI**: Backend detection and pause/resume are implemented, but VALET frontend for viewing the blocked page and resolving blockers is not yet built.
 
 ### Known Limitations
 
-5. **Single database connection for LISTEN/NOTIFY**: The worker uses a direct Postgres connection (`pg.Client`). Transaction-mode poolers (pgbouncer port 6543) do not support LISTEN/NOTIFY; the 5s fallback poll handles this, but with added latency.
-6. **Cost tracking race condition**: `CostControlService.recordJobCost()` reads then updates `gh_user_usage` without a database-level atomic increment. Concurrent jobs for the same user could result in slightly inaccurate monthly totals.
-7. **No E2E test automation in CI**: The CI pipeline runs unit and integration tests, but E2E tests (`bun run test:e2e`) are not wired into the GitHub Actions workflow.
-8. **Alert rules are hardcoded**: `AlertManager` has fixed thresholds. No configuration file or database-driven alert rules.
+6. **Single database connection for LISTEN/NOTIFY**: The worker uses a direct Postgres connection (`pg.Client`). Transaction-mode poolers (pgbouncer port 6543) do not support LISTEN/NOTIFY; the 5s fallback poll handles this, but with added latency.
+7. **Cost tracking race condition**: `CostControlService.recordJobCost()` reads then updates `gh_user_usage` without a database-level atomic increment. Concurrent jobs for the same user could result in slightly inaccurate monthly totals.
+8. **No E2E test automation in CI**: The CI pipeline runs unit and integration tests, but E2E tests (`bun run test:e2e`) are not wired into the GitHub Actions workflow.
+9. **Alert rules are hardcoded**: `AlertManager` has fixed thresholds. No configuration file or database-driven alert rules.
 
 ### Not Yet Implemented
 
-9. **Supabase Storage for screenshots**: `screenshot_urls` column exists but screenshot upload to Supabase Storage is referenced in JobExecutor but may not be fully wired.
-10. **Key rotation automation**: CredentialEncryption supports key rotation via `GH_CREDENTIAL_PREV_KEYS`, but there is no automated rotation script or re-encryption migration tool.
-11. **Worker auto-scaling**: Workers must be manually started. No auto-scaling based on queue depth.
-12. **Observability dashboard**: `/monitoring/dashboard` aggregates data but there is no dedicated UI consuming it.
+10. **Supabase Storage for screenshots**: `screenshot_urls` column exists but screenshot upload to Supabase Storage is referenced in JobExecutor but may not be fully wired.
+11. **Key rotation automation**: CredentialEncryption supports key rotation via `GH_CREDENTIAL_PREV_KEYS`, but there is no automated rotation script or re-encryption migration tool.
+12. **Worker auto-scaling**: Workers must be manually started. No auto-scaling based on queue depth.
+13. **Observability dashboard**: `/monitoring/dashboard` aggregates data but there is no dedicated UI consuming it.
 
 ---
 

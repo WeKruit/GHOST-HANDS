@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach } from 'bun:test';
+import { describe, expect, test, beforeEach } from 'vitest';
 import { CostTracker, BudgetExceededError } from '../../../src/workers/costControl';
 import { ProgressTracker } from '../../../src/workers/progressTracker';
 

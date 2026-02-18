@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test } from 'vitest';
 import { ValetApplySchema, ValetTaskSchema } from '../../../src/api/schemas/valet.js';
 
 // ---------------------------------------------------------------------------

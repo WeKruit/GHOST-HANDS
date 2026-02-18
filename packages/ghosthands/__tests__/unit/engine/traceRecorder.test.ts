@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, mock } from 'bun:test';
+import { describe, expect, test, beforeEach, vi } from 'vitest';
 import { TraceRecorder, type TraceRecorderOptions } from '../../../src/engine/TraceRecorder';
 import type { ManualStep, LocatorDescriptor } from '../../../src/engine/types';
 import type { BrowserAutomationAdapter, AdapterEvent } from '../../../src/adapters/types';
@@ -13,33 +13,33 @@ function createMockAdapter() {
   let evaluateCallIndex = 0;
 
   const mockPage = {
-    evaluate: mock(async (fn: any, ...args: any[]) => {
+    evaluate: vi.fn(async (fn: any, ...args: any[]) => {
       const result = evaluateResults[evaluateCallIndex];
       evaluateCallIndex++;
       return result ?? null;
     }),
-    url: mock(() => 'https://boards.greenhouse.io/company/jobs/12345'),
+    url: vi.fn(() => 'https://boards.greenhouse.io/company/jobs/12345'),
   } as unknown as Page;
 
   const adapter = {
     type: 'magnitude' as const,
-    on: mock((event: AdapterEvent, handler: (...args: any[]) => void) => {
+    on: vi.fn((event: AdapterEvent, handler: (...args: any[]) => void) => {
       emitter.on(event, handler);
     }),
-    off: mock((event: AdapterEvent, handler: (...args: any[]) => void) => {
+    off: vi.fn((event: AdapterEvent, handler: (...args: any[]) => void) => {
       emitter.off(event, handler);
     }),
     get page() { return mockPage; },
     // Stubs for interface completeness
-    start: mock(async () => {}),
-    stop: mock(async () => {}),
-    isActive: mock(() => true),
-    act: mock(async () => ({ success: true, message: '', durationMs: 0 })),
-    extract: mock(async () => ({} as any)),
-    navigate: mock(async () => {}),
-    getCurrentUrl: mock(async () => 'https://example.com'),
-    screenshot: mock(async () => Buffer.from('')),
-    registerCredentials: mock(() => {}),
+    start: vi.fn(async () => {}),
+    stop: vi.fn(async () => {}),
+    isActive: vi.fn(() => true),
+    act: vi.fn(async () => ({ success: true, message: '', durationMs: 0 })),
+    extract: vi.fn(async () => ({} as any)),
+    navigate: vi.fn(async () => {}),
+    getCurrentUrl: vi.fn(async () => 'https://example.com'),
+    screenshot: vi.fn(async () => Buffer.from('')),
+    registerCredentials: vi.fn(() => {}),
   } as unknown as BrowserAutomationAdapter;
 
   return {
