@@ -58,7 +58,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libwayland-client0 \
     fonts-noto-color-emoji \
     fonts-liberation \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# BAML runtime uses vendored OpenSSL (native-tls-vendored) via openssl-probe.
+# Explicitly set cert paths so the statically-linked OpenSSL finds system CAs.
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_DIR=/etc/ssl/certs
 
 WORKDIR /app
 
