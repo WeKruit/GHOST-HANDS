@@ -2,14 +2,14 @@
 
 **Last Updated:** 2026-02-18
 
-This document maps the entire CI/CD pipeline from git push to running code on EC2, marking each step's status.
+This document maps the entire CI/CD pipeline from git push to running code on EC2.
 
 ---
 
 ## Pipeline Overview
 
 ```
-git push main
+git push (main or staging)
   │
   ▼
 ┌─────────────────────────────────────────────────────────────────┐
@@ -18,69 +18,88 @@ git push main
 │     ├── test-unit (bun run test:unit)                           │
 │     └── test-integration (needs Supabase secrets)               │
 └────────────────────────┬────────────────────────────────────────┘
-                         │ (main branch push only)
+                         │ (push to main or staging)
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  ✅ Docker Build & Push to ECR                                  │
-│     docker build --build-arg COMMIT_SHA=... → ECR:$sha + :latest│
-│     Needs: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION │
-│            ECR_REPOSITORY                                       │
+│     staging: ECR:staging-$sha                                   │
+│     main:    ECR:$sha + :latest                                 │
 └────────────────────────┬────────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  ⚠️  Deploy Webhook to VALET                                    │
+│  ✅ Deploy Webhook to VALET                                     │
 │     POST $VALET_DEPLOY_WEBHOOK_URL                              │
 │     Event: ghosthands.deploy_ready                              │
 │     HMAC-SHA256 signed with VALET_DEPLOY_WEBHOOK_SECRET         │
-│                                                                 │
-│     Status: CI sends it, but VALET handler is NOT yet built.    │
-│     Webhook silently fails (non-blocking), logged as warning.   │
+│     Handler: VALET /api/v1/webhooks/ghosthands/deploy           │
 └────────────────────────┬────────────────────────────────────────┘
-                         │ (intended: VALET → EC2 deploy trigger)
+                         │ (if auto-deploy enabled)
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  ❌ EC2 Container Restart — THE BROKEN LINK                     │
-│                                                                 │
-│     Current state: NOTHING triggers EC2 to pull the new image.  │
-│     - No VALET DeployService (handler doesn't exist)            │
-│     - No watchtower or image polling agent on EC2               │
-│     - No cron job or systemd timer                              │
-│                                                                 │
-│     The deploy.sh script EXISTS and is complete, but            │
-│     nobody calls it automatically.                              │
-│                                                                 │
-│     WORKAROUND: Manual deploy via scripts/deploy-ec2.sh         │
-│       ./scripts/deploy-ec2.sh              # Full pipeline      │
-│       ./scripts/deploy-ec2.sh --deploy-only # Just EC2 restart  │
-│       ./scripts/deploy-ec2.sh --verify      # Check version     │
+│  ✅ VALET DeployService → Rolling Deploy                        │
+│     1. Creates deploy record + notifies admins                  │
+│     2. Checks config:auto_deploy:<environment> in Redis         │
+│     3. If enabled: finds running sandboxes for environment      │
+│     4. For each sandbox:                                        │
+│        a. GET http://<ip>:8000/health → check activeWorkers     │
+│        b. Wait for drain (poll until activeWorkers == 0)        │
+│        c. POST http://<ip>:8000/deploy { image_tag }            │
+│     5. Updates deploy status (deploying → completed/failed)     │
 └────────────────────────┬────────────────────────────────────────┘
-                         │ (when deploy.sh runs)
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  ✅ EC2 Deploy Server (port 8000)                               │
+│     scripts/deploy-server.ts — Bun HTTP server                  │
+│     1. Verifies X-Deploy-Secret header                          │
+│     2. Runs scripts/deploy.sh deploy <image_tag>                │
+│        → ECR login, docker compose pull, graceful drain,        │
+│          compose up, health check, rollback on failure           │
+│     3. Returns { success, message } to VALET                    │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  ✅ Worker Start & Registration                                 │
-│     1. ECR login + docker compose pull                          │
-│     2. Graceful drain (HTTP POST /worker/drain → wait for idle) │
-│     3. docker compose up -d (API + Worker)                      │
-│     4. Restart any targeted workers                             │
-│     5. Health check (30 attempts, 2s interval)                  │
-│     6. Worker UPSERT into gh_worker_registry                    │
-│     7. Heartbeat every 30s                                      │
-│     8. SIGTERM → drain → deregister → exit                      │
+│     1. Worker UPSERT into gh_worker_registry (3 retries)        │
+│     2. Heartbeat every 30s                                      │
+│     3. HTTP status server on GH_WORKER_PORT (default 3101)      │
+│     4. SIGTERM → drain → deregister → exit                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
+## Branch / Environment Mapping
+
+| Branch | Image Tag | Deploy Target | Auto-Deploy |
+|--------|-----------|---------------|-------------|
+| `staging` | `staging-<sha>` | Staging sandboxes | Via VALET admin config |
+| `main` | `<sha>` + `latest` | Staging first, then production | Via VALET admin config |
+
+**Flow for main branch:**
+1. CI builds image tagged `<sha>` + `latest`
+2. `deploy-staging` job sends webhook with `environment: staging`
+3. After staging succeeds, `deploy-production` sends webhook with `environment: production`
+
+**Flow for staging branch:**
+1. CI builds image tagged `staging-<sha>` (no `:latest`)
+2. `deploy-staging` job sends webhook with `environment: staging`
+3. No production deploy
+
+---
+
 ## Step-by-Step Details
 
-### Step 1: GitHub Actions CI ✅
+### Step 1: GitHub Actions CI
 
 **File:** `.github/workflows/ci.yml`
 
 | Trigger | Jobs |
 |---------|------|
 | Push to main | typecheck, test-unit, test-integration, docker, deploy-staging, deploy-production |
+| Push to staging | typecheck, test-unit, test-integration, docker, deploy-staging |
 | PR to main | typecheck, test-unit, test-integration |
 
 **Secrets required:**
@@ -88,7 +107,8 @@ git push main
 | Secret | Used by |
 |--------|---------|
 | `SUPABASE_URL` | test-integration |
-| `SUPABASE_SERVICE_KEY` | test-integration |
+| `SUPABASE_SECRET_KEY` | test-integration |
+| `SUPABASE_PUBLISHABLE_KEY` | test-integration |
 | `SUPABASE_DIRECT_URL` | test-integration |
 | `GH_SERVICE_SECRET` | test-integration |
 | `GH_ENCRYPTION_KEY` | test-integration |
@@ -100,7 +120,7 @@ git push main
 | `VALET_DEPLOY_WEBHOOK_URL` | deploy-staging, deploy-production |
 | `VALET_DEPLOY_WEBHOOK_SECRET` | deploy-staging, deploy-production |
 
-### Step 2: Docker Build ✅
+### Step 2: Docker Build
 
 **File:** `Dockerfile`
 
@@ -112,26 +132,29 @@ Multi-stage build:
 Build args baked into image:
 - `COMMIT_SHA` — Git commit SHA
 - `BUILD_TIME` — ISO 8601 build timestamp
-- `IMAGE_TAG` — ECR image tag
+- `IMAGE_TAG` — ECR image tag (includes `staging-` prefix for staging)
 
 Same image, different CMD:
 - API: `bun packages/ghosthands/src/api/server.ts` (port 3100)
 - Worker: `bun packages/ghosthands/src/workers/main.ts` (port 3101)
+- Deploy Server: `bun scripts/deploy-server.ts` (port 8000)
 
-### Step 3: ECR Push ✅
+### Step 3: ECR Push
 
-Tags: `$ECR_REGISTRY/$ECR_REPOSITORY:$COMMIT_SHA` + `:latest`
+- Staging: `$ECR_REGISTRY/$ECR_REPOSITORY:staging-$SHA`
+- Main: `$ECR_REGISTRY/$ECR_REPOSITORY:$SHA` + `:latest`
 
-### Step 4: Deploy Webhook ⚠️
+### Step 4: Deploy Webhook
 
 CI sends HMAC-signed POST to VALET with payload:
 ```json
 {
   "event": "ghosthands.deploy_ready",
-  "image": "ECR_REGISTRY/ECR_REPOSITORY:SHA",
-  "image_tag": "SHA",
+  "image": "ECR_REGISTRY/ECR_REPOSITORY:TAG",
+  "image_tag": "staging-SHA or SHA",
   "commit_sha": "...",
   "commit_message": "...",
+  "branch": "staging|main",
   "environment": "staging|production",
   "run_url": "https://github.com/.../actions/runs/..."
 }
@@ -142,28 +165,82 @@ Headers:
 - `X-GH-Event: deploy_ready`
 - `X-GH-Environment: staging|production`
 
-**Current gap:** VALET does not have a webhook handler for this event. The webhook returns a non-2xx status and CI logs a warning. Non-blocking.
+**VALET handler:** `POST /api/v1/webhooks/ghosthands/deploy` — verifies HMAC signature, creates deploy record, checks auto-deploy config.
 
-### Step 5: EC2 Container Restart ❌
+### Step 5: VALET DeployService
 
-**This is the broken link.** There is no automation to pull the new image on EC2.
+**File (VALET):** `apps/api/src/modules/sandboxes/deploy.service.ts`
 
-**`scripts/deploy.sh`** is the intended mechanism — it's comprehensive and handles:
-- ECR login + docker compose pull
-- Graceful worker drain (HTTP + SIGTERM fallback)
-- Compose up with new image
-- Targeted worker restart
-- Health check with retry
-- Rollback on failure
+Rolling deploy across sandboxes:
+1. `createFromWebhook()` creates deploy record in Redis
+2. Checks `config:auto_deploy:<environment>` Redis key
+3. If enabled, `triggerDeploy()` starts rolling deploy:
+   - Finds sandboxes with matching environment + `ec2Status: running`
+   - For each: drain → deploy → verify
+4. Admins can manually trigger via `POST /api/v1/admin/deploys/:id/trigger`
 
-But nothing invokes it automatically.
+**Drain logic:**
+- `GET http://<ip>:8000/health` → reads `activeWorkers` count
+- Polls every 5s until `activeWorkers === 0` (5-minute timeout)
 
-### Step 6: Worker Registration ✅
+**Deploy call:**
+- `POST http://<ip>:8000/deploy` with `{ image_tag }` body
+- 60-second timeout
+- Expects `{ success: boolean, message: string }` response
+
+### Step 6: EC2 Deploy Server
+
+**File:** `scripts/deploy-server.ts`
+
+Lightweight Bun HTTP server running on port 8000 on each EC2 sandbox.
+
+| Endpoint | Auth | Purpose |
+|----------|------|---------|
+| `GET /health` | None | Returns `activeWorkers` count for drain logic |
+| `GET /version` | None | Returns current image version info |
+| `POST /deploy` | `X-Deploy-Secret` | Triggers `deploy.sh deploy <image_tag>` |
+| `POST /drain` | `X-Deploy-Secret` | Triggers `deploy.sh drain` |
+
+**Auth:** `X-Deploy-Secret` header must match `GH_DEPLOY_SECRET` env var (timing-safe comparison).
+
+**Required env var:** `GH_DEPLOY_SECRET` — shared secret between VALET and EC2 deploy servers.
+
+### Step 7: Worker Registration
 
 On startup (`workers/main.ts`):
 1. UPSERT into `gh_worker_registry` (worker_id, status=active, ec2 metadata)
-2. Heartbeat every 30s (updates last_heartbeat, current_job_id, status)
-3. On SIGTERM: drain active jobs → mark offline → exit
+2. 3-retry registration with exponential backoff (2s, 4s)
+3. Verification query after insert
+4. Heartbeat every 30s (updates last_heartbeat, current_job_id, status)
+5. On SIGTERM: drain active jobs → mark offline → exit
+
+---
+
+## Enabling Auto-Deploy
+
+Auto-deploy is controlled per-environment via VALET admin API:
+
+```bash
+# Check current config
+curl -H "Authorization: Bearer $ADMIN_JWT" \
+  https://api.valet.app/api/v1/admin/deploys/config
+
+# Enable auto-deploy for staging
+curl -X PUT -H "Authorization: Bearer $ADMIN_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"staging": true}' \
+  https://api.valet.app/api/v1/admin/deploys/config
+
+# Enable auto-deploy for production
+curl -X PUT -H "Authorization: Bearer $ADMIN_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"prod": true}' \
+  https://api.valet.app/api/v1/admin/deploys/config
+```
+
+**Recommended setup:**
+- Staging: auto-deploy enabled (pushes to `staging` branch auto-deploy)
+- Production: auto-deploy disabled (manual trigger via admin UI after staging verification)
 
 ---
 
@@ -172,7 +249,10 @@ On startup (`workers/main.ts`):
 After deploying, check what code is running:
 
 ```bash
-# Via SSH
+# Via deploy server (port 8000)
+curl -s http://<sandbox_ip>:8000/version | jq
+
+# Via GH API (port 3100, localhost only)
 ssh ec2-user@HOST "curl -s http://localhost:3100/health/version" | jq
 
 # Via deploy script
@@ -183,8 +263,9 @@ Returns:
 ```json
 {
   "service": "ghosthands",
+  "environment": "staging",
   "commit_sha": "a44c35d...",
-  "image_tag": "a44c35d...",
+  "image_tag": "staging-a44c35d...",
   "build_time": "2026-02-18T12:00:00Z",
   "uptime_ms": 12345,
   "node_env": "production"
@@ -195,7 +276,7 @@ Returns:
 
 ## Manual Deploy Workflow
 
-Until the VALET deploy webhook handler is built, use the manual deploy script:
+For manual deploys (or when auto-deploy is disabled):
 
 ```bash
 # Full pipeline: build → push ECR → SSH deploy → verify
@@ -216,52 +297,91 @@ Configuration: copy `.env.deploy.example` to `.env.deploy`.
 
 ---
 
-## What Needs to Be Built
+## Docker Compose Files
 
-### Priority 1: VALET Deploy Webhook Handler
-Build `POST /api/v1/webhooks/ghosthands/deploy` in VALET that:
-1. Validates HMAC-SHA256 signature
-2. Records deployment in database
-3. SSHs to EC2 (or calls an EC2 endpoint) to run `scripts/deploy.sh deploy <tag>`
-4. Reports success/failure back
+| File | Environment | Deploy Server | Notes |
+|------|-------------|---------------|-------|
+| `docker-compose.prod.yml` | Production | Port 8000 | `GH_ENVIRONMENT=production` (default) |
+| `docker-compose.staging.yml` | Staging | Port 8000 | `GH_ENVIRONMENT=staging` |
 
-### Priority 2: EC2 Deploy Agent (Alternative)
-Instead of VALET triggering deploys, run a lightweight agent on EC2 that:
-- Polls ECR for new `:latest` tag every 60s
-- Compares with currently running image digest
-- If different, runs `scripts/deploy.sh deploy latest`
+Both include: API (3100), Worker (3101), Deploy Server (8000).
 
-This is simpler than SSH-based deploys and doesn't require VALET to have EC2 access.
+`scripts/deploy.sh` auto-detects compose file based on `GH_ENVIRONMENT` env var.
 
 ---
 
-## Docker Compose (Production)
+## EC2 Environment Setup
 
-**File:** `docker-compose.prod.yml`
+Required env vars in `.env` on each EC2 sandbox:
 
-- References `${ECR_IMAGE}` for both API and Worker
-- API on port 3100 (localhost only), Worker on port 3101
-- Health checks, restart policies, log rotation
-- Memory limits: API 512MB, Worker 2GB
-- `MAX_CONCURRENT_JOBS=1` (single-task-per-worker)
+| Variable | Purpose |
+|----------|---------|
+| `SUPABASE_URL` | Supabase API URL |
+| `SUPABASE_SECRET_KEY` | Service key for DB access |
+| `DATABASE_URL` | Postgres connection string |
+| `GH_SERVICE_SECRET` | API authentication |
+| `GH_ENCRYPTION_KEY` | AES-256-GCM for credentials |
+| `GH_DEPLOY_SECRET` | Deploy server auth (shared with VALET) |
+| `GH_ENVIRONMENT` | `staging` or `production` |
+| `ECR_REGISTRY` | ECR registry URL |
+| `ECR_REPOSITORY` | ECR repository name |
+| `AWS_REGION` | AWS region for ECR login |
+| `GH_WORKER_ID` | Worker identity for registry |
+| `EC2_INSTANCE_ID` | EC2 instance metadata |
+| `EC2_IP` | EC2 public IP |
 
 ---
 
-## GitHub Actions Secrets Checklist
+## VALET-Side Setup
 
-| Secret | Purpose | Set? |
-|--------|---------|------|
-| `AWS_ACCESS_KEY_ID` | ECR push | Check in GitHub Settings |
-| `AWS_SECRET_ACCESS_KEY` | ECR push | Check in GitHub Settings |
-| `AWS_REGION` | ECR push | Check in GitHub Settings |
-| `ECR_REPOSITORY` | ECR push | Check in GitHub Settings |
-| `ECR_REGISTRY` | Deploy webhook payload | Check in GitHub Settings |
-| `SUPABASE_URL` | Integration tests | Check in GitHub Settings |
-| `SUPABASE_SERVICE_KEY` | Integration tests | Check in GitHub Settings |
-| `SUPABASE_DIRECT_URL` | Integration tests | Check in GitHub Settings |
-| `GH_SERVICE_SECRET` | Integration tests | Check in GitHub Settings |
-| `GH_ENCRYPTION_KEY` | Integration tests | Check in GitHub Settings |
-| `VALET_DEPLOY_WEBHOOK_URL` | Deploy notification | Optional until handler exists |
-| `VALET_DEPLOY_WEBHOOK_SECRET` | Deploy notification | Optional until handler exists |
+### GitHub Secrets
 
-**To check:** Go to GitHub → Settings → Secrets and variables → Actions
+| Secret | Purpose |
+|--------|---------|
+| `AWS_ACCESS_KEY_ID` | ECR push |
+| `AWS_SECRET_ACCESS_KEY` | ECR push |
+| `AWS_REGION` | ECR push |
+| `ECR_REPOSITORY` | ECR push |
+| `ECR_REGISTRY` | Deploy webhook payload |
+| `VALET_DEPLOY_WEBHOOK_URL` | Where CI sends deploy notifications |
+| `VALET_DEPLOY_WEBHOOK_SECRET` | HMAC signing for webhook |
+| `SUPABASE_URL` | Integration tests |
+| `SUPABASE_SECRET_KEY` | Integration tests |
+| `SUPABASE_PUBLISHABLE_KEY` | Integration tests |
+| `SUPABASE_DIRECT_URL` | Integration tests |
+| `GH_SERVICE_SECRET` | Integration tests |
+| `GH_ENCRYPTION_KEY` | Integration tests |
+
+### VALET Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `VALET_DEPLOY_WEBHOOK_SECRET` | Verify HMAC signature from GH CI |
+| `GH_DEPLOY_SECRET` | Auth header sent to EC2 deploy server |
+
+**Note:** `GH_DEPLOY_SECRET` must be set in VALET's environment so the DeployService can authenticate with EC2 deploy servers. VALET's `deployToSandbox()` method needs to include `X-Deploy-Secret` header. This is a pending change on the VALET side.
+
+---
+
+## Troubleshooting
+
+### Image pushed to ECR but not deployed
+1. Check if VALET webhook URL is configured: `VALET_DEPLOY_WEBHOOK_URL`
+2. Check CI logs for webhook response status
+3. Check VALET API logs for webhook handler errors
+4. Check if auto-deploy is enabled: `GET /api/v1/admin/deploys/config`
+5. Manually trigger: `POST /api/v1/admin/deploys/:id/trigger`
+
+### Deploy server returning 401
+- Verify `GH_DEPLOY_SECRET` matches between VALET and EC2
+- Check `X-Deploy-Secret` header is being sent
+
+### Worker not registering after deploy
+- Check `gh_worker_registry` table
+- Verify `SUPABASE_SECRET_KEY` and `DATABASE_URL` in `.env`
+- Check worker container logs: `docker compose -f docker-compose.prod.yml logs worker`
+
+### Health check failing
+- API must be healthy before worker starts (depends_on condition)
+- Check port 3100 is accessible: `curl http://localhost:3100/health`
+- Check deploy server port 8000: `curl http://localhost:8000/health`
