@@ -155,7 +155,7 @@ start_targeted_worker() {
     -e GH_WORKER_ID="$worker_id" \
     -e GH_WORKER_PORT="$status_port" \
     -e DISPLAY=:99 \
-    -e MAX_CONCURRENT_JOBS="${MAX_CONCURRENT_JOBS:-2}" \
+    -e MAX_CONCURRENT_JOBS="${MAX_CONCURRENT_JOBS:-1}" \
     -e SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     -e SSL_CERT_DIR=/etc/ssl/certs \
     -p "127.0.0.1:${status_port}:${status_port}" \

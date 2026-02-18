@@ -48,6 +48,14 @@ export const JOB_EVENT_TYPES = {
   HITL_RESUMED: 'hitl_resumed',
   HITL_TIMEOUT: 'hitl_timeout',
 
+  // Credential injection
+  CREDENTIAL_INJECTION_ATTEMPTED: 'credential_injection_attempted',
+  CREDENTIAL_INJECTION_SUCCEEDED: 'credential_injection_succeeded',
+  CREDENTIAL_INJECTION_FAILED: 'credential_injection_failed',
+
+  // URL monitoring
+  URL_CHANGE_DETECTED: 'url_change_detected',
+
   // Browser crash
   BROWSER_CRASH_DETECTED: 'browser_crash_detected',
   BROWSER_CRASH_RECOVERED: 'browser_crash_recovered',
