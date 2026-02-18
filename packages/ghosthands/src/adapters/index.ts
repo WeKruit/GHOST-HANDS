@@ -11,6 +11,7 @@ export type {
   ObservationResult,
   ObservationBlocker,
   BlockerCategory,
+  ResolutionContext,
   LLMConfig,
   BrowserLaunchOptions,
 } from './types';

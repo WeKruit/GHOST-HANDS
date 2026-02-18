@@ -80,7 +80,7 @@ export interface BrowserAutomationAdapter {
   pause?(): Promise<void>;
 
   /** Resume a paused automation agent */
-  resume?(): Promise<void>;
+  resume?(context?: ResolutionContext): Promise<void>;
 
   /** Whether the agent is currently paused */
   isPaused?(): boolean;
@@ -156,6 +156,14 @@ export interface ObservedElement {
 
 // -- HITL types --
 
+/** Context passed to adapter.resume() when the human provides credentials or codes */
+export interface ResolutionContext {
+  /** How the blocker was resolved */
+  resolutionType: 'manual' | 'code_entry' | 'credentials' | 'skip';
+  /** Credential data (2FA code, login creds, etc.) — NEVER log this */
+  resolutionData?: Record<string, unknown>;
+}
+
 export type BlockerCategory = 'captcha' | 'login' | '2fa' | 'bot_check' | 'rate_limited' | 'verification' | 'unknown';
 
 export interface ObservationBlocker {
@@ -197,7 +205,7 @@ export interface HitlCapableAdapter extends BrowserAutomationAdapter {
   pause(): Promise<void>;
 
   /** Resume execution after human intervention. Always defined. */
-  resume(): Promise<void>;
+  resume(context?: ResolutionContext): Promise<void>;
 
   /** Whether the adapter is currently paused. Always defined. */
   isPaused(): boolean;

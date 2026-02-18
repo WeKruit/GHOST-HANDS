@@ -13,6 +13,7 @@ import type {
   ObservedElement,
   ObservationResult,
   ObservationBlocker,
+  ResolutionContext,
 } from './types';
 import type { StagehandObserver } from '../engine/StagehandObserver';
 import type { ObservedElement as EngineObservedElement } from '../engine/types';
@@ -36,6 +37,7 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
   private _paused = false;
   private _pauseGateResolve: (() => void) | null = null;
   private _pauseGate: Promise<void> | null = null;
+  private _lastResolutionContext: ResolutionContext | null = null;
 
   async start(options: AdapterStartOptions): Promise<void> {
     // Resolve model configs to get pricing info for cost calculation
@@ -243,8 +245,12 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
     }
   }
 
-  async resume(): Promise<void> {
+  async resume(context?: ResolutionContext): Promise<void> {
     if (!this._paused) return;
+
+    // Store context for potential inspection by callers
+    this._lastResolutionContext = context ?? null;
+
     this._paused = false;
     // Resume the underlying Magnitude agent if available
     if (this.agent) {
@@ -256,6 +262,10 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
       this._pauseGateResolve = null;
       this._pauseGate = null;
     }
+  }
+
+  get lastResolutionContext(): ResolutionContext | null {
+    return this._lastResolutionContext;
   }
 
   isPaused(): boolean {

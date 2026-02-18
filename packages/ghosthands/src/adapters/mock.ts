@@ -8,6 +8,7 @@ import type {
   ObservationResult,
   ObservationBlocker,
   BlockerCategory,
+  ResolutionContext,
 } from './types';
 import type { Page } from 'playwright';
 import type { ZodSchema } from 'zod';
@@ -54,6 +55,7 @@ export class MockAdapter implements HitlCapableAdapter {
   private _currentUrl = 'about:blank';
   private _pauseGateResolve: (() => void) | null = null;
   private _pauseGate: Promise<void> | null = null;
+  private _lastResolutionContext: ResolutionContext | null = null;
 
   constructor(config: MockAdapterConfig = {}) {
     this.config = {
@@ -202,14 +204,19 @@ export class MockAdapter implements HitlCapableAdapter {
     });
   }
 
-  async resume(): Promise<void> {
+  async resume(context?: ResolutionContext): Promise<void> {
     if (!this._paused) return;
+    this._lastResolutionContext = context ?? null;
     this._paused = false;
     if (this._pauseGateResolve) {
       this._pauseGateResolve();
       this._pauseGateResolve = null;
       this._pauseGate = null;
     }
+  }
+
+  get lastResolutionContext(): ResolutionContext | null {
+    return this._lastResolutionContext;
   }
 
   isPaused(): boolean {
