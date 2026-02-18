@@ -156,7 +156,7 @@ export interface ObservedElement {
 
 // -- HITL types --
 
-export type BlockerCategory = 'captcha' | 'login' | '2fa' | 'bot_check' | 'unknown';
+export type BlockerCategory = 'captcha' | 'login' | '2fa' | 'bot_check' | 'rate_limited' | 'verification' | 'unknown';
 
 export interface ObservationBlocker {
   /** Classification of the blocker */

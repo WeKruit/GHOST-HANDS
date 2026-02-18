@@ -19,6 +19,8 @@ import { ExecutionEngine } from '../engine/ExecutionEngine.js';
 import { ManualStore } from '../engine/ManualStore.js';
 import { CookbookExecutor } from '../engine/CookbookExecutor.js';
 import { TraceRecorder } from '../engine/TraceRecorder.js';
+import { StagehandObserver } from '../engine/StagehandObserver.js';
+import type { MagnitudeAdapter } from '../adapters/magnitude.js';
 import { ThoughtThrottle, JOB_EVENT_TYPES } from '../events/JobEventTypes.js';
 
 // Re-export AutomationJob from the canonical location for backward compat
@@ -133,6 +135,7 @@ export class JobExecutor {
   async execute(job: AutomationJob): Promise<void> {
     const heartbeat = this.startHeartbeat(job.id);
     let adapter: BrowserAutomationAdapter | null = null;
+    let observer: StagehandObserver | undefined;
 
     // Initialize cost tracker with budget limits
     const qualityPreset = resolveQualityPreset(job.input_data, job.metadata);
@@ -301,13 +304,39 @@ export class JobExecutor {
         ...(storedSession ? { storageState: storedSession } : {}),
       });
 
+      // 7a. Attach StagehandObserver for enriched blocker detection (optional)
+      if (adapter.type === 'magnitude' && 'setObserver' in adapter) {
+        try {
+          const cdpUrl = (adapter.page?.context()?.browser() as any)?.wsEndpoint?.();
+          if (cdpUrl) {
+            const observerModel = llmSetup.imageLlm
+              ? `${llmSetup.imageLlm.provider}/${llmSetup.imageLlm.options.model}`
+              : `${llmSetup.llm.provider}/${llmSetup.llm.options.model}`;
+            observer = new StagehandObserver({
+              cdpUrl,
+              model: observerModel,
+              verbose: 0,
+              logEvent: (eventType: string, metadata?: Record<string, any>) =>
+                this.logJobEvent(job.id, eventType, metadata || {}),
+            });
+            await observer.init();
+            (adapter as MagnitudeAdapter).setObserver(observer);
+            await this.logJobEvent(job.id, 'observer_attached', { model: observerModel });
+          }
+        } catch (err) {
+          // Observer is optional — don't fail the job if it can't attach
+          console.warn(`[JobExecutor] StagehandObserver init failed for job ${job.id}:`, err);
+          observer = undefined;
+        }
+      }
+
       // 8. Register credentials if available
       if (credentials) {
         adapter.registerCredentials(credentials);
       }
 
       // 8.5. Check for blockers after initial page navigation
-      const initiallyBlocked = await this.checkForBlockers(job, adapter);
+      const initiallyBlocked = await this.checkForBlockers(job, adapter, costTracker);
       if (initiallyBlocked) {
         throw new Error('Page blocked after initial navigation and HITL resolution failed');
       }
@@ -551,6 +580,34 @@ export class JobExecutor {
 
           adapter = recovered;
 
+          // Re-attach StagehandObserver to the new adapter after crash recovery
+          if (observer) {
+            try { await observer.stop(); } catch { /* old observer cleanup */ }
+            observer = undefined;
+          }
+          if (adapter.type === 'magnitude' && 'setObserver' in adapter) {
+            try {
+              const cdpUrl = (adapter.page?.context()?.browser() as any)?.wsEndpoint?.();
+              if (cdpUrl) {
+                const observerModel = llmSetup.imageLlm
+                  ? `${llmSetup.imageLlm.provider}/${llmSetup.imageLlm.options.model}`
+                  : `${llmSetup.llm.provider}/${llmSetup.llm.options.model}`;
+                observer = new StagehandObserver({
+                  cdpUrl,
+                  model: observerModel,
+                  verbose: 0,
+                  logEvent: (eventType: string, metadata?: Record<string, any>) =>
+                    this.logJobEvent(job.id, eventType, metadata || {}),
+                });
+                await observer.init();
+                (adapter as MagnitudeAdapter).setObserver(observer);
+              }
+            } catch (err) {
+              console.warn(`[JobExecutor] StagehandObserver re-attach failed after crash recovery for job ${job.id}:`, err);
+              observer = undefined;
+            }
+          }
+
           // Re-wire event handlers on the new adapter
           thoughtThrottle.reset();
           adapter.on('thought', (thought: string) => {
@@ -772,7 +829,7 @@ export class JobExecutor {
       if (adapter && HITL_ELIGIBLE_ERRORS.has(errorCode)) {
         try {
           // Use checkForBlockers for proper detect → pause → verify flow
-          const stillBlocked = await this.checkForBlockers(job, adapter);
+          const stillBlocked = await this.checkForBlockers(job, adapter, costTracker);
           if (!stillBlocked) {
             // Blocker resolved (or detection didn't find one after error classification).
             // Try direct HITL as fallback since the error was classified as captcha/login.
@@ -781,7 +838,7 @@ export class JobExecutor {
               confidence: 0.9,
               details: errorMessage,
               source: 'dom',
-            });
+            }, costTracker);
             if (resumed) {
               const hitlSnapshot = costTracker.getSnapshot();
               await costService.recordJobCost(job.user_id, job.id, hitlSnapshot).catch((err) => {
@@ -829,6 +886,9 @@ export class JobExecutor {
       }
     } finally {
       clearInterval(heartbeat);
+      if (observer) {
+        try { await observer.stop(); } catch { /* best-effort cleanup */ }
+      }
       if (adapter) {
         try {
           await adapter.stop();
@@ -915,6 +975,7 @@ export class JobExecutor {
   async checkForBlockers(
     job: AutomationJob,
     adapter: BrowserAutomationAdapter,
+    costTracker?: CostTracker,
   ): Promise<boolean> {
     let blockerResult: BlockerResult | null = null;
     try {
@@ -938,7 +999,7 @@ export class JobExecutor {
       details: blockerResult.details,
     });
 
-    const resumed = await this.requestHumanIntervention(job, adapter, blockerResult);
+    const resumed = await this.requestHumanIntervention(job, adapter, blockerResult, costTracker);
 
     if (resumed) {
       // Post-resume verification: re-check for blockers up to MAX_POST_RESUME_CHECKS times
@@ -962,7 +1023,7 @@ export class JobExecutor {
 
         if (attempt < MAX_POST_RESUME_CHECKS) {
           // Re-pause and wait for another human intervention
-          const reResumed = await this.requestHumanIntervention(job, adapter, stillBlocked);
+          const reResumed = await this.requestHumanIntervention(job, adapter, stillBlocked, costTracker);
           if (!reResumed) {
             return true; // Timed out — still blocked
           }
@@ -987,6 +1048,7 @@ export class JobExecutor {
     job: AutomationJob,
     adapter: BrowserAutomationAdapter,
     blockerResult: BlockerResult,
+    costTracker?: CostTracker,
   ): Promise<boolean> {
     const timeoutSeconds = this.hitlTimeoutSeconds;
 
@@ -1036,6 +1098,7 @@ export class JobExecutor {
 
     // 4. Notify VALET via callback
     if (job.callback_url) {
+      const costSnapshot = costTracker?.getSnapshot();
       callbackNotifier.notifyHumanNeeded(
         job.id,
         job.callback_url,
@@ -1044,9 +1107,22 @@ export class JobExecutor {
           screenshot_url: screenshotUrl,
           page_url: pageUrl,
           timeout_seconds: timeoutSeconds,
+          description: blockerResult.details,
+          metadata: {
+            blocker_confidence: blockerResult.confidence,
+            captcha_type: blockerResult.type === 'captcha'
+              ? (blockerResult.selector?.match(/recaptcha|hcaptcha|funcaptcha|turnstile/i)?.[0]?.toLowerCase() ?? 'unknown')
+              : undefined,
+            detection_method: blockerResult.source,
+          },
         },
         job.valet_task_id,
         this.workerId,
+        costSnapshot ? {
+          total_cost_usd: costSnapshot.totalCost,
+          action_count: costSnapshot.actionCount,
+          total_tokens: costSnapshot.inputTokens + costSnapshot.outputTokens,
+        } : undefined,
       ).catch((err) => {
         console.warn(`[JobExecutor] HITL callback failed for job ${job.id}:`, err);
       });

@@ -117,7 +117,7 @@ export type PageObservation = z.infer<typeof PageObservationSchema>;
 // ── BlockerDetection ─────────────────────────────────────────────────────
 // Mirrors Sprint 1 BlockerDetector types with added selectors array
 
-export const BlockerTypeSchema = z.enum(['captcha', 'login', '2fa', 'bot_check']);
+export const BlockerTypeSchema = z.enum(['captcha', 'login', '2fa', 'bot_check', 'rate_limited', 'verification']);
 export type BlockerType = z.infer<typeof BlockerTypeSchema>;
 
 export const BlockerDetectionSchema = z.object({

@@ -11,6 +11,12 @@ export interface InteractionInfo {
   screenshot_url?: string;
   page_url?: string;
   timeout_seconds?: number;
+  description?: string;
+  metadata?: {
+    blocker_confidence?: number;
+    captcha_type?: string;
+    detection_method?: string;
+  };
 }
 
 export interface CallbackPayload {
@@ -169,6 +175,7 @@ export class CallbackNotifier {
     interactionData: InteractionInfo,
     valetTaskId?: string | null,
     workerId?: string,
+    cost?: { total_cost_usd: number; action_count: number; total_tokens: number },
   ): Promise<boolean> {
     const payload: CallbackPayload = {
       job_id: jobId,
@@ -176,6 +183,7 @@ export class CallbackNotifier {
       status: 'needs_human',
       ...(workerId && { worker_id: workerId }),
       interaction: interactionData,
+      ...(cost && { cost }),
       completed_at: new Date().toISOString(),
     };
     return this.sendWithRetry(callbackUrl, payload);
