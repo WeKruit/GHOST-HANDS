@@ -616,9 +616,10 @@ describe('LLM provider connectivity', () => {
   // when in a Docker/CI environment.
 
   describe('SSL environment (Docker/CI)', () => {
+    // Only require SSL_CERT_FILE/DIR when actually inside a Docker container.
+    // GitHub Actions sets CI=true but does NOT set these env vars (bare Ubuntu runner).
     const isDocker =
       !!process.env.DOCKER ||
-      !!process.env.CI ||
       fs.existsSync('/.dockerenv');
 
     const envTestFn = isDocker ? test : test.skip;
