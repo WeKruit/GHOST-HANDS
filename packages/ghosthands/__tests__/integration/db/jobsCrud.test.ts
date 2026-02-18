@@ -259,7 +259,8 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
       {
         user_id: TEST_USER_ID,
         domain,
-        session_data_encrypted: 'encrypted-v1',
+        session_data: 'encrypted-v1',
+        encryption_key_id: 'test-key-v1',
         expires_at: new Date(Date.now() + 3600_000).toISOString(),
       },
       { onConflict: 'user_id,domain' },
@@ -271,7 +272,8 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
       {
         user_id: TEST_USER_ID,
         domain,
-        session_data_encrypted: 'encrypted-v2',
+        session_data: 'encrypted-v2',
+        encryption_key_id: 'test-key-v1',
         expires_at: new Date(Date.now() + 7200_000).toISOString(),
       },
       { onConflict: 'user_id,domain' },
@@ -286,7 +288,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
       .eq('domain', domain);
 
     expect(data).toHaveLength(1);
-    expect(data![0].session_data_encrypted).toBe('encrypted-v2');
+    expect(data![0].session_data).toBe('encrypted-v2');
 
     // Cleanup
     await supabase
