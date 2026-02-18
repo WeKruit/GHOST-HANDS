@@ -339,11 +339,22 @@ All under `/api/v1/gh/valet`. Designed for VALET-specific workflows.
 |--------|------|-------------|
 | POST | `/valet/apply` | Rich application request (profile, resume, QA answers) |
 | POST | `/valet/task` | Generic task request |
-| POST | `/valet/resume/:jobId` | Resume a paused HITL job |
+| POST | `/valet/resume/:jobId` | Resume a paused HITL job (supports credential injection) |
 | GET | `/valet/status/:jobId` | VALET-compatible status (cost breakdown, manual info, interactions) |
 | GET | `/valet/sessions/:userId` | List user's browser sessions |
 | DELETE | `/valet/sessions/:userId` | Clear user's browser sessions |
 | POST | `/valet/workers/deregister` | Deregister a worker and cancel its active jobs |
+
+**POST /valet/resume/:jobId** accepts:
+```json
+{
+  "resolved_by": "human",              // "human" (default) | "system"
+  "resolution_notes": "Solved captcha", // optional, max 500 chars
+  "resolution_type": "code_entry",      // optional: "manual" | "code_entry" | "credentials" | "skip"
+  "resolution_data": { "code": "123456" } // optional: arbitrary JSON (credentials, 2FA codes)
+}
+```
+When `resolution_type` or `resolution_data` is present, the route stores them in `interaction_data` JSONB before firing NOTIFY. The JobExecutor reads and clears this data on wake-up.
 
 **POST /valet/apply** is the primary entry point from VALET. It accepts a full user profile (name, email, phone, LinkedIn, work history, education, skills), resume reference, QA overrides, quality preset, and callback URL. It transforms this into the internal job format and inserts into gh_automation_jobs.
 
@@ -419,9 +430,20 @@ Properties exposed: `activeJobCount`, `isRunning`, `currentJobId`
 **HITL (Human-in-the-Loop):**
 - Triggered by `captcha_blocked` or `login_required` errors
 - Sets job status to `paused`, sends `needs_human` callback to VALET
-- Waits for NOTIFY on `gh_hitl_resume_<jobId>` channel (or polls every 10s)
+- Waits for NOTIFY on `gh_job_resume` channel (or polls every 3s via Supabase)
 - Default timeout: 300s (5 minutes, configurable via `hitlTimeoutSeconds`)
 - VALET resumes via `POST /valet/resume/:jobId`
+
+**Credential injection (HITL resume):**
+- When VALET sends `POST /valet/resume/:jobId` with `resolution_type` and `resolution_data`, the route stores these in `interaction_data` JSONB before firing `pg_notify('gh_job_resume', jobId)`
+- On wake, `waitForResume()` returns a `ResumeResult` with `{ resumed, resolutionType, resolutionData }`
+- `readAndClearResolutionData()` reads resolution fields from DB and immediately clears them (SECURITY: credentials/codes must not persist)
+- Based on `resolutionType`:
+  - `code_entry`: `injectCode()` fills the first visible 2FA/OTP input using Playwright selectors (autocomplete, name, inputmode patterns) and clicks submit
+  - `credentials`: `injectCredentials()` fills username/email + password fields via Playwright selectors and clicks submit
+  - `manual` / `skip`: No injection, adapter resumes directly
+- After injection, `adapter.resume(context)` is called with a `ResolutionContext` so adapters can track the resolution type
+- Post-resume verification re-checks for blockers up to 3 times (`MAX_POST_RESUME_CHECKS`)
 
 **Progress tracking:**
 - `ProgressTracker` tracks 11 lifecycle steps: queued, initializing, navigating, analyzing, filling, uploading, answering, reviewing, submitting, extracting, completed
@@ -502,7 +524,7 @@ Monthly budgets by tier:
 - `screenshot()` -- Returns Buffer
 - `getBrowserSession()` -- Export Playwright storageState as JSON
 - `registerCredentials(creds)` -- Register sensitive values to exclude from LLM
-- `pause()` / `resume()` / `isPaused()` -- HITL support
+- `pause()` / `resume(context?: ResolutionContext)` / `isPaused()` -- HITL support. `ResolutionContext` carries `resolutionType` and `resolutionData` from the human resolver.
 
 **Events:** `actionStarted`, `actionDone`, `tokensUsed`, `thought`, `error`, `progress`
 
@@ -795,6 +817,7 @@ Staging and production deploys notify VALET via webhook:
 
 ### Recently Resolved
 
+- **HITL credential injection**: Resume endpoint (`POST /valet/resume/:jobId`) now accepts `resolution_type` (`code_entry`, `credentials`, `manual`, `skip`) and `resolution_data` (arbitrary JSON). JobExecutor reads resolution data on wake-up, injects 2FA codes or credentials via Playwright selectors, passes `ResolutionContext` to adapter.resume(), and clears sensitive data from DB immediately. See Section 4.3.
 - **HITL blocker detection**: BlockerDetector now supports dual-mode detection (DOM + LLM observe). JobExecutor calls `checkForBlockers()` after navigation and on HITL-eligible errors, pausing the adapter and notifying VALET when blockers are found. See Section 7.3.
 - **Cost on failure**: All JobExecutor exit paths (preflight failure, validation failure, error catch) now capture cost snapshots and include them in callbacks. Preflight/validation failures report zero cost. See Section 5.3 (MagnitudeAdapter) and `workers/callbackNotifier.ts`.
 - **HitlCapableAdapter interface**: Unified adapter interface for HITL-capable adapters. Both MagnitudeAdapter and MockAdapter implement it. See Section 5.2.

@@ -26,8 +26,16 @@ import { ThoughtThrottle, JOB_EVENT_TYPES } from '../events/JobEventTypes.js';
 // Re-export AutomationJob from the canonical location for backward compat
 export type { AutomationJob } from './taskHandlers/types.js';
 import type { AutomationJob } from './taskHandlers/types.js';
+import type { ResolutionContext } from '../adapters/types.js';
 
 // --- Types ---
+
+/** Result of waiting for a paused job to be resumed, including any resolution data. */
+interface ResumeResult {
+  resumed: boolean;
+  resolutionType?: 'manual' | 'code_entry' | 'credentials' | 'skip';
+  resolutionData?: Record<string, unknown>;
+}
 
 export interface JobExecutorOptions {
   supabase: SupabaseClient;
@@ -1129,12 +1137,24 @@ export class JobExecutor {
     }
 
     // 5. Wait for NOTIFY or timeout
-    const resumed = await this.waitForResume(job.id, timeoutSeconds);
+    const result = await this.waitForResume(job.id, timeoutSeconds);
 
-    if (resumed) {
-      // 6. Resume the adapter
+    if (result.resumed) {
+      // 6. Inject credentials/code BEFORE resuming the adapter
+      if (result.resolutionType === 'code_entry' && result.resolutionData?.code) {
+        await this.injectCode(adapter, result.resolutionData.code as string);
+      } else if (result.resolutionType === 'credentials' && result.resolutionData) {
+        await this.injectCredentials(adapter, result.resolutionData);
+      }
+      // 'manual' and 'skip' — no injection needed
+
+      // 7. Resume the adapter (unblock the pause gate)
       if (adapter.resume) {
-        await adapter.resume();
+        const ctx: ResolutionContext = {
+          resolutionType: result.resolutionType || 'manual',
+          resolutionData: result.resolutionData,
+        };
+        await adapter.resume(ctx);
       }
       await this.supabase
         .from('gh_automation_jobs')
@@ -1145,7 +1165,10 @@ export class JobExecutor {
         })
         .eq('id', job.id);
 
-      await this.logJobEvent(job.id, 'hitl_resumed', {});
+      await this.logJobEvent(job.id, 'hitl_resumed', {
+        resolution_type: result.resolutionType || 'manual',
+        // SECURITY: Never log resolutionData — it may contain passwords/codes
+      });
 
       if (job.callback_url) {
         callbackNotifier.notifyResumed(job.id, job.callback_url, job.valet_task_id, this.workerId).catch((err) => {
@@ -1155,7 +1178,7 @@ export class JobExecutor {
       return true;
     }
 
-    // 7. Timeout — fail the job
+    // 8. Timeout — fail the job
     await this.logJobEvent(job.id, 'hitl_timeout', { timeout_seconds: timeoutSeconds });
     await this.supabase
       .from('gh_automation_jobs')
@@ -1176,8 +1199,9 @@ export class JobExecutor {
   /**
    * Listen on the Postgres NOTIFY channel for a resume signal.
    * Falls back to polling if no pg pool is available.
+   * Returns ResumeResult with resolution type/data from the DB.
    */
-  private async waitForResume(jobId: string, timeoutSeconds: number): Promise<boolean> {
+  private async waitForResume(jobId: string, timeoutSeconds: number): Promise<ResumeResult> {
     if (this.pgPool) {
       return this.waitForResumeViaPg(jobId, timeoutSeconds);
     }
@@ -1185,12 +1209,12 @@ export class JobExecutor {
     return this.waitForResumeViaPolling(jobId, timeoutSeconds);
   }
 
-  private async waitForResumeViaPg(jobId: string, timeoutSeconds: number): Promise<boolean> {
+  private async waitForResumeViaPg(jobId: string, timeoutSeconds: number): Promise<ResumeResult> {
     const client = await this.pgPool!.connect();
     try {
       await client.query('LISTEN gh_job_resume');
 
-      return await new Promise<boolean>((resolve) => {
+      const notified = await new Promise<boolean>((resolve) => {
         const timeout = setTimeout(() => {
           cleanup();
           resolve(false);
@@ -1212,6 +1236,13 @@ export class JobExecutor {
 
         client.on('notification', onNotification);
       });
+
+      if (!notified) {
+        return { resumed: false };
+      }
+
+      // Read resolution data from DB
+      return this.readAndClearResolutionData(jobId);
     } catch (err) {
       client.release();
       console.warn(`[JobExecutor] PG LISTEN failed for job ${jobId}, falling back to polling:`, err);
@@ -1219,7 +1250,7 @@ export class JobExecutor {
     }
   }
 
-  private async waitForResumeViaPolling(jobId: string, timeoutSeconds: number): Promise<boolean> {
+  private async waitForResumeViaPolling(jobId: string, timeoutSeconds: number): Promise<ResumeResult> {
     const pollIntervalMs = 3000;
     const deadline = Date.now() + timeoutSeconds * 1000;
 
@@ -1231,13 +1262,70 @@ export class JobExecutor {
         .single();
 
       if (data?.status === 'running') {
-        return true;
+        // Read resolution data from DB
+        return this.readAndClearResolutionData(jobId);
       }
 
       await new Promise((r) => setTimeout(r, pollIntervalMs));
     }
 
-    return false;
+    return { resumed: false };
+  }
+
+  /**
+   * Read resolution data from DB and clear it immediately for security.
+   * Resolution data may contain passwords, 2FA codes, etc.
+   * Uses pgPool if available, falls back to Supabase.
+   */
+  private async readAndClearResolutionData(jobId: string): Promise<ResumeResult> {
+    try {
+      if (this.pgPool) {
+        const { rows } = await this.pgPool.query(
+          `SELECT interaction_data FROM gh_automation_jobs WHERE id = $1::UUID`,
+          [jobId],
+        );
+        const interactionData = rows[0]?.interaction_data as Record<string, any> | null;
+        const resolutionType = interactionData?.resolution_type || 'manual';
+        const resolutionData = interactionData?.resolution_data || undefined;
+
+        // SECURITY: Clear resolution data from DB immediately after reading.
+        // This data may contain passwords, 2FA codes, or other credentials.
+        await this.pgPool.query(`
+          UPDATE gh_automation_jobs
+          SET interaction_data = interaction_data - 'resolution_type' - 'resolution_data' - 'resolved_by' - 'resolved_at'
+          WHERE id = $1::UUID
+        `, [jobId]);
+
+        return { resumed: true, resolutionType, resolutionData };
+      }
+
+      // Fallback: use Supabase client
+      const { data } = await this.supabase
+        .from('gh_automation_jobs')
+        .select('interaction_data')
+        .eq('id', jobId)
+        .single();
+
+      const interactionData = data?.interaction_data as Record<string, any> | null;
+      const resolutionType = interactionData?.resolution_type || 'manual';
+      const resolutionData = interactionData?.resolution_data || undefined;
+
+      // SECURITY: Clear resolution data via Supabase
+      // Build cleaned interaction_data without resolution fields
+      if (interactionData) {
+        const { resolution_type, resolution_data, resolved_by, resolved_at, ...cleaned } = interactionData;
+        await this.supabase
+          .from('gh_automation_jobs')
+          .update({ interaction_data: cleaned })
+          .eq('id', jobId);
+      }
+
+      return { resumed: true, resolutionType, resolutionData };
+    } catch (err) {
+      console.warn(`[JobExecutor] Failed to read resolution data for job ${jobId}:`, err);
+      // Still resumed, just without resolution data
+      return { resumed: true, resolutionType: 'manual' };
+    }
   }
 
   // --- Heartbeat ---
@@ -1388,6 +1476,123 @@ export class JobExecutor {
       .getPublicUrl(path);
 
     return data.publicUrl;
+  }
+
+  // --- Credential / Code Injection ---
+
+  /**
+   * Inject a 2FA/verification code into the current page via Playwright.
+   * Deterministic field-filling — bypasses the AI agent for reliability.
+   * SECURITY: Never log the code value.
+   */
+  private async injectCode(adapter: BrowserAutomationAdapter, code: string): Promise<void> {
+    const page = adapter.page;
+    if (!page) return;
+
+    const selectors = [
+      'input[autocomplete="one-time-code"]',
+      'input[name*="code" i]',
+      'input[name*="otp" i]',
+      'input[name*="totp" i]',
+      'input[name*="verification" i]',
+      'input[name*="token" i]',
+      'input[name*="2fa" i]',
+      'input[name*="mfa" i]',
+      'input[type="tel"][maxlength="6"]',
+      'input[type="number"][maxlength="6"]',
+      'input[inputmode="numeric"]',
+    ];
+
+    for (const selector of selectors) {
+      try {
+        const el = await page.$(selector);
+        if (el && await el.isVisible()) {
+          await el.fill(code);
+          console.log(`[JobExecutor] Injected 2FA code via selector: ${selector}`);
+          // Try to submit
+          const submitBtn = await page.$('button[type="submit"], input[type="submit"], button:has-text("Verify"), button:has-text("Submit"), button:has-text("Continue")');
+          if (submitBtn && await submitBtn.isVisible()) {
+            await submitBtn.click();
+          }
+          return;
+        }
+      } catch {
+        // Selector may not be valid on this page, try next
+      }
+    }
+    console.warn('[JobExecutor] Could not find 2FA code input field — resuming without injection');
+  }
+
+  /**
+   * Inject login credentials into the current page via Playwright.
+   * SECURITY: Never log credential values — only log the selector matched.
+   */
+  private async injectCredentials(
+    adapter: BrowserAutomationAdapter,
+    data: Record<string, unknown>,
+  ): Promise<void> {
+    const page = adapter.page;
+    if (!page) return;
+
+    const username = (data.username || data.email) as string | undefined;
+    const password = data.password as string | undefined;
+
+    if (!username && !password) return;
+
+    if (username) {
+      const usernameSelectors = [
+        'input[autocomplete="username"]',
+        'input[autocomplete="email"]',
+        'input[name="username"]',
+        'input[name="email"]',
+        'input[name="login"]',
+        'input[name="userId"]',
+        'input[name="loginId"]',
+        'input[type="email"]',
+        'input[id*="username" i]',
+        'input[id*="email" i]',
+        'input[id*="login" i]',
+      ];
+      for (const sel of usernameSelectors) {
+        try {
+          const el = await page.$(sel);
+          if (el && await el.isVisible()) {
+            await el.fill(username);
+            console.log(`[JobExecutor] Injected username via selector: ${sel}`);
+            break;
+          }
+        } catch { /* try next */ }
+      }
+    }
+
+    if (password) {
+      const passwordSelectors = [
+        'input[type="password"]',
+        'input[autocomplete="current-password"]',
+        'input[name="password"]',
+        'input[name="passwd"]',
+      ];
+      for (const sel of passwordSelectors) {
+        try {
+          const el = await page.$(sel);
+          if (el && await el.isVisible()) {
+            await el.fill(password);
+            console.log(`[JobExecutor] Injected password via selector: ${sel}`);
+            break;
+          }
+        } catch { /* try next */ }
+      }
+    }
+
+    if (username || password) {
+      try {
+        const submitBtn = await page.$('button[type="submit"], input[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Submit"), button:has-text("Continue")');
+        if (submitBtn && await submitBtn.isVisible()) {
+          await submitBtn.click();
+          await page.waitForLoadState('networkidle').catch(() => {});
+        }
+      } catch { /* best effort */ }
+    }
   }
 
   // --- Error classification ---

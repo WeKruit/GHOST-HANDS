@@ -222,6 +222,22 @@ export function createValetRoutes(pool: pg.Pool) {
       }, 409);
     }
 
+    // Store resolution data in interaction_data JSONB before firing NOTIFY
+    // so the JobExecutor can read credentials/codes when it wakes up
+    if (body.resolution_type || body.resolution_data) {
+      await pool.query(`
+        UPDATE gh_automation_jobs
+        SET interaction_data = COALESCE(interaction_data, '{}'::jsonb) || $2::jsonb,
+            updated_at = NOW()
+        WHERE id = $1::UUID
+      `, [jobId, JSON.stringify({
+        resolution_type: body.resolution_type || 'manual',
+        resolution_data: body.resolution_data || null,
+        resolved_by: body.resolved_by,
+        resolved_at: new Date().toISOString(),
+      })]);
+    }
+
     // Fire NOTIFY so the listening JobExecutor picks up the resume signal
     await pool.query("SELECT pg_notify('gh_job_resume', $1)", [jobId]);
 
@@ -239,6 +255,7 @@ export function createValetRoutes(pool: pg.Pool) {
       job_id: jobId,
       status: 'running',
       resolved_by: body.resolved_by,
+      resolution_type: body.resolution_type || 'manual',
     });
   });
 
