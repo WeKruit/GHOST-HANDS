@@ -1,6 +1,7 @@
 # VALET Integration Contract — Comprehensive Reference
 
 **Date:** 2026-02-17
+**Last Verified:** 2026-02-18 (all endpoints verified against source code)
 **Covers:** Sprints 1-5 (all GhostHands capabilities)
 **Status:** Active
 **Breaking Changes:** None (all additive, backward compatible)
@@ -193,9 +194,10 @@ Rich application request with full profile data.
 | `timeout_seconds` | 30-1800 | No | 300 | Max execution time |
 | `idempotency_key` | string | No | - | Prevents duplicate submissions |
 | `target_worker_id` | string | No | null | Route to specific worker (null = any available) |
+| `worker_affinity` | enum | No | preferred | strict (must use target worker), preferred (try target, fallback to any), any |
 | `metadata` | object | No | {} | Arbitrary key-value pairs |
 
-### 4.1.1 Model Reference (31 models)
+### 4.1.1 Model Reference (30 models)
 
 **Accuracy-focused models (recommended for production):**
 
@@ -228,6 +230,14 @@ Rich application request with full profile data.
 | claude-haiku | Anthropic | Yes | $0.80 | $4.00 | Budget Claude with vision |
 | claude-sonnet | Anthropic | Yes | $3.00 | $15.00 | Strong Claude reasoning |
 | gpt-4o | OpenAI | Yes | $2.50 | $10.00 | Proven multimodal |
+| deepseek-reasoner | DeepSeek | No | $0.55 | $2.19 | Reasoning model (no vision) |
+| kimi-8k | Moonshot | Yes | $0.60 | $3.00 | Kimi 8K context with vision |
+| kimi-32k | Moonshot | Yes | $0.60 | $3.00 | Kimi 32K context with vision |
+| kimi-128k | Moonshot | Yes | $0.60 | $3.00 | Kimi 128K context with vision |
+| minimax-vl | MiniMax | Yes | $0.20 | $1.10 | MiniMax vision model |
+| minimax-m2.5 | MiniMax | No | $0.20 | $1.10 | MiniMax text model |
+| qwen-32b | SiliconFlow | Yes | $0.26 | $0.78 | Mid-range Qwen2.5 with vision |
+| glm-5 | Zhipu AI | Yes | $0.50 | $0.50 | GLM-5, vision via OpenAI-compatible API |
 
 **Cost per job (typical 8K input + 2K output tokens):**
 
@@ -478,6 +488,70 @@ Delete stored session for a specific domain.
 ### 4.8 Clear All Sessions — `DELETE /valet/sessions/:userId`
 
 Delete all stored sessions for a user ("log out everywhere").
+
+### 4.9 Deregister Worker — `POST /valet/workers/deregister`
+
+Called by VALET when terminating a sandbox to mark the worker offline and optionally cancel its active jobs.
+
+**Request:**
+
+```json
+{
+  "target_worker_id": "user-abc-123",
+  "reason": "sandbox_terminated",
+  "cancel_active_jobs": true,
+  "drain_timeout_seconds": 30
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `target_worker_id` | string | Yes | - | Worker identifier to deregister |
+| `reason` | string | No | - | Why the worker is being deregistered |
+| `cancel_active_jobs` | boolean | No | false | If true, cancel all active jobs for this worker |
+| `drain_timeout_seconds` | number | No | - | Optional drain timeout (0-300) |
+
+**Response (200):**
+
+```json
+{
+  "deregistered_workers": ["worker-id-1"],
+  "cancelled_job_ids": ["job-uuid-1", "job-uuid-2"],
+  "reason": "sandbox_terminated"
+}
+```
+
+**Response (404):** No workers found with the given `target_worker_id`.
+
+When `cancel_active_jobs` is true, all queued/running/paused jobs for the matching workers are set to `failed` with error code `worker_deregistered`, and a `failed` callback is sent to VALET for each cancelled job that has a `callback_url`.
+
+### 4.10 List Workers — `GET /monitoring/workers`
+
+Returns all registered workers with status, heartbeat, and job counts.
+
+**Response:**
+
+```json
+{
+  "count": 3,
+  "workers": [
+    {
+      "worker_id": "worker-prod-1",
+      "status": "active",
+      "target_worker_id": "user-abc-123",
+      "ec2_instance_id": "i-0abc123",
+      "ec2_ip": "10.0.1.5",
+      "current_job_id": "job-uuid",
+      "registered_at": "2026-02-16T08:00:00Z",
+      "last_heartbeat": "2026-02-16T12:00:00Z",
+      "jobs_completed": 42,
+      "jobs_failed": 2,
+      "uptime_seconds": 14400
+    }
+  ],
+  "timestamp": "2026-02-16T12:00:05Z"
+}
+```
 
 ---
 
@@ -1560,6 +1634,6 @@ curl https://gh.example.com/api/v1/gh/valet/sessions/$USER_ID \
 
 8. **Dual-model requires vision:** The `image_model` field is only used if the specified model has `vision: true` in the model registry. Non-vision models passed as `image_model` are silently ignored (single-model fallback).
 
-9. **No worker registry/discovery API:** There is no endpoint to list active workers or their status. VALET must track workers via EC2 instance management + `deploy.sh status`. A worker registry is planned for Sprint 5.
+9. **Worker registry is read-only:** `GET /monitoring/workers` lists all registered workers. There is no API to register workers (they self-register on startup). Use `POST /valet/workers/deregister` to mark workers offline.
 
 10. **Thought events are throttled:** AI thinking events (`thought`) are limited to max 1 per 2 seconds to avoid excessive DB writes. For higher-resolution thinking, use `progress.current_action` from Realtime job updates.
