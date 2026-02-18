@@ -23,7 +23,12 @@ set -euo pipefail
 #   ECR_REPOSITORY  — e.g., ghosthands
 #   AWS_REGION      — e.g., us-east-1
 
-COMPOSE_FILE="docker-compose.prod.yml"
+# Auto-detect compose file based on GH_ENVIRONMENT
+if [ "${GH_ENVIRONMENT:-production}" = "staging" ]; then
+  COMPOSE_FILE="docker-compose.staging.yml"
+else
+  COMPOSE_FILE="docker-compose.prod.yml"
+fi
 COMPOSE_DIR="${GHOSTHANDS_DIR:-/opt/ghosthands}"
 HEALTH_URL="http://localhost:3100/health"
 WORKER_STATUS_URL="http://localhost:${GH_WORKER_PORT:-3101}/worker"

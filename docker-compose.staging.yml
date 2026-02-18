@@ -1,10 +1,13 @@
-# docker-compose.prod.yml
-# Production deployment for GhostHands API + Worker
+# docker-compose.staging.yml
+# Staging deployment for GhostHands — identical to prod but with staging-specific defaults
+#
+# Differences from production:
+#   - GH_ENVIRONMENT=staging (reported in health endpoints)
+#   - Deploy server bound to 0.0.0.0:8000 (for VALET access)
+#   - Lower resource limits (staging instances are smaller)
 #
 # Usage:
-#   docker compose -f docker-compose.prod.yml up -d
-#   docker compose -f docker-compose.prod.yml logs -f
-#   docker compose -f docker-compose.prod.yml down
+#   ECR_IMAGE=<registry>/ghosthands:staging-<sha> docker compose -f docker-compose.staging.yml up -d
 
 services:
   # GhostHands API Server
@@ -16,6 +19,7 @@ services:
     env_file: .env
     environment:
       - NODE_ENV=production
+      - GH_ENVIRONMENT=staging
       - GH_API_PORT=3100
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
       - SSL_CERT_DIR=/etc/ssl/certs
@@ -38,7 +42,6 @@ services:
         max-file: "3"
 
   # Deploy Server — receives deploy commands from VALET's DeployService
-  # Runs on port 8000, calls deploy.sh to execute deploys
   deploy-server:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "scripts/deploy-server.ts"]
@@ -47,6 +50,7 @@ services:
     env_file: .env
     environment:
       - NODE_ENV=production
+      - GH_ENVIRONMENT=staging
       - GH_DEPLOY_PORT=8000
       - GH_API_PORT=3100
       - GH_WORKER_PORT=3101
@@ -69,11 +73,6 @@ services:
         max-file: "3"
 
   # GhostHands Worker (default instance, no target routing)
-  # For VALET-routed workers, start via docker run with GH_WORKER_ID:
-  #   docker run -d --env-file .env \
-  #     -e GH_WORKER_ID=<sandbox-uuid> -e DISPLAY=:99 \
-  #     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-  #     ${ECR_IMAGE} bun packages/ghosthands/src/workers/main.ts
   worker:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "packages/ghosthands/src/workers/main.ts"]
@@ -82,6 +81,7 @@ services:
     env_file: .env
     environment:
       - NODE_ENV=production
+      - GH_ENVIRONMENT=staging
       - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-1}
       - GH_WORKER_PORT=3101
       - DISPLAY=:99
