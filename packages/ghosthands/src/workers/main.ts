@@ -14,6 +14,8 @@ import { registerBuiltinHandlers } from './taskHandlers/index.js';
  * 4. Executes jobs via BrowserAgent.act()
  * 5. Updates job status and results in the database
  * 6. Sends heartbeats every 30s during execution
+ * 7. Exposes a status HTTP server on GH_WORKER_PORT (default 3101)
+ *    so VALET/deploy.sh can check if it's safe to restart
  */
 
 function parseWorkerId(): string {
@@ -144,6 +146,69 @@ async function main(): Promise<void> {
 
   // Start polling
   await poller.start();
+
+  // ── Worker Status HTTP Server ──────────────────────────────────────
+  // Lightweight HTTP endpoint so VALET / deploy.sh can check worker state
+  // before initiating a deploy. Runs on GH_WORKER_PORT (default 3101).
+  //
+  // Endpoints:
+  //   GET /worker/status  — worker state (active jobs, draining, uptime)
+  //   GET /worker/health  — 200 if idle & ready, 503 if busy or draining
+  //   POST /worker/drain  — stop accepting new jobs, wait for active to finish
+  const workerPort = parseInt(process.env.GH_WORKER_PORT || '3101', 10);
+  const startTime = Date.now();
+
+  if (typeof Bun !== 'undefined') {
+    Bun.serve({
+      port: workerPort,
+      fetch(req) {
+        const url = new URL(req.url);
+
+        if (url.pathname === '/worker/status') {
+          return Response.json({
+            worker_id: WORKER_ID,
+            active_jobs: poller.activeJobCount,
+            max_concurrent: maxConcurrent,
+            is_running: poller.isRunning,
+            is_draining: shuttingDown,
+            uptime_ms: Date.now() - startTime,
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        if (url.pathname === '/worker/health') {
+          const idle = poller.activeJobCount === 0 && !shuttingDown;
+          return Response.json(
+            {
+              status: idle ? 'idle' : shuttingDown ? 'draining' : 'busy',
+              active_jobs: poller.activeJobCount,
+              deploy_safe: idle,
+            },
+            { status: idle ? 200 : 503 },
+          );
+        }
+
+        if (url.pathname === '/worker/drain' && req.method === 'POST') {
+          if (!shuttingDown) {
+            console.log(`[Worker] Drain requested via HTTP — stopping job pickup`);
+            shuttingDown = true;
+            // Stop accepting new jobs but let active ones finish
+            poller.stop().then(() => {
+              console.log(`[Worker] Drain complete — all jobs finished`);
+            });
+          }
+          return Response.json({
+            status: 'draining',
+            active_jobs: poller.activeJobCount,
+            worker_id: WORKER_ID,
+          });
+        }
+
+        return Response.json({ error: 'not_found' }, { status: 404 });
+      },
+    });
+    console.log(`[Worker] Status server on port ${workerPort}`);
+  }
 
   console.log(`[Worker] ${WORKER_ID} running (maxConcurrent=${maxConcurrent})`);
   console.log(`[Worker] Listening for jobs on gh_job_created channel`);

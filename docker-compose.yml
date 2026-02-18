@@ -40,10 +40,13 @@ services:
       context: .
       dockerfile: Dockerfile
     command: ["bun", "--watch", "packages/ghosthands/src/workers/main.ts"]
+    ports:
+      - "${GH_WORKER_PORT:-3101}:3101"
     env_file: .env
     environment:
       - NODE_ENV=development
       - MAX_CONCURRENT_JOBS=1
+      - GH_WORKER_PORT=3101
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
       - SSL_CERT_DIR=/etc/ssl/certs
       # For headed mode on a host with Xvfb, add DISPLAY=:99

@@ -13,6 +13,7 @@ set -euo pipefail
 #   ./scripts/deploy.sh status               # Show current status
 #   ./scripts/deploy.sh drain                # Stop worker, keep API running
 #   ./scripts/deploy.sh health               # Exit 0 if healthy, 1 if not
+#   ./scripts/deploy.sh worker-status        # Check if worker is busy or idle
 #   ./scripts/deploy.sh start-worker <id>    # Start a targeted worker
 #   ./scripts/deploy.sh stop-worker <id>     # Stop a targeted worker
 #   ./scripts/deploy.sh list-workers         # List all targeted worker containers
@@ -25,8 +26,10 @@ set -euo pipefail
 COMPOSE_FILE="docker-compose.prod.yml"
 COMPOSE_DIR="${GHOSTHANDS_DIR:-/opt/ghosthands}"
 HEALTH_URL="http://localhost:3100/health"
+WORKER_STATUS_URL="http://localhost:${GH_WORKER_PORT:-3101}/worker"
 MAX_HEALTH_ATTEMPTS=30
 HEALTH_INTERVAL=2
+MAX_DRAIN_WAIT=60  # seconds to wait for worker to finish active jobs
 # Targeted worker containers are labelled so we can discover them
 WORKER_LABEL="gh.role=targeted-worker"
 
@@ -60,6 +63,69 @@ ecr_login() {
   aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "${ECR_REGISTRY}" 2>/dev/null
 }
 
+# ── Worker status & graceful drain ──────────────────────────────
+# The worker exposes an HTTP status server on GH_WORKER_PORT (default 3101).
+# VALET / deploy.sh uses this to check if the worker is mid-task and to
+# request a graceful drain before stopping the container.
+
+worker_status() {
+  curl -sf "${WORKER_STATUS_URL}/status" 2>/dev/null
+}
+
+worker_health() {
+  curl -sf "${WORKER_STATUS_URL}/health" 2>/dev/null
+}
+
+# Graceful drain: tell worker to stop picking up new jobs, then wait
+# for active jobs to finish before returning.
+graceful_drain_worker() {
+  log "Checking worker status before drain..."
+
+  # Check if worker status endpoint is available
+  local status_json
+  status_json=$(worker_health 2>/dev/null) || true
+
+  if [ -z "$status_json" ]; then
+    warn "Worker status endpoint not available (older image?). Falling back to SIGTERM drain."
+    return 1
+  fi
+
+  # Check if worker has active jobs
+  local deploy_safe
+  deploy_safe=$(echo "$status_json" | grep -o '"deploy_safe":[a-z]*' | cut -d: -f2)
+
+  if [ "$deploy_safe" = "true" ]; then
+    log "Worker is idle — safe to deploy immediately"
+    echo "WORKER_DRAIN=idle"
+    return 0
+  fi
+
+  # Worker is busy — request drain via HTTP
+  log "Worker has active job(s). Requesting graceful drain..."
+  curl -sf -X POST "${WORKER_STATUS_URL}/drain" > /dev/null 2>&1 || true
+
+  # Poll until worker is idle or timeout
+  local waited=0
+  while [ "$waited" -lt "$MAX_DRAIN_WAIT" ]; do
+    status_json=$(worker_health 2>/dev/null) || true
+    deploy_safe=$(echo "$status_json" | grep -o '"deploy_safe":[a-z]*' | cut -d: -f2)
+
+    if [ "$deploy_safe" = "true" ]; then
+      log "Worker drained successfully after ${waited}s"
+      echo "WORKER_DRAIN=drained"
+      return 0
+    fi
+
+    echo "  Waiting for active job to finish... (${waited}s/${MAX_DRAIN_WAIT}s)"
+    sleep 2
+    waited=$((waited + 2))
+  done
+
+  warn "Worker did not drain within ${MAX_DRAIN_WAIT}s — proceeding with SIGTERM"
+  echo "WORKER_DRAIN=timeout"
+  return 1
+}
+
 # ── Targeted worker management ─────────────────────────────────
 # Targeted workers are standalone containers (not in compose) started
 # by VALET with a specific GH_WORKER_ID for sandbox routing.
@@ -76,21 +142,29 @@ start_targeted_worker() {
     docker rm "$name" 2>/dev/null || true
   fi
 
-  log "Starting targeted worker: $name (id=$worker_id)"
+  # Each targeted worker gets a unique status port (3110 + offset from name hash)
+  local port_offset
+  port_offset=$(echo "$worker_id" | cksum | awk '{print $1 % 50}')
+  local status_port=$((3110 + port_offset))
+
+  log "Starting targeted worker: $name (id=$worker_id, status_port=$status_port)"
   docker run -d \
     --name "$name" \
     --env-file "${COMPOSE_DIR}/.env" \
     -e NODE_ENV=production \
     -e GH_WORKER_ID="$worker_id" \
+    -e GH_WORKER_PORT="$status_port" \
     -e DISPLAY=:99 \
     -e MAX_CONCURRENT_JOBS="${MAX_CONCURRENT_JOBS:-2}" \
     -e SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     -e SSL_CERT_DIR=/etc/ssl/certs \
+    -p "127.0.0.1:${status_port}:${status_port}" \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
     --memory=2g --cpus=2.0 \
     --restart unless-stopped \
     --label "$WORKER_LABEL" \
     --label "gh.worker_id=$worker_id" \
+    --label "gh.status_port=$status_port" \
     "$image" bun packages/ghosthands/src/workers/main.ts
 
   log "Worker $name started"
@@ -155,8 +229,12 @@ cmd_deploy() {
   # Pull new images
   docker compose -f "$COMPOSE_FILE" pull
 
-  # Stop compose worker first to drain active jobs gracefully
-  log "Draining compose worker..."
+  # Graceful drain: ask worker to finish active jobs before stopping
+  if graceful_drain_worker; then
+    log "Graceful drain succeeded — stopping worker container"
+  else
+    log "Graceful drain unavailable — using SIGTERM with 35s timeout"
+  fi
   docker compose -f "$COMPOSE_FILE" stop -t 35 worker 2>/dev/null || true
 
   # Restart compose services (API + default worker)
@@ -210,7 +288,10 @@ cmd_drain() {
   log "Draining worker (stopping job pickup, waiting for active jobs)..."
   cd "$COMPOSE_DIR"
 
-  # Stop worker with 60s timeout for graceful drain
+  # Try graceful HTTP drain first, then SIGTERM fallback
+  if graceful_drain_worker; then
+    log "Worker drained gracefully via HTTP"
+  fi
   docker compose -f "$COMPOSE_FILE" stop -t 60 worker
   log "Worker drained. API still running."
   echo "DRAIN_STATUS=success"
@@ -279,8 +360,13 @@ case "${1:-help}" in
   list-workers)
     list_targeted_workers
     ;;
+  worker-status)
+    # Quick check: is the worker busy or safe to deploy?
+    status_json=$(worker_health 2>/dev/null) || { echo "WORKER_STATUS=unreachable"; exit 1; }
+    echo "$status_json"
+    ;;
   *)
-    echo "Usage: $0 {deploy [tag]|rollback|drain|status|health|start-worker <id>|stop-worker <id>|list-workers}"
+    echo "Usage: $0 {deploy [tag]|rollback|drain|status|health|worker-status|start-worker <id>|stop-worker <id>|list-workers}"
     exit 1
     ;;
 esac
