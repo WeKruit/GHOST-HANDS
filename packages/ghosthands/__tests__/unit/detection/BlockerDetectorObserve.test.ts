@@ -173,7 +173,7 @@ describe('BlockerDetector — observe-based detection', () => {
       const result = detector.classifyObservedElements(elements);
 
       expect(result).not.toBeNull();
-      expect(result!.type).toBe('rate_limit');
+      expect(result!.type).toBe('rate_limited');
     });
 
     test('detects visual verification (slider) from observed element', () => {
@@ -183,7 +183,7 @@ describe('BlockerDetector — observe-based detection', () => {
       const result = detector.classifyObservedElements(elements);
 
       expect(result).not.toBeNull();
-      expect(result!.type).toBe('visual_verification');
+      expect(result!.type).toBe('verification');
     });
 
     test('returns highest confidence match from multiple elements', () => {
@@ -346,7 +346,7 @@ describe('BlockerDetector — observe-based detection', () => {
       const result = await detector.detectBlocker(page);
 
       expect(result).not.toBeNull();
-      expect(result!.type).toBe('rate_limit');
+      expect(result!.type).toBe('rate_limited');
     });
 
     test('detects rate limiting: "rate limited"', async () => {
@@ -354,7 +354,7 @@ describe('BlockerDetector — observe-based detection', () => {
       const result = await detector.detectBlocker(page);
 
       expect(result).not.toBeNull();
-      expect(result!.type).toBe('rate_limit');
+      expect(result!.type).toBe('rate_limited');
     });
 
     test('detects visual verification: "select all images with"', async () => {
@@ -362,7 +362,7 @@ describe('BlockerDetector — observe-based detection', () => {
       const result = await detector.detectBlocker(page);
 
       expect(result).not.toBeNull();
-      expect(result!.type).toBe('visual_verification');
+      expect(result!.type).toBe('verification');
     });
 
     test('detects visual verification: "slide to verify"', async () => {
@@ -370,7 +370,7 @@ describe('BlockerDetector — observe-based detection', () => {
       const result = await detector.detectBlocker(page);
 
       expect(result).not.toBeNull();
-      expect(result!.type).toBe('visual_verification');
+      expect(result!.type).toBe('verification');
     });
 
     test('detects login text: "sign in to continue"', async () => {

@@ -274,6 +274,171 @@ describe('backward compatibility — no worker_id', () => {
   });
 });
 
+// ── HITL callback: description, metadata, and cost ──────────────────────
+
+describe('HITL callback — description, metadata, and cost', () => {
+  let notifier: CallbackNotifier;
+  let capture: ReturnType<typeof createFetchCapture>;
+
+  const CALLBACK_URL = 'https://valet.example.com/callback';
+  const WORKER_ID = 'worker-us-east-1-abc';
+  const JOB_ID = 'job-hitl-001';
+  const VALET_TASK_ID = 'valet-task-hitl-001';
+
+  beforeEach(() => {
+    notifier = new CallbackNotifier();
+    capture = createFetchCapture();
+  });
+
+  afterEach(() => {
+    capture.restore();
+  });
+
+  test('needs_human callback includes description and metadata when provided', async () => {
+    await notifier.notifyHumanNeeded(
+      JOB_ID,
+      CALLBACK_URL,
+      {
+        type: 'captcha',
+        screenshot_url: 'https://screenshots.example.com/captcha.png',
+        page_url: 'https://boards.greenhouse.io/apply',
+        timeout_seconds: 300,
+        description: 'reCAPTCHA iframe detected on page',
+        metadata: {
+          blocker_confidence: 0.95,
+          captcha_type: 'recaptcha',
+          detection_method: 'dom',
+        },
+      },
+      VALET_TASK_ID,
+      WORKER_ID,
+    );
+
+    expect(capture.payloads).toHaveLength(1);
+    const payload = capture.payloads[0];
+    expect(payload.status).toBe('needs_human');
+    expect(payload.interaction).toEqual({
+      type: 'captcha',
+      screenshot_url: 'https://screenshots.example.com/captcha.png',
+      page_url: 'https://boards.greenhouse.io/apply',
+      timeout_seconds: 300,
+      description: 'reCAPTCHA iframe detected on page',
+      metadata: {
+        blocker_confidence: 0.95,
+        captcha_type: 'recaptcha',
+        detection_method: 'dom',
+      },
+    });
+  });
+
+  test('needs_human callback includes cost data when provided', async () => {
+    const cost = {
+      total_cost_usd: 0.042,
+      action_count: 7,
+      total_tokens: 3200,
+    };
+
+    await notifier.notifyHumanNeeded(
+      JOB_ID,
+      CALLBACK_URL,
+      {
+        type: 'login',
+        screenshot_url: 'https://screenshots.example.com/login.png',
+        page_url: 'https://linkedin.com/login',
+        timeout_seconds: 120,
+        description: 'Login wall detected',
+        metadata: {
+          blocker_confidence: 0.9,
+          detection_method: 'dom',
+        },
+      },
+      VALET_TASK_ID,
+      WORKER_ID,
+      cost,
+    );
+
+    expect(capture.payloads).toHaveLength(1);
+    const payload = capture.payloads[0];
+    expect(payload.status).toBe('needs_human');
+    expect(payload.cost).toEqual({
+      total_cost_usd: 0.042,
+      action_count: 7,
+      total_tokens: 3200,
+    });
+    expect(payload.interaction?.description).toBe('Login wall detected');
+    expect(payload.interaction?.metadata?.blocker_confidence).toBe(0.9);
+  });
+
+  test('needs_human callback omits cost when not provided (backward compat)', async () => {
+    await notifier.notifyHumanNeeded(
+      JOB_ID,
+      CALLBACK_URL,
+      {
+        type: 'captcha',
+        screenshot_url: 'https://screenshots.example.com/captcha.png',
+        page_url: 'https://boards.greenhouse.io/apply',
+        timeout_seconds: 300,
+      },
+      VALET_TASK_ID,
+      WORKER_ID,
+    );
+
+    expect(capture.payloads).toHaveLength(1);
+    const payload = capture.payloads[0];
+    expect(payload.status).toBe('needs_human');
+    expect(payload).not.toHaveProperty('cost');
+    // interaction should still work without description/metadata
+    expect(payload.interaction).toEqual({
+      type: 'captcha',
+      screenshot_url: 'https://screenshots.example.com/captcha.png',
+      page_url: 'https://boards.greenhouse.io/apply',
+      timeout_seconds: 300,
+    });
+  });
+
+  test('needs_human callback with cost and description in full HITL lifecycle', async () => {
+    // 1. Running
+    await notifier.notifyRunning(JOB_ID, CALLBACK_URL, VALET_TASK_ID, undefined, WORKER_ID);
+
+    // 2. Needs human with enriched data
+    await notifier.notifyHumanNeeded(
+      JOB_ID,
+      CALLBACK_URL,
+      {
+        type: 'captcha',
+        screenshot_url: 'https://screenshots.example.com/blocker.png',
+        page_url: 'https://boards.greenhouse.io/apply',
+        timeout_seconds: 300,
+        description: 'Cloudflare Turnstile challenge detected',
+        metadata: {
+          blocker_confidence: 0.95,
+          captcha_type: 'turnstile',
+          detection_method: 'combined',
+        },
+      },
+      VALET_TASK_ID,
+      WORKER_ID,
+      { total_cost_usd: 0.018, action_count: 3, total_tokens: 1500 },
+    );
+
+    // 3. Resumed
+    await notifier.notifyResumed(JOB_ID, CALLBACK_URL, VALET_TASK_ID, WORKER_ID);
+
+    expect(capture.payloads).toHaveLength(3);
+
+    const needsHuman = capture.payloads[1];
+    expect(needsHuman.status).toBe('needs_human');
+    expect(needsHuman.cost).toEqual({
+      total_cost_usd: 0.018,
+      action_count: 3,
+      total_tokens: 1500,
+    });
+    expect(needsHuman.interaction?.description).toBe('Cloudflare Turnstile challenge detected');
+    expect(needsHuman.interaction?.metadata?.captcha_type).toBe('turnstile');
+    expect(needsHuman.interaction?.metadata?.detection_method).toBe('combined');
+  });
+});
+
 // ── VALET status endpoint returns worker_id ─────────────────────────────
 
 describe('VALET status endpoint — worker_id', () => {

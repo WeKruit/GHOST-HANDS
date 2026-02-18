@@ -380,7 +380,7 @@ describe('BlockerDetectionSchema', () => {
 
 describe('BlockerTypeSchema', () => {
   test('accepts all valid blocker types', () => {
-    const types = ['captcha', 'login', '2fa', 'bot_check'];
+    const types = ['captcha', 'login', '2fa', 'bot_check', 'rate_limited', 'verification'];
     for (const t of types) {
       expect(BlockerTypeSchema.parse(t)).toBe(t);
     }

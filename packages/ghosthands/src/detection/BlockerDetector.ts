@@ -11,7 +11,7 @@
 import type { Page } from 'playwright';
 import type { BrowserAutomationAdapter, ObservedElement } from '../adapters/types.js';
 
-export type BlockerType = 'captcha' | 'login' | '2fa' | 'bot_check' | 'rate_limit' | 'visual_verification';
+export type BlockerType = 'captcha' | 'login' | '2fa' | 'bot_check' | 'rate_limited' | 'verification';
 
 export type DetectionSource = 'dom' | 'observe' | 'combined';
 
@@ -66,8 +66,8 @@ const SELECTOR_PATTERNS: Omit<DOMMatch, 'details'>[] = [
   { type: 'bot_check', selector: '[data-datadome]', confidence: 0.85 },
 
   // -- Visual verification --
-  { type: 'visual_verification', selector: '.slider-captcha', confidence: 0.85 },
-  { type: 'visual_verification', selector: '[data-slider-captcha]', confidence: 0.85 },
+  { type: 'verification', selector: '.slider-captcha', confidence: 0.85 },
+  { type: 'verification', selector: '[data-slider-captcha]', confidence: 0.85 },
 ];
 
 // Text patterns checked against document.body.innerText
@@ -102,16 +102,16 @@ const TEXT_PATTERNS: { type: BlockerType; pattern: RegExp; confidence: number }[
   { type: 'bot_check', pattern: /please verify you('re| are) human/i, confidence: 0.85 },
 
   // -- Rate limiting --
-  { type: 'rate_limit', pattern: /too many requests/i, confidence: 0.9 },
-  { type: 'rate_limit', pattern: /please try again later/i, confidence: 0.65 },
-  { type: 'rate_limit', pattern: /rate limit(ed)?/i, confidence: 0.85 },
-  { type: 'rate_limit', pattern: /429/i, confidence: 0.5 },
+  { type: 'rate_limited', pattern: /too many requests/i, confidence: 0.9 },
+  { type: 'rate_limited', pattern: /please try again later/i, confidence: 0.65 },
+  { type: 'rate_limited', pattern: /rate limit(ed)?/i, confidence: 0.85 },
+  { type: 'rate_limited', pattern: /429/i, confidence: 0.5 },
 
   // -- Visual verification text --
-  { type: 'visual_verification', pattern: /select all images with/i, confidence: 0.9 },
-  { type: 'visual_verification', pattern: /slide to (verify|unlock)/i, confidence: 0.85 },
-  { type: 'visual_verification', pattern: /audio challenge/i, confidence: 0.8 },
-  { type: 'visual_verification', pattern: /drag the (slider|puzzle)/i, confidence: 0.85 },
+  { type: 'verification', pattern: /select all images with/i, confidence: 0.9 },
+  { type: 'verification', pattern: /slide to (verify|unlock)/i, confidence: 0.85 },
+  { type: 'verification', pattern: /audio challenge/i, confidence: 0.8 },
+  { type: 'verification', pattern: /drag the (slider|puzzle)/i, confidence: 0.85 },
 ];
 
 /** Keywords in observe() element descriptions that map to blocker types */
@@ -142,15 +142,15 @@ const OBSERVE_CLASSIFICATION: { pattern: RegExp; type: BlockerType; confidence: 
   { pattern: /browser fingerprint/i, type: 'bot_check', confidence: 0.8 },
 
   // Rate limiting
-  { pattern: /too many requests/i, type: 'rate_limit', confidence: 0.9 },
-  { pattern: /rate limit/i, type: 'rate_limit', confidence: 0.85 },
-  { pattern: /try again later/i, type: 'rate_limit', confidence: 0.7 },
+  { pattern: /too many requests/i, type: 'rate_limited', confidence: 0.9 },
+  { pattern: /rate limit/i, type: 'rate_limited', confidence: 0.85 },
+  { pattern: /try again later/i, type: 'rate_limited', confidence: 0.7 },
 
   // Visual verification
-  { pattern: /select.*images?/i, type: 'visual_verification', confidence: 0.85 },
-  { pattern: /slider|slide/i, type: 'visual_verification', confidence: 0.8 },
-  { pattern: /puzzle/i, type: 'visual_verification', confidence: 0.75 },
-  { pattern: /audio challenge/i, type: 'visual_verification', confidence: 0.8 },
+  { pattern: /select.*images?/i, type: 'verification', confidence: 0.85 },
+  { pattern: /slider|slide/i, type: 'verification', confidence: 0.8 },
+  { pattern: /puzzle/i, type: 'verification', confidence: 0.75 },
+  { pattern: /audio challenge/i, type: 'verification', confidence: 0.8 },
 ];
 
 const OBSERVE_INSTRUCTION =
