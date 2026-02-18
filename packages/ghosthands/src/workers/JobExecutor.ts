@@ -193,6 +193,8 @@ export class JobExecutor {
           job.id,
           job.callback_url,
           job.valet_task_id,
+          undefined,
+          this.workerId,
         ).catch((err) => {
           console.warn(`[JobExecutor] Running callback failed for job ${job.id}:`, err);
         });
@@ -378,6 +380,7 @@ export class JobExecutor {
             valet_task_id: job.valet_task_id,
             callback_url: job.callback_url,
             status: 'completed',
+            worker_id: this.workerId,
             result_data: resultData,
             result_summary: 'Task completed via cookbook replay',
             screenshot_urls: screenshotUrls,
@@ -697,6 +700,7 @@ export class JobExecutor {
           valet_task_id: job.valet_task_id,
           callback_url: job.callback_url,
           status: 'completed',
+          worker_id: this.workerId,
           result_data: resultData,
           result_summary: resultSummary,
           screenshot_urls: screenshotUrls,
@@ -756,6 +760,7 @@ export class JobExecutor {
           valet_task_id: job.valet_task_id,
           callback_url: job.callback_url,
           status: 'failed',
+          worker_id: this.workerId,
           error_code: errorCode,
           error_details: { message: errorMessage },
           llm_cost_cents: Math.round(snapshot.totalCost * 100),
@@ -910,6 +915,7 @@ export class JobExecutor {
           timeout_seconds: timeoutSeconds,
         },
         job.valet_task_id,
+        this.workerId,
       ).catch((err) => {
         console.warn(`[JobExecutor] HITL callback failed for job ${job.id}:`, err);
       });
@@ -935,7 +941,7 @@ export class JobExecutor {
       await this.logJobEvent(job.id, 'hitl_resumed', {});
 
       if (job.callback_url) {
-        callbackNotifier.notifyResumed(job.id, job.callback_url, job.valet_task_id).catch((err) => {
+        callbackNotifier.notifyResumed(job.id, job.callback_url, job.valet_task_id, this.workerId).catch((err) => {
           console.warn(`[JobExecutor] Resume callback failed for job ${job.id}:`, err);
         });
       }

@@ -2,8 +2,9 @@ import { Hono } from 'hono';
 import pg from 'pg';
 import { validateBody } from '../middleware/index.js';
 import { rateLimitMiddleware } from '../../security/rateLimit.js';
-import { ValetApplySchema, ValetTaskSchema, ValetResumeSchema } from '../schemas/valet.js';
-import type { ValetApplyInput, ValetTaskInput, ValetResumeInput } from '../schemas/valet.js';
+import { ValetApplySchema, ValetTaskSchema, ValetResumeSchema, ValetDeregisterSchema } from '../schemas/valet.js';
+import type { ValetApplyInput, ValetTaskInput, ValetResumeInput, ValetDeregisterInput } from '../schemas/valet.js';
+import { callbackNotifier } from '../../workers/callbackNotifier.js';
 
 type AppVariables = {
   validatedBody: unknown;
@@ -78,13 +79,14 @@ export function createValetRoutes(pool: pg.Pool) {
     // Insert job — includes VALET-specific columns (callback_url, valet_task_id)
     // added in migration 005. Also stored in metadata as backup.
     // execution_mode column added in migration 011.
+    // worker_affinity column added in migration 013.
     const result = await pool.query(`
       INSERT INTO gh_automation_jobs (
         user_id, created_by, job_type, target_url, task_description,
         input_data, priority, max_retries, timeout_seconds,
         tags, idempotency_key, metadata, target_worker_id,
-        callback_url, valet_task_id, execution_mode
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        callback_url, valet_task_id, execution_mode, worker_affinity
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
       RETURNING id, status, created_at
     `, [
       body.valet_user_id,
@@ -110,6 +112,7 @@ export function createValetRoutes(pool: pg.Pool) {
       body.callback_url || null,
       body.valet_task_id,
       body.execution_mode,
+      body.worker_affinity,
     ]);
 
     const job = result.rows[0];
@@ -157,13 +160,14 @@ export function createValetRoutes(pool: pg.Pool) {
       ...(body.image_model ? { image_model: body.image_model } : {}),
     };
 
+    // worker_affinity column added in migration 013.
     const result = await pool.query(`
       INSERT INTO gh_automation_jobs (
         user_id, created_by, job_type, target_url, task_description,
         input_data, priority, max_retries, timeout_seconds,
         tags, idempotency_key, metadata, target_worker_id,
-        callback_url, valet_task_id, execution_mode
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        callback_url, valet_task_id, execution_mode, worker_affinity
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
       RETURNING id, status, created_at
     `, [
       body.valet_user_id,
@@ -182,6 +186,7 @@ export function createValetRoutes(pool: pg.Pool) {
       body.callback_url || null,
       body.valet_task_id,
       body.execution_mode,
+      body.worker_affinity,
     ]);
 
     const job = result.rows[0];
@@ -234,6 +239,77 @@ export function createValetRoutes(pool: pg.Pool) {
       job_id: jobId,
       status: 'running',
       resolved_by: body.resolved_by,
+    });
+  });
+
+  // ─── POST /valet/workers/deregister — Deregister a worker ──────
+  // Called by VALET when terminating a sandbox to mark the worker offline
+  // and optionally cancel its active jobs.
+
+  valet.post('/workers/deregister', rateLimitMiddleware(), validateBody(ValetDeregisterSchema), async (c) => {
+    const body = c.get('validatedBody') as ValetDeregisterInput;
+
+    // Find worker(s) matching the target_worker_id
+    const { rows: workers } = await pool.query(
+      `SELECT worker_id, current_job_id FROM gh_worker_registry WHERE target_worker_id = $1`,
+      [body.target_worker_id]
+    );
+
+    if (workers.length === 0) {
+      return c.json({
+        error: 'not_found',
+        message: `No workers found with target_worker_id: ${body.target_worker_id}`,
+      }, 404);
+    }
+
+    // Mark all matching workers as offline
+    const workerIds = workers.map((w: any) => w.worker_id);
+    await pool.query(
+      `UPDATE gh_worker_registry SET status = 'offline', current_job_id = NULL, last_heartbeat = NOW()
+       WHERE target_worker_id = $1`,
+      [body.target_worker_id]
+    );
+
+    const cancelledJobIds: string[] = [];
+
+    // Optionally cancel active jobs for these workers
+    if (body.cancel_active_jobs) {
+      const { rows: cancelledJobs } = await pool.query(`
+        UPDATE gh_automation_jobs
+        SET status = 'failed',
+            error_code = 'worker_deregistered',
+            error_details = jsonb_build_object(
+              'message', 'Worker was deregistered by VALET',
+              'reason', $2::TEXT,
+              'target_worker_id', $3::TEXT
+            ),
+            completed_at = NOW(),
+            updated_at = NOW()
+        WHERE worker_id = ANY($1::TEXT[])
+          AND status IN ('queued', 'running', 'paused')
+        RETURNING id, callback_url, valet_task_id
+      `, [workerIds, body.reason || 'sandbox_terminated', body.target_worker_id]);
+
+      for (const job of cancelledJobs) {
+        cancelledJobIds.push(job.id);
+        // Send failed callback to VALET for each cancelled job
+        if (job.callback_url) {
+          callbackNotifier.notifyCompletion(job.callback_url, {
+            job_id: job.id,
+            valet_task_id: job.valet_task_id || null,
+            status: 'failed',
+            error_code: 'worker_deregistered',
+            error_message: body.reason || 'Worker sandbox terminated by VALET',
+            completed_at: new Date().toISOString(),
+          }).catch(() => {});
+        }
+      }
+    }
+
+    return c.json({
+      deregistered_workers: workerIds,
+      cancelled_job_ids: cancelledJobIds,
+      reason: body.reason || null,
     });
   });
 
@@ -338,7 +414,7 @@ export function createValetRoutes(pool: pg.Pool) {
              interaction_type, interaction_data, paused_at,
              started_at, completed_at, created_at,
              metadata, callback_url, valet_task_id,
-             execution_mode, browser_mode, final_mode
+             execution_mode, browser_mode, final_mode, worker_id
       FROM gh_automation_jobs WHERE id = $1::UUID
     `, [jobId]);
 
@@ -356,6 +432,7 @@ export function createValetRoutes(pool: pg.Pool) {
       valet_task_id: job.valet_task_id || meta.valet_task_id || null,
       status: job.status,
       status_message: job.status_message,
+      worker_id: job.worker_id || null,
       progress: meta.progress || null,
       result: job.status === 'completed' ? {
         data: job.result_data,

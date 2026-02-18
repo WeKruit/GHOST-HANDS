@@ -69,6 +69,7 @@ export const ValetApplySchema = z.object({
   idempotency_key: z.string().max(255).optional(),
   metadata: z.record(z.unknown()).default({}),
   target_worker_id: z.string().max(100).nullable().optional(),
+  worker_affinity: z.enum(['strict', 'preferred', 'any']).default('preferred'),
   model: z.string().max(100).optional().describe('LLM model alias (e.g. "qwen-72b", "deepseek-chat", "claude-sonnet")'),
   image_model: z.string().max(100).optional().describe('Separate model for vision/screenshot analysis'),
   execution_mode: z.enum(['auto', 'ai_only', 'cookbook_only']).default('auto'),
@@ -92,6 +93,7 @@ export const ValetTaskSchema = z.object({
   idempotency_key: z.string().max(255).optional(),
   metadata: z.record(z.unknown()).default({}),
   target_worker_id: z.string().max(100).nullable().optional(),
+  worker_affinity: z.enum(['strict', 'preferred', 'any']).default('preferred'),
   model: z.string().max(100).optional().describe('LLM model alias (e.g. "qwen-72b", "deepseek-chat", "claude-sonnet")'),
   image_model: z.string().max(100).optional().describe('Separate model for vision/screenshot analysis'),
   execution_mode: z.enum(['auto', 'ai_only', 'cookbook_only']).default('auto'),
@@ -115,3 +117,14 @@ export const ValetSessionDeleteSchema = z.object({
 });
 
 export type ValetSessionDeleteInput = z.infer<typeof ValetSessionDeleteSchema>;
+
+// --- VALET Worker Deregistration ---
+
+export const ValetDeregisterSchema = z.object({
+  target_worker_id: z.string().min(1).max(255),
+  reason: z.string().max(500).optional(),
+  cancel_active_jobs: z.boolean().default(false),
+  drain_timeout_seconds: z.number().int().min(0).max(300).optional(),
+});
+
+export type ValetDeregisterInput = z.infer<typeof ValetDeregisterSchema>;
