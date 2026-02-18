@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
+import { describe, expect, test, beforeEach, afterEach } from 'vitest';
 import { CallbackNotifier } from '../../../src/workers/callbackNotifier.js';
 import { ValetApplySchema, ValetTaskSchema } from '../../../src/api/schemas/valet.js';
 

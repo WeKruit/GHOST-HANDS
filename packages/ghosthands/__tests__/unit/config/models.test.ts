@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
+import { describe, expect, test, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 
@@ -46,24 +46,24 @@ describe('models.config.json structure', () => {
 
   test('all models have required fields', () => {
     for (const [alias, entry] of Object.entries(config.models) as [string, any][]) {
-      expect(entry.provider).toBeString();
-      expect(entry.model).toBeString();
+      expect(entry.provider).toBeTypeOf('string');
+      expect(entry.model).toBeTypeOf('string');
       expect(typeof entry.vision).toBe('boolean');
       expect(entry.cost).toBeDefined();
-      expect(entry.cost.input).toBeNumber();
-      expect(entry.cost.output).toBeNumber();
+      expect(entry.cost.input).toBeTypeOf('number');
+      expect(entry.cost.output).toBeTypeOf('number');
       expect(entry.cost.unit).toBe('$/M tokens');
     }
   });
 
   test('all providers have required fields', () => {
     for (const [key, provider] of Object.entries(config.providers) as [string, any][]) {
-      expect(provider.name).toBeString();
-      expect(provider.envKey).toBeString();
-      expect(provider.docs).toBeString();
+      expect(provider.name).toBeTypeOf('string');
+      expect(provider.envKey).toBeTypeOf('string');
+      expect(provider.docs).toBeTypeOf('string');
       // baseUrl is optional (anthropic doesn't have one)
       if (key !== 'anthropic') {
-        expect(provider.baseUrl).toBeString();
+        expect(provider.baseUrl).toBeTypeOf('string');
       }
     }
   });

@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, afterEach, mock, spyOn } from 'bun:test';
+import { describe, expect, test, beforeEach, afterEach, vi } from 'vitest';
 import { StagehandObserver, type StagehandObserverConfig } from '../../../src/engine/StagehandObserver';
 import type { ObservedElement } from '../../../src/engine/types';
 
@@ -26,7 +26,7 @@ const MockStagehandInstance = {
   },
 };
 
-mock.module('@browserbasehq/stagehand', () => ({
+vi.mock('@browserbasehq/stagehand', () => ({
   Stagehand: class MockStagehand {
     constructor(opts: any) {
       mockConstructorOpts = opts;

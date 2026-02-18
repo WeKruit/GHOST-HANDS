@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach } from 'bun:test';
+import { describe, expect, test, beforeEach } from 'vitest';
 import { JOB_EVENT_TYPES, ThoughtThrottle } from '../../../src/events/JobEventTypes';
 import type { JobEventType } from '../../../src/events/JobEventTypes';
 

@@ -43,6 +43,7 @@ export const JOB_EVENT_TYPES = {
   SESSION_SAVED: 'session_saved',
 
   // HITL
+  BLOCKER_DETECTED: 'blocker_detected',
   HITL_PAUSED: 'hitl_paused',
   HITL_RESUMED: 'hitl_resumed',
   HITL_TIMEOUT: 'hitl_timeout',

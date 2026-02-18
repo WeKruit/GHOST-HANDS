@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, mock, spyOn } from 'bun:test';
+import { describe, expect, test, beforeEach, vi } from 'vitest';
 import { ActionBookConnector } from '../../../src/connectors/actionbookConnector';
 import type { Actionbook, ParsedElements, ChunkActionDetail } from '@actionbookdev/sdk';
 
@@ -6,8 +6,8 @@ import type { Actionbook, ParsedElements, ChunkActionDetail } from '@actionbookd
 
 function createMockClient(overrides: Partial<Actionbook> = {}): Actionbook {
   return {
-    searchActions: mock(() => Promise.resolve('area_id: workday.com:/:default\nDescription: Workday login page\n')),
-    getActionByAreaId: mock(() => Promise.resolve(
+    searchActions: vi.fn(() => Promise.resolve('area_id: workday.com:/:default\nDescription: Workday login page\n')),
+    getActionByAreaId: vi.fn(() => Promise.resolve(
       'Elements:\n' +
       '  username_field:\n' +
       '    css: input#username\n' +
@@ -23,8 +23,8 @@ function createMockClient(overrides: Partial<Actionbook> = {}): Actionbook {
       '    allow_methods: click\n' +
       '    depends_on: username_field, password_field'
     )),
-    listSources: mock(() => Promise.resolve({ success: true, results: [], count: 0 })),
-    searchSources: mock(() => Promise.resolve({ success: true, query: '', results: [], count: 0 })),
+    listSources: vi.fn(() => Promise.resolve({ success: true, results: [], count: 0 })),
+    searchSources: vi.fn(() => Promise.resolve({ success: true, query: '', results: [], count: 0 })),
     ...overrides,
   } as unknown as Actionbook;
 }
@@ -142,7 +142,7 @@ describe('ActionBookConnector', () => {
 
     test('returns graceful message when no results', async () => {
       const noResultsClient = createMockClient({
-        searchActions: mock(() => Promise.resolve('No actions found.')),
+        searchActions: vi.fn(() => Promise.resolve('No actions found.')),
       });
       const noResultsConnector = new ActionBookConnector(noResultsClient);
       const actions = noResultsConnector.getActionSpace();
@@ -159,7 +159,7 @@ describe('ActionBookConnector', () => {
 
     test('handles API errors gracefully', async () => {
       const errorClient = createMockClient({
-        searchActions: mock(() => Promise.reject(new Error('API rate limited'))),
+        searchActions: vi.fn(() => Promise.reject(new Error('API rate limited'))),
       });
       const errorConnector = new ActionBookConnector(errorClient);
       const actions = errorConnector.getActionSpace();
@@ -205,7 +205,7 @@ describe('ActionBookConnector', () => {
 
     test('handles not-found errors gracefully', async () => {
       const notFoundClient = createMockClient({
-        getActionByAreaId: mock(() => Promise.reject(new Error('Not found'))),
+        getActionByAreaId: vi.fn(() => Promise.reject(new Error('Not found'))),
       });
       const notFoundConnector = new ActionBookConnector(notFoundClient);
       const actions = notFoundConnector.getActionSpace();

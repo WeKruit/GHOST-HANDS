@@ -107,13 +107,12 @@ export class CallbackNotifier {
       payload.error_message = job.error_details?.message;
     }
 
-    if (job.llm_cost_cents != null) {
-      payload.cost = {
-        total_cost_usd: job.llm_cost_cents / 100,
-        action_count: job.action_count || 0,
-        total_tokens: job.total_tokens || 0,
-      };
-    }
+    // Always include cost data — even on failure (cost may be zero)
+    payload.cost = {
+      total_cost_usd: job.llm_cost_cents != null ? job.llm_cost_cents / 100 : 0,
+      action_count: job.action_count || 0,
+      total_tokens: job.total_tokens || 0,
+    };
 
     // Sprint 3: Mode tracking fields
     const jobMeta = typeof job.metadata === 'object' ? (job.metadata || {}) : {};

@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test } from 'vitest';
 import { Hono } from 'hono';
 import { models } from '../../../src/api/routes/models';
 
@@ -11,7 +11,7 @@ describe('GET /models', () => {
     expect(res.status).toBe(200);
 
     const body = await res.json();
-    expect(body.models).toBeArray();
+    expect(body.models).toBeInstanceOf(Array);
     expect(body.models.length).toBeGreaterThan(0);
   });
 
@@ -20,14 +20,14 @@ describe('GET /models', () => {
     const body = await res.json();
 
     for (const model of body.models) {
-      expect(model.alias).toBeString();
-      expect(model.model).toBeString();
-      expect(model.provider).toBeString();
-      expect(model.provider_name).toBeString();
+      expect(model.alias).toBeTypeOf('string');
+      expect(model.model).toBeTypeOf('string');
+      expect(model.provider).toBeTypeOf('string');
+      expect(model.provider_name).toBeTypeOf('string');
       expect(typeof model.vision).toBe('boolean');
       expect(model.cost).toBeDefined();
-      expect(model.cost.input).toBeNumber();
-      expect(model.cost.output).toBeNumber();
+      expect(model.cost.input).toBeTypeOf('number');
+      expect(model.cost.output).toBeTypeOf('number');
       expect(model.cost.unit).toBe('$/M tokens');
     }
   });
@@ -36,13 +36,13 @@ describe('GET /models', () => {
     const res = await app.request('/models');
     const body = await res.json();
 
-    expect(body.presets).toBeArray();
+    expect(body.presets).toBeInstanceOf(Array);
     expect(body.presets.length).toBeGreaterThanOrEqual(4);
 
     for (const preset of body.presets) {
-      expect(preset.name).toBeString();
-      expect(preset.description).toBeString();
-      expect(preset.model).toBeString();
+      expect(preset.name).toBeTypeOf('string');
+      expect(preset.description).toBeTypeOf('string');
+      expect(preset.model).toBeTypeOf('string');
     }
   });
 

@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, mock } from 'bun:test';
+import { describe, expect, test, beforeEach, vi } from 'vitest';
 import {
   PageObserver,
   detectPlatform,
@@ -51,7 +51,7 @@ function createMockPage(opts: MockPageOptions = {}): Page {
   const domMarkers = opts.domMarkers ?? {};
   const tagStructure = opts.tagStructure ?? 'html>head>body>main>form>input+input+button';
 
-  const evaluateImpl = mock(async (fn: any, ...args: any[]) => {
+  const evaluateImpl = vi.fn(async (fn: any, ...args: any[]) => {
     // The evaluate function receives serialized arguments
     const fnStr = fn.toString();
 
@@ -84,9 +84,9 @@ function createMockPage(opts: MockPageOptions = {}): Page {
   });
 
   return {
-    url: mock(() => url),
+    url: vi.fn(() => url),
     evaluate: evaluateImpl,
-    $$eval: mock(async (selector: string, fn: any) => {
+    $$eval: vi.fn(async (selector: string, fn: any) => {
       if (selector === 'form') return forms;
       if (selector.includes('button')) return buttons;
       if (selector.includes('nav')) return navigation;
@@ -177,8 +177,8 @@ describe('PageObserver', () => {
       // detectPageType uses page.evaluate with an inline function that runs in browser.
       // In tests, we mock evaluate to return the expected page type directly.
       const page = {
-        url: mock(() => 'https://example.com/apply'),
-        evaluate: mock(async () => 'form'),
+        url: vi.fn(() => 'https://example.com/apply'),
+        evaluate: vi.fn(async () => 'form'),
       } as unknown as Page;
 
       const result = await detectPageType(page);
@@ -187,8 +187,8 @@ describe('PageObserver', () => {
 
     test('returns "unknown" for empty page', async () => {
       const page = {
-        url: mock(() => 'https://example.com'),
-        evaluate: mock(async () => 'unknown'),
+        url: vi.fn(() => 'https://example.com'),
+        evaluate: vi.fn(async () => 'unknown'),
       } as unknown as Page;
 
       const result = await detectPageType(page);
@@ -197,8 +197,8 @@ describe('PageObserver', () => {
 
     test('returns "unknown" when evaluate throws', async () => {
       const page = {
-        url: mock(() => 'https://example.com'),
-        evaluate: mock(async () => { throw new Error('page crashed'); }),
+        url: vi.fn(() => 'https://example.com'),
+        evaluate: vi.fn(async () => { throw new Error('page crashed'); }),
       } as unknown as Page;
 
       const result = await detectPageType(page);
@@ -297,10 +297,10 @@ describe('PageObserver', () => {
       initialized = true,
     ): StagehandObserver {
       return {
-        isInitialized: mock(() => initialized),
-        observe: mock(async (_instruction: string) => elements),
-        init: mock(async () => {}),
-        stop: mock(async () => {}),
+        isInitialized: vi.fn(() => initialized),
+        observe: vi.fn(async (_instruction: string) => elements),
+        init: vi.fn(async () => {}),
+        stop: vi.fn(async () => {}),
       } as unknown as StagehandObserver;
     }
 
@@ -384,8 +384,8 @@ describe('PageObserver', () => {
         buttons: [{ selector: 'button', text: 'Apply' }],
       });
       const stagehand = {
-        isInitialized: mock(() => true),
-        observe: mock(async () => { throw new Error('Stagehand CDP disconnected'); }),
+        isInitialized: vi.fn(() => true),
+        observe: vi.fn(async () => { throw new Error('Stagehand CDP disconnected'); }),
       } as unknown as StagehandObserver;
 
       const observer = new PageObserver();
@@ -403,8 +403,8 @@ describe('PageObserver', () => {
     test('delegates to BlockerDetector', async () => {
       // Create a page that triggers CAPTCHA detection
       const page = {
-        url: mock(() => 'https://example.com'),
-        evaluate: mock(async (fn: any, arg?: any) => {
+        url: vi.fn(() => 'https://example.com'),
+        evaluate: vi.fn(async (fn: any, arg?: any) => {
           if (Array.isArray(arg)) {
             // Selector patterns — simulate reCAPTCHA iframe found
             return arg
@@ -426,8 +426,8 @@ describe('PageObserver', () => {
 
     test('returns null when no blocker detected', async () => {
       const page = {
-        url: mock(() => 'https://example.com'),
-        evaluate: mock(async (fn: any, arg?: any) => {
+        url: vi.fn(() => 'https://example.com'),
+        evaluate: vi.fn(async (fn: any, arg?: any) => {
           if (Array.isArray(arg)) return [];
           return 'Welcome to our job board';
         }),

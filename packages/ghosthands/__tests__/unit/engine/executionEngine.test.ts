@@ -1,4 +1,4 @@
-import { describe, expect, test, mock, beforeEach } from 'bun:test';
+import { describe, expect, test, vi, beforeEach } from 'vitest';
 import { ExecutionEngine } from '../../../src/engine/ExecutionEngine';
 import type { ActionManual } from '../../../src/engine/types';
 import type { ExecutionParams } from '../../../src/engine/ExecutionEngine';
@@ -30,15 +30,15 @@ function makeManual(overrides: Partial<ActionManual> = {}): ActionManual {
 
 function createMockManualStore(manual: ActionManual | null = null) {
   return {
-    lookup: mock(() => Promise.resolve(manual)),
-    recordSuccess: mock(() => Promise.resolve()),
-    recordFailure: mock(() => Promise.resolve()),
+    lookup: vi.fn(() => Promise.resolve(manual)),
+    recordSuccess: vi.fn(() => Promise.resolve()),
+    recordFailure: vi.fn(() => Promise.resolve()),
   };
 }
 
 function createMockCookbookExecutor(success = true, stepsCompleted = 2, error?: string) {
   return {
-    executeAll: mock(() =>
+    executeAll: vi.fn(() =>
       Promise.resolve({
         success,
         stepsCompleted,
@@ -56,21 +56,21 @@ function createMockAdapter() {
 
 function createMockCostTracker() {
   return {
-    setMode: mock(() => {}),
-    recordModeStep: mock(() => {}),
-    getSnapshot: mock(() => ({})),
+    setMode: vi.fn(() => {}),
+    recordModeStep: vi.fn(() => {}),
+    getSnapshot: vi.fn(() => ({})),
   } as any;
 }
 
 function createMockProgress() {
   return {
-    setExecutionMode: mock(() => {}),
-    setStep: mock(() => Promise.resolve()),
+    setExecutionMode: vi.fn(() => {}),
+    setStep: vi.fn(() => Promise.resolve()),
   } as any;
 }
 
 function createMockLogEvent() {
-  return mock((_eventType: string, _metadata: Record<string, any>) => Promise.resolve());
+  return vi.fn((_eventType: string, _metadata: Record<string, any>) => Promise.resolve());
 }
 
 function createParams(overrides: Partial<ExecutionParams> = {}): ExecutionParams {
@@ -295,7 +295,7 @@ describe('ExecutionEngine', () => {
     beforeEach(() => {
       manualStore = createMockManualStore(makeManual());
       cookbookExecutor = {
-        executeAll: mock(() => Promise.reject(new Error('CDP connection lost'))),
+        executeAll: vi.fn(() => Promise.reject(new Error('CDP connection lost'))),
       };
       engine = new ExecutionEngine({
         manualStore: manualStore as any,
@@ -439,8 +439,8 @@ describe('ExecutionEngine', () => {
 
       // Minimal tracker without setMode/setExecutionMode
       const params = createParams({
-        costTracker: { getSnapshot: mock(() => ({})) } as any,
-        progress: { setStep: mock(() => Promise.resolve()) } as any,
+        costTracker: { getSnapshot: vi.fn(() => ({})) } as any,
+        progress: { setStep: vi.fn(() => Promise.resolve()) } as any,
       });
 
       // Should not throw
