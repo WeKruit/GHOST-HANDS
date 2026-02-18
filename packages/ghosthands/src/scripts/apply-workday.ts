@@ -23,7 +23,7 @@ import { TEST_WORKDAY_PROFILE, TEST_QA_OVERRIDES } from '../workers/taskHandlers
 // --- Config ---
 
 const DEFAULT_WORKDAY_URL =
-  'https://workday.wd5.myworkdayjobs.com/en-US/Workday/job/USA%2C-GA%2C-Atlanta/Software-Application-Engineer----US-Federal-_JR-0104403-1/apply/applyManually';
+  'https://workday.wd5.myworkdayjobs.com/en-US/Workday/job/Canada%2C-BC%2C-Vancouver/Software-Engineer-III-Senior-Software-Engineer--Full-Stack-_JR-0103512/apply/applyManually?q=software+engineer';
 
 const TEST_USER_ID = '00000000-0000-0000-0000-000000000001';
 
