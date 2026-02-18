@@ -111,7 +111,7 @@ function toDbRow(userId: string, payload: Record<string, unknown>): Record<strin
  * const client = new GhostHandsClient({
  *   mode: 'db',
  *   supabaseUrl: process.env.SUPABASE_URL!,
- *   supabaseKey: process.env.SUPABASE_SERVICE_KEY!,
+ *   supabaseKey: process.env.SUPABASE_SECRET_KEY!,
  * });
  * ```
  */

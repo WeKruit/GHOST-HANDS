@@ -6,11 +6,11 @@ export function getSupabaseClient(): SupabaseClient {
   if (supabaseInstance) return supabaseInstance;
 
   const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_KEY;
+  const key = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
 
   if (!url || !key) {
     throw new Error(
-      'Missing SUPABASE_URL or SUPABASE_SERVICE_KEY environment variables'
+      'Missing SUPABASE_URL or SUPABASE_SECRET_KEY environment variables'
     );
   }
 
@@ -23,15 +23,18 @@ export function getSupabaseClient(): SupabaseClient {
 /** Create a client scoped to a user JWT (for RLS-enforced queries) */
 export function getSupabaseUserClient(jwt: string): SupabaseClient {
   const url = process.env.SUPABASE_URL;
-  const anonKey = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_KEY;
+  const publishableKey = process.env.SUPABASE_PUBLISHABLE_KEY
+    || process.env.SUPABASE_ANON_KEY
+    || process.env.SUPABASE_SECRET_KEY
+    || process.env.SUPABASE_SERVICE_KEY;
 
-  if (!url || !anonKey) {
+  if (!url || !publishableKey) {
     throw new Error(
-      'Missing SUPABASE_URL or SUPABASE_ANON_KEY environment variables'
+      'Missing SUPABASE_URL or SUPABASE_PUBLISHABLE_KEY environment variables'
     );
   }
 
-  return createClient(url, anonKey, {
+  return createClient(url, publishableKey, {
     global: { headers: { Authorization: `Bearer ${jwt}` } },
     auth: { persistSession: false },
   });

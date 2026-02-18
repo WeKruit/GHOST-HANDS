@@ -52,7 +52,8 @@ jobs:
       - run: bun run test:integration
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
           SUPABASE_DIRECT_URL: ${{ secrets.SUPABASE_DIRECT_URL }}
           GH_SERVICE_SECRET: ${{ secrets.GH_SERVICE_SECRET }}
           GH_ENCRYPTION_KEY: ${{ secrets.GH_ENCRYPTION_KEY }}
