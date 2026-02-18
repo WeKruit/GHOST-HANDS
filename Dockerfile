@@ -62,9 +62,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # BAML runtime uses vendored OpenSSL (native-tls-vendored) via openssl-probe.
-# Explicitly set cert paths so the statically-linked OpenSSL finds system CAs.
+# The vendored OpenSSL's default OPENSSLDIR is /usr/local/ssl (from openssl-src
+# crate), which does NOT exist in Debian images. We:
+#   1. Set SSL_CERT_FILE/DIR env vars (openssl-probe reads these first)
+#   2. Symlink /usr/local/ssl → Debian cert paths (belt-and-suspenders fallback)
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV SSL_CERT_DIR=/etc/ssl/certs
+RUN mkdir -p /usr/local/ssl && \
+    ln -s /etc/ssl/certs/ca-certificates.crt /usr/local/ssl/cert.pem && \
+    ln -s /etc/ssl/certs /usr/local/ssl/certs
 
 WORKDIR /app
 

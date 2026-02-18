@@ -46,10 +46,13 @@ services:
   worker:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "packages/ghosthands/src/workers/main.ts"]
+    ports:
+      - "127.0.0.1:${GH_WORKER_PORT:-3101}:3101"
     env_file: .env
     environment:
       - NODE_ENV=production
       - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-2}
+      - GH_WORKER_PORT=3101
       - DISPLAY=:99
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
       - SSL_CERT_DIR=/etc/ssl/certs
