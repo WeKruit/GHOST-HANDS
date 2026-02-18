@@ -148,25 +148,48 @@ async function main(): Promise<void> {
   // ── Worker Registry ────────────────────────────────────────────
   // UPSERT into gh_worker_registry so the fleet monitoring endpoint
   // and VALET deregistration know about this worker.
+  // Registration MUST succeed before polling starts — if it fails after
+  // retries, exit so Docker restarts the container.
   const targetWorkerId = process.env.GH_WORKER_ID || null;
-  const ec2InstanceId = process.env.EC2_INSTANCE_ID || null;
-  const ec2Ip = process.env.EC2_IP || null;
+  const ec2InstanceId = process.env.EC2_INSTANCE_ID || 'unknown';
+  const ec2Ip = process.env.EC2_IP || 'unknown';
 
-  try {
-    await pgDirect.query(`
-      INSERT INTO gh_worker_registry (worker_id, status, target_worker_id, ec2_instance_id, ec2_ip, registered_at, last_heartbeat)
-      VALUES ($1, 'active', $2, $3, $4, NOW(), NOW())
-      ON CONFLICT (worker_id) DO UPDATE SET
-        status = 'active',
-        target_worker_id = COALESCE($2, gh_worker_registry.target_worker_id),
-        ec2_instance_id = COALESCE($3, gh_worker_registry.ec2_instance_id),
-        ec2_ip = COALESCE($4, gh_worker_registry.ec2_ip),
-        last_heartbeat = NOW()
-    `, [WORKER_ID, targetWorkerId, ec2InstanceId, ec2Ip]);
-    console.log(`[Worker] Registered in gh_worker_registry`);
-  } catch (err) {
-    // Non-fatal: registry table may not exist yet if migration hasn't run
-    console.warn(`[Worker] Failed to register in worker registry:`, err instanceof Error ? err.message : err);
+  const MAX_REGISTRATION_RETRIES = 3;
+  for (let attempt = 1; attempt <= MAX_REGISTRATION_RETRIES; attempt++) {
+    try {
+      await pgDirect.query(`
+        INSERT INTO gh_worker_registry (worker_id, status, target_worker_id, ec2_instance_id, ec2_ip, registered_at, last_heartbeat)
+        VALUES ($1, 'active', $2, $3, $4, NOW(), NOW())
+        ON CONFLICT (worker_id) DO UPDATE SET
+          status = 'active',
+          target_worker_id = COALESCE($2, gh_worker_registry.target_worker_id),
+          ec2_instance_id = COALESCE($3, gh_worker_registry.ec2_instance_id),
+          ec2_ip = COALESCE($4, gh_worker_registry.ec2_ip),
+          last_heartbeat = NOW()
+      `, [WORKER_ID, targetWorkerId, ec2InstanceId, ec2Ip]);
+
+      // Verify the registration actually persisted
+      const verify = await pgDirect.query(
+        'SELECT worker_id, status FROM gh_worker_registry WHERE worker_id = $1',
+        [WORKER_ID]
+      );
+      if (!verify.rows[0]) {
+        throw new Error(`Worker registration verification failed for ${WORKER_ID}`);
+      }
+      console.log(`[Worker] Registered in gh_worker_registry (status: ${verify.rows[0].status})`);
+      break; // Success
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (attempt < MAX_REGISTRATION_RETRIES) {
+        const backoffMs = Math.pow(2, attempt) * 1000; // 2s, 4s
+        console.error(`[Worker] Registration attempt ${attempt}/${MAX_REGISTRATION_RETRIES} failed: ${errMsg} — retrying in ${backoffMs}ms`);
+        await new Promise((r) => setTimeout(r, backoffMs));
+      } else {
+        console.error(`[Worker] Registration failed after ${MAX_REGISTRATION_RETRIES} attempts: ${errMsg}`);
+        console.error(`[Worker] Cannot start without registry entry — exiting`);
+        process.exit(1);
+      }
+    }
   }
 
   // Heartbeat every 30s — updates last_heartbeat and current_job_id

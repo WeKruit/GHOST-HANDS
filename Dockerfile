@@ -34,6 +34,14 @@ RUN bun run build
 # Stage 3: Production runtime
 FROM oven/bun:1.2-debian AS runtime
 
+# Build metadata (set via --build-arg in CI)
+ARG COMMIT_SHA="unknown"
+ARG BUILD_TIME="unknown"
+ARG IMAGE_TAG="unknown"
+ENV COMMIT_SHA=${COMMIT_SHA}
+ENV BUILD_TIME=${BUILD_TIME}
+ENV IMAGE_TAG=${IMAGE_TAG}
+
 # Install system dependencies for Patchright/Chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

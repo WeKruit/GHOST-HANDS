@@ -65,7 +65,7 @@ describe('injectCode()', () => {
     const adapter = createAdapterWithPage(page);
     const executor = await createMinimalExecutor();
 
-    await (executor as any).injectCode(adapter, '123456');
+    await (executor as any).injectCode('test-job-id', adapter, '123456');
 
     expect(page.filledValues['input[autocomplete="one-time-code"]']).toBe('123456');
   });
@@ -77,7 +77,7 @@ describe('injectCode()', () => {
     const adapter = createAdapterWithPage(page);
     const executor = await createMinimalExecutor();
 
-    await (executor as any).injectCode(adapter, '999888');
+    await (executor as any).injectCode('test-job-id', adapter, '999888');
 
     expect(page.filledValues['input[name*="code" i]']).toBe('999888');
   });
@@ -89,7 +89,7 @@ describe('injectCode()', () => {
 
     // Should not throw
     await expect(
-      (executor as any).injectCode(adapter, '123456'),
+      (executor as any).injectCode('test-job-id', adapter, '123456'),
     ).resolves.toBeUndefined();
   });
 
@@ -110,7 +110,7 @@ describe('injectCode()', () => {
     const adapter = createAdapterWithPage(page);
     const executor = await createMinimalExecutor();
 
-    await (executor as any).injectCode(adapter, '111111');
+    await (executor as any).injectCode('test-job-id', adapter, '111111');
 
     // No fields should have been filled since all are hidden
     expect(Object.keys(page.filledValues)).toHaveLength(0);
@@ -121,7 +121,7 @@ describe('injectCode()', () => {
     const executor = await createMinimalExecutor();
 
     await expect(
-      (executor as any).injectCode(adapter, '000000'),
+      (executor as any).injectCode('test-job-id', adapter, '000000'),
     ).resolves.toBeUndefined();
   });
 });
@@ -140,7 +140,7 @@ describe('injectCredentials()', () => {
     const adapter = createAdapterWithPage(page);
     const executor = await createMinimalExecutor();
 
-    await (executor as any).injectCredentials(adapter, {
+    await (executor as any).injectCredentials('test-job-id', adapter, {
       username: 'admin',
       password: 'secret123',
     });
@@ -157,7 +157,7 @@ describe('injectCredentials()', () => {
     const adapter = createAdapterWithPage(page);
     const executor = await createMinimalExecutor();
 
-    await (executor as any).injectCredentials(adapter, {
+    await (executor as any).injectCredentials('test-job-id', adapter, {
       email: 'user@example.com',
       password: 'pass',
     });
@@ -173,7 +173,7 @@ describe('injectCredentials()', () => {
     const adapter = createAdapterWithPage(page);
     const executor = await createMinimalExecutor();
 
-    await (executor as any).injectCredentials(adapter, {
+    await (executor as any).injectCredentials('test-job-id', adapter, {
       password: 'only-pass',
     });
 
@@ -189,7 +189,7 @@ describe('injectCredentials()', () => {
     const adapter = createAdapterWithPage(page);
     const executor = await createMinimalExecutor();
 
-    await (executor as any).injectCredentials(adapter, {
+    await (executor as any).injectCredentials('test-job-id', adapter, {
       username: 'only-user',
     });
 
@@ -202,7 +202,7 @@ describe('injectCredentials()', () => {
     const executor = await createMinimalExecutor();
 
     await expect(
-      (executor as any).injectCredentials(adapter, {
+      (executor as any).injectCredentials('test-job-id', adapter, {
         username: 'user',
         password: 'pass',
       }),
@@ -217,7 +217,7 @@ describe('injectCredentials()', () => {
     const adapter = createAdapterWithPage(page);
     const executor = await createMinimalExecutor();
 
-    await (executor as any).injectCredentials(adapter, {});
+    await (executor as any).injectCredentials('test-job-id', adapter, {});
 
     // No fields filled, no submit clicked
     expect(Object.keys(page.filledValues)).toHaveLength(0);
@@ -229,7 +229,7 @@ describe('injectCredentials()', () => {
     const executor = await createMinimalExecutor();
 
     await expect(
-      (executor as any).injectCredentials(adapter, { username: 'x', password: 'y' }),
+      (executor as any).injectCredentials('test-job-id', adapter, { username: 'x', password: 'y' }),
     ).resolves.toBeUndefined();
   });
 
@@ -242,7 +242,7 @@ describe('injectCredentials()', () => {
     const adapter = createAdapterWithPage(page);
     const executor = await createMinimalExecutor();
 
-    await (executor as any).injectCredentials(adapter, {
+    await (executor as any).injectCredentials('test-job-id', adapter, {
       username: 'user123',
       password: 'pass456',
     });

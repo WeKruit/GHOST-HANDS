@@ -76,6 +76,9 @@ const DEFAULT_HITL_TIMEOUT_SECONDS = 300; // 5 minutes
 const MAX_CRASH_RECOVERIES = 2;
 const BLOCKER_CONFIDENCE_THRESHOLD = 0.6;
 const MAX_POST_RESUME_CHECKS = 3;
+const BLOCKER_CHECK_INTERVAL_MS = 15_000; // Minimum interval between action-triggered blocker checks
+const PERIODIC_BLOCKER_CHECK_MS = 30_000; // Periodic timer-based blocker check interval
+const CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK = 3; // Check for blockers after this many consecutive action failures
 
 /** Error codes that should trigger HITL instead of immediate retry */
 const HITL_ELIGIBLE_ERRORS = new Set([
@@ -144,6 +147,7 @@ export class JobExecutor {
     const heartbeat = this.startHeartbeat(job.id);
     let adapter: BrowserAutomationAdapter | null = null;
     let observer: StagehandObserver | undefined;
+    let blockerCheckInterval: ReturnType<typeof setInterval> | null = null;
 
     // Initialize cost tracker with budget limits
     const qualityPreset = resolveQualityPreset(job.input_data, job.metadata);
@@ -504,7 +508,15 @@ export class JobExecutor {
         }
       });
 
-      adapter.on('actionStarted', (action: { variant: string }) => {
+      // Track state for periodic blocker checks, URL monitoring, and failure escalation
+      let lastBlockerCheckTime = Date.now();
+      let consecutiveActionFailures = 0;
+      const targetDomain = new URL(job.target_url).hostname;
+      let lastKnownUrl = job.target_url;
+
+      adapter.on('actionStarted', async (action: { variant: string }) => {
+        // Track consecutive failures: incremented on start, reset on actionDone
+        consecutiveActionFailures++;
         costTracker.recordAction(); // throws ActionLimitExceededError if over limit
         costTracker.recordModeStep('magnitude');
         progress.onActionStarted(action.variant);
@@ -512,14 +524,60 @@ export class JobExecutor {
           action: action.variant,
           action_count: costTracker.getSnapshot().actionCount,
         });
+
+        // If repeated action failures, check for blockers before continuing
+        if (consecutiveActionFailures >= CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK && adapter) {
+          try {
+            const blocked = await this.checkForBlockers(job, adapter, costTracker);
+            if (blocked) {
+              // HITL handled — the blocker was likely the root cause of failures
+            }
+          } catch {
+            // Non-fatal
+          }
+        }
       });
 
-      adapter.on('actionDone', (action: { variant: string }) => {
+      adapter.on('actionDone', async (action: { variant: string }) => {
         progress.onActionDone(action.variant);
+        consecutiveActionFailures = 0; // Reset on successful action
         this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
           action: action.variant,
           action_count: costTracker.getSnapshot().actionCount,
         });
+
+        // Periodic blocker check after actions (throttled)
+        const now = Date.now();
+        if (now - lastBlockerCheckTime >= BLOCKER_CHECK_INTERVAL_MS) {
+          lastBlockerCheckTime = now;
+          try {
+            // URL change detection — check if page navigated to a non-target domain
+            const currentUrl = await adapter!.getCurrentUrl();
+            if (currentUrl !== lastKnownUrl) {
+              lastKnownUrl = currentUrl;
+              try {
+                const currentDomain = new URL(currentUrl).hostname;
+                if (currentDomain !== targetDomain) {
+                  await this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
+                    from_domain: targetDomain,
+                    to_url: currentUrl,
+                  });
+                }
+              } catch {
+                // Invalid URL — skip domain comparison
+              }
+            }
+
+            // Use detectBlocker (DOM-only) for speed, not detectWithAdapter (which calls observe/LLM)
+            const blocked = await this.checkForBlockers(job, adapter!, costTracker);
+            if (blocked) {
+              // checkForBlockers already handled HITL flow internally
+            }
+          } catch (err) {
+            if ((err as Error).message?.includes('Blocker detected')) throw err;
+            // Detection errors are non-fatal
+          }
+        }
       });
 
       adapter.on('tokensUsed', (usage: TokenUsage) => {
@@ -536,6 +594,19 @@ export class JobExecutor {
           cost_usd: usage.inputCost + usage.outputCost,
         });
       });
+
+      // Start periodic blocker check timer (catches blockers even when adapter is stuck)
+      blockerCheckInterval = setInterval(async () => {
+        if (!adapter || adapter.isPaused?.()) return; // Don't check while paused
+        try {
+          const blocked = await this.checkForBlockers(job, adapter, costTracker);
+          if (blocked) {
+            // Already handled internally — the job will be paused
+          }
+        } catch {
+          // Non-fatal
+        }
+      }, PERIODIC_BLOCKER_CHECK_MS);
 
       // 10. Build TaskContext and delegate to handler (with crash recovery)
       const timeoutMs = job.timeout_seconds * 1000;
@@ -626,20 +697,67 @@ export class JobExecutor {
               });
             }
           });
-          adapter.on('actionStarted', (action: { variant: string }) => {
+          adapter.on('actionStarted', async (action: { variant: string }) => {
+            consecutiveActionFailures++;
             costTracker.recordAction();
             progress.onActionStarted(action.variant);
             this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_STARTED, {
               action: action.variant,
               action_count: costTracker.getSnapshot().actionCount,
             });
+
+            if (consecutiveActionFailures >= CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK && adapter) {
+              try {
+                const blocked = await this.checkForBlockers(job, adapter, costTracker);
+                if (blocked) {
+                  // HITL handled
+                }
+              } catch {
+                // Non-fatal
+              }
+            }
           });
-          adapter.on('actionDone', (action: { variant: string }) => {
+          // Reset blocker check state after crash recovery
+          lastBlockerCheckTime = Date.now();
+          consecutiveActionFailures = 0;
+          lastKnownUrl = job.target_url;
+
+          adapter.on('actionDone', async (action: { variant: string }) => {
             progress.onActionDone(action.variant);
+            consecutiveActionFailures = 0;
             this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
               action: action.variant,
               action_count: costTracker.getSnapshot().actionCount,
             });
+
+            // Periodic blocker check after actions (throttled)
+            const now = Date.now();
+            if (now - lastBlockerCheckTime >= BLOCKER_CHECK_INTERVAL_MS) {
+              lastBlockerCheckTime = now;
+              try {
+                const currentUrl = await adapter!.getCurrentUrl();
+                if (currentUrl !== lastKnownUrl) {
+                  lastKnownUrl = currentUrl;
+                  try {
+                    const currentDomain = new URL(currentUrl).hostname;
+                    if (currentDomain !== targetDomain) {
+                      await this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
+                        from_domain: targetDomain,
+                        to_url: currentUrl,
+                      });
+                    }
+                  } catch {
+                    // Invalid URL — skip domain comparison
+                  }
+                }
+                const blocked = await this.checkForBlockers(job, adapter!, costTracker);
+                if (blocked) {
+                  // checkForBlockers already handled HITL flow
+                }
+              } catch (err) {
+                if ((err as Error).message?.includes('Blocker detected')) throw err;
+              }
+            }
           });
           adapter.on('tokensUsed', (usage: TokenUsage) => {
             costTracker.recordTokenUsage({
@@ -894,6 +1012,7 @@ export class JobExecutor {
       }
     } finally {
       clearInterval(heartbeat);
+      if (blockerCheckInterval) clearInterval(blockerCheckInterval);
       if (observer) {
         try { await observer.stop(); } catch { /* best-effort cleanup */ }
       }
@@ -985,6 +1104,16 @@ export class JobExecutor {
     adapter: BrowserAutomationAdapter,
     costTracker?: CostTracker,
   ): Promise<boolean> {
+    // Log that we're starting blocker detection
+    let currentUrl: string | undefined;
+    try {
+      currentUrl = await adapter.getCurrentUrl();
+    } catch { /* best effort */ }
+
+    await this.logJobEvent(job.id, JOB_EVENT_TYPES.OBSERVATION_STARTED, {
+      url: currentUrl,
+    });
+
     let blockerResult: BlockerResult | null = null;
     try {
       blockerResult = await this.blockerDetector.detectWithAdapter(adapter);
@@ -995,6 +1124,10 @@ export class JobExecutor {
     }
 
     if (!blockerResult || blockerResult.confidence < BLOCKER_CONFIDENCE_THRESHOLD) {
+      await this.logJobEvent(job.id, JOB_EVENT_TYPES.OBSERVATION_COMPLETED, {
+        result: 'clear',
+        url: currentUrl,
+      });
       return false;
     }
 
@@ -1098,10 +1231,12 @@ export class JobExecutor {
       await adapter.pause();
     }
 
-    await this.logJobEvent(job.id, 'hitl_paused', {
+    await this.logJobEvent(job.id, JOB_EVENT_TYPES.HITL_PAUSED, {
       blocker_type: blockerResult.type,
       confidence: blockerResult.confidence,
+      source: blockerResult.source,
       page_url: pageUrl,
+      screenshot_url: screenshotUrl,
     });
 
     // 4. Notify VALET via callback
@@ -1142,9 +1277,9 @@ export class JobExecutor {
     if (result.resumed) {
       // 6. Inject credentials/code BEFORE resuming the adapter
       if (result.resolutionType === 'code_entry' && result.resolutionData?.code) {
-        await this.injectCode(adapter, result.resolutionData.code as string);
+        await this.injectCode(job.id, adapter, result.resolutionData.code as string);
       } else if (result.resolutionType === 'credentials' && result.resolutionData) {
-        await this.injectCredentials(adapter, result.resolutionData);
+        await this.injectCredentials(job.id, adapter, result.resolutionData);
       }
       // 'manual' and 'skip' — no injection needed
 
@@ -1165,7 +1300,7 @@ export class JobExecutor {
         })
         .eq('id', job.id);
 
-      await this.logJobEvent(job.id, 'hitl_resumed', {
+      await this.logJobEvent(job.id, JOB_EVENT_TYPES.HITL_RESUMED, {
         resolution_type: result.resolutionType || 'manual',
         // SECURITY: Never log resolutionData — it may contain passwords/codes
       });
@@ -1179,7 +1314,7 @@ export class JobExecutor {
     }
 
     // 8. Timeout — fail the job
-    await this.logJobEvent(job.id, 'hitl_timeout', { timeout_seconds: timeoutSeconds });
+    await this.logJobEvent(job.id, JOB_EVENT_TYPES.HITL_TIMEOUT, { timeout_seconds: timeoutSeconds });
     await this.supabase
       .from('gh_automation_jobs')
       .update({
@@ -1485,9 +1620,13 @@ export class JobExecutor {
    * Deterministic field-filling — bypasses the AI agent for reliability.
    * SECURITY: Never log the code value.
    */
-  private async injectCode(adapter: BrowserAutomationAdapter, code: string): Promise<void> {
+  private async injectCode(jobId: string, adapter: BrowserAutomationAdapter, code: string): Promise<void> {
     const page = adapter.page;
     if (!page) return;
+
+    await this.logJobEvent(jobId, JOB_EVENT_TYPES.CREDENTIAL_INJECTION_ATTEMPTED, {
+      injection_type: 'code_entry',
+    });
 
     const selectors = [
       'input[autocomplete="one-time-code"]',
@@ -1509,6 +1648,10 @@ export class JobExecutor {
         if (el && await el.isVisible()) {
           await el.fill(code);
           console.log(`[JobExecutor] Injected 2FA code via selector: ${selector}`);
+          await this.logJobEvent(jobId, JOB_EVENT_TYPES.CREDENTIAL_INJECTION_SUCCEEDED, {
+            injection_type: 'code_entry',
+            selector,
+          });
           // Try to submit
           const submitBtn = await page.$('button[type="submit"], input[type="submit"], button:has-text("Verify"), button:has-text("Submit"), button:has-text("Continue")');
           if (submitBtn && await submitBtn.isVisible()) {
@@ -1521,6 +1664,10 @@ export class JobExecutor {
       }
     }
     console.warn('[JobExecutor] Could not find 2FA code input field — resuming without injection');
+    await this.logJobEvent(jobId, JOB_EVENT_TYPES.CREDENTIAL_INJECTION_FAILED, {
+      injection_type: 'code_entry',
+      reason: 'no_matching_input_field',
+    });
   }
 
   /**
@@ -1528,6 +1675,7 @@ export class JobExecutor {
    * SECURITY: Never log credential values — only log the selector matched.
    */
   private async injectCredentials(
+    jobId: string,
     adapter: BrowserAutomationAdapter,
     data: Record<string, unknown>,
   ): Promise<void> {
@@ -1538,6 +1686,15 @@ export class JobExecutor {
     const password = data.password as string | undefined;
 
     if (!username && !password) return;
+
+    await this.logJobEvent(jobId, JOB_EVENT_TYPES.CREDENTIAL_INJECTION_ATTEMPTED, {
+      injection_type: 'credentials',
+      has_username: !!username,
+      has_password: !!password,
+    });
+
+    let usernameInjected = false;
+    let passwordInjected = false;
 
     if (username) {
       const usernameSelectors = [
@@ -1559,6 +1716,7 @@ export class JobExecutor {
           if (el && await el.isVisible()) {
             await el.fill(username);
             console.log(`[JobExecutor] Injected username via selector: ${sel}`);
+            usernameInjected = true;
             break;
           }
         } catch { /* try next */ }
@@ -1578,13 +1736,19 @@ export class JobExecutor {
           if (el && await el.isVisible()) {
             await el.fill(password);
             console.log(`[JobExecutor] Injected password via selector: ${sel}`);
+            passwordInjected = true;
             break;
           }
         } catch { /* try next */ }
       }
     }
 
-    if (username || password) {
+    if (usernameInjected || passwordInjected) {
+      await this.logJobEvent(jobId, JOB_EVENT_TYPES.CREDENTIAL_INJECTION_SUCCEEDED, {
+        injection_type: 'credentials',
+        username_injected: usernameInjected,
+        password_injected: passwordInjected,
+      });
       try {
         const submitBtn = await page.$('button[type="submit"], input[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Submit"), button:has-text("Continue")');
         if (submitBtn && await submitBtn.isVisible()) {
@@ -1592,6 +1756,11 @@ export class JobExecutor {
           await page.waitForLoadState('networkidle').catch(() => {});
         }
       } catch { /* best effort */ }
+    } else {
+      await this.logJobEvent(jobId, JOB_EVENT_TYPES.CREDENTIAL_INJECTION_FAILED, {
+        injection_type: 'credentials',
+        reason: 'no_matching_input_fields',
+      });
     }
   }
 

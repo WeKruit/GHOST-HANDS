@@ -153,10 +153,36 @@ const OBSERVE_CLASSIFICATION: { pattern: RegExp; type: BlockerType; confidence: 
   { pattern: /audio challenge/i, type: 'verification', confidence: 0.8 },
 ];
 
+// URL-based blocker detection — catches redirects to known blocker pages
+const BLOCKER_URL_PATTERNS: { pattern: RegExp; type: BlockerType; confidence: number }[] = [
+  { pattern: /google\.com\/sorry/i, type: 'captcha', confidence: 0.95 },
+  { pattern: /cloudflare\.com\/cdn-cgi\/challenge/i, type: 'bot_check', confidence: 0.95 },
+  { pattern: /challenges\.cloudflare\.com/i, type: 'bot_check', confidence: 0.95 },
+  { pattern: /captcha/i, type: 'captcha', confidence: 0.6 },
+];
+
 const OBSERVE_INSTRUCTION =
   'Look for CAPTCHAs, login walls, verification challenges, 2FA prompts, rate limiting messages, or bot detection on this page. Report any blocking elements that prevent normal interaction.';
 
 export class BlockerDetector {
+  /**
+   * Check the current URL against known blocker URL patterns.
+   * This is the cheapest possible check (string comparison, no DOM access).
+   */
+  checkUrl(url: string): BlockerResult | null {
+    for (const { pattern, type, confidence } of BLOCKER_URL_PATTERNS) {
+      if (pattern.test(url)) {
+        return {
+          type,
+          confidence,
+          details: `URL matches blocker pattern: ${pattern.source}`,
+          source: 'dom',
+        };
+      }
+    }
+    return null;
+  }
+
   /**
    * Detect if the current page shows a blocker using DOM inspection only.
    * Returns the highest-confidence match, or null if none found.
@@ -164,6 +190,14 @@ export class BlockerDetector {
    * This is the original fast-path detection (cheap, no LLM calls).
    */
   async detectBlocker(page: Page): Promise<BlockerResult | null> {
+    // Check URL first (cheapest possible check)
+    try {
+      const urlResult = this.checkUrl(page.url());
+      if (urlResult) return urlResult;
+    } catch {
+      // page.url() can fail if page is closed
+    }
+
     const matches = await this.runDOMDetection(page);
     if (matches.length === 0) return null;
 
@@ -175,12 +209,22 @@ export class BlockerDetector {
    * Detect blockers using both DOM inspection and the adapter's observe() method.
    *
    * Strategy:
+   * 0. Check URL against known blocker patterns (cheapest check).
    * 1. Run fast DOM detection first.
    * 2. If DOM finds a high-confidence blocker (>= 0.8), return immediately.
    * 3. Otherwise, run observe() for richer vision-based detection.
    * 4. Combine results from both passes for highest confidence.
    */
   async detectWithAdapter(adapter: BrowserAutomationAdapter): Promise<BlockerResult | null> {
+    // Pass 0: URL-based detection (cheapest check)
+    try {
+      const currentUrl = await adapter.getCurrentUrl();
+      const urlResult = this.checkUrl(currentUrl);
+      if (urlResult && urlResult.confidence >= 0.8) return urlResult;
+    } catch {
+      // getCurrentUrl() can fail if browser is disconnected
+    }
+
     // Pass 1: Fast DOM detection
     const domMatches = await this.runDOMDetection(adapter.page);
 
