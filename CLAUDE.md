@@ -126,16 +126,20 @@ bun run test:e2e           # Full system tests, sequential
 ## Environment Variables
 
 Required:
-- `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` -- Supabase connection
+- `SUPABASE_URL` -- Supabase project URL
+- `SUPABASE_SECRET_KEY` -- Supabase secret key (`sb_secret_...`). Replaces legacy `service_role` JWT.
 - `DATABASE_URL` or `SUPABASE_DIRECT_URL` -- Postgres connection string
 - `GH_SERVICE_SECRET` -- API authentication key
 - `GH_CREDENTIAL_KEY` -- 64 hex chars for AES-256-GCM encryption
 
 Optional:
+- `SUPABASE_PUBLISHABLE_KEY` -- Supabase publishable key (`sb_publishable_...`). Replaces legacy `anon` JWT.
 - `GH_MODEL` / `GH_IMAGE_MODEL` -- Default LLM model aliases
 - `GH_API_PORT` (default 3100), `GH_WORKER_PORT` (default 3101)
 - `GH_WORKER_ID` -- Worker identity for registry
 - `EC2_INSTANCE_ID`, `EC2_IP` -- EC2 metadata for monitoring
+
+> **Note:** Legacy env var names (`SUPABASE_SERVICE_KEY`, `SUPABASE_ANON_KEY`) are still accepted as fallbacks but deprecated. Use the new names.
 
 ---
 

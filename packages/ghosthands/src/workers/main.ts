@@ -53,7 +53,7 @@ async function main(): Promise<void> {
 
   // Validate required environment variables
   const supabaseUrl = requireEnv('SUPABASE_URL');
-  const supabaseServiceKey = requireEnv('SUPABASE_SERVICE_KEY');
+  const supabaseServiceKey = process.env.SUPABASE_SECRET_KEY || requireEnv('SUPABASE_SERVICE_KEY');
   // Prefer transaction-mode pooler (port 6543) to avoid session pool limits.
   // LISTEN/NOTIFY won't work through transaction pooler, but fallback polling handles it.
   const dbUrl = process.env.DATABASE_URL || process.env.SUPABASE_DIRECT_URL || requireEnv('DATABASE_DIRECT_URL');

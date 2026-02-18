@@ -2,7 +2,7 @@
  * DB Integration Tests — GhostHands tables CRUD operations
  *
  * Tests direct DB operations against Supabase for all gh_ prefixed tables.
- * Requires real Supabase credentials (SUPABASE_URL, SUPABASE_SERVICE_KEY).
+ * Requires real Supabase credentials (SUPABASE_URL, SUPABASE_SECRET_KEY).
  *
  * Run:
  *   bun run test:integration -- __tests__/integration/db/jobsCrud.test.ts

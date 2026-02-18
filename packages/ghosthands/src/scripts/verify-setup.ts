@@ -29,7 +29,7 @@ const requiredEnvVars = [
   'DATABASE_URL',
   'DATABASE_DIRECT_URL',
   'SUPABASE_URL',
-  'SUPABASE_SERVICE_KEY',
+  'SUPABASE_SECRET_KEY',
 ];
 
 const optionalEnvVars = [
