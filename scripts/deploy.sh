@@ -84,6 +84,8 @@ start_targeted_worker() {
     -e GH_WORKER_ID="$worker_id" \
     -e DISPLAY=:99 \
     -e MAX_CONCURRENT_JOBS="${MAX_CONCURRENT_JOBS:-2}" \
+    -e SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    -e SSL_CERT_DIR=/etc/ssl/certs \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
     --memory=2g --cpus=2.0 \
     --restart unless-stopped \
