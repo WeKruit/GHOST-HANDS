@@ -164,6 +164,112 @@ describe('VALET Status API — mode/cost fields', () => {
       expect(capturedPayload.manual).toBeUndefined();
     });
   });
+
+  describe('CallbackNotifier — worker_id field', () => {
+    let capturedPayload: any = null;
+    let notifier: CallbackNotifier;
+
+    beforeEach(() => {
+      capturedPayload = null;
+      notifier = new CallbackNotifier();
+      globalThis.fetch = async (_url: string | URL | Request, init?: any) => {
+        capturedPayload = JSON.parse(init.body);
+        return new Response('OK', { status: 200 });
+      };
+    });
+
+    test('notifyFromJob includes worker_id when provided', async () => {
+      await notifier.notifyFromJob({
+        id: 'job-w1',
+        callback_url: 'https://example.com/callback',
+        status: 'completed',
+        worker_id: 'worker-abc-123',
+        result_data: { applied: true },
+      });
+
+      expect(capturedPayload.worker_id).toBe('worker-abc-123');
+    });
+
+    test('notifyFromJob omits worker_id when not provided', async () => {
+      await notifier.notifyFromJob({
+        id: 'job-w2',
+        callback_url: 'https://example.com/callback',
+        status: 'completed',
+        result_data: { applied: true },
+      });
+
+      expect(capturedPayload.worker_id).toBeUndefined();
+    });
+
+    test('notifyRunning includes worker_id when provided', async () => {
+      await notifier.notifyRunning(
+        'job-w3',
+        'https://example.com/callback',
+        'valet-task-1',
+        undefined,
+        'worker-run-456',
+      );
+
+      expect(capturedPayload.worker_id).toBe('worker-run-456');
+      expect(capturedPayload.status).toBe('running');
+    });
+
+    test('notifyRunning omits worker_id when not provided', async () => {
+      await notifier.notifyRunning(
+        'job-w4',
+        'https://example.com/callback',
+        'valet-task-2',
+      );
+
+      expect(capturedPayload.worker_id).toBeUndefined();
+    });
+
+    test('notifyHumanNeeded includes worker_id when provided', async () => {
+      await notifier.notifyHumanNeeded(
+        'job-w5',
+        'https://example.com/callback',
+        { type: 'captcha', screenshot_url: 'https://example.com/ss.png' },
+        'valet-task-3',
+        'worker-hitl-789',
+      );
+
+      expect(capturedPayload.worker_id).toBe('worker-hitl-789');
+      expect(capturedPayload.status).toBe('needs_human');
+    });
+
+    test('notifyHumanNeeded omits worker_id when not provided', async () => {
+      await notifier.notifyHumanNeeded(
+        'job-w6',
+        'https://example.com/callback',
+        { type: 'login' },
+        'valet-task-4',
+      );
+
+      expect(capturedPayload.worker_id).toBeUndefined();
+    });
+
+    test('notifyResumed includes worker_id when provided', async () => {
+      await notifier.notifyResumed(
+        'job-w7',
+        'https://example.com/callback',
+        'valet-task-5',
+        'worker-resume-101',
+      );
+
+      expect(capturedPayload.worker_id).toBe('worker-resume-101');
+      expect(capturedPayload.status).toBe('resumed');
+    });
+
+    test('notifyResumed omits worker_id when not provided', async () => {
+      await notifier.notifyResumed(
+        'job-w8',
+        'https://example.com/callback',
+        'valet-task-6',
+      );
+
+      expect(capturedPayload.worker_id).toBeUndefined();
+    });
+  });
 });
 
 describe('VALET Schema — model + execution_mode fields', () => {

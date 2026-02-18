@@ -119,6 +119,7 @@ async function main(): Promise<void> {
     console.log(`[Worker] Draining ${poller.activeJobCount} active job(s)...`);
 
     await poller.stop();
+    await deregisterWorker();
 
     try {
       await pgDirect.end();
@@ -143,6 +144,61 @@ async function main(): Promise<void> {
     // Give time for logs to flush, then exit
     setTimeout(() => process.exit(1), 1000);
   });
+
+  // ── Worker Registry ────────────────────────────────────────────
+  // UPSERT into gh_worker_registry so the fleet monitoring endpoint
+  // and VALET deregistration know about this worker.
+  const targetWorkerId = process.env.GH_WORKER_ID || null;
+  const ec2InstanceId = process.env.EC2_INSTANCE_ID || null;
+  const ec2Ip = process.env.EC2_IP || null;
+
+  try {
+    await pgDirect.query(`
+      INSERT INTO gh_worker_registry (worker_id, status, target_worker_id, ec2_instance_id, ec2_ip, registered_at, last_heartbeat)
+      VALUES ($1, 'active', $2, $3, $4, NOW(), NOW())
+      ON CONFLICT (worker_id) DO UPDATE SET
+        status = 'active',
+        target_worker_id = COALESCE($2, gh_worker_registry.target_worker_id),
+        ec2_instance_id = COALESCE($3, gh_worker_registry.ec2_instance_id),
+        ec2_ip = COALESCE($4, gh_worker_registry.ec2_ip),
+        last_heartbeat = NOW()
+    `, [WORKER_ID, targetWorkerId, ec2InstanceId, ec2Ip]);
+    console.log(`[Worker] Registered in gh_worker_registry`);
+  } catch (err) {
+    // Non-fatal: registry table may not exist yet if migration hasn't run
+    console.warn(`[Worker] Failed to register in worker registry:`, err instanceof Error ? err.message : err);
+  }
+
+  // Heartbeat every 30s — updates last_heartbeat and current_job_id
+  const HEARTBEAT_INTERVAL_MS = 30_000;
+  const heartbeatTimer = setInterval(async () => {
+    try {
+      await pgDirect.query(`
+        UPDATE gh_worker_registry
+        SET last_heartbeat = NOW(),
+            current_job_id = $2::UUID,
+            status = $3
+        WHERE worker_id = $1
+      `, [WORKER_ID, poller.currentJobId, shuttingDown ? 'draining' : 'active']);
+    } catch (err) {
+      console.warn(`[Worker] Heartbeat update failed:`, err instanceof Error ? err.message : err);
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+
+  // Helper to mark worker offline in registry
+  const deregisterWorker = async (): Promise<void> => {
+    clearInterval(heartbeatTimer);
+    try {
+      await pgDirect.query(`
+        UPDATE gh_worker_registry
+        SET status = 'offline', current_job_id = NULL, last_heartbeat = NOW()
+        WHERE worker_id = $1
+      `, [WORKER_ID]);
+      console.log(`[Worker] Marked offline in gh_worker_registry`);
+    } catch (err) {
+      console.warn(`[Worker] Failed to deregister:`, err instanceof Error ? err.message : err);
+    }
+  };
 
   // Start polling
   await poller.start();
@@ -192,6 +248,11 @@ async function main(): Promise<void> {
           if (!shuttingDown) {
             console.log(`[Worker] Drain requested via HTTP — stopping job pickup`);
             shuttingDown = true;
+            // Update registry status to draining
+            pgDirect.query(
+              `UPDATE gh_worker_registry SET status = 'draining' WHERE worker_id = $1`,
+              [WORKER_ID]
+            ).catch(() => {});
             // Stop accepting new jobs but let active ones finish
             poller.stop().then(() => {
               console.log(`[Worker] Drain complete — all jobs finished`);

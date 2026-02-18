@@ -17,6 +17,7 @@ export interface CallbackPayload {
   job_id: string;
   valet_task_id: string | null;
   status: 'completed' | 'failed' | 'needs_human' | 'resumed' | 'running';
+  worker_id?: string;
   result_data?: Record<string, any>;
   result_summary?: string;
   screenshot_url?: string;
@@ -73,6 +74,7 @@ export class CallbackNotifier {
     valet_task_id?: string | null;
     callback_url?: string | null;
     status: string;
+    worker_id?: string;
     result_data?: Record<string, any>;
     result_summary?: string;
     screenshot_urls?: string[];
@@ -92,6 +94,7 @@ export class CallbackNotifier {
       job_id: job.id,
       valet_task_id: job.valet_task_id || null,
       status: job.status === 'completed' ? 'completed' : 'failed',
+      ...(job.worker_id && { worker_id: job.worker_id }),
       completed_at: new Date().toISOString(),
     };
 
@@ -145,11 +148,13 @@ export class CallbackNotifier {
     callbackUrl: string,
     valetTaskId?: string | null,
     metadata?: { execution_mode?: string; manual_id?: string | null },
+    workerId?: string,
   ): Promise<boolean> {
     const payload: CallbackPayload = {
       job_id: jobId,
       valet_task_id: valetTaskId || null,
       status: 'running',
+      ...(workerId && { worker_id: workerId }),
       completed_at: new Date().toISOString(),
       ...(metadata?.execution_mode && { execution_mode: metadata.execution_mode }),
     };
@@ -164,11 +169,13 @@ export class CallbackNotifier {
     callbackUrl: string,
     interactionData: InteractionInfo,
     valetTaskId?: string | null,
+    workerId?: string,
   ): Promise<boolean> {
     const payload: CallbackPayload = {
       job_id: jobId,
       valet_task_id: valetTaskId || null,
       status: 'needs_human',
+      ...(workerId && { worker_id: workerId }),
       interaction: interactionData,
       completed_at: new Date().toISOString(),
     };
@@ -182,11 +189,13 @@ export class CallbackNotifier {
     jobId: string,
     callbackUrl: string,
     valetTaskId?: string | null,
+    workerId?: string,
   ): Promise<boolean> {
     const payload: CallbackPayload = {
       job_id: jobId,
       valet_task_id: valetTaskId || null,
       status: 'resumed',
+      ...(workerId && { worker_id: workerId }),
       completed_at: new Date().toISOString(),
     };
     return this.sendWithRetry(callbackUrl, payload);
