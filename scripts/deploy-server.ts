@@ -6,9 +6,10 @@
  *
  * Endpoints:
  *   GET  /health  — Returns worker health + active task count (no auth)
+ *   GET  /metrics — Returns system-level CPU/memory/disk stats (no auth)
+ *   GET  /version — Returns deploy server version + current image info
  *   POST /deploy  — Triggers deploy.sh with image_tag (requires X-Deploy-Secret)
  *   POST /drain   — Triggers graceful worker drain (requires X-Deploy-Secret)
- *   GET  /version — Returns deploy server version + current image info
  *
  * Auth:
  *   POST endpoints require X-Deploy-Secret header matching GH_DEPLOY_SECRET env var.
@@ -26,7 +27,8 @@
  */
 
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import os from 'node:os';
+import { spawn, execSync } from 'node:child_process';
 
 const DEPLOY_PORT = parseInt(process.env.GH_DEPLOY_PORT || '8000', 10);
 const DEPLOY_SECRET = process.env.GH_DEPLOY_SECRET;
@@ -143,6 +145,56 @@ if (typeof Bun !== 'undefined') {
           version: '1.0.0',
           ghosthands: apiVersion ?? { status: 'unreachable' },
           uptimeMs: Date.now() - startedAt,
+        });
+      }
+
+      // ── GET /metrics — Unauthenticated system metrics ────────
+      if (url.pathname === '/metrics' && req.method === 'GET') {
+        // CPU usage: average across all cores over a 500ms sample
+        const cpus = os.cpus();
+        const cores = cpus.length;
+        const loadAvg = os.loadavg()[0] ?? 0; // 1-minute load average
+        const cpuPercent = Math.min(100, (loadAvg / cores) * 100);
+
+        // Memory
+        const totalMem = os.totalmem();
+        const freeMem = os.freemem();
+        const usedMem = totalMem - freeMem;
+
+        // Disk usage via df
+        let diskUsedGb = 0;
+        let diskTotalGb = 0;
+        try {
+          const dfOut = execSync("df -BG / | tail -1 | awk '{print $2, $3}'", {
+            encoding: 'utf-8',
+            timeout: 3000,
+          }).trim();
+          const [totalStr, usedStr] = dfOut.split(/\s+/);
+          diskTotalGb = parseFloat(totalStr?.replace('G', '') ?? '0');
+          diskUsedGb = parseFloat(usedStr?.replace('G', '') ?? '0');
+        } catch {
+          // Disk metrics unavailable
+        }
+
+        return Response.json({
+          cpu: {
+            usagePercent: Math.round(cpuPercent * 10) / 10,
+            cores,
+          },
+          memory: {
+            usedMb: Math.round(usedMem / 1024 / 1024),
+            totalMb: Math.round(totalMem / 1024 / 1024),
+            usagePercent: Math.round((usedMem / totalMem) * 1000) / 10,
+          },
+          disk: {
+            usedGb: diskUsedGb,
+            totalGb: diskTotalGb,
+            usagePercent: diskTotalGb > 0 ? Math.round((diskUsedGb / diskTotalGb) * 1000) / 10 : 0,
+          },
+          network: {
+            rxBytesPerSec: 0,
+            txBytesPerSec: 0,
+          },
         });
       }
 
