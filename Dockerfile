@@ -93,12 +93,13 @@ COPY --from=build /app/packages/ghosthands/package.json ./packages/ghosthands/
 # Note: bun hoists all dependencies to root node_modules/, so
 # packages/ghosthands/node_modules/ typically doesn't exist.
 
-# Install Patchright browser binaries (Chromium only)
-RUN bunx patchright install chromium
-
-# Create non-root user
+# Create non-root user first so browser install goes to the right home dir
 RUN groupadd -r ghosthands && useradd -r -g ghosthands -m ghosthands
+
+# Install Patchright browser binaries (Chromium only) as ghosthands user
+# Must run AFTER creating the user so browsers install to /home/ghosthands/.cache/
 USER ghosthands
+RUN bunx patchright install chromium
 
 # Default: start API server
 EXPOSE 3100
