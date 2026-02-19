@@ -48,7 +48,9 @@ services:
     environment:
       - NODE_ENV=production
       - GH_DEPLOY_PORT=8000
+      - GH_API_HOST=api
       - GH_API_PORT=3100
+      - GH_WORKER_HOST=worker
       - GH_WORKER_PORT=3101
       - GHOSTHANDS_DIR=/app
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
