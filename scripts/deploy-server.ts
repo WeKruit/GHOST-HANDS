@@ -215,7 +215,7 @@ if (typeof Bun !== 'undefined') {
       }
 
       // ── GET /containers — Running Docker containers ───────────
-      // Uses Docker Engine API via Unix socket (no Docker CLI needed)
+      // Returns ContainerInfo[] matching VALET's expected schema
       if (url.pathname === '/containers' && req.method === 'GET') {
         try {
           const resp = await fetch('http://localhost/containers/json', {
@@ -227,42 +227,49 @@ if (typeof Bun !== 'undefined') {
           if (!resp.ok) throw new Error(`Docker API: ${resp.status}`);
           const raw = (await resp.json()) as Array<Record<string, unknown>>;
 
+          // Return flat array matching ContainerInfo type
           const containers = raw.map((c) => ({
+            id: ((c.Id as string) ?? '').slice(0, 12),
             name: ((c.Names as string[]) ?? [])[0]?.replace(/^\//, '') ?? 'unknown',
-            image: c.Image ?? 'unknown',
-            status: c.Status ?? 'unknown',
-            state: c.State ?? 'unknown',
-            created: c.Created ? new Date((c.Created as number) * 1000).toISOString() : null,
+            image: (c.Image as string) ?? 'unknown',
+            status: (c.Status as string) ?? 'unknown',
+            state: (c.State as string) ?? 'unknown',
+            ports: ((c.Ports as Array<{ PublicPort?: number; PrivatePort?: number; Type?: string }>) ?? [])
+              .filter((p) => p.PublicPort)
+              .map((p) => `${p.PublicPort}→${p.PrivatePort}/${p.Type ?? 'tcp'}`),
+            createdAt: c.Created ? new Date((c.Created as number) * 1000).toISOString() : '',
+            labels: (c.Labels as Record<string, string>) ?? {},
           }));
 
-          return Response.json({ containers, count: containers.length });
+          return Response.json(containers);
         } catch (err) {
-          return Response.json({
-            containers: [],
-            count: 0,
-            error: err instanceof Error ? err.message : 'Failed to list containers',
-          });
+          // Return empty array on error (client expects ContainerInfo[])
+          return Response.json([]);
         }
       }
 
       // ── GET /workers — Worker registry status ─────────────────
+      // Returns WorkerInfo[] matching VALET's expected schema
       if (url.pathname === '/workers' && req.method === 'GET') {
         const workerHealth = await fetchJson(`http://${WORKER_HOST}:${WORKER_PORT}/worker/health`);
         const workerStatus = await fetchJson(`http://${WORKER_HOST}:${WORKER_PORT}/worker/status`);
 
-        return Response.json({
-          workers: [
-            {
-              id: workerHealth?.worker_id ?? workerStatus?.worker_id ?? 'unknown',
-              status: workerHealth?.status ?? 'unknown',
-              activeJobs: (workerStatus?.active_jobs as number) ?? 0,
-              maxConcurrent: (workerStatus?.max_concurrent as number) ?? 1,
-              deploySafe: workerHealth?.deploy_safe ?? null,
-              lastHeartbeat: workerHealth?.last_heartbeat ?? null,
-              uptime: workerHealth?.uptime ?? null,
-            },
-          ],
-        });
+        const workerId = (workerHealth?.worker_id ?? workerStatus?.worker_id ?? 'unknown') as string;
+        const uptimeMs = (workerHealth?.uptime as number) ?? 0;
+
+        // Return flat array matching WorkerInfo type
+        return Response.json([
+          {
+            workerId,
+            containerId: '',
+            containerName: 'ghosthands-worker-1',
+            status: (workerHealth?.status as string) ?? 'unknown',
+            activeJobs: (workerStatus?.active_jobs as number) ?? 0,
+            statusPort: WORKER_PORT,
+            uptime: Math.round(uptimeMs / 1000),
+            image: 'ghosthands:latest',
+          },
+        ]);
       }
 
       // ── POST /deploy — Authenticated deploy trigger ─────────
