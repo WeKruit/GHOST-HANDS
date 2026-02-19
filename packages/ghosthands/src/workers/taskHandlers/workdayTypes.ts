@@ -25,6 +25,8 @@ export const WorkdayEducationSchema = z.object({
 export const WorkdayExperienceSchema = z.object({
   company: z.string(),
   title: z.string(),
+  location: z.string().optional(),
+  currently_work_here: z.boolean().optional().default(false),
   start_date: z.string(),
   end_date: z.string(),
   description: z.string(),
@@ -51,6 +53,12 @@ export const WorkdayUserProfileSchema = z.object({
 
   // Work experience
   experience: z.array(WorkdayExperienceSchema).default([]),
+
+  // Skills (typeahead tags on My Experience page)
+  skills: z.array(z.string()).default([]),
+
+  // Resume file path (relative to cwd or absolute)
+  resume_path: z.string().optional(),
 
   // Legal/compliance
   work_authorization: z.string().default('Yes'),
@@ -83,32 +91,35 @@ export const TEST_WORKDAY_PROFILE: WorkdayUserProfile = {
     zip: '95112',
     country: 'United States of America',
   },
-  linkedin_url: 'https://linkedin.com/in/happywu192',
-  website_url: 'https://happywu.dev',
-  current_company: '',
-  current_title: 'Student',
+  linkedin_url: 'www.linkedin.com/in/spencerwang1',
+  website_url: '',
+  current_company: 'WeKruit',
+  current_title: 'Software developer',
 
   education: [
     {
-      school: 'University of California, Berkeley',
-      degree: "Bachelor's Degree",
+      school: 'University of California, Los Angeles',
+      degree: 'Bachelor of Science',
       field_of_study: 'Computer Science',
-      gpa: '3.7',
-      start_date: '2023-08',
-      end_date: '2027-05',
+      start_date: '',
+      end_date: '',
     },
   ],
 
   experience: [
     {
-      company: 'Tech Startup Inc',
-      title: 'Software Engineering Intern',
-      start_date: '2025-06',
-      end_date: '2025-08',
-      description:
-        'Built REST APIs using Node.js and TypeScript. Developed React components for a SaaS platform. Wrote unit and integration tests with Jest.',
+      company: 'WeKruit',
+      title: 'Software developer',
+      location: 'LA',
+      currently_work_here: true,
+      start_date: '2026-01',
+      end_date: '',
+      description: 'Working at WeKruit Yippie!!!',
     },
   ],
+
+  skills: ['Python', 'Amazon Web Services (AWS)'],
+  resume_path: 'resumeTemp.pdf',
 
   work_authorization: 'Yes',
   visa_sponsorship: 'No',
