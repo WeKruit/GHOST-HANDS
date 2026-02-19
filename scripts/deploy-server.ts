@@ -5,11 +5,13 @@
  * to trigger deploys and check health on each EC2 sandbox.
  *
  * Endpoints:
- *   GET  /health  — Returns worker health + active task count (no auth)
- *   GET  /metrics — Returns system-level CPU/memory/disk stats (no auth)
- *   GET  /version — Returns deploy server version + current image info
- *   POST /deploy  — Triggers deploy.sh with image_tag (requires X-Deploy-Secret)
- *   POST /drain   — Triggers graceful worker drain (requires X-Deploy-Secret)
+ *   GET  /health      — Returns worker health + active task count (no auth)
+ *   GET  /metrics     — Returns system-level CPU/memory/disk stats (no auth)
+ *   GET  /version     — Returns deploy server version + current image info
+ *   GET  /containers  — Returns running Docker containers (no auth)
+ *   GET  /workers     — Returns worker registry status (no auth)
+ *   POST /deploy      — Triggers deploy.sh with image_tag (requires X-Deploy-Secret)
+ *   POST /drain       — Triggers graceful worker drain (requires X-Deploy-Secret)
  *
  * Auth:
  *   POST endpoints require X-Deploy-Secret header matching GH_DEPLOY_SECRET env var.
@@ -27,6 +29,7 @@
  */
 
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import os from 'node:os';
 import { spawn, execSync } from 'node:child_process';
 
@@ -152,16 +155,27 @@ if (typeof Bun !== 'undefined') {
 
       // ── GET /metrics — Unauthenticated system metrics ────────
       if (url.pathname === '/metrics' && req.method === 'GET') {
-        // CPU usage: average across all cores over a 500ms sample
+        // CPU usage: 1-minute load average
         const cpus = os.cpus();
         const cores = cpus.length;
-        const loadAvg = os.loadavg()[0] ?? 0; // 1-minute load average
+        const loadAvg = os.loadavg()[0] ?? 0;
         const cpuPercent = Math.min(100, (loadAvg / cores) * 100);
 
-        // Memory
+        // Memory — use MemAvailable from /proc/meminfo on Linux
+        // os.freemem() returns MemFree which excludes reclaimable buff/cache,
+        // making usage appear ~95% when real usage is ~20%.
         const totalMem = os.totalmem();
-        const freeMem = os.freemem();
-        const usedMem = totalMem - freeMem;
+        let availableMem = os.freemem(); // fallback for non-Linux
+        try {
+          const meminfo = fs.readFileSync('/proc/meminfo', 'utf-8');
+          const match = meminfo.match(/MemAvailable:\s+(\d+)\s+kB/);
+          if (match) {
+            availableMem = parseInt(match[1], 10) * 1024; // kB → bytes
+          }
+        } catch {
+          // /proc/meminfo not available (macOS), use os.freemem() fallback
+        }
+        const usedMem = totalMem - availableMem;
 
         // Disk usage via df
         let diskUsedGb = 0;
@@ -197,6 +211,52 @@ if (typeof Bun !== 'undefined') {
             rxBytesPerSec: 0,
             txBytesPerSec: 0,
           },
+        });
+      }
+
+      // ── GET /containers — Running Docker containers ───────────
+      if (url.pathname === '/containers' && req.method === 'GET') {
+        try {
+          const raw = execSync(
+            'docker ps --format \'{"name":"{{.Names}}","image":"{{.Image}}","status":"{{.Status}}","ports":"{{.Ports}}","created":"{{.CreatedAt}}"}\'',
+            { encoding: 'utf-8', timeout: 5000 },
+          ).trim();
+
+          const containers = raw
+            .split('\n')
+            .filter(Boolean)
+            .map((line) => {
+              try { return JSON.parse(line); } catch { return null; }
+            })
+            .filter(Boolean);
+
+          return Response.json({ containers, count: containers.length });
+        } catch (err) {
+          return Response.json({
+            containers: [],
+            count: 0,
+            error: err instanceof Error ? err.message : 'Failed to list containers',
+          });
+        }
+      }
+
+      // ── GET /workers — Worker registry status ─────────────────
+      if (url.pathname === '/workers' && req.method === 'GET') {
+        const workerHealth = await fetchJson(`http://${WORKER_HOST}:${WORKER_PORT}/worker/health`);
+        const workerStatus = await fetchJson(`http://${WORKER_HOST}:${WORKER_PORT}/worker/status`);
+
+        return Response.json({
+          workers: [
+            {
+              id: workerHealth?.worker_id ?? workerStatus?.worker_id ?? 'unknown',
+              status: workerHealth?.status ?? 'unknown',
+              activeJobs: (workerStatus?.active_jobs as number) ?? 0,
+              maxConcurrent: (workerStatus?.max_concurrent as number) ?? 1,
+              deploySafe: workerHealth?.deploy_safe ?? null,
+              lastHeartbeat: workerHealth?.last_heartbeat ?? null,
+              uptime: workerHealth?.uptime ?? null,
+            },
+          ],
         });
       }
 
