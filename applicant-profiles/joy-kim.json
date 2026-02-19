@@ -1,0 +1,233 @@
+{
+  "meta": {
+    "profile_name": "Joy Kim - Software Engineer",
+    "created_at": "2026-02-14",
+    "version": "1.0"
+  },
+  "personal": {
+    "firstName": "Joy",
+    "lastName": "Kim",
+    "fullName": "Joy Kim",
+    "email": "shuizhuolana@gmail.com",
+    "phone": "(310) 849-4938",
+    "phoneFormatted": "310-849-4938",
+    "location": {
+      "city": "Los Angeles",
+      "state": "California",
+      "stateAbbr": "CA",
+      "country": "United States",
+      "countryCode": "US",
+      "zipCode": "90001"
+    }
+  },
+  "links": {
+    "linkedin": "https://linkedin.com/in/joykim",
+    "github": "https://github.com/joykimdev",
+    "portfolio": "",
+    "personalWebsite": ""
+  },
+  "education": {
+    "degree": "Bachelor of Science",
+    "major": "Computer Science",
+    "school": "University of Southern California",
+    "schoolShort": "USC",
+    "gpa": "3.82",
+    "graduationYear": "2022",
+    "graduationMonth": "May",
+    "graduationDate": "2022-05",
+    "startDate": "2018-08",
+    "relevantCoursework": [
+      "Data Structures and Algorithms",
+      "Operating Systems",
+      "Distributed Systems",
+      "Database Systems",
+      "Machine Learning",
+      "Computer Networks",
+      "Software Engineering"
+    ]
+  },
+  "experience": [
+    {
+      "title": "Software Engineer II",
+      "company": "Stripe",
+      "location": "Remote / San Francisco, CA",
+      "startDate": "2024-06",
+      "endDate": "Present",
+      "current": true,
+      "duration": "Jun 2024 - Present",
+      "responsibilities": [
+        "Architected a real-time fraud detection pipeline using Kafka and Flink, reducing fraudulent transactions by 34% and saving an estimated $4.2M annually",
+        "Led migration of Ruby monolith to Go microservices, cutting p99 API latency from 420ms to 85ms",
+        "Built optimized A/B testing infrastructure that enabled 60+ concurrent experiments across the Payments team",
+        "Mentored 2 junior engineers through bi-weekly 1:1s and code review sessions; both received mid-year promotions"
+      ]
+    },
+    {
+      "title": "Software Engineer I",
+      "company": "Lyft",
+      "location": "Seattle, WA / Remote",
+      "startDate": "2022-07",
+      "endDate": "2024-05",
+      "current": false,
+      "duration": "Jul 2022 - May 2024",
+      "responsibilities": [
+        "Developed dynamic surge-pricing engine in Python and AWS Lambda, processing 2M+ ride requests per hour with <100ms latency",
+        "Redesigned driver-matching algorithm, improving average match time by 22% and increasing driver acceptance rates",
+        "Shipped a self-serve analytics dashboard (React + GraphQL) used by 300+ internal stakeholders to monitor ride metrics in real-time",
+        "Automated CI/CD pipeline with GitHub Actions and Terraform, reducing deployment times from 45 minutes to 8 minutes"
+      ]
+    },
+    {
+      "title": "Software Engineering Intern",
+      "company": "Amazon Web Services (AWS)",
+      "location": "Seattle, WA",
+      "startDate": "2021-05",
+      "endDate": "2021-08",
+      "current": false,
+      "duration": "May 2021 - Aug 2021",
+      "responsibilities": [
+        "Built a cost anomaly detection tool for the AWS Cost Explorer team using Python and scikit-learn, flagging millions in billing discrepancies",
+        "Contributed 3 production bug fixes in the first two weeks; patches shipped to 200,000+ AWS customers"
+      ]
+    },
+    {
+      "title": "Undergraduate Research Assistant",
+      "company": "USC Information Sciences Institute",
+      "location": "Los Angeles, CA",
+      "startDate": "2020-01",
+      "endDate": "2021-04",
+      "current": false,
+      "duration": "Jan 2020 - Apr 2021",
+      "responsibilities": [
+        "Implemented graph neural network models (PyTorch Geometric) for NLP citation-network tasks; results published in ACL 2021 workshop"
+      ]
+    }
+  ],
+  "skills": {
+    "programmingLanguages": [
+      "Python",
+      "Go",
+      "JavaScript",
+      "TypeScript",
+      "Ruby",
+      "SQL",
+      "Java"
+    ],
+    "frameworks": [
+      "React",
+      "Node.js",
+      "Next.js",
+      "Express",
+      "Django",
+      "Flask",
+      "PyTorch",
+      "PostgreSQL"
+    ],
+    "tools": [
+      "Kafka",
+      "Flink",
+      "AWS Lambda",
+      "Docker",
+      "Kubernetes",
+      "GitHub Actions",
+      "Terraform",
+      "Redis",
+      "GraphQL"
+    ],
+    "categories": {
+      "backend": ["Python", "Go", "Ruby", "Node.js", "PostgreSQL", "Redis"],
+      "frontend": ["React", "TypeScript", "Next.js"],
+      "infrastructure": ["AWS", "Docker", "Kubernetes", "Terraform"],
+      "data": ["Kafka", "Flink", "PostgreSQL", "Redis"],
+      "ml": ["PyTorch", "scikit-learn"]
+    }
+  },
+  "projects": [
+    {
+      "name": "PocketBudget",
+      "description": "Personal finance tracker with ML spending predictions",
+      "technologies": ["Next.js", "tRPC", "PostgreSQL", "Plaid API"],
+      "highlights": [
+        "Full-stack app built with Next.js, tRPC, and Plaid API integration",
+        "1,200+ active users with 4.7★ App Store rating",
+        "Trained an LSTM model on anonymized transaction data to predict monthly overspending with 87% accuracy"
+      ],
+      "url": "",
+      "github": ""
+    }
+  ],
+  "workPreferences": {
+    "desiredRoles": [
+      "Software Engineer",
+      "Backend Engineer",
+      "Full Stack Engineer",
+      "Senior Software Engineer"
+    ],
+    "desiredLocations": [
+      "Remote",
+      "San Francisco Bay Area",
+      "Los Angeles",
+      "Seattle",
+      "New York"
+    ],
+    "workAuthorization": "US Citizen",
+    "requiresSponsorship": false,
+    "willingToRelocate": true,
+    "remotePreference": "Remote or Hybrid",
+    "startDate": "Immediately available",
+    "noticePeriod": "2 weeks"
+  },
+  "questionsAndAnswers": {
+    "whyThisCompany": "I'm excited about [COMPANY] because of its mission to [MISSION]. My experience building scalable systems at Stripe and Lyft aligns perfectly with the technical challenges you're solving. I'm particularly interested in [SPECIFIC_PROJECT/TEAM].",
+    "whyThisRole": "This role combines my passion for backend systems and my experience with real-time data processing. At Stripe, I built fraud detection pipelines handling millions of transactions, which directly translates to the scale challenges mentioned in the job description.",
+    "greatestStrength": "My greatest strength is translating complex technical problems into elegant, scalable solutions. At Stripe, I reduced fraudulent transactions by 34% through a Kafka-Flink pipeline, saving $4.2M annually.",
+    "greatestWeakness": "I sometimes dive too deep into technical details when a simpler solution exists. I've learned to step back, validate assumptions with stakeholders, and prioritize pragmatic solutions over perfect ones.",
+    "conflictResolution": "At Lyft, I disagreed with a senior engineer about our matching algorithm approach. I ran A/B tests comparing both methods, shared data-driven results, and we collaborated on a hybrid solution that improved metrics by 22%.",
+    "careerGoals": "In 5 years, I see myself as a tech lead or engineering manager, leading a team solving high-impact distributed systems problems. I want to mentor engineers while staying close to the technical work.",
+    "whyLeaving": "I'm looking for a role with deeper technical challenges in [DOMAIN] and opportunities to work on systems at even greater scale. Stripe gave me incredible growth, and I'm ready for the next challenge.",
+    "expectedSalary": "Based on my experience and market research, I'm targeting $180,000-$220,000 base salary, plus equity. I'm flexible and open to discussing total compensation.",
+    "availableStartDate": "I can start with 2 weeks' notice from the offer acceptance date.",
+    "diversityStatement": "As a woman in tech, I'm passionate about building inclusive engineering cultures. At Lyft, I co-founded a women in engineering group that grew to 50+ members and ran monthly mentorship sessions."
+  },
+  "references": [
+    {
+      "name": "Available upon request",
+      "title": "",
+      "company": "",
+      "email": "",
+      "phone": "",
+      "relationship": ""
+    }
+  ],
+  "additional": {
+    "yearsOfExperience": 3,
+    "currentTitle": "Software Engineer II",
+    "currentCompany": "Stripe",
+    "currentSalary": 180000,
+    "desiredSalary": 200000,
+    "securityClearance": "None",
+    "veteranStatus": "Not a veteran",
+    "disabilityStatus": "No disability",
+    "race": "Prefer not to answer",
+    "gender": "Female",
+    "lgbtq": "Prefer not to answer"
+  },
+  "documents": {
+    "resume": {
+      "filename": "joy-kim-resume.pdf",
+      "path": "./resumes/joy-kim-resume.pdf",
+      "url": ""
+    },
+    "coverLetter": {
+      "filename": "",
+      "path": "",
+      "url": ""
+    },
+    "portfolio": {
+      "filename": "",
+      "path": "",
+      "url": ""
+    }
+  }
+}
+
