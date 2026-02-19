@@ -215,20 +215,25 @@ if (typeof Bun !== 'undefined') {
       }
 
       // ── GET /containers — Running Docker containers ───────────
+      // Uses Docker Engine API via Unix socket (no Docker CLI needed)
       if (url.pathname === '/containers' && req.method === 'GET') {
         try {
-          const raw = execSync(
-            'docker ps --format \'{"name":"{{.Names}}","image":"{{.Image}}","status":"{{.Status}}","ports":"{{.Ports}}","created":"{{.CreatedAt}}"}\'',
-            { encoding: 'utf-8', timeout: 5000 },
-          ).trim();
+          const resp = await fetch('http://localhost/containers/json', {
+            // @ts-ignore — Bun supports unix sockets via fetch
+            unix: '/var/run/docker.sock',
+            signal: AbortSignal.timeout(5000),
+          });
 
-          const containers = raw
-            .split('\n')
-            .filter(Boolean)
-            .map((line) => {
-              try { return JSON.parse(line); } catch { return null; }
-            })
-            .filter(Boolean);
+          if (!resp.ok) throw new Error(`Docker API: ${resp.status}`);
+          const raw = (await resp.json()) as Array<Record<string, unknown>>;
+
+          const containers = raw.map((c) => ({
+            name: ((c.Names as string[]) ?? [])[0]?.replace(/^\//, '') ?? 'unknown',
+            image: c.Image ?? 'unknown',
+            status: c.Status ?? 'unknown',
+            state: c.State ?? 'unknown',
+            created: c.Created ? new Date((c.Created as number) * 1000).toISOString() : null,
+          }));
 
           return Response.json({ containers, count: containers.length });
         } catch (err) {
