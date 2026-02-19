@@ -12,7 +12,7 @@ services:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "packages/ghosthands/src/api/server.ts"]
     ports:
-      - "127.0.0.1:${GH_API_PORT:-3100}:3100"
+      - "${GH_API_PORT:-3100}:3100"
     env_file: .env
     environment:
       - NODE_ENV=production
@@ -80,7 +80,7 @@ services:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "packages/ghosthands/src/workers/main.ts"]
     ports:
-      - "127.0.0.1:${GH_WORKER_PORT:-3101}:3101"
+      - "${GH_WORKER_PORT:-3101}:3101"
     env_file: .env
     environment:
       - NODE_ENV=production
