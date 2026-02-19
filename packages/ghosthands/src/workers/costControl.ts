@@ -73,9 +73,9 @@ export class ActionLimitExceededError extends Error {
 
 /** Per-task LLM budget (in USD) by quality preset */
 const TASK_BUDGET: Record<QualityPreset, number> = {
-  speed: 0.02,
-  balanced: 0.10,
-  quality: 0.30,
+  speed: 0.05,
+  balanced: 0.25,
+  quality: 0.50,
 };
 
 /** Per-user monthly budget (in USD) by subscription tier */
