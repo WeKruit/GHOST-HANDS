@@ -32,7 +32,9 @@ import { spawn, execSync } from 'node:child_process';
 
 const DEPLOY_PORT = parseInt(process.env.GH_DEPLOY_PORT || '8000', 10);
 const DEPLOY_SECRET = process.env.GH_DEPLOY_SECRET;
+const API_HOST = process.env.GH_API_HOST || 'localhost';
 const API_PORT = parseInt(process.env.GH_API_PORT || '3100', 10);
+const WORKER_HOST = process.env.GH_WORKER_HOST || 'localhost';
 const WORKER_PORT = parseInt(process.env.GH_WORKER_PORT || '3101', 10);
 const GHOSTHANDS_DIR = process.env.GHOSTHANDS_DIR || '/opt/ghosthands';
 const DEPLOY_SCRIPT = `${GHOSTHANDS_DIR}/scripts/deploy.sh`;
@@ -115,11 +117,11 @@ if (typeof Bun !== 'undefined') {
       // Returns activeWorkers count for VALET's drain logic
       if (url.pathname === '/health' && req.method === 'GET') {
         // Check GH API health
-        const apiHealth = await fetchJson(`http://localhost:${API_PORT}/health`);
+        const apiHealth = await fetchJson(`http://${API_HOST}:${API_PORT}/health`);
 
         // Check worker status
-        const workerHealth = await fetchJson(`http://localhost:${WORKER_PORT}/worker/health`);
-        const workerStatus = await fetchJson(`http://localhost:${WORKER_PORT}/worker/status`);
+        const workerHealth = await fetchJson(`http://${WORKER_HOST}:${WORKER_PORT}/worker/health`);
+        const workerStatus = await fetchJson(`http://${WORKER_HOST}:${WORKER_PORT}/worker/status`);
 
         const activeWorkers = (workerStatus?.active_jobs as number) ?? 0;
         const deploySafe = (workerHealth?.deploy_safe as boolean) ?? (activeWorkers === 0);
@@ -139,7 +141,7 @@ if (typeof Bun !== 'undefined') {
 
       // ── GET /version — Unauthenticated version info ─────────
       if (url.pathname === '/version' && req.method === 'GET') {
-        const apiVersion = await fetchJson(`http://localhost:${API_PORT}/health/version`);
+        const apiVersion = await fetchJson(`http://${API_HOST}:${API_PORT}/health/version`);
         return Response.json({
           deployServer: 'ghosthands-deploy-server',
           version: '1.0.0',
@@ -304,7 +306,7 @@ if (typeof Bun !== 'undefined') {
   });
 
   console.log(`[deploy-server] Listening on port ${DEPLOY_PORT}`);
-  console.log(`[deploy-server] GH API: localhost:${API_PORT}, Worker: localhost:${WORKER_PORT}`);
+  console.log(`[deploy-server] GH API: ${API_HOST}:${API_PORT}, Worker: ${WORKER_HOST}:${WORKER_PORT}`);
   console.log(`[deploy-server] Deploy script: ${DEPLOY_SCRIPT}`);
 } else {
   console.error('[deploy-server] This server requires Bun runtime');
