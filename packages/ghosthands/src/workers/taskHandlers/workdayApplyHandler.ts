@@ -43,12 +43,12 @@ const PageStateSchema = z.object({
     'error',
     'unknown',
   ]),
-  page_title: z.string().optional().default(''),
-  has_apply_button: z.boolean().optional().default(false),
-  has_next_button: z.boolean().optional().default(false),
-  has_submit_button: z.boolean().optional().default(false),
-  has_sign_in_with_google: z.boolean().optional().default(false),
-  error_message: z.string().optional().default(''),
+  page_title: z.string().optional().default('').catch(''),
+  has_apply_button: z.boolean().optional().default(false).catch(false),
+  has_next_button: z.boolean().optional().default(false).catch(false),
+  has_submit_button: z.boolean().optional().default(false).catch(false),
+  has_sign_in_with_google: z.boolean().optional().default(false).catch(false),
+  error_message: z.string().optional().default('').catch(''),
 });
 
 type PageState = z.input<typeof PageStateSchema>;
@@ -100,7 +100,7 @@ export class WorkdayApplyHandler implements TaskHandler {
         await this.waitForPageLoad(adapter);
 
         // Detect current page type
-        const pageState = await this.detectPage(adapter);
+        let pageState = await this.detectPage(adapter);
         console.log(`[WorkdayApply] Page ${pagesProcessed}: ${pageState.page_type} (title: ${pageState.page_title || 'N/A'})`);
 
         // Handle based on page type
@@ -137,20 +137,35 @@ export class WorkdayApplyHandler implements TaskHandler {
             await this.handleExperiencePage(adapter, userProfile);
             break;
 
-          case 'questions':
+          case 'questions': {
             await progress.setStep(ProgressStep.ANSWERING_QUESTIONS);
-            await this.handleFormPage(adapter, 'application questions', dataPrompt);
+            const qResult = await this.handleFormPage(adapter, 'application questions', dataPrompt);
+            if (qResult === 'review_detected') {
+              pageState = { page_type: 'review', page_title: 'Review' };
+              continue; // re-enter loop — will hit the 'review' case
+            }
             break;
+          }
 
-          case 'voluntary_disclosure':
+          case 'voluntary_disclosure': {
             await progress.setStep(ProgressStep.ANSWERING_QUESTIONS);
-            await this.handleVoluntaryDisclosure(adapter, dataPrompt);
+            const vResult = await this.handleVoluntaryDisclosure(adapter, dataPrompt);
+            if (vResult === 'review_detected') {
+              pageState = { page_type: 'review', page_title: 'Review' };
+              continue;
+            }
             break;
+          }
 
-          case 'self_identify':
+          case 'self_identify': {
             await progress.setStep(ProgressStep.ANSWERING_QUESTIONS);
-            await this.handleSelfIdentify(adapter, dataPrompt);
+            const sResult = await this.handleSelfIdentify(adapter, dataPrompt);
+            if (sResult === 'review_detected') {
+              pageState = { page_type: 'review', page_title: 'Review' };
+              continue;
+            }
             break;
+          }
 
           case 'review':
             // We've reached the review page — STOP HERE
@@ -316,36 +331,45 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
       if (currentUrl.includes('myworkdayjobs.com') && (currentUrl.includes('login') || currentUrl.includes('signin'))) {
         return { page_type: 'login', page_title: 'Workday Login' };
       }
-      // DOM-based fallback: read the page heading text to classify
-      // IMPORTANT: Check review FIRST because the review page contains ALL section headings
-      // (e.g. "Application Questions", "My Information") as part of the summary.
+      // DOM-based fallback: read the page heading text to classify.
+      // IMPORTANT: Only use the MAIN page heading (h1/h2/h3) for classification,
+      // NOT progress bar step titles which contain "Review" on every page.
       const domFallback = await adapter.page.evaluate(() => {
         const bodyText = document.body.innerText.toLowerCase();
-        const headings = Array.from(document.querySelectorAll('h1, h2, h3, [data-automation-id*="pageHeader"], [data-automation-id*="stepTitle"]'));
+        // Only read actual page headings — NOT progress bar steps (stepTitle)
+        const headings = Array.from(document.querySelectorAll('h1, h2, h3, [data-automation-id*="pageHeader"]'));
         const headingText = headings.map(h => h.textContent?.toLowerCase() || '').join(' ');
 
-        // REVIEW page detection: The review page is a READ-ONLY summary with no form inputs,
-        // just text showing what was filled in. It has a "Submit" button.
-        // Key difference from the last form page: review has NO dropdowns ("Select One" buttons),
-        // NO unfilled inputs, and the heading contains "Review".
-        const hasSelectOneDropdowns = !!document.querySelector('button')
-          && Array.from(document.querySelectorAll('button')).some(b => (b.textContent || '').trim() === 'Select One');
+        // Structural signals — used for review detection
+        const hasSelectOneDropdowns = Array.from(document.querySelectorAll('button')).some(b => (b.textContent || '').trim() === 'Select One');
         const hasFormInputs = document.querySelectorAll('input[type="text"]:not([readonly]), textarea:not([readonly]), input[type="email"], input[type="tel"]').length > 0;
-
-        if (headingText.includes('review')) return 'review';
-        // If there are no editable form fields and no unfilled dropdowns, it's likely the review page
         const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
         const buttonTexts = buttons.map(b => (b.textContent || '').trim().toLowerCase());
         const hasSubmitButton = buttonTexts.some(t => t === 'submit' || t === 'submit application');
         const hasSaveAndContinue = buttonTexts.some(t => t.includes('save and continue'));
-        if (hasSubmitButton && !hasSaveAndContinue && !hasSelectOneDropdowns && !hasFormInputs) return 'review';
 
-        const allText = headingText + ' ' + bodyText.substring(0, 2000);
-        if (allText.includes('application questions') || allText.includes('additional questions')) return 'questions';
-        if (allText.includes('voluntary disclosures') || allText.includes('voluntary self')) return 'voluntary_disclosure';
-        if (allText.includes('self identify') || allText.includes('self-identify') || allText.includes('disability status')) return 'self_identify';
-        if (allText.includes('my experience') || allText.includes('work experience') || allText.includes('resume')) return 'experience';
-        if (allText.includes('my information') || allText.includes('personal info')) return 'personal_info';
+        // REVIEW page detection FIRST: The review page is a read-only summary that
+        // contains ALL section headings ("Application Questions", "My Information", etc.)
+        // in its body. Check structural indicators before text matching to avoid false positives.
+        if (!hasSelectOneDropdowns && !hasFormInputs && !hasSaveAndContinue && hasSubmitButton) return 'review';
+        if (headingText.includes('review') && !hasSelectOneDropdowns && !hasFormInputs) return 'review';
+
+        // Now check specific page types by heading text (NOT body text — the review page
+        // body contains all section names which would cause false positives)
+        if (headingText.includes('application questions') || headingText.includes('additional questions')) return 'questions';
+        if (headingText.includes('voluntary disclosures') || headingText.includes('voluntary self')) return 'voluntary_disclosure';
+        if (headingText.includes('self identify') || headingText.includes('self-identify')) return 'self_identify';
+        if (headingText.includes('my experience') || headingText.includes('work experience')) return 'experience';
+        if (headingText.includes('my information') || headingText.includes('personal info')) return 'personal_info';
+
+        // Broader body text search as last resort (only if heading didn't match)
+        const bodyStart = bodyText.substring(0, 2000);
+        if (bodyStart.includes('application questions') || bodyStart.includes('additional questions')) return 'questions';
+        if (bodyStart.includes('voluntary disclosures')) return 'voluntary_disclosure';
+        if (bodyStart.includes('self identify') || bodyStart.includes('self-identify') || bodyStart.includes('disability status')) return 'self_identify';
+        if (bodyStart.includes('my experience') || bodyStart.includes('resume')) return 'experience';
+        if (bodyStart.includes('my information')) return 'personal_info';
+
         return 'unknown';
       });
       if (domFallback !== 'unknown') {
@@ -721,12 +745,12 @@ SCREENING QUESTIONS (if any appear on this page):
     adapter: BrowserAutomationAdapter,
     pageDescription: string,
     dataPrompt: string,
-  ): Promise<void> {
+  ): Promise<'done' | 'review_detected'> {
     console.log(`[WorkdayApply] Filling ${pageDescription} page...`);
 
     const fillPrompt = buildFormPagePrompt(pageDescription, dataPrompt);
 
-    await this.fillWithSmartScroll(adapter, fillPrompt, pageDescription);
+    return this.fillWithSmartScroll(adapter, fillPrompt, pageDescription);
   }
 
   /**
@@ -758,7 +782,30 @@ SCREENING QUESTIONS (if any appear on this page):
       if (!fs.existsSync(resumePath)) {
         console.warn(`[WorkdayApply] [MyExperience] Resume not found at ${resumePath} — skipping upload.`);
       } else {
-        try {
+        // Check if a resume is already uploaded (e.g. from a previous partial fill)
+        const alreadyUploaded = await adapter.page.evaluate(`
+          (() => {
+            // Workday shows the uploaded filename near the file input area
+            var fileArea = document.querySelector('[data-automation-id="resumeSection"], [data-automation-id="attachmentsSection"], [data-automation-id="fileUploadSection"]');
+            var searchArea = fileArea || document.body;
+            var text = searchArea.innerText || '';
+            // Look for common resume file extensions in visible text
+            if (/\\.(pdf|docx?|rtf|txt)/i.test(text)) return true;
+            // Look for a delete/remove button near file inputs (Workday shows X next to uploaded files)
+            var deleteBtn = searchArea.querySelector('[data-automation-id="delete-file"], button[aria-label*="delete" i], button[aria-label*="remove" i]');
+            if (deleteBtn) return true;
+            // Check if there's a visible filename element near the file input
+            var fileNames = searchArea.querySelectorAll('[data-automation-id="fileName"], [data-automation-id="file-name"], .file-name');
+            for (var i = 0; i < fileNames.length; i++) {
+              if ((fileNames[i].textContent || '').trim().length > 2) return true;
+            }
+            return false;
+          })()
+        `) as boolean;
+
+        if (alreadyUploaded) {
+          console.log('[WorkdayApply] [MyExperience] Resume already uploaded — skipping.');
+        } else try {
           const fileInput = adapter.page.locator('input[type="file"]').first();
           await fileInput.setInputFiles(resumePath);
           console.log('[WorkdayApply] [MyExperience] Resume file set via DOM file input.');
@@ -804,7 +851,7 @@ WORK EXPERIENCE (click "Add" under Work Experience section first):
   Company: ${exp.company}
   Location: ${exp.location || ''}
   I currently work here: ${exp.currently_work_here ? 'YES — check the checkbox' : 'No'}
-  From date: ${fromDate} — IMPORTANT: The date field has TWO parts side by side: MM on the LEFT and YYYY on the RIGHT. You MUST click on the LEFT part (the MM box) first, NOT the right part (YYYY). Then type "${fromDate.replace('/', '')}" as continuous digits — Workday will auto-advance from the MM box to the YYYY box as you type.
+  From date: ${fromDate} — Look for the text "MM" on screen and click DIRECTLY on the letters "MM". Do NOT click the calendar icon or the "YYYY" box. After clicking "MM", type "${fromDate.replace('/', '')}" as continuous digits — Workday auto-advances to YYYY. If you see "1900" or an error, click the "YYYY" box, press Delete 6 times to clear it, then retype "${fromDate.replace('/', '')}".
   Role Description: ${exp.description}
 `;
     }
@@ -814,14 +861,21 @@ WORK EXPERIENCE (click "Add" under Work Experience section first):
 EDUCATION (click "Add" under Education section first):
   School or University: ${edu.school}
   Degree: ${edu.degree} (this is a DROPDOWN — click it, then type "${edu.degree}" to filter and select)
-  Field of Study: ${edu.field_of_study} (this is a TYPEAHEAD — type "${edu.field_of_study}", wait for suggestions to load, then press Enter to select the first match)
+  Field of Study: ${edu.field_of_study} (this is a TYPEAHEAD — follow these steps exactly:
+    1. Click the Field of Study input.
+    2. Type "${edu.field_of_study}" into the input.
+    3. Press Enter to trigger the dropdown to update.
+    4. Wait a moment for the options to load.
+    5. Look through the visible options for "${edu.field_of_study}" and click it.
+    6. If the correct option is NOT visible in the dropdown, scroll through the dropdown list by clicking the scrollbar on the side of the dropdown to find and click the correct option.
+  )
 `;
     }
 
     if (userProfile.skills && userProfile.skills.length > 0) {
       dataBlock += `
 SKILLS (find the skills input field, usually has placeholder "Type to Add Skills"):
-  For EACH skill below: click the skills input, type the skill name, WAIT for the autocomplete dropdown to appear, then press Enter to select the first match. After selecting, click on empty whitespace to dismiss the dropdown before typing the next skill.
+  For EACH skill below: click the skills input, type the skill name, press Enter to trigger the dropdown, WAIT for the autocomplete dropdown to appear, then CLICK the matching option from the dropdown. If the correct option is not visible, scroll the dropdown to find it. After selecting, click on empty whitespace to dismiss the dropdown before typing the next skill.
   Skills to add: ${userProfile.skills.map(s => `"${s}"`).join(', ')}
 `;
     }
@@ -842,9 +896,14 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
     const MAX_LLM_CALLS = 6;
     let llmCallCount = 0;
 
-    // Scroll to top
+    // Scroll to top before DOM fills
     await adapter.page.evaluate(() => window.scrollTo(0, 0));
     await adapter.page.waitForTimeout(500);
+
+    // Scroll back to top before the LLM loop begins.
+    // centerNextEmptyField and DOM interactions above may have shifted the scroll position.
+    await adapter.page.evaluate(() => window.scrollTo(0, 0));
+    await adapter.page.waitForTimeout(400);
 
     for (let round = 1; round <= MAX_SCROLL_ROUNDS; round++) {
       // Always invoke LLM — experience page has dynamic content behind Add buttons
@@ -890,23 +949,23 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
   private async handleVoluntaryDisclosure(
     adapter: BrowserAutomationAdapter,
     dataPrompt: string,
-  ): Promise<void> {
+  ): Promise<'done' | 'review_detected'> {
     console.log('[WorkdayApply] Filling voluntary self-identification page...');
 
     const fillPrompt = buildVoluntaryDisclosurePrompt();
 
-    await this.fillWithSmartScroll(adapter, fillPrompt, 'voluntary disclosure');
+    return this.fillWithSmartScroll(adapter, fillPrompt, 'voluntary disclosure');
   }
 
   private async handleSelfIdentify(
     adapter: BrowserAutomationAdapter,
     dataPrompt: string,
-  ): Promise<void> {
+  ): Promise<'done' | 'review_detected'> {
     console.log('[WorkdayApply] Filling self-identification page...');
 
     const fillPrompt = buildSelfIdentifyPrompt();
 
-    await this.fillWithSmartScroll(adapter, fillPrompt, 'self-identify');
+    return this.fillWithSmartScroll(adapter, fillPrompt, 'self-identify');
   }
 
   private async handleGenericPage(
@@ -940,9 +999,9 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
     adapter: BrowserAutomationAdapter,
     fillPrompt: string,
     pageLabel: string,
-  ): Promise<void> {
+  ): Promise<'done' | 'review_detected'> {
     const MAX_SCROLL_ROUNDS = 10;
-    const MAX_LLM_CALLS = 4; // Safety limit: max LLM invocations per page to prevent infinite loops
+    const MAX_LLM_CALLS = 20; // Safety limit: raised because one-dropdown-per-turn needs more calls
     let llmCallCount = 0;
 
     // SAFETY: Quick check if this is actually the review page (misclassified).
@@ -961,7 +1020,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
     });
     if (isActuallyReview) {
       console.log(`[WorkdayApply] [${pageLabel}] SAFETY: This is the review page — skipping all fill logic.`);
-      return;
+      return 'review_detected';
     }
 
     // Scroll to top first
@@ -993,6 +1052,11 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
     await this.fillDateFieldsProgrammatically(adapter);
     // DOM-first: check any required checkboxes (Terms & Conditions, Privacy, etc.)
     await this.checkRequiredCheckboxes(adapter);
+
+    // Scroll back to top so the LLM assessment loop starts from the beginning of the page.
+    // DOM fills above may have scrolled the page as they interacted with elements.
+    await adapter.page.evaluate(() => window.scrollTo(0, 0));
+    await adapter.page.waitForTimeout(400);
 
     // Check if there are empty fields remaining that need the LLM
     const needsLLM = await this.hasEmptyVisibleFields(adapter);
@@ -1061,6 +1125,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
 
     // Final: click the navigation button and handle validation errors
     await this.clickNextWithErrorRecovery(adapter, fillPrompt, pageLabel);
+    return 'done';
   }
 
   /**
@@ -1192,68 +1257,87 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
    *
    * Returns true if an empty field was found and centered, false otherwise.
    */
+  /**
+   * Nudge the first empty field in the current viewport to the center of the screen.
+   *
+   * IMPORTANT: Only considers fields already within (or near) the current viewport.
+   * This prevents fighting with fillWithSmartScroll's progressive top-down scrolling —
+   * we never yank the viewport backwards to a field above the current scroll position.
+   */
   private async centerNextEmptyField(
     adapter: BrowserAutomationAdapter,
   ): Promise<boolean> {
-    const centered = await adapter.page.evaluate(() => {
-      // 1. Empty text inputs / textareas
-      const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
-        'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input:not([type]), textarea'
-      );
-      for (const inp of inputs) {
-        if (inp.disabled || inp.readOnly) continue;
-        if (inp.type === 'hidden') continue;
-        const rect = inp.getBoundingClientRect();
-        if (rect.width < 20 || rect.height < 10) continue;
-        // Skip date segment inputs
-        const ph = (inp.placeholder || '').toUpperCase();
-        if (ph === 'MM' || ph === 'DD' || ph === 'YYYY') continue;
-        // Skip internal dropdown inputs
-        if (inp.closest('[role="listbox"], [data-automation-id*="dropdown"], [data-automation-id*="selectWidget"]')) continue;
-        // Skip hidden via CSS
-        const style = window.getComputedStyle(inp);
-        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
-        if (inp.getAttribute('aria-hidden') === 'true') continue;
-        // Skip optional internal fields
-        const ident = ((inp.getAttribute('data-automation-id') || '') + ' ' + (inp.name || '') + ' ' + (inp.getAttribute('aria-label') || '')).toLowerCase();
-        if (ident.includes('extension') || ident.includes('countryphone') || ident.includes('phonecode') || ident.includes('middlename') || ident.includes('middle name') || ident.includes('middle-name')) continue;
+    // Uses a string-based evaluate to avoid Bun's __name injection into browser context.
+    const centered = await adapter.page.evaluate(`
+      (() => {
+        var vh = window.innerHeight;
 
-        if (!inp.value || inp.value.trim() === '') {
-          inp.scrollIntoView({ block: 'center', behavior: 'instant' });
+        // 1. Empty text inputs / textareas
+        var inputs = document.querySelectorAll(
+          'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input:not([type]), textarea'
+        );
+        for (var i = 0; i < inputs.length; i++) {
+          var inp = inputs[i];
+          if (inp.disabled || inp.readOnly) continue;
+          if (inp.type === 'hidden') continue;
+          var rect = inp.getBoundingClientRect();
+          if (rect.width < 20 || rect.height < 10) continue;
+          // Only consider fields in or near the current viewport
+          if (!(rect.bottom > 0 && rect.top < vh * 1.2)) continue;
+          // Skip date segment inputs
+          var ph = (inp.placeholder || '').toUpperCase();
+          if (ph === 'MM' || ph === 'DD' || ph === 'YYYY') continue;
+          // Skip internal dropdown inputs
+          if (inp.closest('[role="listbox"], [data-automation-id*="dropdown"], [data-automation-id*="selectWidget"]')) continue;
+          // Skip hidden via CSS
+          var style = window.getComputedStyle(inp);
+          if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+          if (inp.getAttribute('aria-hidden') === 'true') continue;
+          // Skip optional internal fields
+          var ident = ((inp.getAttribute('data-automation-id') || '') + ' ' + (inp.name || '') + ' ' + (inp.getAttribute('aria-label') || '')).toLowerCase();
+          if (ident.includes('extension') || ident.includes('countryphone') || ident.includes('phonecode') || ident.includes('middlename') || ident.includes('middle name') || ident.includes('middle-name')) continue;
+
+          if (!inp.value || inp.value.trim() === '') {
+            inp.scrollIntoView({ block: 'center', behavior: 'instant' });
+            return true;
+          }
+        }
+
+        // 2. Unfilled dropdowns ("Select One" buttons)
+        var buttons = document.querySelectorAll('button');
+        for (var j = 0; j < buttons.length; j++) {
+          var btn = buttons[j];
+          var text = (btn.textContent || '').trim();
+          if (text !== 'Select One') continue;
+          var bRect = btn.getBoundingClientRect();
+          if (bRect.width === 0 || bRect.height === 0) continue;
+          if (!(bRect.bottom > 0 && bRect.top < vh * 1.2)) continue;
+          var bStyle = window.getComputedStyle(btn);
+          if (bStyle.display === 'none' || bStyle.visibility === 'hidden') continue;
+          btn.scrollIntoView({ block: 'center', behavior: 'instant' });
           return true;
         }
-      }
 
-      // 2. Unfilled dropdowns ("Select One" buttons)
-      const buttons = document.querySelectorAll('button');
-      for (const btn of buttons) {
-        const text = (btn.textContent || '').trim();
-        if (text !== 'Select One') continue;
-        const rect = btn.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
-        const style = window.getComputedStyle(btn);
-        if (style.display === 'none' || style.visibility === 'hidden') continue;
-        btn.scrollIntoView({ block: 'center', behavior: 'instant' });
-        return true;
-      }
-
-      // 3. Unchecked required checkboxes
-      const checkboxes = document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]:not(:checked)');
-      for (const cb of checkboxes) {
-        const rect = cb.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) continue;
-        const parent = cb.closest('div, label, fieldset');
-        const parentText = (parent?.textContent || '').toLowerCase();
-        if (parentText.includes('acknowledge') || parentText.includes('terms') ||
-            parentText.includes('agree') || parentText.includes('privacy') ||
-            parentText.includes('required') || parentText.includes('*')) {
-          cb.scrollIntoView({ block: 'center', behavior: 'instant' });
-          return true;
+        // 3. Unchecked required checkboxes
+        var checkboxes = document.querySelectorAll('input[type="checkbox"]:not(:checked)');
+        for (var k = 0; k < checkboxes.length; k++) {
+          var cb = checkboxes[k];
+          var cRect = cb.getBoundingClientRect();
+          if (cRect.width === 0 && cRect.height === 0) continue;
+          if (!(cRect.bottom > 0 && cRect.top < vh * 1.2)) continue;
+          var parent = cb.closest('div, label, fieldset');
+          var parentText = (parent ? parent.textContent : '').toLowerCase();
+          if (parentText.includes('acknowledge') || parentText.includes('terms') ||
+              parentText.includes('agree') || parentText.includes('privacy') ||
+              parentText.includes('required') || parentText.includes('*')) {
+            cb.scrollIntoView({ block: 'center', behavior: 'instant' });
+            return true;
+          }
         }
-      }
 
-      return false;
-    });
+        return false;
+      })()
+    `) as boolean;
 
     if (centered) {
       await adapter.page.waitForTimeout(300);
@@ -2089,8 +2173,9 @@ ${fillPrompt}`,
 
   /**
    * Find and click a dropdown option matching the target answer.
-   * Strategy: 1) Check if option is already visible in DOM, 2) Type to filter,
-   * 3) Scroll through options with reasonable increments until match found.
+   * Strategy: 1) Check if option is already visible in DOM, 2) Type answer + Enter
+   * to trigger Workday's search/filter, wait for results, then click match,
+   * 3) If not found, use LLM to scroll through the dropdown and find/click it.
    */
   private async clickDropdownOption(
     adapter: BrowserAutomationAdapter,
@@ -2138,12 +2223,14 @@ ${fillPrompt}`,
 
     if (directClick) return true;
 
-    // Phase 2: Type-to-filter — type the answer text to filter the dropdown list
-    console.log(`[WorkdayApply] [Dropdown] Typing "${searchText}" to filter...`);
+    // Phase 2: Type the answer text and press Enter so Workday updates the dropdown list
+    console.log(`[WorkdayApply] [Dropdown] Typing "${searchText}" and pressing Enter to search...`);
     await adapter.page.keyboard.type(searchText, { delay: 50 });
-    await adapter.page.waitForTimeout(500);
+    await adapter.page.keyboard.press('Enter');
+    // Wait for Workday to process the search and update the dropdown options
+    await adapter.page.waitForTimeout(1000);
 
-    // Check if typing filtered to a matching option
+    // Check if the correct option is now visible after Enter
     const typedMatch = await adapter.page.evaluate((target: string) => {
       const targetLower = target.toLowerCase();
       const options = document.querySelectorAll(
@@ -2170,54 +2257,39 @@ ${fillPrompt}`,
 
     if (typedMatch) return true;
 
-    // Phase 3: Scroll through the dropdown listbox to find the option.
-    // Use keyboard arrows (more reliable than mouse scroll for listboxes).
-    console.log(`[WorkdayApply] [Dropdown] Typing didn't filter, scrolling through options...`);
+    // Phase 3: The correct option is not visible after typing + Enter.
+    // Use the LLM to scroll through the dropdown options (click the scrollbar)
+    // and find then click the correct option.
+    console.log(`[WorkdayApply] [Dropdown] Option not found after search — using LLM to scroll and find "${searchText}"...`);
 
-    // Clear the typed text first by selecting all and deleting
-    await adapter.page.keyboard.press('Home');
-    await adapter.page.waitForTimeout(100);
+    const llmScrollPrompt = [
+      `A dropdown menu is currently open on the page.`,
+      `I need to find and select the option "${searchText}" (or the closest match).`,
+      `The correct option is NOT currently visible in the dropdown list.`,
+      `SCROLL through the dropdown options by clicking the dropdown's scrollbar or dragging it downward to reveal more options.`,
+      `After scrolling, look for "${searchText}" and click on it when you find it.`,
+      `If you reach the end of the list without finding an exact match, click the closest matching option.`,
+      `Do NOT click outside the dropdown or close it — only scroll within it and select the correct option.`,
+    ].join('\n');
 
-    // Use Down Arrow to scroll through options, checking after each batch
-    const MAX_SCROLL_ATTEMPTS = 30;
-    for (let attempt = 0; attempt < MAX_SCROLL_ATTEMPTS; attempt++) {
-      // Press Down 3 times per attempt (move through options faster)
-      for (let k = 0; k < 3; k++) {
-        await adapter.page.keyboard.press('ArrowDown');
-        await adapter.page.waitForTimeout(80);
+    try {
+      await adapter.act(llmScrollPrompt);
+      await adapter.page.waitForTimeout(500);
+
+      // Verify the LLM successfully selected something (dropdown should now be closed)
+      const dropdownClosed = await adapter.page.evaluate(() => {
+        const listbox = document.querySelector('[role="listbox"]');
+        if (!listbox) return true;
+        const rect = (listbox as HTMLElement).getBoundingClientRect();
+        return rect.width === 0 || rect.height === 0;
+      });
+
+      if (dropdownClosed) {
+        console.log(`[WorkdayApply] [Dropdown] LLM scroll+select succeeded.`);
+        return true;
       }
-
-      // Check if a matching option is now highlighted or visible
-      const scrollMatch = await adapter.page.evaluate((target: string) => {
-        const targetLower = target.toLowerCase();
-
-        // Check focused/highlighted option
-        const focused = document.querySelector('[role="option"][aria-selected="true"], [role="option"]:focus, [role="option"].selected');
-        if (focused) {
-          const text = focused.textContent?.trim().toLowerCase() || '';
-          if (text === targetLower || text.startsWith(targetLower) || text.includes(targetLower) || (text.length > 2 && targetLower.includes(text))) {
-            (focused as HTMLElement).click();
-            return 'clicked';
-          }
-        }
-
-        // Also check all visible options
-        const options = document.querySelectorAll(
-          '[role="option"], [role="listbox"] li, ' +
-            '[data-automation-id*="promptOption"], [data-automation-id*="selectOption"]',
-        );
-        for (const opt of options) {
-          const text = opt.textContent?.trim().toLowerCase() || '';
-          if (text === targetLower || text.startsWith(targetLower) || text.includes(targetLower)) {
-            (opt as HTMLElement).click();
-            return 'clicked';
-          }
-        }
-
-        return 'not_found';
-      }, searchText);
-
-      if (scrollMatch === 'clicked') return true;
+    } catch (err) {
+      console.warn(`[WorkdayApply] [Dropdown] LLM scroll attempt failed:`, err);
     }
 
     return false;
