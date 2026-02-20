@@ -6,7 +6,7 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { createClient } from '@supabase/supabase-js';
-import { createAdapter, type AdapterType } from '../adapters/index.js';
+import { createAdapter, type AdapterType, type LLMConfig } from '../adapters/index.js';
 import { loadModelConfig } from '../config/models.js';
 
 // Load env
@@ -27,7 +27,7 @@ async function main() {
   console.log(`   Model: ${resolved.alias} (${resolved.model})`);
   console.log(`   Provider: ${resolved.llmClient.provider}`);
 
-  const llmClient = resolved.llmClient;
+  const llmClient = resolved.llmClient as LLMConfig;
 
   console.log('2. Creating adapter...');
   const adapterType = (process.env.GH_BROWSER_ENGINE || 'magnitude') as AdapterType;
