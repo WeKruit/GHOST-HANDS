@@ -50,6 +50,12 @@ const SELECTOR_PATTERNS: Omit<DOMMatch, 'details'>[] = [
   { type: 'captcha', selector: 'iframe[src*="funcaptcha"]', confidence: 0.9 },
   { type: 'captcha', selector: '#FunCaptcha', confidence: 0.85 },
 
+  // -- Audio CAPTCHA --
+  { type: 'captcha', selector: '.rc-audiochallenge', confidence: 0.95 },
+  { type: 'captcha', selector: '#audio-source', confidence: 0.9 },
+  { type: 'captcha', selector: 'audio[src*="captcha"]', confidence: 0.85 },
+  { type: 'captcha', selector: 'button[aria-label*="audio"]', confidence: 0.7 },
+
   // -- Login --
   { type: 'login', selector: 'form[action*="login"]', confidence: 0.8 },
   { type: 'login', selector: 'form[action*="signin"]', confidence: 0.8 },
@@ -107,10 +113,15 @@ const TEXT_PATTERNS: { type: BlockerType; pattern: RegExp; confidence: number }[
   { type: 'rate_limited', pattern: /rate limit(ed)?/i, confidence: 0.85 },
   { type: 'rate_limited', pattern: /429/i, confidence: 0.5 },
 
+  // -- Audio CAPTCHA text --
+  { type: 'captcha', pattern: /press play and type what you hear/i, confidence: 0.9 },
+  { type: 'captcha', pattern: /listen and type the numbers/i, confidence: 0.9 },
+  { type: 'captcha', pattern: /audio challenge/i, confidence: 0.85 },
+  { type: 'captcha', pattern: /switch to audio/i, confidence: 0.7 },
+
   // -- Visual verification text --
   { type: 'verification', pattern: /select all images with/i, confidence: 0.9 },
   { type: 'verification', pattern: /slide to (verify|unlock)/i, confidence: 0.85 },
-  { type: 'verification', pattern: /audio challenge/i, confidence: 0.8 },
   { type: 'verification', pattern: /drag the (slider|puzzle)/i, confidence: 0.85 },
 ];
 
@@ -146,11 +157,15 @@ const OBSERVE_CLASSIFICATION: { pattern: RegExp; type: BlockerType; confidence: 
   { pattern: /rate limit/i, type: 'rate_limited', confidence: 0.85 },
   { pattern: /try again later/i, type: 'rate_limited', confidence: 0.7 },
 
+  // Audio CAPTCHA
+  { pattern: /audio challenge/i, type: 'captcha', confidence: 0.85 },
+  { pattern: /press play.*type/i, type: 'captcha', confidence: 0.9 },
+  { pattern: /listen.*type.*numbers/i, type: 'captcha', confidence: 0.9 },
+
   // Visual verification
   { pattern: /select.*images?/i, type: 'verification', confidence: 0.85 },
   { pattern: /slider|slide/i, type: 'verification', confidence: 0.8 },
   { pattern: /puzzle/i, type: 'verification', confidence: 0.75 },
-  { pattern: /audio challenge/i, type: 'verification', confidence: 0.8 },
 ];
 
 // URL-based blocker detection — catches redirects to known blocker pages
