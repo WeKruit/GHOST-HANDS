@@ -41,6 +41,8 @@ export interface TaskContext {
   progress: ProgressTracker;
   credentials: Record<string, string> | null;
   dataPrompt: string;
+  /** Local file path to the downloaded resume, if a resume_ref was provided */
+  resumeFilePath?: string | null;
 }
 
 export interface TaskResult {
