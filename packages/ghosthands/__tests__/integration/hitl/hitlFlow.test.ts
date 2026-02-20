@@ -1,6 +1,31 @@
 import { describe, expect, test, beforeEach, afterEach, mock } from 'bun:test';
 import { CallbackNotifier } from '../../../src/workers/callbackNotifier.js';
 import { MockAdapter } from '../../../src/adapters/mock.js';
+import {
+  HITL_ELIGIBLE_ERRORS,
+  classifyError,
+} from '../../../src/workers/JobExecutor.js';
+
+// ── Shared test helper ───────────────────────────────────────────────────
+
+function createMockSupabase() {
+  const updates: Record<string, any>[] = [];
+  const chainable: Record<string, any> = {};
+  chainable.select = () => chainable;
+  chainable.eq = () => chainable;
+  chainable.single = () => Promise.resolve({ data: null, error: null });
+  chainable.update = (data: Record<string, any>) => {
+    updates.push(data);
+    return chainable;
+  };
+  chainable.insert = () => Promise.resolve({ data: null, error: null });
+
+  return {
+    from: () => chainable,
+    _chain: chainable,
+    _updates: updates,
+  };
+}
 
 // ── CallbackNotifier tests ────────────────────────────────────────────────
 
@@ -185,25 +210,6 @@ describe('MockAdapter pause/resume', () => {
 // ── HITL flow simulation (requestHumanIntervention logic) ─────────────────
 
 describe('HITL flow simulation', () => {
-  function createMockSupabase() {
-    const updates: Record<string, any>[] = [];
-    const chainable: Record<string, any> = {};
-    chainable.select = () => chainable;
-    chainable.eq = () => chainable;
-    chainable.single = () => Promise.resolve({ data: null, error: null });
-    chainable.update = (data: Record<string, any>) => {
-      updates.push(data);
-      return chainable;
-    };
-    chainable.insert = () => Promise.resolve({ data: null, error: null });
-
-    return {
-      from: () => chainable,
-      _chain: chainable,
-      _updates: updates,
-    };
-  }
-
   test('full pause -> resume flow updates job status correctly', async () => {
     const supabase = createMockSupabase();
     const adapter = new MockAdapter();
@@ -463,32 +469,8 @@ describe('pg LISTEN/NOTIFY mock', () => {
 
 describe('2FA triggers HITL pause (WEK-67)', () => {
   // Verify that the error classification and HITL eligibility gate work for 2FA
-
-  const ERROR_CLASSIFICATIONS: Array<{ pattern: RegExp; code: string }> = [
-    { pattern: /budget.?exceeded/i, code: 'budget_exceeded' },
-    { pattern: /action.?limit.?exceeded/i, code: 'action_limit_exceeded' },
-    { pattern: /captcha/i, code: 'captcha_blocked' },
-    { pattern: /2fa|two.?factor|verification code|authenticator/i, code: '2fa_required' },
-    { pattern: /login|sign.?in/i, code: 'login_required' },
-    { pattern: /timeout/i, code: 'timeout' },
-    { pattern: /rate.?limit/i, code: 'rate_limited' },
-    { pattern: /not.?found|selector/i, code: 'element_not_found' },
-    { pattern: /disconnect|connection|ECONNREFUSED|ECONNRESET/i, code: 'network_error' },
-    { pattern: /browser.*closed|target.*closed/i, code: 'browser_crashed' },
-  ];
-
-  const HITL_ELIGIBLE_ERRORS = new Set([
-    'captcha_blocked',
-    'login_required',
-    '2fa_required',
-  ]);
-
-  function classifyError(message: string): string {
-    for (const { pattern, code } of ERROR_CLASSIFICATIONS) {
-      if (pattern.test(message)) return code;
-    }
-    return 'internal_error';
-  }
+  // ERROR_CLASSIFICATIONS, HITL_ELIGIBLE_ERRORS, and classifyError are imported
+  // from JobExecutor.ts so tests exercise the actual production constants.
 
   function mapErrorToBlockerType(errorCode: string): string {
     return errorCode === 'captcha_blocked' ? 'captcha' : errorCode === '2fa_required' ? '2fa' : 'login';
@@ -572,49 +554,11 @@ describe('2FA triggers HITL pause (WEK-67)', () => {
     expect(lastUpdate.status).toBe('running');
     expect(lastUpdate.paused_at).toBeNull();
   });
-
-  function createMockSupabase() {
-    const updates: Record<string, any>[] = [];
-    const chainable: Record<string, any> = {};
-    chainable.select = () => chainable;
-    chainable.eq = () => chainable;
-    chainable.single = () => Promise.resolve({ data: null, error: null });
-    chainable.update = (data: Record<string, any>) => {
-      updates.push(data);
-      return chainable;
-    };
-    chainable.insert = () => Promise.resolve({ data: null, error: null });
-
-    return {
-      from: () => chainable,
-      _chain: chainable,
-      _updates: updates,
-    };
-  }
 });
 
 // ── Job status transitions ────────────────────────────────────────────────
 
 describe('job status transitions', () => {
-  function createMockSupabase() {
-    const updates: Record<string, any>[] = [];
-    const chainable: Record<string, any> = {};
-    chainable.select = () => chainable;
-    chainable.eq = () => chainable;
-    chainable.single = () => Promise.resolve({ data: null, error: null });
-    chainable.update = (data: Record<string, any>) => {
-      updates.push(data);
-      return chainable;
-    };
-    chainable.insert = () => Promise.resolve({ data: null, error: null });
-
-    return {
-      from: () => chainable,
-      _chain: chainable,
-      _updates: updates,
-    };
-  }
-
   test('running -> paused -> running transition', async () => {
     const supabase = createMockSupabase();
 
