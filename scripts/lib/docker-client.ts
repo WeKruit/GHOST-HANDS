@@ -9,6 +9,25 @@
  */
 
 /**
+ * Fetch function for making HTTP requests to Docker Engine API.
+ * Can be replaced for testing purposes.
+ */
+let fetchImpl: typeof fetch = fetch;
+
+/**
+ * Sets a custom fetch implementation (primarily for testing).
+ *
+ * @param customFetch - Custom fetch function to use
+ */
+export function setFetchImpl(customFetch: typeof fetch): void {
+  fetchImpl = customFetch;
+  // Debug logging to verify the mock is being set (for tests)
+  if (typeof process !== 'undefined' && process.env.NODE_ENV === 'test') {
+    console.log('[docker-client] setFetchImpl called, custom fetch:', typeof customFetch);
+  }
+}
+
+/**
  * Configuration for creating a Docker container.
  *
  * @see https://docs.docker.com/engine/api/v1.44/#tag/Container/operation/ContainerCreate
@@ -162,7 +181,7 @@ async function dockerFetch(
   console.log(`[docker-client] ${fetchOptions.method || 'GET'} ${LOG_BASE_URL}${path}`);
 
   try {
-    const response = await fetch(`${DOCKER_API_BASE}${path}`, {
+    const response = await fetchImpl(`${DOCKER_API_BASE}${path}`, {
       ...fetchOptions,
       // @ts-expect-error — Bun supports unix sockets via fetch
       unix: DOCKER_SOCKET,
