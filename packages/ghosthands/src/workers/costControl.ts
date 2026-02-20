@@ -86,7 +86,7 @@ export const JOB_TYPE_BUDGET_OVERRIDES: Record<string, number> = {
 /** Per-user monthly budget (in USD) by subscription tier */
 export const MONTHLY_BUDGET: Record<BudgetTier, number> = {
   free: 0.50,
-  starter: 20.00,
+  starter: 2.00,
   pro: 10.00,
   premium: 10.00,
   enterprise: 100.00,
