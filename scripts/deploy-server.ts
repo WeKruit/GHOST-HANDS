@@ -10,8 +10,9 @@
  *   GET  /version     — Returns deploy server version + current image info
  *   GET  /containers  — Returns running Docker containers (no auth)
  *   GET  /workers     — Returns worker registry status (no auth)
- *   POST /deploy      — Triggers deploy.sh with image_tag (requires X-Deploy-Secret)
+ *   POST /deploy      — Rolling deploy via Docker Engine API (requires X-Deploy-Secret)
  *   POST /drain       — Triggers graceful worker drain (requires X-Deploy-Secret)
+ *   POST /rollback    — Stub for future rollback support (requires X-Deploy-Secret)
  *
  * Auth:
  *   POST endpoints require X-Deploy-Secret header matching GH_DEPLOY_SECRET env var.
@@ -25,13 +26,24 @@
  *   GH_DEPLOY_PORT       — Port to listen on (default: 8000)
  *   GH_API_PORT          — GH API health port (default: 3100)
  *   GH_WORKER_PORT       — GH worker status port (default: 3101)
- *   GHOSTHANDS_DIR       — Path to GH install dir (default: /opt/ghosthands)
+ *   GH_ENVIRONMENT       — Deploy environment: staging | production (default: staging)
  */
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
-import { spawn, execSync } from 'node:child_process';
+import { execSync } from 'node:child_process';
+
+import {
+  pullImage,
+  stopContainer,
+  removeContainer,
+  createContainer,
+  startContainer,
+  pruneImages,
+} from './lib/docker-client';
+import { getEcrAuth } from './lib/ecr-auth';
+import { getServiceConfigs, type ServiceDefinition } from './lib/container-configs';
 
 const DEPLOY_PORT = parseInt(process.env.GH_DEPLOY_PORT || '8000', 10);
 const DEPLOY_SECRET = process.env.GH_DEPLOY_SECRET;
@@ -39,11 +51,30 @@ const API_HOST = process.env.GH_API_HOST || 'localhost';
 const API_PORT = parseInt(process.env.GH_API_PORT || '3100', 10);
 const WORKER_HOST = process.env.GH_WORKER_HOST || 'localhost';
 const WORKER_PORT = parseInt(process.env.GH_WORKER_PORT || '3101', 10);
-const GHOSTHANDS_DIR = process.env.GHOSTHANDS_DIR || '/opt/ghosthands';
-const DEPLOY_SCRIPT = `${GHOSTHANDS_DIR}/scripts/deploy.sh`;
+
+/** Deployment environment, determined from env vars */
+const currentEnvironment: 'staging' | 'production' =
+  (process.env.GH_ENVIRONMENT as 'staging' | 'production') ||
+  (process.env.NODE_ENV === 'production' ? 'production' : 'staging');
 
 const startedAt = Date.now();
-let currentDeploy: { imageTag: string; startedAt: number; pid: number } | null = null;
+let currentDeploy: { imageTag: string; startedAt: number; step: string } | null = null;
+
+// ── Deploy Result Types ─────────────────────────────────────────────
+
+interface DeployResult {
+  success: true;
+  duration: number;
+  imageTag: string;
+  spaceReclaimed: number;
+}
+
+interface DeployFailure {
+  success: false;
+  error: string;
+  failedStep?: string;
+  failedService?: string;
+}
 
 if (!DEPLOY_SECRET) {
   console.error('[deploy-server] FATAL: GH_DEPLOY_SECRET is required');
@@ -75,39 +106,179 @@ async function fetchJson(url: string, timeoutMs = 5000): Promise<Record<string, 
   }
 }
 
-function runDeployScript(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  return new Promise((resolve) => {
-    const proc = spawn('bash', [DEPLOY_SCRIPT, ...args], {
-      cwd: GHOSTHANDS_DIR,
-      env: { ...process.env, PATH: process.env.PATH },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+// ── Deploy Helpers ────────────────────────────────────────────────
 
-    let stdout = '';
-    let stderr = '';
+/**
+ * Polls a service health endpoint until it returns 200 or the timeout expires.
+ *
+ * @param serviceName - Service name for logging
+ * @param healthUrl - HTTP health check URL
+ * @param timeoutMs - Maximum wait time in milliseconds
+ * @throws Error if the service does not become healthy within timeoutMs
+ */
+async function waitForHealthy(
+  serviceName: string,
+  healthUrl: string | undefined,
+  timeoutMs: number,
+): Promise<void> {
+  if (!healthUrl) return;
+  const deadline = Date.now() + timeoutMs;
+  console.log(`[deploy] Waiting for ${serviceName} to become healthy (${healthUrl}, timeout ${timeoutMs}ms)`);
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(healthUrl, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        console.log(`[deploy] ${serviceName} is healthy`);
+        return;
+      }
+    } catch {
+      // Still starting up — retry
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error(`${serviceName} failed health check after ${timeoutMs}ms`);
+}
 
-    proc.stdout.on('data', (data: Buffer) => {
-      const str = data.toString();
-      stdout += str;
-      process.stdout.write(`[deploy.sh] ${str}`);
-    });
-    proc.stderr.on('data', (data: Buffer) => {
-      const str = data.toString();
-      stderr += str;
-      process.stderr.write(`[deploy.sh] ${str}`);
-    });
+/**
+ * Sends a POST to a service's drain endpoint for graceful shutdown.
+ * Non-fatal: logs but does not throw on failure.
+ *
+ * @param drainUrl - HTTP endpoint to POST for graceful drain
+ * @param timeoutMs - Maximum wait time in milliseconds
+ */
+async function drainService(drainUrl: string, timeoutMs: number): Promise<void> {
+  try {
+    console.log(`[deploy] Draining via ${drainUrl} (timeout ${timeoutMs}ms)`);
+    await fetch(drainUrl, { method: 'POST', signal: AbortSignal.timeout(timeoutMs) });
+    console.log(`[deploy] Drain completed`);
+  } catch (err) {
+    console.log(`[deploy] Drain failed (non-fatal): ${err}`);
+  }
+}
 
-    // Timeout after 5 minutes
-    const timeout = setTimeout(() => {
-      proc.kill('SIGTERM');
-      resolve({ code: 1, stdout, stderr: stderr + '\nDeploy timed out after 5 minutes' });
-    }, 5 * 60 * 1000);
+/**
+ * Executes a full rolling deploy via Docker Engine API.
+ *
+ * Steps:
+ *   1. Authenticate with ECR
+ *   2. Pull new image
+ *   3. Load service configs
+ *   4. Stop phase: drain + stop + remove (respecting stopOrder)
+ *   5. Start phase: create + start + health check (respecting startOrder)
+ *   6. Prune old images
+ *
+ * @param imageTag - ECR image tag to deploy
+ * @returns DeployResult on success, DeployFailure on error
+ */
+async function executeDeploy(imageTag: string): Promise<DeployResult | DeployFailure> {
+  const startTime = Date.now();
 
-    proc.on('close', (code) => {
-      clearTimeout(timeout);
-      resolve({ code: code ?? 1, stdout, stderr });
-    });
-  });
+  try {
+    // 1. Authenticate with ECR
+    if (currentDeploy) currentDeploy.step = 'ecr-auth';
+    console.log('[deploy] Authenticating with ECR...');
+    const ecrAuth = await getEcrAuth();
+    console.log(`[deploy] ECR auth obtained (registry: ${ecrAuth.registryUrl})`);
+
+    // 2. Pull new image
+    if (currentDeploy) currentDeploy.step = 'pull-image';
+    const fullImage = `${ecrAuth.registryUrl}/wekruit/ghosthands`;
+    console.log(`[deploy] Pulling image: ${fullImage}:${imageTag}`);
+    await pullImage(fullImage, imageTag, ecrAuth.token);
+    console.log(`[deploy] Image pulled successfully`);
+
+    // 3. Get service configs
+    if (currentDeploy) currentDeploy.step = 'load-configs';
+    const services = getServiceConfigs(imageTag, currentEnvironment);
+    console.log(`[deploy] Loaded ${services.length} service configs (env: ${currentEnvironment})`);
+
+    // 4. Stop phase (respect stopOrder — lower numbers stop first)
+    if (currentDeploy) currentDeploy.step = 'stop-services';
+    const stopOrder = [...services].sort((a, b) => a.stopOrder - b.stopOrder);
+    for (const service of stopOrder) {
+      if (service.skipOnSelfUpdate) {
+        console.log(`[deploy] Skipping stop for ${service.name} (self-update protection)`);
+        continue;
+      }
+
+      console.log(`[deploy] Stopping ${service.name} (stopOrder: ${service.stopOrder})`);
+
+      // Drain if endpoint exists
+      if (service.drainEndpoint) {
+        await drainService(service.drainEndpoint, service.drainTimeout);
+      }
+
+      try {
+        await stopContainer(service.name, 30);
+        await removeContainer(service.name);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[deploy] Failed to stop/remove ${service.name}: ${msg}`);
+        return {
+          success: false,
+          error: `Failed to stop service: ${msg}`,
+          failedStep: 'stop-services',
+          failedService: service.name,
+        };
+      }
+    }
+
+    // 5. Start phase (respect startOrder — lower numbers start first)
+    if (currentDeploy) currentDeploy.step = 'start-services';
+    const startOrder = [...services].sort((a, b) => a.startOrder - b.startOrder);
+    for (const service of startOrder) {
+      if (service.skipOnSelfUpdate) {
+        console.log(`[deploy] Skipping start for ${service.name} (self-update protection)`);
+        continue;
+      }
+
+      console.log(`[deploy] Creating and starting ${service.name} (startOrder: ${service.startOrder})`);
+
+      try {
+        await createContainer(service.name, service.config);
+        await startContainer(service.name);
+        await waitForHealthy(service.name, service.healthEndpoint, service.healthTimeout);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[deploy] Failed to start ${service.name}: ${msg}`);
+        return {
+          success: false,
+          error: `Failed to start service: ${msg}`,
+          failedStep: 'start-services',
+          failedService: service.name,
+        };
+      }
+    }
+
+    // 6. Prune old images
+    if (currentDeploy) currentDeploy.step = 'prune-images';
+    console.log('[deploy] Pruning old images...');
+    let spaceReclaimed = 0;
+    try {
+      const pruneResult = await pruneImages();
+      spaceReclaimed = pruneResult.spaceReclaimed;
+      console.log(`[deploy] Pruned images, reclaimed ${spaceReclaimed} bytes`);
+    } catch (err) {
+      // Non-fatal: log but don't fail the deploy
+      console.log(`[deploy] Image prune failed (non-fatal): ${err}`);
+    }
+
+    return {
+      success: true,
+      duration: Date.now() - startTime,
+      imageTag,
+      spaceReclaimed,
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const step = currentDeploy?.step ?? 'unknown';
+    console.error(`[deploy] Deploy failed at step "${step}": ${msg}`);
+    return {
+      success: false,
+      error: msg,
+      failedStep: step,
+    };
+  }
 }
 
 if (typeof Bun !== 'undefined') {
@@ -316,30 +487,29 @@ if (typeof Bun !== 'undefined') {
         currentDeploy = {
           imageTag,
           startedAt: Date.now(),
-          pid: 0,
+          step: 'initializing',
         };
 
         try {
-          const result = await runDeployScript(['deploy', imageTag]);
-          const elapsedMs = Date.now() - currentDeploy.startedAt;
+          const result = await executeDeploy(imageTag);
           currentDeploy = null;
 
-          if (result.code === 0) {
-            console.log(`[deploy-server] Deploy succeeded: ${imageTag} (${elapsedMs}ms)`);
+          if (result.success) {
+            console.log(`[deploy-server] Deploy succeeded: ${imageTag} (${result.duration}ms)`);
             return Response.json({
               success: true,
               message: `Deploy successful: ${imageTag}`,
-              imageTag,
-              elapsedMs,
+              duration: result.duration,
+              imageTag: result.imageTag,
             });
           } else {
-            console.error(`[deploy-server] Deploy failed: ${imageTag} (exit ${result.code})`);
+            console.error(`[deploy-server] Deploy failed: ${imageTag} — ${result.error}`);
             return Response.json(
               {
                 success: false,
-                message: `Deploy failed (exit ${result.code}): ${result.stderr.slice(-500)}`,
-                imageTag,
-                elapsedMs,
+                error: result.error,
+                failedStep: result.failedStep,
+                failedService: result.failedService,
               },
               { status: 500 },
             );
@@ -349,7 +519,7 @@ if (typeof Bun !== 'undefined') {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[deploy-server] Deploy error: ${msg}`);
           return Response.json(
-            { success: false, message: `Deploy error: ${msg}` },
+            { success: false, error: `Deploy error: ${msg}` },
             { status: 500 },
           );
         }
@@ -365,12 +535,30 @@ if (typeof Bun !== 'undefined') {
         }
 
         console.log('[deploy-server] Drain requested');
-        const result = await runDeployScript(['drain']);
+        try {
+          // Drain the worker via its HTTP endpoint
+          await drainService(`http://${WORKER_HOST}:${WORKER_PORT}/drain`, 60_000);
+          return Response.json({ success: true, message: 'Drain complete' });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return Response.json({ success: false, message: `Drain failed: ${msg}` }, { status: 500 });
+        }
+      }
 
-        return Response.json({
-          success: result.code === 0,
-          message: result.code === 0 ? 'Drain complete' : 'Drain failed',
-        });
+      // ── POST /rollback — Stub for future rollback support ──────
+      if (url.pathname === '/rollback' && req.method === 'POST') {
+        if (!verifySecret(req)) {
+          return Response.json(
+            { success: false, message: 'Unauthorized' },
+            { status: 401 },
+          );
+        }
+
+        // v1: rollback not yet implemented — report error
+        return Response.json(
+          { success: false, message: 'Rollback not yet implemented. Redeploy with a previous image tag.' },
+          { status: 501 },
+        );
       }
 
       return Response.json({ error: 'not_found' }, { status: 404 });
@@ -379,7 +567,7 @@ if (typeof Bun !== 'undefined') {
 
   console.log(`[deploy-server] Listening on port ${DEPLOY_PORT}`);
   console.log(`[deploy-server] GH API: ${API_HOST}:${API_PORT}, Worker: ${WORKER_HOST}:${WORKER_PORT}`);
-  console.log(`[deploy-server] Deploy script: ${DEPLOY_SCRIPT}`);
+  console.log(`[deploy-server] Environment: ${currentEnvironment}, Deploy method: Docker API`);
 } else {
   console.error('[deploy-server] This server requires Bun runtime');
   process.exit(1);

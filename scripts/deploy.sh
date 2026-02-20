@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# NOTE: This script is for MANUAL operations only (SSH into EC2).
+# Automated deploys go through deploy-server.ts via Docker Engine API.
+# This script requires: aws CLI, docker CLI, docker compose, curl
+#
 # GhostHands Deploy Script
 #
 # Called by VALET's deployment controller on each EC2 instance.

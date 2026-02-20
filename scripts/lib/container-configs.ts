@@ -1,0 +1,194 @@
+/**
+ * Hardcoded Container Configuration Definitions
+ *
+ * Defines the 3 GhostHands service containers (API, Worker, Deploy Server)
+ * with their Docker create configs, health checks, drain endpoints,
+ * and startup/shutdown ordering.
+ *
+ * These definitions replace docker-compose for deploy-server managed deploys.
+ * The deploy-server uses these configs to create containers via Docker API.
+ *
+ * @module scripts/lib/container-configs
+ * @see WEK-80
+ */
+
+import * as fs from 'fs';
+import type { ContainerCreateConfig } from './docker-client';
+
+/** ECR registry base URL */
+const ECR_REGISTRY = '471112621974.dkr.ecr.us-east-1.amazonaws.com/wekruit/ghosthands';
+
+/** Path to .env file on the EC2 host */
+const ENV_FILE_PATH = '/opt/ghosthands/.env';
+
+/**
+ * Defines a deployable service container with health check,
+ * drain, and ordering metadata.
+ */
+export interface ServiceDefinition {
+  /** Container name (e.g., "ghosthands-api") */
+  name: string;
+  /** Docker Engine API container create config */
+  config: ContainerCreateConfig;
+  /** HTTP health check URL (e.g., "http://localhost:3100/health") */
+  healthEndpoint?: string;
+  /** Max milliseconds to wait for the container to become healthy */
+  healthTimeout: number;
+  /** Optional HTTP endpoint to POST for graceful drain before stop */
+  drainEndpoint?: string;
+  /** Max milliseconds to wait for drain to complete */
+  drainTimeout: number;
+  /** If true, skip this container during self-update (deploy-server) */
+  skipOnSelfUpdate: boolean;
+  /** Startup ordering — lower numbers start first */
+  startOrder: number;
+  /** Shutdown ordering — lower numbers stop first */
+  stopOrder: number;
+}
+
+/**
+ * Reads a .env file and returns an array of "KEY=VALUE" strings,
+ * filtering out blank lines and comments.
+ *
+ * Sync is acceptable here because this is called once at deploy time.
+ *
+ * @param path - Absolute path to the .env file
+ * @returns Array of environment variable strings (e.g., ["FOO=bar", "BAZ=qux"])
+ */
+export function loadEnvFile(path: string): string[] {
+  const content = fs.readFileSync(path, 'utf-8');
+  return content
+    .split('\n')
+    .filter((line: string) => line.trim() && !line.startsWith('#'))
+    .map((line: string) => line.trim());
+}
+
+/**
+ * Builds the full ECR image URI from a tag.
+ *
+ * @param imageTag - Image tag (e.g., "staging-abc1234" or "prod-def5678")
+ * @returns Full ECR image URI
+ */
+function buildEcrImage(imageTag: string): string {
+  return `${ECR_REGISTRY}:${imageTag}`;
+}
+
+/**
+ * Builds the API service definition.
+ */
+function buildApiService(ecrImage: string, envVars: string[]): ServiceDefinition {
+  return {
+    name: 'ghosthands-api',
+    config: {
+      Image: ecrImage,
+      Cmd: ['bun', 'run', 'packages/ghosthands/dist/api/server.js'],
+      Env: [...envVars, 'GH_API_PORT=3100'],
+      HostConfig: {
+        NetworkMode: 'host',
+        RestartPolicy: {
+          Name: 'unless-stopped',
+        },
+      },
+      Labels: {
+        'gh.service': 'api',
+        'gh.managed': 'true',
+      },
+    },
+    healthEndpoint: 'http://localhost:3100/health',
+    healthTimeout: 30_000,
+    drainEndpoint: undefined,
+    drainTimeout: 0,
+    skipOnSelfUpdate: false,
+    startOrder: 1,
+    stopOrder: 3,
+  };
+}
+
+/**
+ * Builds the Worker service definition.
+ */
+function buildWorkerService(ecrImage: string, envVars: string[]): ServiceDefinition {
+  return {
+    name: 'ghosthands-worker',
+    config: {
+      Image: ecrImage,
+      Cmd: ['bun', 'run', 'packages/ghosthands/dist/workers/start.js'],
+      Env: [...envVars, 'GH_WORKER_PORT=3101', 'MAX_CONCURRENT_JOBS=1'],
+      HostConfig: {
+        NetworkMode: 'host',
+        RestartPolicy: {
+          Name: 'unless-stopped',
+        },
+      },
+      Labels: {
+        'gh.service': 'worker',
+        'gh.managed': 'true',
+      },
+    },
+    healthEndpoint: 'http://localhost:3101/health',
+    healthTimeout: 30_000,
+    drainEndpoint: 'http://localhost:3101/drain',
+    drainTimeout: 60_000,
+    skipOnSelfUpdate: false,
+    startOrder: 2,
+    stopOrder: 1, // First to stop — drain jobs before shutting down other services
+  };
+}
+
+/**
+ * Builds the Deploy Server service definition.
+ */
+function buildDeployServerService(ecrImage: string, envVars: string[]): ServiceDefinition {
+  return {
+    name: 'ghosthands-deploy-server',
+    config: {
+      Image: ecrImage,
+      Cmd: ['bun', 'run', '/opt/ghosthands/scripts/deploy-server.ts'],
+      Env: [...envVars, 'GH_DEPLOY_PORT=8000'],
+      HostConfig: {
+        NetworkMode: 'host',
+        Binds: [
+          '/opt/ghosthands:/opt/ghosthands:ro',
+          '/var/run/docker.sock:/var/run/docker.sock',
+        ],
+        RestartPolicy: {
+          Name: 'unless-stopped',
+        },
+      },
+      Labels: {
+        'gh.service': 'deploy-server',
+        'gh.managed': 'true',
+      },
+    },
+    healthEndpoint: 'http://localhost:8000/health',
+    healthTimeout: 10_000,
+    drainEndpoint: undefined,
+    drainTimeout: 0,
+    skipOnSelfUpdate: true,
+    startOrder: 3,
+    stopOrder: 2,
+  };
+}
+
+/**
+ * Returns all 3 GhostHands service definitions, sorted by startOrder.
+ *
+ * @param imageTag - ECR image tag (e.g., "staging-abc1234")
+ * @param _environment - Target environment (reserved for future environment-specific overrides)
+ * @returns Array of ServiceDefinition sorted by startOrder (ascending)
+ */
+export function getServiceConfigs(
+  imageTag: string,
+  _environment: 'staging' | 'production',
+): ServiceDefinition[] {
+  const ecrImage = buildEcrImage(imageTag);
+  const envVars = loadEnvFile(ENV_FILE_PATH);
+
+  const services: ServiceDefinition[] = [
+    buildApiService(ecrImage, envVars),
+    buildWorkerService(ecrImage, envVars),
+    buildDeployServerService(ecrImage, envVars),
+  ];
+
+  return services.sort((a, b) => a.startOrder - b.startOrder);
+}
