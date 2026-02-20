@@ -53,10 +53,11 @@ export interface JobExecutorOptions {
 
 // --- Error classification ---
 
-const ERROR_CLASSIFICATIONS: Array<{ pattern: RegExp; code: string }> = [
+export const ERROR_CLASSIFICATIONS: Array<{ pattern: RegExp; code: string }> = [
   { pattern: /budget.?exceeded/i, code: 'budget_exceeded' },
   { pattern: /action.?limit.?exceeded/i, code: 'action_limit_exceeded' },
   { pattern: /captcha/i, code: 'captcha_blocked' },
+  { pattern: /2fa|two.?factor|verification code|authenticator/i, code: '2fa_required' },
   { pattern: /login|sign.?in/i, code: 'login_required' },
   { pattern: /timeout/i, code: 'timeout' },
   { pattern: /rate.?limit/i, code: 'rate_limited' },
@@ -85,10 +86,19 @@ const PERIODIC_BLOCKER_CHECK_MS = 30_000; // Periodic timer-based blocker check 
 const CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK = 3; // Check for blockers after this many consecutive action failures
 
 /** Error codes that should trigger HITL instead of immediate retry */
-const HITL_ELIGIBLE_ERRORS = new Set([
+export const HITL_ELIGIBLE_ERRORS = new Set([
   'captcha_blocked',
   'login_required',
+  '2fa_required',
 ]);
+
+/** Classify an error message into an error code using ERROR_CLASSIFICATIONS. */
+export function classifyError(message: string): string {
+  for (const { pattern, code } of ERROR_CLASSIFICATIONS) {
+    if (pattern.test(message)) return code;
+  }
+  return 'internal_error';
+}
 
 // --- Platform detection ---
 
@@ -176,11 +186,18 @@ export class JobExecutor {
     });
 
     try {
-      // 0. Pre-flight budget check
-      const preflight = await costService.preflightBudgetCheck(
-        job.user_id,
-        qualityPreset,
-      );
+      // 0. Pre-flight budget check (skip in development)
+      const isDev = (process.env.NODE_ENV || 'development') === 'development';
+      const preflight = isDev
+        ? { allowed: true, remainingBudget: Infinity, taskBudget: 0 }
+        : await costService.preflightBudgetCheck(
+            job.user_id,
+            qualityPreset,
+            job.job_type,
+          );
+      if (isDev) {
+        console.log(`[JobExecutor] Skipping budget preflight (NODE_ENV=development)`);
+      }
       if (!preflight.allowed) {
         await this.updateJobStatus(job.id, 'failed', preflight.reason);
         await this.logJobEvent(job.id, 'budget_preflight_failed', {
@@ -374,6 +391,46 @@ export class JobExecutor {
         adapter.registerCredentials(credentials);
       }
 
+      // 8.5. Inject stored browser session (e.g. Google auth cookies)
+      if (this.sessionManager) try {
+        // Load Google session for Sign-in-with-Google flows
+        // Try multiple Google-related domains since the session may be stored under any of them
+        const googleDomains = ['accounts.google.com', 'mail.google.com', 'google.com'];
+        let googleSessionInjected = false;
+        for (const domain of googleDomains) {
+          if (googleSessionInjected) break;
+          const googleSession = await this.sessionManager.loadSession(job.user_id, domain);
+          if (googleSession) {
+            const cookies = (googleSession as any).cookies || [];
+            if (cookies.length > 0) {
+              await adapter.page.context().addCookies(cookies);
+              console.log(`[JobExecutor] Injected ${cookies.length} Google session cookies (from ${domain}) for user ${job.user_id}`);
+              googleSessionInjected = true;
+            }
+          }
+        }
+
+        // Also try loading session for the target domain
+        const injTargetDomain = new URL(job.target_url).hostname;
+        const targetSession = await this.sessionManager.loadSession(job.user_id, injTargetDomain);
+        if (targetSession) {
+          const cookies = (targetSession as any).cookies || [];
+          if (cookies.length > 0) {
+            await adapter.page.context().addCookies(cookies);
+            console.log(`[JobExecutor] Injected ${cookies.length} ${injTargetDomain} session cookies`);
+          }
+        }
+        // Reload page after cookie injection so Workday SSO picks up the Google session
+        if (googleSessionInjected) {
+          console.log(`[JobExecutor] Reloading page after session injection...`);
+          await adapter.page.reload({ waitUntil: 'networkidle' }).catch(() => {});
+          await adapter.page.waitForTimeout(2000);
+        }
+      } catch (err) {
+        // Session injection failure is non-fatal — worker can still try fresh login
+        console.warn(`[JobExecutor] Session injection failed (non-fatal):`, err);
+      }
+
       // 8a. Auto-attach resume to file inputs via Playwright filechooser event.
       // This covers ALL execution paths (handlers, cookbook, crash recovery).
       if (resumeFilePath) {
@@ -388,7 +445,7 @@ export class JobExecutor {
         adapter.page.on('filechooser', fileChooserHandler);
       }
 
-      // 8.5. Check for blockers after initial page navigation
+      // 8.6. Check for blockers after initial page navigation
       const initiallyBlocked = await this.checkForBlockers(job, adapter, costTracker);
       if (initiallyBlocked) {
         throw new Error('Page blocked after initial navigation and HITL resolution failed');
@@ -540,101 +597,15 @@ export class JobExecutor {
 
       // 9a. Wire up event tracking with cost control + progress for Magnitude path
       const thoughtThrottle = new ThoughtThrottle(2000);
-
-      adapter.on('thought', (thought: string) => {
-        progress.recordThought(thought);
-        if (thoughtThrottle.shouldEmit()) {
-          this.logJobEvent(job.id, JOB_EVENT_TYPES.THOUGHT, {
-            content: thought.slice(0, 500),
-          });
-        }
-      });
-
-      // Track state for periodic blocker checks, URL monitoring, and failure escalation
-      let lastBlockerCheckTime = Date.now();
-      let consecutiveActionFailures = 0;
       const targetDomain = new URL(job.target_url).hostname;
-      let lastKnownUrl = job.target_url;
+      const blockerState = {
+        lastCheckTime: Date.now(),
+        consecutiveFailures: 0,
+        lastKnownUrl: job.target_url,
+      };
 
-      adapter.on('actionStarted', async (action: { variant: string }) => {
-        // Track consecutive failures: incremented on start, reset on actionDone
-        consecutiveActionFailures++;
-        costTracker.recordAction(); // throws ActionLimitExceededError if over limit
-        costTracker.recordModeStep('magnitude');
-        progress.onActionStarted(action.variant);
-        this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_STARTED, {
-          action: action.variant,
-          action_count: costTracker.getSnapshot().actionCount,
-        });
-
-        // If repeated action failures, check for blockers before continuing
-        if (consecutiveActionFailures >= CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK && adapter) {
-          try {
-            const blocked = await this.checkForBlockers(job, adapter, costTracker);
-            if (blocked) {
-              // HITL handled — the blocker was likely the root cause of failures
-            }
-          } catch {
-            // Non-fatal
-          }
-        }
-      });
-
-      adapter.on('actionDone', async (action: { variant: string }) => {
-        progress.onActionDone(action.variant);
-        consecutiveActionFailures = 0; // Reset on successful action
-        this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
-          action: action.variant,
-          action_count: costTracker.getSnapshot().actionCount,
-        });
-
-        // Periodic blocker check after actions (throttled)
-        const now = Date.now();
-        if (now - lastBlockerCheckTime >= BLOCKER_CHECK_INTERVAL_MS) {
-          lastBlockerCheckTime = now;
-          try {
-            // URL change detection — check if page navigated to a non-target domain
-            const currentUrl = await adapter!.getCurrentUrl();
-            if (currentUrl !== lastKnownUrl) {
-              lastKnownUrl = currentUrl;
-              try {
-                const currentDomain = new URL(currentUrl).hostname;
-                if (currentDomain !== targetDomain) {
-                  await this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
-                    from_domain: targetDomain,
-                    to_url: currentUrl,
-                  });
-                }
-              } catch {
-                // Invalid URL — skip domain comparison
-              }
-            }
-
-            // Use detectBlocker (DOM-only) for speed, not detectWithAdapter (which calls observe/LLM)
-            const blocked = await this.checkForBlockers(job, adapter!, costTracker);
-            if (blocked) {
-              // checkForBlockers already handled HITL flow internally
-            }
-          } catch (err) {
-            if ((err as Error).message?.includes('Blocker detected')) throw err;
-            // Detection errors are non-fatal
-          }
-        }
-      });
-
-      adapter.on('tokensUsed', (usage: TokenUsage) => {
-        costTracker.recordTokenUsage({
-          inputTokens: usage.inputTokens,
-          outputTokens: usage.outputTokens,
-          inputCost: usage.inputCost,
-          outputCost: usage.outputCost,
-        }); // throws BudgetExceededError if over budget
-        this.logJobEvent(job.id, JOB_EVENT_TYPES.TOKENS_USED, {
-          model: (usage as any).model || 'unknown',
-          input_tokens: usage.inputTokens,
-          output_tokens: usage.outputTokens,
-          cost_usd: usage.inputCost + usage.outputCost,
-        });
+      this.wireAdapterEvents(adapter, {
+        job, costTracker, progress, thoughtThrottle, blockerState, targetDomain,
       });
 
       // Start periodic blocker check timer (catches blockers even when adapter is stuck)
@@ -732,89 +703,12 @@ export class JobExecutor {
 
           // Re-wire event handlers on the new adapter
           thoughtThrottle.reset();
-          adapter.on('thought', (thought: string) => {
-            progress.recordThought(thought);
-            if (thoughtThrottle.shouldEmit()) {
-              this.logJobEvent(job.id, JOB_EVENT_TYPES.THOUGHT, {
-                content: thought.slice(0, 500),
-              });
-            }
-          });
-          adapter.on('actionStarted', async (action: { variant: string }) => {
-            consecutiveActionFailures++;
-            costTracker.recordAction();
-            progress.onActionStarted(action.variant);
-            this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_STARTED, {
-              action: action.variant,
-              action_count: costTracker.getSnapshot().actionCount,
-            });
+          blockerState.lastCheckTime = Date.now();
+          blockerState.consecutiveFailures = 0;
+          blockerState.lastKnownUrl = job.target_url;
 
-            if (consecutiveActionFailures >= CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK && adapter) {
-              try {
-                const blocked = await this.checkForBlockers(job, adapter, costTracker);
-                if (blocked) {
-                  // HITL handled
-                }
-              } catch {
-                // Non-fatal
-              }
-            }
-          });
-          // Reset blocker check state after crash recovery
-          lastBlockerCheckTime = Date.now();
-          consecutiveActionFailures = 0;
-          lastKnownUrl = job.target_url;
-
-          adapter.on('actionDone', async (action: { variant: string }) => {
-            progress.onActionDone(action.variant);
-            consecutiveActionFailures = 0;
-            this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
-              action: action.variant,
-              action_count: costTracker.getSnapshot().actionCount,
-            });
-
-            // Periodic blocker check after actions (throttled)
-            const now = Date.now();
-            if (now - lastBlockerCheckTime >= BLOCKER_CHECK_INTERVAL_MS) {
-              lastBlockerCheckTime = now;
-              try {
-                const currentUrl = await adapter!.getCurrentUrl();
-                if (currentUrl !== lastKnownUrl) {
-                  lastKnownUrl = currentUrl;
-                  try {
-                    const currentDomain = new URL(currentUrl).hostname;
-                    if (currentDomain !== targetDomain) {
-                      await this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
-                        from_domain: targetDomain,
-                        to_url: currentUrl,
-                      });
-                    }
-                  } catch {
-                    // Invalid URL — skip domain comparison
-                  }
-                }
-                const blocked = await this.checkForBlockers(job, adapter!, costTracker);
-                if (blocked) {
-                  // checkForBlockers already handled HITL flow
-                }
-              } catch (err) {
-                if ((err as Error).message?.includes('Blocker detected')) throw err;
-              }
-            }
-          });
-          adapter.on('tokensUsed', (usage: TokenUsage) => {
-            costTracker.recordTokenUsage({
-              inputTokens: usage.inputTokens,
-              outputTokens: usage.outputTokens,
-              inputCost: usage.inputCost,
-              outputCost: usage.outputCost,
-            });
-            this.logJobEvent(job.id, JOB_EVENT_TYPES.TOKENS_USED, {
-              model: (usage as any).model || 'unknown',
-              input_tokens: usage.inputTokens,
-              output_tokens: usage.outputTokens,
-              cost_usd: usage.inputCost + usage.outputCost,
-            });
+          this.wireAdapterEvents(adapter, {
+            job, costTracker, progress, thoughtThrottle, blockerState, targetDomain,
           });
 
           await this.logJobEvent(job.id, 'browser_crash_recovered', {
@@ -828,7 +722,7 @@ export class JobExecutor {
         throw new Error('Task handler did not produce a result');
       }
 
-      if (!taskResult.success) {
+      if (!taskResult.success && !taskResult.keepBrowserOpen) {
         throw new Error(taskResult.error || `Task handler '${handler.type}' returned failure`);
       }
 
@@ -921,7 +815,79 @@ export class JobExecutor {
       // 12. Get final cost snapshot
       const finalCost = costTracker.getSnapshot();
 
-      // 13. Mark progress complete and flush
+      // 12.5. Save fresh session cookies back to DB after successful auth
+      if (this.sessionManager) try {
+        const freshState = await adapter.page.context().storageState();
+        // Save Google session (use mail.google.com for consistency with session persistence test)
+        await this.sessionManager.saveSession(
+          job.user_id,
+          'mail.google.com',
+          freshState as unknown as Record<string, unknown>,
+        );
+        // Save target domain session
+        const saveDomain = new URL(job.target_url).hostname;
+        await this.sessionManager.saveSession(
+          job.user_id,
+          saveDomain,
+          freshState as unknown as Record<string, unknown>,
+        );
+        console.log(`[JobExecutor] Saved fresh session cookies for user ${job.user_id}`);
+      } catch (err) {
+        console.warn(`[JobExecutor] Session save failed (non-fatal):`, err);
+      }
+
+      // 13. Handle awaiting_user_review vs completed
+      if (taskResult.awaitingUserReview) {
+        // Job paused at review page — keep browser open
+        await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
+        await progress.flush();
+
+        const resultData = {
+          ...(taskResult.data || {}),
+          cost: {
+            input_tokens: finalCost.inputTokens,
+            output_tokens: finalCost.outputTokens,
+            total_cost_usd: finalCost.totalCost,
+            action_count: finalCost.actionCount,
+          },
+        };
+
+        await this.supabase
+          .from('gh_automation_jobs')
+          .update({
+            status: 'awaiting_user_review',
+            result_data: resultData,
+            result_summary: 'Application filled — waiting for user to review and submit',
+            screenshot_urls: screenshotUrls,
+            llm_cost_cents: Math.round(finalCost.totalCost * 100),
+            action_count: finalCost.actionCount,
+            total_tokens: finalCost.inputTokens + finalCost.outputTokens,
+          })
+          .eq('id', job.id);
+
+        await this.logJobEvent(job.id, 'awaiting_user_review', {
+          handler: handler.type,
+          action_count: finalCost.actionCount,
+          total_tokens: finalCost.inputTokens + finalCost.outputTokens,
+          cost_cents: Math.round(finalCost.totalCost * 100),
+        });
+
+        await costService.recordJobCost(job.user_id, job.id, finalCost);
+
+        console.log(`[JobExecutor] Job ${job.id} awaiting user review (actions=${finalCost.actionCount}, cost=$${finalCost.totalCost.toFixed(4)})`);
+
+        // Keep heartbeat running and browser open — wait indefinitely
+        // The worker process must stay alive for the browser to remain open
+        console.log(`[JobExecutor] Browser is open for manual review. Heartbeat continues.`);
+        console.log(`[JobExecutor] Press Ctrl+C to shut down the worker when done.`);
+
+        // Block indefinitely — the user will Ctrl+C when done
+        await new Promise<void>(() => {
+          // Never resolves — worker stays alive with browser open
+        });
+      }
+
+      // Normal completion flow
       await progress.setStep(ProgressStep.COMPLETED);
       await progress.flush();
 
@@ -1003,7 +969,7 @@ export class JobExecutor {
             // Blocker resolved (or detection didn't find one after error classification).
             // Try direct HITL as fallback since the error was classified as captcha/login.
             const resumed = await this.requestHumanIntervention(job, adapter, {
-              type: errorCode === 'captcha_blocked' ? 'captcha' : 'login',
+              type: errorCode === 'captcha_blocked' ? 'captcha' : errorCode === '2fa_required' ? '2fa' : 'login',
               confidence: 0.9,
               details: errorMessage,
               source: 'dom',
@@ -1141,6 +1107,104 @@ export class JobExecutor {
         })
         .eq('id', job.id);
     }
+  }
+
+  // --- Adapter Event Wiring ---
+
+  /**
+   * Wire adapter event handlers for cost tracking, progress, and blocker detection.
+   * Used both for initial Magnitude-path setup and after crash recovery.
+   */
+  private wireAdapterEvents(
+    adapter: BrowserAutomationAdapter,
+    opts: {
+      job: AutomationJob;
+      costTracker: CostTracker;
+      progress: ProgressTracker;
+      thoughtThrottle: ThoughtThrottle;
+      blockerState: { lastCheckTime: number; consecutiveFailures: number; lastKnownUrl: string };
+      targetDomain: string;
+    },
+  ): void {
+    const { job, costTracker, progress, thoughtThrottle, blockerState, targetDomain } = opts;
+
+    adapter.on('thought', (thought: string) => {
+      progress.recordThought(thought);
+      if (thoughtThrottle.shouldEmit()) {
+        this.logJobEvent(job.id, JOB_EVENT_TYPES.THOUGHT, {
+          content: thought.slice(0, 500),
+        });
+      }
+    });
+
+    adapter.on('actionStarted', async (action: { variant: string }) => {
+      blockerState.consecutiveFailures++;
+      costTracker.recordAction(); // throws ActionLimitExceededError if over limit
+      costTracker.recordModeStep('magnitude');
+      progress.onActionStarted(action.variant);
+      this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_STARTED, {
+        action: action.variant,
+        action_count: costTracker.getSnapshot().actionCount,
+      });
+
+      if (blockerState.consecutiveFailures >= CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK && adapter) {
+        try {
+          await this.checkForBlockers(job, adapter, costTracker);
+        } catch {
+          // Non-fatal
+        }
+      }
+    });
+
+    adapter.on('actionDone', async (action: { variant: string }) => {
+      progress.onActionDone(action.variant);
+      blockerState.consecutiveFailures = 0;
+      this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
+        action: action.variant,
+        action_count: costTracker.getSnapshot().actionCount,
+      });
+
+      const now = Date.now();
+      if (now - blockerState.lastCheckTime >= BLOCKER_CHECK_INTERVAL_MS) {
+        blockerState.lastCheckTime = now;
+        try {
+          const currentUrl = await adapter.getCurrentUrl();
+          if (currentUrl !== blockerState.lastKnownUrl) {
+            blockerState.lastKnownUrl = currentUrl;
+            try {
+              const currentDomain = new URL(currentUrl).hostname;
+              if (currentDomain !== targetDomain) {
+                await this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
+                  from_domain: targetDomain,
+                  to_url: currentUrl,
+                });
+              }
+            } catch {
+              // Invalid URL — skip domain comparison
+            }
+          }
+          await this.checkForBlockers(job, adapter, costTracker);
+        } catch (err) {
+          if ((err as Error).message?.includes('Blocker detected')) throw err;
+          // Detection errors are non-fatal
+        }
+      }
+    });
+
+    adapter.on('tokensUsed', (usage: TokenUsage) => {
+      costTracker.recordTokenUsage({
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        inputCost: usage.inputCost,
+        outputCost: usage.outputCost,
+      }); // throws BudgetExceededError if over budget
+      this.logJobEvent(job.id, JOB_EVENT_TYPES.TOKENS_USED, {
+        model: (usage as any).model || 'unknown',
+        input_tokens: usage.inputTokens,
+        output_tokens: usage.outputTokens,
+        cost_usd: usage.inputCost + usage.outputCost,
+      });
+    });
   }
 
   // --- Blocker Detection ---
@@ -1858,10 +1922,7 @@ export class JobExecutor {
   // --- Error classification ---
 
   private classifyError(message: string): string {
-    for (const { pattern, code } of ERROR_CLASSIFICATIONS) {
-      if (pattern.test(message)) return code;
-    }
-    return 'internal_error';
+    return classifyError(message);
   }
 
   // --- Browser crash detection & recovery ---

@@ -72,14 +72,19 @@ export class ActionLimitExceededError extends Error {
 // ---------------------------------------------------------------------------
 
 /** Per-task LLM budget (in USD) by quality preset */
-const TASK_BUDGET: Record<QualityPreset, number> = {
+export const TASK_BUDGET: Record<QualityPreset, number> = {
   speed: 0.05,
   balanced: 0.25,
   quality: 0.50,
 };
 
+/** Per-job-type budget overrides (in USD) — bypasses quality preset when present */
+export const JOB_TYPE_BUDGET_OVERRIDES: Record<string, number> = {
+  workday_apply: 2.00,
+};
+
 /** Per-user monthly budget (in USD) by subscription tier */
-const MONTHLY_BUDGET: Record<BudgetTier, number> = {
+export const MONTHLY_BUDGET: Record<BudgetTier, number> = {
   free: 0.50,
   starter: 2.00,
   pro: 10.00,
@@ -88,14 +93,15 @@ const MONTHLY_BUDGET: Record<BudgetTier, number> = {
 };
 
 /** Default max actions per job */
-const DEFAULT_MAX_ACTIONS = 50;
+export const DEFAULT_MAX_ACTIONS = 50;
 
 /** Per-job-type action limits (override default) */
-const JOB_TYPE_ACTION_LIMITS: Record<string, number> = {
+export const JOB_TYPE_ACTION_LIMITS: Record<string, number> = {
   apply: 50,
   scrape: 30,
   fill_form: 40,
   custom: 50,
+  workday_apply: 200,
 };
 
 // ---------------------------------------------------------------------------
@@ -125,7 +131,10 @@ export class CostTracker {
     maxActions?: number;
   }) {
     this.jobId = opts.jobId;
-    this.taskBudget = TASK_BUDGET[opts.qualityPreset || 'balanced'];
+    // Per-job-type budget overrides take precedence over quality preset
+    this.taskBudget =
+      (opts.jobType ? JOB_TYPE_BUDGET_OVERRIDES[opts.jobType] : undefined) ??
+      TASK_BUDGET[opts.qualityPreset || 'balanced'];
     this.actionLimit =
       opts.maxActions ??
       (opts.jobType ? JOB_TYPE_ACTION_LIMITS[opts.jobType] : undefined) ??
@@ -240,9 +249,13 @@ export class CostControlService {
   async preflightBudgetCheck(
     userId: string,
     qualityPreset: QualityPreset = 'balanced',
+    jobType?: string,
   ): Promise<PreflightResult> {
     const usage = await this.getUserUsage(userId);
-    const taskBudget = TASK_BUDGET[qualityPreset];
+    // Use per-job-type budget override if available, otherwise fall back to quality preset
+    const taskBudget =
+      (jobType ? JOB_TYPE_BUDGET_OVERRIDES[jobType] : undefined) ??
+      TASK_BUDGET[qualityPreset];
 
     if (usage.remainingBudget < taskBudget) {
       return {

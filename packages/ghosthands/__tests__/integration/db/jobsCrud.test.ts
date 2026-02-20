@@ -301,29 +301,27 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
   // ── DB-008: Filter jobs by status ────────────────────────────────────────
 
   test('DB-008: filter jobs by status — returns only matching', async () => {
-    await insertTestJobs(supabase, [
+    const inserted = await insertTestJobs(supabase, [
       { job_type: JOB_TYPE, status: 'pending' },
       { job_type: JOB_TYPE, status: 'completed' },
       { job_type: JOB_TYPE, status: 'failed' },
     ]);
 
-    const { data: pending } = await supabase
+    const insertedIds = inserted.map((j) => j.id as string);
+
+    // Query for pending jobs scoped to the rows we just inserted
+    const { data: pending, error } = await supabase
       .from('gh_automation_jobs')
-      .select('id')
-      .eq('job_type', JOB_TYPE)
+      .select('id, status')
+      .in('id', insertedIds)
       .eq('status', 'pending');
 
-    expect(pending!.length).toBeGreaterThanOrEqual(1);
+    expect(error).toBeNull();
+    expect(pending).not.toBeNull();
+    expect(pending!.length).toBe(1);
 
-    // All returned should be pending
-    for (const job of pending!) {
-      const { data } = await supabase
-        .from('gh_automation_jobs')
-        .select('status')
-        .eq('id', job.id)
-        .single();
-      expect(data!.status).toBe('pending');
-    }
+    // The single returned row should be the pending one
+    expect(pending![0].status).toBe('pending');
   });
 
   // ── DB-009: scheduled_at for delayed jobs ────────────────────────────────

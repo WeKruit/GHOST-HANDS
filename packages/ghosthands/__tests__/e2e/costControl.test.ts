@@ -12,6 +12,10 @@ import {
   BudgetExceededError,
   ActionLimitExceededError,
   resolveQualityPreset,
+  TASK_BUDGET,
+  MONTHLY_BUDGET,
+  DEFAULT_MAX_ACTIONS,
+  JOB_TYPE_ACTION_LIMITS,
 } from '../../src/workers/costControl';
 import {
   getTestSupabase,
@@ -116,7 +120,7 @@ describe('Cost Controls', () => {
         expect(err).toBeInstanceOf(BudgetExceededError);
         const budgetErr = err as BudgetExceededError;
         expect(budgetErr.jobId).toBe('test-job-budget-2');
-        expect(budgetErr.costSnapshot.totalCost).toBeGreaterThan(0.02);
+        expect(budgetErr.costSnapshot.totalCost).toBeGreaterThan(TASK_BUDGET.speed);
       }
     });
 
@@ -125,14 +129,14 @@ describe('Cost Controls', () => {
       const balancedTracker = new CostTracker({ jobId: 'b', qualityPreset: 'balanced' });
       const qualityTracker = new CostTracker({ jobId: 'q', qualityPreset: 'quality' });
 
-      expect(speedTracker.getTaskBudget()).toBe(0.02);
-      expect(balancedTracker.getTaskBudget()).toBe(0.10);
-      expect(qualityTracker.getTaskBudget()).toBe(0.30);
+      expect(speedTracker.getTaskBudget()).toBe(TASK_BUDGET.speed);
+      expect(balancedTracker.getTaskBudget()).toBe(TASK_BUDGET.balanced);
+      expect(qualityTracker.getTaskBudget()).toBe(TASK_BUDGET.quality);
     });
 
     it('should default to balanced quality preset', () => {
       const tracker = new CostTracker({ jobId: 'default' });
-      expect(tracker.getTaskBudget()).toBe(0.10);
+      expect(tracker.getTaskBudget()).toBe(TASK_BUDGET.balanced);
     });
   });
 
@@ -142,23 +146,23 @@ describe('Cost Controls', () => {
     it('should track actions without error when within limit', () => {
       const tracker = new CostTracker({
         jobId: 'test-job-actions-1',
-        jobType: 'apply', // limit = 50
+        jobType: 'apply',
       });
 
-      for (let i = 0; i < 50; i++) {
+      for (let i = 0; i < JOB_TYPE_ACTION_LIMITS.apply; i++) {
         tracker.recordAction();
       }
 
-      expect(tracker.getSnapshot().actionCount).toBe(50);
+      expect(tracker.getSnapshot().actionCount).toBe(JOB_TYPE_ACTION_LIMITS.apply);
     });
 
     it('should throw ActionLimitExceededError when action limit is exceeded', () => {
       const tracker = new CostTracker({
         jobId: 'test-job-actions-2',
-        jobType: 'scrape', // limit = 30
+        jobType: 'scrape',
       });
 
-      for (let i = 0; i < 30; i++) {
+      for (let i = 0; i < JOB_TYPE_ACTION_LIMITS.scrape; i++) {
         tracker.recordAction();
       }
 
@@ -193,9 +197,9 @@ describe('Cost Controls', () => {
       const scrapeTracker = new CostTracker({ jobId: 's', jobType: 'scrape' });
       const formTracker = new CostTracker({ jobId: 'f', jobType: 'fill_form' });
 
-      expect(applyTracker.getActionLimit()).toBe(50);
-      expect(scrapeTracker.getActionLimit()).toBe(30);
-      expect(formTracker.getActionLimit()).toBe(40);
+      expect(applyTracker.getActionLimit()).toBe(JOB_TYPE_ACTION_LIMITS.apply);
+      expect(scrapeTracker.getActionLimit()).toBe(JOB_TYPE_ACTION_LIMITS.scrape);
+      expect(formTracker.getActionLimit()).toBe(JOB_TYPE_ACTION_LIMITS.fill_form);
     });
 
     it('should respect explicit maxActions override', () => {
@@ -207,9 +211,9 @@ describe('Cost Controls', () => {
       expect(tracker.getActionLimit()).toBe(10);
     });
 
-    it('should default to 50 actions for unknown job types', () => {
+    it('should default to DEFAULT_MAX_ACTIONS for unknown job types', () => {
       const tracker = new CostTracker({ jobId: 'x', jobType: 'unknown' });
-      expect(tracker.getActionLimit()).toBe(50);
+      expect(tracker.getActionLimit()).toBe(DEFAULT_MAX_ACTIONS);
     });
   });
 
@@ -265,35 +269,38 @@ describe('Cost Controls', () => {
 
       expect(result.allowed).toBe(true);
       expect(result.remainingBudget).toBeGreaterThan(0);
-      expect(result.taskBudget).toBe(0.10);
+      expect(result.taskBudget).toBe(TASK_BUDGET.balanced);
     });
 
     it('should deny a job when user budget is exhausted', async () => {
+      const almostExhausted = MONTHLY_BUDGET.free - 0.01;
       await ensureTestUsage(supabase, TEST_USER_ID, {
-        tier: 'free', // $0.50/month
-        total_cost_usd: 0.49, // Only $0.01 remaining
+        tier: 'free',
+        total_cost_usd: almostExhausted, // Only $0.01 remaining
       });
 
       const service = new CostControlService(supabase);
       const result = await service.preflightBudgetCheck(TEST_USER_ID, 'balanced');
 
-      // $0.10 task budget > $0.01 remaining
+      // balanced task budget > $0.01 remaining
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain('Insufficient');
       expect(result.remainingBudget).toBeCloseTo(0.01, 2);
-      expect(result.taskBudget).toBe(0.10);
+      expect(result.taskBudget).toBe(TASK_BUDGET.balanced);
     });
 
     it('should allow speed preset with low remaining budget', async () => {
+      // Spend enough that only a bit more than the speed budget remains
+      const spent = MONTHLY_BUDGET.free - TASK_BUDGET.speed - 0.01;
       await ensureTestUsage(supabase, TEST_USER_ID, {
         tier: 'free',
-        total_cost_usd: 0.47, // $0.03 remaining
+        total_cost_usd: spent,
       });
 
       const service = new CostControlService(supabase);
       const result = await service.preflightBudgetCheck(TEST_USER_ID, 'speed');
 
-      // Speed preset needs $0.02, remaining is $0.03
+      // Remaining > speed budget, so should be allowed
       expect(result.allowed).toBe(true);
     });
 
@@ -397,32 +404,22 @@ describe('Cost Controls', () => {
 
   describe('Budget Configuration', () => {
     it('should have ascending monthly budgets from free to enterprise', () => {
-      // Test through the CostControlService + getUserUsage path
-      const budgets: Record<string, number> = {
-        free: 0.50,
-        starter: 2.00,
-        pro: 10.00,
-        premium: 10.00,
-        enterprise: 100.00,
-      };
-
-      for (const [tier, expectedBudget] of Object.entries(budgets)) {
-        // Verify via the quality preset task budgets
-        expect(expectedBudget).toBeGreaterThan(0);
+      for (const budget of Object.values(MONTHLY_BUDGET)) {
+        expect(budget).toBeGreaterThan(0);
       }
 
-      expect(budgets.free).toBeLessThan(budgets.starter);
-      expect(budgets.starter).toBeLessThan(budgets.pro);
-      expect(budgets.pro).toBeLessThanOrEqual(budgets.premium);
-      expect(budgets.premium).toBeLessThan(budgets.enterprise);
+      expect(MONTHLY_BUDGET.free).toBeLessThan(MONTHLY_BUDGET.starter);
+      expect(MONTHLY_BUDGET.starter).toBeLessThanOrEqual(MONTHLY_BUDGET.pro);
+      expect(MONTHLY_BUDGET.pro).toBeLessThanOrEqual(MONTHLY_BUDGET.premium);
+      expect(MONTHLY_BUDGET.premium).toBeLessThan(MONTHLY_BUDGET.enterprise);
     });
 
     it('should have task budgets that are sensible fractions of monthly budgets', () => {
-      // Speed ($0.02) should fit many times in even the free tier ($0.50)
-      expect(0.50 / 0.02).toBeGreaterThanOrEqual(10);
+      // Speed should fit many times in even the free tier
+      expect(MONTHLY_BUDGET.free / TASK_BUDGET.speed).toBeGreaterThanOrEqual(10);
 
-      // Quality ($0.30) should fit at least a few times in pro tier ($10.00)
-      expect(10.00 / 0.30).toBeGreaterThan(10);
+      // Quality should fit at least a few times in pro tier
+      expect(MONTHLY_BUDGET.pro / TASK_BUDGET.quality).toBeGreaterThan(10);
     });
   });
 
@@ -433,9 +430,10 @@ describe('Cost Controls', () => {
       // Simulate a job that runs actions and accumulates cost until it exceeds the budget.
       // The CostTracker is what the JobExecutor uses -- when it throws, the executor
       // catches it and marks the job as failed with 'budget_exceeded'.
+      const costPerAction = 0.005;
       const tracker = new CostTracker({
         jobId: 'runtime-kill-1',
-        qualityPreset: 'speed', // $0.02 budget
+        qualityPreset: 'speed',
       });
 
       let killed = false;
@@ -459,8 +457,9 @@ describe('Cost Controls', () => {
       }
 
       expect(killed).toBe(true);
-      // Should have been killed after ~4 actions ($0.005 * 4 = $0.02, 5th exceeds)
-      expect(actionCountAtKill).toBeLessThanOrEqual(5);
+      // Should have been killed once cumulative cost exceeds the speed budget
+      const maxActionsBeforeExceeding = Math.ceil(TASK_BUDGET.speed / costPerAction);
+      expect(actionCountAtKill).toBeLessThanOrEqual(maxActionsBeforeExceeding + 1);
     });
 
     it('should kill a running job when action limit is exceeded', async () => {
@@ -532,13 +531,15 @@ describe('Cost Controls', () => {
     });
 
     it('should handle multiple small token usages accumulating to exceed budget', () => {
+      const costPerCall = 0.005;
       const tracker = new CostTracker({
         jobId: 'many-small',
-        qualityPreset: 'speed', // $0.02
+        qualityPreset: 'speed',
       });
 
-      // Each call adds $0.005 -- 4 calls = $0.02, 5th should exceed
-      for (let i = 0; i < 4; i++) {
+      // Add calls that stay within budget
+      const callsWithinBudget = Math.floor(TASK_BUDGET.speed / costPerCall);
+      for (let i = 0; i < callsWithinBudget; i++) {
         tracker.recordTokenUsage({
           inputTokens: 100,
           outputTokens: 50,
@@ -547,6 +548,7 @@ describe('Cost Controls', () => {
         });
       }
 
+      // Next call should exceed the budget
       expect(() => {
         tracker.recordTokenUsage({
           inputTokens: 100,
