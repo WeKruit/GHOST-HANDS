@@ -42,7 +42,7 @@ const PageStateSchema = z.object({
   error_message: z.string().optional().default(''),
 });
 
-type PageState = z.infer<typeof PageStateSchema>;
+type PageState = z.input<typeof PageStateSchema>;
 
 // --- Handler ---
 
