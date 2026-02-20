@@ -155,6 +155,7 @@ export class JobExecutor {
     let observer: StagehandObserver | undefined;
     let blockerCheckInterval: ReturnType<typeof setInterval> | null = null;
     let resumeFilePath: string | null = null;
+    let fileChooserHandler: ((chooser: any) => Promise<void>) | null = null;
 
     // Initialize cost tracker with budget limits
     const qualityPreset = resolveQualityPreset(job.input_data, job.metadata);
@@ -371,6 +372,20 @@ export class JobExecutor {
       // 8. Register credentials if available
       if (credentials) {
         adapter.registerCredentials(credentials);
+      }
+
+      // 8a. Auto-attach resume to file inputs via Playwright filechooser event.
+      // This covers ALL execution paths (handlers, cookbook, crash recovery).
+      if (resumeFilePath) {
+        fileChooserHandler = async (chooser: any) => {
+          try {
+            await chooser.setFiles(resumeFilePath!);
+            logger.info('Resume auto-attached via filechooser', { jobId: job.id });
+          } catch (err) {
+            logger.warn('filechooser setFiles failed', { jobId: job.id, error: String(err) });
+          }
+        };
+        adapter.page.on('filechooser', fileChooserHandler);
       }
 
       // 8.5. Check for blockers after initial page navigation
@@ -1051,10 +1066,14 @@ export class JobExecutor {
           // Adapter may already be stopped
         }
       }
+      // Remove filechooser listener
+      if (fileChooserHandler && adapter) {
+        try { adapter.page.off('filechooser', fileChooserHandler); } catch { /* page may be closed */ }
+      }
       // Clean up downloaded resume file
       if (resumeFilePath) {
         this.resumeDownloader.cleanup(resumeFilePath).catch((err) => {
-          console.warn(`[JobExecutor] Resume cleanup failed for job ${job.id}:`, err);
+          logger.warn('Resume cleanup failed', { jobId: job.id, error: String(err) });
         });
       }
     }
