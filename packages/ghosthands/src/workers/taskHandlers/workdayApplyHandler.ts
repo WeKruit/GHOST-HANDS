@@ -541,9 +541,37 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
         }
 
         default: {
-          // Unknown Google page — use LLM as fallback but with strict instruction
-          console.log('[WorkdayApply] Unknown Google page — using LLM fallback...');
-          await adapter.act(buildGoogleSignInFallbackPrompt(email, password));
+          // Unknown Google page — try DOM-based password fill first (safe),
+          // then fall back to LLM for email/account selection only.
+          // SECURITY: Never pass passwords to LLM prompts — LLM providers log
+          // prompts and completions, so credentials would be exposed.
+          console.log('[WorkdayApply] Unknown Google page — trying DOM password fill, then LLM fallback...');
+
+          // Attempt DOM-based password entry (handles cases the detector missed)
+          const passwordField = adapter.page.locator('input[type="password"]:visible').first();
+          const hasPasswordField = await passwordField.isVisible({ timeout: 1000 }).catch(() => false);
+          if (hasPasswordField && password) {
+            console.log('[WorkdayApply] Found visible password field — filling via DOM...');
+            await passwordField.fill(password);
+            await adapter.page.waitForTimeout(300);
+            const nextClicked = await adapter.page.evaluate(() => {
+              const buttons = document.querySelectorAll('button, div[role="button"]');
+              for (const btn of buttons) {
+                if (btn.textContent?.trim().toLowerCase().includes('next')) {
+                  (btn as HTMLElement).click();
+                  return true;
+                }
+              }
+              return false;
+            });
+            if (!nextClicked) {
+              await adapter.act('Click the "Next" button.');
+            }
+          } else {
+            // No password field visible — safe to use LLM for email/account actions
+            await adapter.act(buildGoogleSignInFallbackPrompt(email));
+          }
+
           await adapter.page.waitForTimeout(2000);
           return;
         }
@@ -611,7 +639,7 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
       throw new Error('Could not find verification code in Gmail');
     }
 
-    console.log(`[WorkdayApply] Found verification code: ${codeResult.code}`);
+    console.log('[WorkdayApply] Found verification code: [REDACTED]');
 
     // Go back to the verification page
     await adapter.navigate(currentUrl);
