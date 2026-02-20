@@ -22,6 +22,7 @@ import { TraceRecorder } from '../engine/TraceRecorder.js';
 import { StagehandObserver } from '../engine/StagehandObserver.js';
 import type { MagnitudeAdapter } from '../adapters/magnitude.js';
 import { ThoughtThrottle, JOB_EVENT_TYPES } from '../events/JobEventTypes.js';
+import { ResumeDownloader, type ResumeRef } from './resumeDownloader.js';
 
 // Re-export AutomationJob from the canonical location for backward compat
 export type { AutomationJob } from './taskHandlers/types.js';
@@ -134,6 +135,7 @@ export class JobExecutor {
   private pgPool: pg.Pool | null;
   private hitlTimeoutSeconds: number;
   private blockerDetector = new BlockerDetector();
+  private resumeDownloader: ResumeDownloader;
 
   constructor(opts: JobExecutorOptions) {
     this.supabase = opts.supabase;
@@ -141,6 +143,7 @@ export class JobExecutor {
     this.sessionManager = opts.sessionManager ?? null;
     this.pgPool = opts.pgPool ?? null;
     this.hitlTimeoutSeconds = opts.hitlTimeoutSeconds ?? DEFAULT_HITL_TIMEOUT_SECONDS;
+    this.resumeDownloader = new ResumeDownloader(opts.supabase);
   }
 
   async execute(job: AutomationJob): Promise<void> {
@@ -148,6 +151,7 @@ export class JobExecutor {
     let adapter: BrowserAutomationAdapter | null = null;
     let observer: StagehandObserver | undefined;
     let blockerCheckInterval: ReturnType<typeof setInterval> | null = null;
+    let resumeFilePath: string | null = null;
 
     // Initialize cost tracker with budget limits
     const qualityPreset = resolveQualityPreset(job.input_data, job.metadata);
@@ -287,6 +291,25 @@ export class JobExecutor {
 
       // 5. Build data prompt from input_data
       const dataPrompt = buildDataPrompt(job.input_data);
+
+      // 5a. Download resume if resume_ref is provided
+      const resumeRef = this.resolveResumeRef(job);
+      if (resumeRef) {
+        try {
+          resumeFilePath = await this.resumeDownloader.download(resumeRef, job.id);
+          await this.logJobEvent(job.id, 'resume_downloaded', {
+            source: resumeRef.storage_path ? 'supabase' : resumeRef.download_url ? 'url' : 's3',
+            file_path: resumeFilePath,
+          });
+          console.log(`[JobExecutor] Resume downloaded for job ${job.id}: ${resumeFilePath}`);
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          await this.logJobEvent(job.id, 'resume_download_failed', {
+            error: errMsg,
+          });
+          throw new Error(`Resume download failed: ${errMsg}`);
+        }
+      }
 
       // 6. Build LLM client config (may include separate image model)
       const llmSetup = this.buildLLMClient(job);
@@ -623,6 +646,7 @@ export class JobExecutor {
           progress,
           credentials,
           dataPrompt,
+          resumeFilePath,
         };
 
         try {
@@ -1022,6 +1046,12 @@ export class JobExecutor {
         } catch {
           // Adapter may already be stopped
         }
+      }
+      // Clean up downloaded resume file
+      if (resumeFilePath) {
+        this.resumeDownloader.cleanup(resumeFilePath).catch((err) => {
+          console.warn(`[JobExecutor] Resume cleanup failed for job ${job.id}:`, err);
+        });
       }
     }
   }
@@ -1584,6 +1614,44 @@ export class JobExecutor {
     }
 
     return result;
+  }
+
+  // --- Resume resolution ---
+
+  /**
+   * Resolve the resume reference from the job.
+   * Checks: job.resume_ref (DB column), metadata.resume_ref (backup), input_data.resume_path.
+   * Returns null if no resume or empty/invalid reference.
+   */
+  private resolveResumeRef(job: AutomationJob): ResumeRef | null {
+    // 1. Direct column (preferred)
+    const directRef = job.resume_ref;
+    if (directRef && typeof directRef === 'object') {
+      const ref = directRef as ResumeRef;
+      if (ref.storage_path || ref.download_url || ref.s3_key) {
+        return ref;
+      }
+    }
+
+    // 2. Backup in metadata
+    const metaRef = job.metadata?.resume_ref;
+    if (metaRef && typeof metaRef === 'object') {
+      const ref = metaRef as ResumeRef;
+      if (ref.storage_path || ref.download_url || ref.s3_key) {
+        return ref;
+      }
+    }
+
+    // 3. Legacy: input_data.resume_path as a download_url or storage_path
+    const legacyPath = job.input_data?.resume_path;
+    if (legacyPath && typeof legacyPath === 'string' && legacyPath.trim() !== '') {
+      if (legacyPath.startsWith('http://') || legacyPath.startsWith('https://')) {
+        return { download_url: legacyPath };
+      }
+      return { storage_path: legacyPath };
+    }
+
+    return null;
   }
 
   // --- Screenshot upload ---
