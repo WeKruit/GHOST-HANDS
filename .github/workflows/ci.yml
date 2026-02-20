@@ -2,7 +2,7 @@ name: CI/CD
 
 on:
   push:
-    branches: [main]
+    branches: [main, staging]
   pull_request:
     branches: [main]
 
@@ -52,22 +52,39 @@ jobs:
       - run: bun run test:integration
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
           SUPABASE_DIRECT_URL: ${{ secrets.SUPABASE_DIRECT_URL }}
           GH_SERVICE_SECRET: ${{ secrets.GH_SERVICE_SECRET }}
           GH_ENCRYPTION_KEY: ${{ secrets.GH_ENCRYPTION_KEY }}
 
-  # ─── Docker build (main branch only) ─────────────────────────
+  # ─── Docker build (main + staging branches) ────────────────────
+  # Staging: tags as staging-<sha>
+  # Main:    tags as <sha> + latest
 
   docker:
     name: Docker Build & Push
     runs-on: ubuntu-latest
     needs: [typecheck, test-unit]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.event_name == 'push'
     outputs:
-      image_tag: ${{ github.sha }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      environment: ${{ steps.meta.outputs.environment }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/staging" ]; then
+            echo "image_tag=staging-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            echo "environment=staging" >> "$GITHUB_OUTPUT"
+            echo "tag_latest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "image_tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            echo "environment=production" >> "$GITHUB_OUTPUT"
+            echo "tag_latest=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -84,22 +101,34 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
+          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+          TAG_LATEST: ${{ steps.meta.outputs.tag_latest }}
         run: |
+          TAGS="-t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          if [ "$TAG_LATEST" = "true" ]; then
+            TAGS="$TAGS -t $ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          fi
+
           docker build \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            --build-arg COMMIT_SHA=${{ github.sha }} \
+            --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --build-arg IMAGE_TAG=$IMAGE_TAG \
+            $TAGS \
             .
+
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          if [ "$TAG_LATEST" = "true" ]; then
+            docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          fi
 
   # ─── Deploy: Staging ──────────────────────────────────────────
+  # Triggers on both staging branch (direct) and main branch (promotion)
 
   deploy-staging:
     name: Deploy Staging
     runs-on: ubuntu-latest
     needs: [docker, test-integration]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.event_name == 'push'
     environment: staging
     steps:
       - name: Notify VALET (staging)
@@ -108,8 +137,8 @@ jobs:
           VALET_DEPLOY_WEBHOOK_SECRET: ${{ secrets.VALET_DEPLOY_WEBHOOK_SECRET }}
           ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
           ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
-          DEPLOY_ENV: staging
+          IMAGE_TAG: ${{ needs.docker.outputs.image_tag }}
+          BRANCH: ${{ github.ref_name }}
         run: |
           if [ -z "$VALET_DEPLOY_WEBHOOK_URL" ]; then
             echo "::warning::VALET_DEPLOY_WEBHOOK_URL not configured for staging. Skipping."
@@ -117,14 +146,14 @@ jobs:
             exit 0
           fi
 
-          PAYLOAD=$(jq -n \
+          PAYLOAD=$(jq -cn \
             --arg event "ghosthands.deploy_ready" \
             --arg image "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" \
             --arg image_tag "${IMAGE_TAG}" \
             --arg image_latest "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest" \
             --arg commit_sha "${{ github.sha }}" \
             --arg commit_message "$(echo "${{ github.event.head_commit.message }}" | head -1)" \
-            --arg branch "main" \
+            --arg branch "${BRANCH}" \
             --arg environment "staging" \
             --arg repository "${{ github.repository }}" \
             --arg run_id "${{ github.run_id }}" \
@@ -155,6 +184,7 @@ jobs:
           fi
 
   # ─── Deploy: Production ───────────────────────────────────────
+  # Only triggers on main branch pushes, after staging succeeds
 
   deploy-production:
     name: Deploy Production
@@ -169,8 +199,7 @@ jobs:
           VALET_DEPLOY_WEBHOOK_SECRET: ${{ secrets.VALET_DEPLOY_WEBHOOK_SECRET }}
           ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
           ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
-          DEPLOY_ENV: production
+          IMAGE_TAG: ${{ needs.docker.outputs.image_tag }}
         run: |
           if [ -z "$VALET_DEPLOY_WEBHOOK_URL" ]; then
             echo "::warning::VALET_DEPLOY_WEBHOOK_URL not configured for production. Skipping."
@@ -178,7 +207,7 @@ jobs:
             exit 0
           fi
 
-          PAYLOAD=$(jq -n \
+          PAYLOAD=$(jq -cn \
             --arg event "ghosthands.deploy_ready" \
             --arg image "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" \
             --arg image_tag "${IMAGE_TAG}" \

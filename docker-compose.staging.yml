@@ -1,0 +1,105 @@
+# docker-compose.staging.yml
+# Staging deployment for GhostHands — identical to prod but with staging-specific defaults
+#
+# Differences from production:
+#   - GH_ENVIRONMENT=staging (reported in health endpoints)
+#   - Deploy server bound to 0.0.0.0:8000 (for VALET access)
+#   - Lower resource limits (staging instances are smaller)
+#
+# Usage:
+#   ECR_IMAGE=<registry>/ghosthands:staging-<sha> docker compose -f docker-compose.staging.yml up -d
+
+services:
+  # GhostHands API Server
+  api:
+    image: ${ECR_IMAGE:-ghosthands:latest}
+    command: ["bun", "packages/ghosthands/src/api/server.ts"]
+    ports:
+      - "127.0.0.1:${GH_API_PORT:-3100}:3100"
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - GH_ENVIRONMENT=staging
+      - GH_API_PORT=3100
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+      - SSL_CERT_DIR=/etc/ssl/certs
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3100/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
+    restart: unless-stopped
+    logging:
+      driver: ${LOG_DRIVER:-json-file}
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Deploy Server — receives deploy commands from VALET's DeployService
+  deploy-server:
+    image: ${ECR_IMAGE:-ghosthands:latest}
+    command: ["bun", "scripts/deploy-server.ts"]
+    ports:
+      - "${GH_DEPLOY_PORT:-8000}:8000"
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - GH_ENVIRONMENT=staging
+      - GH_DEPLOY_PORT=8000
+      - GH_API_PORT=3100
+      - GH_WORKER_PORT=3101
+      - GHOSTHANDS_DIR=/app
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+      - SSL_CERT_DIR=/etc/ssl/certs
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/opt/ghosthands:ro
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+    restart: unless-stopped
+    logging:
+      driver: ${LOG_DRIVER:-json-file}
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # GhostHands Worker (default instance, no target routing)
+  worker:
+    image: ${ECR_IMAGE:-ghosthands:latest}
+    command: ["bun", "packages/ghosthands/src/workers/main.ts"]
+    ports:
+      - "127.0.0.1:${GH_WORKER_PORT:-3101}:3101"
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - GH_ENVIRONMENT=staging
+      - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-1}
+      - GH_WORKER_PORT=3101
+      - DISPLAY=:99
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+      - SSL_CERT_DIR=/etc/ssl/certs
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+    restart: unless-stopped
+    logging:
+      driver: ${LOG_DRIVER:-json-file}
+      options:
+        max-size: "10m"
+        max-file: "3"

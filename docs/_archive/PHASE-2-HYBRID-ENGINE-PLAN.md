@@ -1,0 +1,1617 @@
+# GhostHands Product Roadmap
+
+**Date:** 2026-02-16
+**Status:** Planning
+**Scope:** Phase 2 (Hybrid Engine + HITL) → Phase 3 (Browser Operator + Extension)
+
+### Phases at a Glance
+
+| Phase            | What                                                        | Key Outcome                       |
+| ---------------- | ----------------------------------------------------------- | --------------------------------- |
+| **1 (Complete)** | TaskHandler architecture, VALET integration, worker routing | Jobs execute via AI agent         |
+| **2a-d**         | Hybrid engine: cookbook + AI + HITL + file uploads          | 95% cost reduction, human handoff |
+| **3a-d**         | Browser Operator: extension, CDP, mode switching            | No CAPTCHAs, no 2FA, live view    |
+
+---
+
+## Vision
+
+> "Let the agent understand the page first. If a preset cookbook/RPA is applicable, use it. On error, let the AI agent step in." — Adam
+
+Today every job = full AI exploration ($0.003, ~8s, ~10 LLM calls).
+After Phase 2: repeated jobs = cookbook replay ($0.0001, ~0.5s, 0-1 LLM calls).
+
+---
+
+## Execution Modes
+
+The system supports **three distinct execution modes**. Each mode can run independently, and handlers choose which mode to use per job.
+
+### Mode 1: Pure AI (Magnitude Agent)
+
+**What:** Full vision-based AI agent. The agent looks at screenshots, reasons about the page, and takes actions. This is how GhostHands works today.
+
+**When to use:**
+
+-   POC and capability development
+-   First-time visit to a new ATS platform
+-   Complex pages that resist cookbook automation
+-   Developer testing of new browser automation patterns
+
+**Cost:** ~$0.003 per task, ~8s, ~10 LLM calls
+
+**Code path:**
+
+```typescript
+// Direct adapter call — no engine, no cookbook
+const result = await adapter.act(instruction, { prompt, data });
+```
+
+**This mode is always available.** The `CustomHandler` uses it exclusively. Developers can use it to test and validate Magnitude's raw capabilities against any URL without the engine layer. See [Developer Guide](./DEV-GUIDE-MAGNITUDE.md) for how to extend and test pure AI mode.
+
+### Mode 2: Cookbook-Only (Deterministic RPA)
+
+**What:** Replay a pre-recorded sequence of CSS selector actions. No LLM involved. Pure DOM interaction with template substitution.
+
+**When to use:**
+
+-   Repeat visits to the same ATS platform
+-   High-volume batch applications
+-   When a healthy cookbook exists (health_score >= 70)
+
+**Cost:** ~$0.0001 per task, ~0.5s, 0 LLM calls
+
+**Code path:**
+
+```typescript
+const manual = await manualStore.lookup(url, taskType, platform);
+const result = await cookbookExecutor.execute(page, manual, userData);
+```
+
+### Mode 3: Hybrid (Cookbook + AI Fallback)
+
+**What:** Try cookbook first. If any step fails, AI agent takes over from the current page state. On AI success, save the trace as an updated cookbook.
+
+**When to use:**
+
+-   Production workloads (default for `ApplyHandler`)
+-   When cookbook exists but page may have changed
+-   When reliability matters more than cost
+
+**Cost:** $0.0001 if cookbook works, $0.003 if AI fallback triggers
+
+**Code path:**
+
+```typescript
+const engine = new ExecutionEngine(observer, store, executor, recorder);
+const result = await engine.execute(ctx); // handles mode selection internally
+```
+
+### Mode Selection per Handler
+
+| Handler           | Default Mode | Configurable?                        | Rationale                                             |
+| ----------------- | ------------ | ------------------------------------ | ----------------------------------------------------- |
+| `ApplyHandler`    | Hybrid       | Yes, via `input_data.execution_mode` | Most benefit from cookbooks; ATS forms are repetitive |
+| `CustomHandler`   | Pure AI      | No                                   | Tasks are too varied for cookbooks                    |
+| `ScrapeHandler`   | Hybrid       | Yes                                  | Many scrape targets have stable DOM                   |
+| `FillFormHandler` | Hybrid       | Yes                                  | Forms are ideal for cookbook replay                   |
+
+**Override via job input:**
+
+```jsonc
+{
+  "job_type": "apply",
+  "input_data": {
+    "execution_mode": "ai_only",  // force pure AI (skip cookbook)
+    "user_data": { ... }
+  }
+}
+```
+
+Valid values: `"auto"` (default, hybrid), `"ai_only"`, `"cookbook_only"`
+
+---
+
+## Architecture Overview
+
+### Core Insight: Connector-Based Intelligence
+
+Instead of building a separate "orchestration engine" that sits between TaskHandler and adapter, we make the **Magnitude agent itself intelligent** about cookbooks by giving it a `CookbookConnector`. The agent's LLM decides when to use cookbooks vs explore with AI — no separate decision layer needed.
+
+For the **fast path** (healthy cookbook exists), we short-circuit the agent entirely with a `CookbookExecutor` that replays steps without any LLM calls. The agent is only invoked when the cookbook fails or doesn't exist.
+
+```
+Job arrives (e.g., "Apply to Workday posting")
+  │
+  ▼
+┌─────────────────────────────────────────────────────────┐
+│              ExecutionEngine                              │
+│                                                           │
+│  Step 1: OBSERVE (free — pure DOM, no LLM)               │
+│  ├─ PageObserver: Stagehand-style DOM analysis            │
+│  │   Uses adapter.page (Playwright) directly              │
+│  │   Returns: platform, page type, forms, fingerprint     │
+│  └─ No Stagehand dependency — just Playwright DOM APIs    │
+│                                                           │
+│  Step 2: DECIDE (free — no LLM)                          │
+│  ├─ execution_mode override? → respect it                │
+│  ├─ Cookbook exists + health > 70? → FAST PATH            │
+│  └─ No cookbook or unhealthy? → AGENT PATH                │
+│                                                           │
+│  Step 3a: FAST PATH (cookbook replay, $0, ~0.5s)          │
+│  ├─ CookbookExecutor replays steps via CSS selectors      │
+│  ├─ Template substitution: {{first_name}} → "John"       │
+│  ├─ Verify each step (element exists, action worked)      │
+│  ├─ On step failure → fall through to AGENT PATH         │
+│  └─ On success → update health_score, done               │
+│                                                           │
+│  Step 3b: AGENT PATH (AI + connectors, ~$0.003, ~8s)     │
+│  ├─ Magnitude agent with CookbookConnector:               │
+│  │   ├─ collectObservations() → injects DOM state,        │
+│  │   │   cookbook availability, current step info          │
+│  │   ├─ getActionSpace() → adds custom actions:           │
+│  │   │   • cookbook:try-step  (replay a specific step)     │
+│  │   │   • cookbook:skip-step (skip and use AI instead)    │
+│  │   │   • hitl:request      (pause for human help)       │
+│  │   │   • file:upload       (handle file picker)         │
+│  │   └─ getInstructions() → tells agent about available   │
+│  │       cookbooks and when to use them                   │
+│  ├─ TraceRecorder captures every action for learning      │
+│  └─ On success → save trace as new/updated cookbook        │
+│                                                           │
+│  Step 4: LEARN (free)                                    │
+│  ├─ Record success/failure → update health_score          │
+│  ├─ If AI explored: save trace → new cookbook              │
+│  ├─ Template detection: "John" → {{first_name}}          │
+│  └─ Report cost savings vs full AI                       │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Why This Design
+
+**Why connector-based, not a separate engine?**
+
+-   The agent ALREADY has intelligence (LLM reasoning). Adding a separate decision layer duplicates logic.
+-   Connectors inject knowledge (cookbook steps, DOM state) INTO the agent's context.
+-   The agent decides organically: "I see a cookbook step for this field. I'll use cookbook:try-step. Oh it failed — I'll type the value myself."
+-   For the fast path (healthy cookbook), we bypass the agent entirely — no LLM needed.
+
+**Why Stagehand-style observation without Stagehand?**
+
+-   Stagehand can't run alongside Magnitude (different agent lifecycle, would need its own LLM session).
+-   But we don't need Stagehand itself — just its PATTERN: DOM analysis via Playwright APIs.
+-   `PageObserver` uses `page.$$eval()`, `page.locator()`, attribute analysis — all free, all fast.
+-   This gives us the same output: platform detection, form field discovery, CSS selectors.
+
+**Why not make the agent decide EVERYTHING?**
+
+-   Cookbook replay is deterministic. Using LLM to decide "should I click this button at selector X with value Y" is wasteful.
+-   Fast path: CookbookExecutor handles the obvious case (healthy cookbook → replay).
+-   Agent path: only invoked when cookbook doesn't exist, is unhealthy, or fails mid-replay.
+-   This is the 95% cost reduction: most repeat jobs never invoke the LLM.
+
+### Adapter Composition (Single Page, Multiple Capabilities)
+
+The key insight from the adapter research: we don't need multiple adapter instances. ONE MagnitudeAdapter provides the page, and everything else operates on that same page:
+
+```
+┌──────────────────────────────────────────────────────┐
+│                    TaskHandler                        │
+│  (ApplyHandler, ScrapeHandler, etc.)                 │
+│                                                       │
+│  ┌────────────────────────────────────────────────┐  │
+│  │              ExecutionEngine                    │  │
+│  │                                                 │  │
+│  │  ┌──────────────┐   ┌───────────────────────┐  │  │
+│  │  │ PageObserver  │   │  CookbookExecutor     │  │  │
+│  │  │ (DOM analysis)│   │  (step replay)        │  │  │
+│  │  └──────┬───────┘   └──────────┬────────────┘  │  │
+│  │         │                       │               │  │
+│  │         │    ┌──────────────────┤               │  │
+│  │         ▼    ▼                  ▼               │  │
+│  │  ┌──────────────────────────────────────────┐  │  │
+│  │  │        adapter.page (Playwright Page)     │  │  │
+│  │  │                                           │  │  │
+│  │  │  Shared across ALL capabilities:          │  │  │
+│  │  │  • MagnitudeAdapter.act() (AI vision)     │  │  │
+│  │  │  • CookbookExecutor (CSS selector replay) │  │  │
+│  │  │  • PageObserver (DOM analysis)            │  │  │
+│  │  │  • FileUploadHelper (filechooser event)   │  │  │
+│  │  │  • TraceRecorder (event capture)          │  │  │
+│  │  └──────────────────────────────────────────┘  │  │
+│  └────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────┘
+```
+
+Everything shares `adapter.page`. No separate browser instances, no adapter switching.
+
+---
+
+## Components to Build
+
+### 1. PageObserver — Stagehand-style DOM analysis (no LLM)
+
+**Purpose:** Analyze the DOM to identify page type, form fields, buttons, and structure. Uses the same Playwright page exposed by MagnitudeAdapter — no separate browser, no Stagehand dependency.
+
+**Why not use Stagehand directly?** Stagehand runs its own agent lifecycle with its own LLM session. It can't share a page with Magnitude. But we don't need Stagehand — we just need its PATTERN: structured DOM analysis via Playwright APIs.
+
+**Implementation:** Pure Playwright DOM traversal. Free, fast, no LLM calls.
+
+```typescript
+interface PageObservation {
+    url: string;
+    platform: string; // 'workday' | 'greenhouse' | 'lever' | etc
+    pageType: string; // 'login' | 'form' | 'multi-step' | 'confirmation'
+    fingerprint: string; // hash of page structure for matching
+
+    forms: FormObservation[]; // detected forms
+    buttons: ButtonObservation[]; // clickable actions
+    navigation: NavObservation[]; // page navigation elements
+
+    // For cookbook matching
+    urlPattern: string; // generalized: "*.myworkdayjobs.com/*/apply/*"
+    structureHash: string; // DOM structure fingerprint
+}
+
+interface FormObservation {
+    selector: string;
+    fields: FieldObservation[];
+    submitButton?: string;
+}
+
+interface FieldObservation {
+    selector: string;
+    type: string; // 'text' | 'email' | 'select' | 'radio' | etc
+    name: string; // input name attribute
+    label: string; // associated label text
+    required: boolean;
+    placeholder?: string;
+    options?: string[]; // for select/radio
+}
+```
+
+**Key insight:** This is pure DOM traversal — no LLM calls needed. Fast and free.
+
+### 2. ManualStore — CRUD for cookbooks in Supabase
+
+**Purpose:** Store, retrieve, and manage action cookbooks (manuals) in `gh_action_manuals`.
+
+**Table** (already defined in `supabase-migration.sql`):
+
+```sql
+CREATE TABLE gh_action_manuals (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    url_pattern TEXT NOT NULL,
+    task_pattern TEXT NOT NULL,
+    platform TEXT,
+    steps JSONB NOT NULL,
+    health_score INTEGER DEFAULT 100,
+    success_count INTEGER DEFAULT 0,
+    failure_count INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    last_used TIMESTAMPTZ,
+    last_verified TIMESTAMPTZ,
+    created_by TEXT
+);
+```
+
+**Service API:**
+
+```typescript
+interface ManualStore {
+    lookup(
+        url: string,
+        taskType: string,
+        platform?: string
+    ): Promise<ActionManual | null>;
+    saveFromTrace(
+        trace: ActionTrace,
+        metadata: TraceMetadata
+    ): Promise<ActionManual>;
+    recordSuccess(manualId: string): Promise<void>;
+    recordFailure(manualId: string): Promise<void>;
+    get(id: string): Promise<ActionManual | null>;
+}
+```
+
+### 3. CookbookExecutor — Deterministic step replay
+
+**Purpose:** Replay a cookbook's steps using CSS selectors and direct DOM interaction. No LLM needed.
+
+```typescript
+interface ManualStep {
+    order: number;
+    selector: string;
+    action: "click" | "type" | "select" | "wait" | "navigate" | "scroll";
+    value?: string; // literal or template: "{{first_name}}"
+    description: string;
+    waitAfter?: number;
+    verification?: {
+        type: "element_visible" | "url_changed" | "text_present";
+        value: string;
+    };
+}
+```
+
+### 4. TraceRecorder — Capture AI actions as replayable steps
+
+**Purpose:** When the AI agent runs in explore mode, record every action to save as a cookbook.
+
+Hooks into Magnitude's events:
+
+-   `actionStarted` → record action variant, timestamp
+-   `actionDone` → query DOM for what was acted on, extract CSS selector + value
+-   `thought` → capture reasoning for debugging
+
+**Selector extraction:** After each action, TraceRecorder queries the page to find what element was acted on and extracts a stable CSS selector. Priority: `[data-testid]` > `[data-automation-id]` > `[aria-label]` > `[name]` > `[id]` > text content.
+
+### 5. CookbookConnector — Make the agent cookbook-aware (AgentConnector)
+
+**Purpose:** When the agent IS running (AI path), give it awareness of available cookbooks so it can choose to replay known steps rather than exploring blindly.
+
+This is the key connector that makes the agent INTELLIGENT about cookbooks. It implements Magnitude's `AgentConnector` interface:
+
+```typescript
+// src/connectors/cookbookConnector.ts
+
+export class CookbookConnector implements AgentConnector {
+    id = "cookbook";
+
+    constructor(
+        private manualStore: ManualStore,
+        private cookbookExecutor: CookbookExecutor,
+        private pageObserver: PageObserver,
+        private currentManual: ActionManual | null,
+        private userData: Record<string, any>
+    ) {}
+
+    // Inject cookbook awareness into agent's context each turn
+    async collectObservations(): Promise<string> {
+        const observation = await this.pageObserver.observe(this.page);
+        const cookbook = this.currentManual;
+
+        if (!cookbook) {
+            return `Page: ${observation.platform} (${observation.pageType}). No cookbook available — explore freely.`;
+        }
+
+        const nextStep = cookbook.steps[this.currentStepIndex];
+        return `
+Page: ${observation.platform} (${observation.pageType}).
+Cookbook available (health: ${cookbook.health_score}/100, ${cookbook.steps.length} steps).
+Next cookbook step: ${nextStep.description} → ${nextStep.action} on "${nextStep.selector}"
+You can use cookbook:try-step to replay it, or act normally to explore.
+    `.trim();
+    }
+
+    // Give the agent cookbook actions
+    getActionSpace(): ActionDefinition<any>[] {
+        return [
+            createAction({
+                name: "cookbook:try-step",
+                description:
+                    "Replay the next cookbook step using CSS selectors (fast, no LLM)",
+                schema: z.object({}),
+                resolver: async ({ agent }) => {
+                    const step =
+                        this.currentManual!.steps[this.currentStepIndex];
+                    const result = await this.cookbookExecutor.executeStep(
+                        (agent as any).page,
+                        step,
+                        this.userData
+                    );
+                    if (result.success) this.currentStepIndex++;
+                    return result;
+                },
+            }),
+            createAction({
+                name: "cookbook:skip-step",
+                description:
+                    "Skip the current cookbook step and let AI handle it",
+                schema: z.object({ reason: z.string() }),
+                resolver: async ({ input }) => {
+                    this.currentStepIndex++;
+                    // Agent will handle this step with its own AI
+                },
+            }),
+            createAction({
+                name: "file:upload",
+                description:
+                    "Upload a file to a file input (handles OS file picker automatically)",
+                schema: z.object({
+                    selector: z
+                        .string()
+                        .describe("CSS selector of the upload button/input"),
+                }),
+                resolver: async ({ input, agent }) => {
+                    const page = (agent as any).page;
+                    await this.fileUploadHelper.uploadFile(
+                        page,
+                        input.selector,
+                        this.resumePath
+                    );
+                },
+            }),
+        ];
+    }
+
+    // Tell the agent how to use cookbooks
+    async getInstructions(): Promise<string> {
+        if (!this.currentManual) {
+            return "No cookbook available. Explore the page normally.";
+        }
+        return `
+A cookbook is available for this page (${this.currentManual.steps.length} recorded steps).
+PREFER using cookbook:try-step for each step — it's faster and cheaper.
+If a cookbook step fails or looks wrong, use cookbook:skip-step and handle it yourself.
+For file upload fields, use file:upload instead of clicking the upload button.
+    `.trim();
+    }
+}
+```
+
+**This is the bridge between ActionBook ideology and Magnitude's agent.** The agent sees cookbook steps as available tools and decides organically whether to use them or explore. When cookbooks work, the agent calls `cookbook:try-step` repeatedly (fast, free). When something fails, it falls back to its own AI reasoning (slower, costs tokens).
+
+### 6. ExecutionEngine — Orchestrator with fast path
+
+**Purpose:** Orchestrates the full flow: observe → decide → execute (fast path or agent path) → learn.
+
+The engine does NOT use LLM for decision-making. It handles the obvious case (healthy cookbook → replay all steps without agent) and only invokes the Magnitude agent when the cookbook is missing, unhealthy, or fails.
+
+```typescript
+// src/engine/ExecutionEngine.ts
+
+export class ExecutionEngine {
+    async execute(ctx: TaskContext): Promise<TaskResult> {
+        const { adapter, job } = ctx;
+        const page = adapter.page;
+
+        // 1. OBSERVE (free)
+        const observation = await this.pageObserver.observe(page);
+
+        // 2. LOOKUP COOKBOOK (free)
+        const manual = await this.manualStore.lookup(
+            observation.urlPattern,
+            job.task_description,
+            observation.platform
+        );
+
+        // 3a. FAST PATH — healthy cookbook, no LLM needed
+        if (
+            manual &&
+            manual.health_score >= 70 &&
+            ctx.executionMode !== "ai_only"
+        ) {
+            const result = await this.cookbookExecutor.executeAll(
+                page,
+                manual,
+                ctx.userData
+            );
+            if (result.success) {
+                await this.manualStore.recordSuccess(manual.id);
+                return { success: true, data: { mode: "cookbook", cost: 0 } };
+            }
+            // Cookbook failed — fall through to agent path
+            await this.manualStore.recordFailure(manual.id);
+        }
+
+        // 3b. AGENT PATH — Magnitude with CookbookConnector
+        const connector = new CookbookConnector(
+            this.manualStore,
+            this.cookbookExecutor,
+            this.pageObserver,
+            manual,
+            ctx.userData
+        );
+        const recorder = new TraceRecorder();
+
+        // Attach connector and recorder to the adapter/agent
+        const result = await adapter.act(job.task_description, {
+            prompt: ctx.dataPrompt,
+            data: ctx.userData,
+            connectors: [connector], // agent sees cookbook actions
+        });
+
+        // 4. LEARN — save successful AI trace as new cookbook
+        if (result.success && recorder.hasTrace()) {
+            await this.manualStore.saveFromTrace(recorder.getTrace(), {
+                url: observation.urlPattern,
+                platform: observation.platform,
+                taskType: job.job_type,
+            });
+        }
+
+        return result;
+    }
+}
+```
+
+The engine respects `execution_mode` overrides, making it possible to force pure AI mode even when a cookbook exists.
+
+### 6. FileUploadHelper — Handle OS-level file pickers
+
+**The Problem:** When the agent clicks "Upload Resume", the browser opens an OS-level file picker dialog. The AI agent can't see or interact with it — it's outside the browser DOM.
+
+**The Solution:** Playwright's `page.on('filechooser')` event intercepts the dialog before it opens. No OS interaction needed.
+
+```typescript
+// src/engine/FileUploadHelper.ts
+
+export class FileUploadHelper {
+    /**
+     * Upload a file to any file input — works for all upload patterns:
+     * - <input type="file"> elements
+     * - Custom drag-and-drop zones
+     * - Buttons that trigger file pickers
+     */
+    async uploadFile(
+        page: Page,
+        triggerSelector: string, // button/input that opens the picker
+        filePath: string // local path to the file
+    ): Promise<void> {
+        // Method 1: Direct input (fastest, works for <input type="file">)
+        const input = await page.$(triggerSelector);
+        if (input && (await input.getAttribute("type")) === "file") {
+            await input.setInputFiles(filePath);
+            return;
+        }
+
+        // Method 2: Intercept file chooser (works for any trigger)
+        const [fileChooser] = await Promise.all([
+            page.waitForEvent("filechooser"),
+            page.click(triggerSelector),
+        ]);
+        await fileChooser.setFiles(filePath);
+    }
+
+    /**
+     * Upload from buffer (for files stored in cloud storage / DB)
+     */
+    async uploadBuffer(
+        page: Page,
+        triggerSelector: string,
+        buffer: Buffer,
+        filename: string
+    ): Promise<void> {
+        const [fileChooser] = await Promise.all([
+            page.waitForEvent("filechooser"),
+            page.click(triggerSelector),
+        ]);
+        await fileChooser.setFiles({
+            name: filename,
+            mimeType: "application/pdf",
+            buffer,
+        });
+    }
+
+    /**
+     * Handle drag-and-drop upload zones
+     */
+    async uploadViaDragDrop(
+        page: Page,
+        dropZoneSelector: string,
+        filePath: string
+    ): Promise<void> {
+        const buffer = await readFile(filePath);
+        await page.dispatchEvent(dropZoneSelector, "drop", {
+            dataTransfer: { files: [{ name: basename(filePath), buffer }] },
+        });
+    }
+}
+```
+
+**Key insight:** `page.on('filechooser')` is a Playwright-native feature that works in both server and operator mode because it hooks at the CDP level, not the OS level. The file picker dialog is suppressed — it never actually opens.
+
+**How files reach the worker:**
+
+| Browser Mode | File Source                  | How                                              |
+| ------------ | ---------------------------- | ------------------------------------------------ |
+| **Server**   | Cloud storage (Supabase, S3) | Worker downloads file to temp dir before upload  |
+| **Operator** | User's local filesystem      | Extension reads file, sends buffer via WebSocket |
+
+**In Server mode:**
+
+```typescript
+// Worker downloads resume from Supabase storage
+const resumeBuffer = await supabase.storage
+    .from("resumes")
+    .download(job.input_data.resume_path);
+
+// Intercept file chooser and upload
+await fileUploadHelper.uploadBuffer(
+    page,
+    '[data-testid="upload-resume"]',
+    resumeBuffer,
+    "resume.pdf"
+);
+```
+
+**In Operator mode (Phase 3):**
+
+```typescript
+// Extension reads file from user's machine
+// Worker sends: { command: 'readFile', path: '/Users/adam/resume.pdf' }
+// Extension responds with file buffer
+// Worker uses same uploadBuffer() method
+```
+
+### 7. Error Recovery — Strategy switching mid-execution
+
+| Scenario                                 | Current Behavior   | Phase 2 Behavior                                |
+| ---------------------------------------- | ------------------ | ----------------------------------------------- |
+| Cookbook step fails (selector not found) | N/A                | AI takes over from current page state           |
+| Cookbook step fails (page changed)       | N/A                | Re-observe page, try updated selector, or AI    |
+| AI agent fails (timeout)                 | Retry whole job    | Retry with fresh page observation               |
+| AI agent fails (captcha)                 | Retry              | Flag for human review                           |
+| New ATS version detected                 | Full AI every time | Invalidate old cookbook, AI explores, saves new |
+
+**Health score degradation:** Degrades by 5 per failure (15 after 5+ failures). Below 70 = cookbook skipped. Below 30 = flagged for re-exploration.
+
+---
+
+## Extension Points for Developers
+
+### Adding New Platforms (Pure AI POC)
+
+Developers working on new ATS platform support should use **Pure AI mode** for initial capability validation. The workflow:
+
+1. Use `bun run job:dev` or `submit-test-job.ts` to submit a job with `execution_mode: "ai_only"`
+2. Watch the Magnitude agent interact with the page
+3. Identify patterns, failure points, and form structures
+4. Optionally create a custom connector for platform-specific logic
+5. Once validated, let the engine record the trace as a cookbook
+
+See [DEV-GUIDE-MAGNITUDE.md](./DEV-GUIDE-MAGNITUDE.md) for the full developer workflow.
+
+### Adding Custom Connectors
+
+Magnitude's `AgentConnector` interface allows developers to extend the agent with:
+
+-   **Custom actions** — new commands the agent can use (e.g., `workday:selectDropdown`)
+-   **Custom instructions** — prompt engineering for specific platforms
+-   **Custom observations** — additional context the agent sees each turn
+
+These connectors work in all three execution modes. In hybrid mode, the engine uses the connector during AI fallback.
+
+### Adding Custom TaskHandlers
+
+New job types can be added by implementing the `TaskHandler` interface and registering in the registry. Each handler chooses its own execution mode.
+
+```typescript
+class MyNewHandler implements TaskHandler {
+    readonly type = "my_new_type";
+    readonly description = "Handle a new type of automation";
+
+    async execute(ctx: TaskContext): Promise<TaskResult> {
+        // Pure AI mode — just call adapter directly
+        const result = await ctx.adapter.act("Do the thing", {
+            prompt: ctx.dataPrompt,
+        });
+        return { success: result.success, data: { mode: "ai_only" } };
+    }
+}
+
+// Register in taskHandlers/index.ts:
+taskHandlerRegistry.register(new MyNewHandler());
+```
+
+---
+
+## Implementation Order
+
+### Phase 2a: Foundation (Week 1-2)
+
+1. **PageObserver** — DOM analysis, platform detection, field discovery
+2. **ManualStore** — CRUD operations against `gh_action_manuals`
+3. **CookbookExecutor** — Step replay with template substitution
+4. **FileUploadHelper** — file chooser interception, buffer uploads, drag-drop
+5. **Unit tests** for all four (TDD per CLAUDE.md)
+
+### Phase 2b: Intelligence + HITL (Week 3-4)
+
+6. **TraceRecorder** — Hook into Magnitude events, capture traces
+7. **Trace-to-Cookbook converter** — Convert AI traces to replayable ManualSteps
+8. **ExecutionEngine** — Decision logic + fallback orchestration
+9. **Blocker detection** — DOM patterns + thought patterns → HITL trigger
+10. **Pause + screenshot + callback** — extend CallbackNotifier for `needs_human`
+11. **Resume endpoint** — `POST /valet/resume/:jobId`
+12. **Integration into TaskHandlers** — Wire engine into ApplyHandler (keep CustomHandler as pure AI)
+
+### Phase 2c: Learning Loop (Week 5-6)
+
+13. **Template detection** — Auto-detect which values should be `{{templates}}`
+14. **Health score system** — Degradation, re-exploration triggers
+15. **Cookbook versioning** — Handle ATS platform updates
+16. **Postgres LISTEN for resume** — Worker listens for HITL resume signals
+17. **Timeout handling** — Auto-fail after interaction timeout
+
+### Phase 2d: Optimization (Week 7-8)
+
+18. **Platform-specific cookbooks** — Pre-built for Workday, Greenhouse, Lever
+19. **Multi-step form handling** — Navigate multi-page applications
+20. **File upload in cookbooks** — Record/replay file upload steps with template paths
+21. **Metrics & reporting** — Cost savings dashboard, cookbook hit rates
+22. **E2E tests** — Full loop: AI explore → save cookbook → replay cookbook
+
+---
+
+## Integration Points
+
+### Where it fits in JobExecutor
+
+The ExecutionEngine slots in at step 10 of `JobExecutor.execute()`:
+
+```typescript
+// BEFORE (current — still works for CustomHandler):
+const actResult = await adapter.act(job.task_description, { ... });
+
+// AFTER (Phase 2 — for ApplyHandler, ScrapeHandler, FillFormHandler):
+const engine = new ExecutionEngine(pageObserver, manualStore, cookbookExecutor, traceRecorder);
+const result = await engine.execute(ctx);
+```
+
+**Important:** The engine is opt-in per handler. Handlers that don't need it continue calling `adapter.act()` directly. This preserves the ability to run pure AI mode for POC work.
+
+### VALET Integration
+
+No changes needed to VALET. The execution engine is internal to GhostHands workers.
+
+VALET can optionally:
+
+-   Pass `execution_mode` in `input_data` to force a specific mode
+-   Read `result_data.mode` to see which mode was used
+-   Read `result_data.cost_savings_pct` to track savings
+
+### Database
+
+The `gh_action_manuals` table is already defined in `supabase-migration.sql`. Needs:
+
+-   Migration applied to live Supabase
+-   Additional indexes for URL pattern matching
+-   RLS policies for multi-tenant access
+
+---
+
+## Cost Impact
+
+| Metric                           | Today (AI only) | After Phase 2     |
+| -------------------------------- | --------------- | ----------------- |
+| First application to new ATS     | $0.003, 8s      | $0.003, 8s (same) |
+| Repeat application (same ATS)    | $0.003, 8s      | $0.0001, 0.5s     |
+| 100 applications (10 unique ATS) | $0.30           | $0.039            |
+| Monthly cost (1000 apps)         | $3.00           | $0.13             |
+| **Reduction**                    | —               | **95.7%**         |
+
+---
+
+## Key Design Decisions
+
+### 1. Connector-based intelligence over separate decision engine
+
+Instead of building a separate orchestration layer with if/else logic, we give the Magnitude agent cookbook-awareness via `CookbookConnector`. The agent's LLM decides organically when to use cookbooks vs explore. The fast path (healthy cookbook) bypasses the agent entirely.
+
+### 2. Stagehand patterns without Stagehand dependency
+
+Stagehand can't share a page with Magnitude (different agent lifecycle). Instead, PageObserver implements Stagehand-STYLE DOM analysis using Playwright APIs directly on `adapter.page`. Same output, no extra dependency.
+
+### 3. Single page, multiple capabilities
+
+Everything operates on the same Playwright Page exposed by MagnitudeAdapter: DOM observation, cookbook replay, AI vision, file uploads, trace recording. No adapter switching, no separate browser instances.
+
+### 4. Pure AI mode must always be available
+
+Developers need unrestricted access to Magnitude's raw capabilities for testing, POC, and extending platform support. The engine layer is opt-in, never forced.
+
+### 5. CSS selectors over XPath
+
+CSS selectors are more stable across page renders. XPath breaks when DOM structure changes. Selector priority: `[data-testid]` > `[data-automation-id]` > `[aria-label]` > `[name]` > `[id]`.
+
+### 6. Health scores over binary success/failure
+
+Gradual degradation allows cookbooks to survive occasional flakiness. A single failure shouldn't invalidate a cookbook that's worked 50 times.
+
+### 7. Template detection for reusability
+
+If we just save literal values ("John"), the cookbook only works for one user. Template detection (`{{first_name}}`) makes cookbooks reusable across all users.
+
+### 8. Never modify Magnitude core
+
+Per CLAUDE.md: all extensions via connectors/adapters. CookbookConnector implements AgentConnector. ExecutionEngine wraps the adapter, never patches it.
+
+---
+
+## Files to Create/Modify
+
+| File                                                | Action     | Description                                         |
+| --------------------------------------------------- | ---------- | --------------------------------------------------- |
+| `src/engine/PageObserver.ts`                        | **NEW**    | DOM analysis and page fingerprinting                |
+| `src/engine/ManualStore.ts`                         | **NEW**    | CRUD for gh_action_manuals                          |
+| `src/engine/CookbookExecutor.ts`                    | **NEW**    | Deterministic step replay                           |
+| `src/engine/FileUploadHelper.ts`                    | **NEW**    | File chooser interception, buffer upload, drag-drop |
+| `src/engine/TraceRecorder.ts`                       | **NEW**    | Capture AI actions as traces                        |
+| `src/engine/ExecutionEngine.ts`                     | **NEW**    | Fast-path + agent-path orchestration                |
+| `src/connectors/cookbookConnector.ts`               | **NEW**    | AgentConnector: cookbook awareness + actions        |
+| `src/engine/templateResolver.ts`                    | **NEW**    | `{{var}}` substitution                              |
+| `src/engine/types.ts`                               | **NEW**    | Shared interfaces                                   |
+| `src/engine/index.ts`                               | **NEW**    | Exports                                             |
+| `src/workers/taskHandlers/applyHandler.ts`          | **MODIFY** | Use ExecutionEngine                                 |
+| `src/workers/taskHandlers/types.ts`                 | **MODIFY** | Add engine to TaskContext                           |
+| `src/workers/JobExecutor.ts`                        | **MODIFY** | Initialize engine + HITL flow                       |
+| `src/workers/callbackNotifier.ts`                   | **MODIFY** | Add `notifyInteraction()` for HITL                  |
+| `src/api/routes/valet.ts`                           | **MODIFY** | Add `POST /valet/resume/:jobId`                     |
+| `src/db/migrations/008_verify_manuals_table.sql`    | **NEW**    | Ensure table + indexes exist                        |
+| `src/db/migrations/009_add_interaction_columns.sql` | **NEW**    | interaction_type, interaction_data, paused_at       |
+| `__tests__/unit/engine/`                            | **NEW**    | Full test suite (TDD)                               |
+
+---
+
+## Human-in-the-Loop (HITL) Interaction System
+
+### The Problem
+
+Some situations can't be solved by AI or cookbooks:
+
+-   **CAPTCHA / reCAPTCHA** — bot detection challenges
+-   **2FA / MFA** — SMS codes, authenticator apps, email verification
+-   **"Are you human?"** — bot check interstitials
+-   **Complex screening questions** — ambiguous or subjective answers the user should decide
+-   **Login required** — platform needs the user's real credentials
+-   **Payment / legal** — terms acceptance, payment info
+
+Today these all result in `failed` status with error codes like `captcha_blocked` or `login_required`. The job retries and fails again.
+
+### The Solution: Pause + Notify + Handoff + Resume
+
+```
+Agent encounters blocker (CAPTCHA, 2FA, etc.)
+  │
+  ▼
+┌─────────────────────────────────────────────────┐
+│  1. DETECT                                       │
+│     Agent or PageObserver detects blocker type    │
+│     via DOM patterns, error classification,       │
+│     or AI reasoning ("I see a CAPTCHA")          │
+│                                                   │
+│  2. PAUSE                                        │
+│     agent.pause() — halts the action loop         │
+│     Job status → 'paused'                        │
+│     Take screenshot of blocker                    │
+│                                                   │
+│  3. NOTIFY VALET                                 │
+│     POST callback_url with:                       │
+│       status: 'needs_human'                       │
+│       reason: 'captcha_detected'                  │
+│       screenshot_url: '...'                       │
+│       interaction_url: 'ws://cdp-endpoint'        │
+│       interaction_expires_at: '+5 minutes'        │
+│                                                   │
+│  4. HUMAN TAKES OVER                             │
+│     VALET shows notification to user              │
+│     User connects to browser (CDP or VNC)         │
+│     User solves CAPTCHA / enters 2FA code         │
+│     User signals "done" via VALET UI              │
+│                                                   │
+│  5. RESUME                                       │
+│     VALET calls POST /valet/resume/:jobId         │
+│     agent.resume() — continues from paused state  │
+│     Job status → 'running'                        │
+│                                                   │
+│  6. TIMEOUT (if human doesn't respond)            │
+│     After interaction_timeout (default 5 min):    │
+│     Job fails with 'human_timeout'                │
+│     Browser cleaned up                            │
+└─────────────────────────────────────────────────┘
+```
+
+### Blocker Detection
+
+Blockers are detected at multiple levels:
+
+**Level 1: Error classification (existing)**
+The `ERROR_CLASSIFICATIONS` in JobExecutor already catches `captcha_blocked` and `login_required`. Instead of retrying, these now trigger the HITL flow.
+
+**Level 2: PageObserver DOM patterns (Phase 2)**
+
+```typescript
+interface BlockerDetection {
+    type: "captcha" | "2fa" | "login" | "bot_check" | "unknown";
+    confidence: number; // 0-1
+    screenshot?: string; // URL to screenshot of the blocker
+    description: string; // human-readable: "reCAPTCHA v2 detected"
+    selectors?: string[]; // relevant DOM selectors
+}
+
+// DOM pattern matching (no LLM needed)
+const BLOCKER_PATTERNS = [
+    {
+        type: "captcha",
+        selectors: ['iframe[src*="recaptcha"]', ".h-captcha", "#captcha"],
+    },
+    {
+        type: "2fa",
+        selectors: [
+            'input[name*="otp"]',
+            'input[name*="code"]',
+            '[data-automation-id*="verification"]',
+        ],
+    },
+    {
+        type: "login",
+        selectors: [
+            'input[type="password"]',
+            'form[action*="login"]',
+            "#login-form",
+        ],
+    },
+    {
+        type: "bot_check",
+        selectors: [
+            ".challenge-running",
+            "#challenge-stage",
+            ".cf-browser-verification",
+        ],
+    },
+];
+```
+
+**Level 3: AI reasoning (during explore mode)**
+The agent's `thought` events may contain phrases like "I see a CAPTCHA" or "It's asking for a verification code". These are pattern-matched to trigger HITL.
+
+```typescript
+const THOUGHT_BLOCKERS = [
+    { pattern: /captcha|recaptcha|hcaptcha/i, type: "captcha" },
+    { pattern: /verification code|2fa|two.factor|authenticator/i, type: "2fa" },
+    { pattern: /sign.?in|log.?in|password/i, type: "login" },
+    { pattern: /are you (a )?human|bot.?(check|detect)/i, type: "bot_check" },
+];
+```
+
+### Callback Payload (VALET Notification)
+
+When a blocker is detected, GhostHands sends a callback to VALET:
+
+```typescript
+interface HumanInteractionCallback {
+    job_id: string;
+    valet_task_id: string | null;
+    status: "needs_human";
+    interaction: {
+        reason:
+            | "captcha"
+            | "2fa"
+            | "login"
+            | "bot_check"
+            | "screening_question";
+        description: string; // "reCAPTCHA detected on Workday application page"
+        screenshot_url: string; // screenshot of the blocker
+        current_url: string; // where the browser is stuck
+        // Browser access for human takeover
+        cdp_url?: string; // ws://... for Chrome DevTools Protocol
+        vnc_url?: string; // VNC viewer URL (for cloud browsers)
+        viewer_url?: string; // web-based browser viewer
+        // Timing
+        paused_at: string; // ISO timestamp
+        expires_at: string; // when the interaction times out
+        timeout_seconds: number; // how long to wait (default: 300)
+    };
+    progress: {
+        step: string;
+        progress_pct: number;
+        actions_completed: number;
+    };
+}
+```
+
+### VALET Resume Endpoint
+
+New endpoint for VALET to signal "human is done":
+
+```
+POST /api/v1/gh/valet/resume/:jobId
+```
+
+**Request:**
+
+```jsonc
+{
+    "action": "resume", // or "cancel" if user gives up
+    "resolution": "solved", // what the human did
+    "notes": "Solved CAPTCHA" // optional human notes
+}
+```
+
+**Response:**
+
+```jsonc
+{
+    "job_id": "abc-123",
+    "status": "running", // resumed
+    "resumed_at": "2026-02-16T..."
+}
+```
+
+**Implementation:**
+
+```typescript
+valet.post("/resume/:jobId", async (c) => {
+    const jobId = c.req.param("jobId");
+    const body = await c.req.json();
+
+    // Verify job is actually paused
+    const { rows } = await pool.query(
+        "SELECT id, status, worker_id FROM gh_automation_jobs WHERE id = $1::UUID",
+        [jobId]
+    );
+
+    if (rows.length === 0) return c.json({ error: "not_found" }, 404);
+    if (rows[0].status !== "paused") {
+        return c.json(
+            {
+                error: "not_paused",
+                message: `Job is ${rows[0].status}, not paused`,
+            },
+            409
+        );
+    }
+
+    if (body.action === "cancel") {
+        // User gave up — cancel the job
+        await pool.query(
+            `UPDATE gh_automation_jobs SET status = 'cancelled', completed_at = NOW() WHERE id = $1`,
+            [jobId]
+        );
+        return c.json({ job_id: jobId, status: "cancelled" });
+    }
+
+    // Signal the worker to resume via Postgres NOTIFY
+    await pool.query(`NOTIFY gh_job_resume, '${jobId}'`);
+
+    // Log the interaction
+    await pool.query(
+        `INSERT INTO gh_job_events (job_id, event_type, message, metadata)
+     VALUES ($1, 'human_resumed', $2, $3)`,
+        [
+            jobId,
+            body.notes || "Human resolved blocker",
+            JSON.stringify({ resolution: body.resolution }),
+        ]
+    );
+
+    return c.json({
+        job_id: jobId,
+        status: "running",
+        resumed_at: new Date().toISOString(),
+    });
+});
+```
+
+### Worker-Side: Pause + Wait + Resume
+
+In `JobExecutor`, the HITL flow hooks into the existing error handling:
+
+```typescript
+// In JobExecutor.execute(), when a blocker is detected:
+
+private async requestHumanIntervention(
+  job: AutomationJob,
+  adapter: BrowserAutomationAdapter,
+  blocker: BlockerDetection,
+  progress: ProgressTracker,
+): Promise<'resumed' | 'cancelled' | 'timeout'> {
+  // 1. Pause the agent
+  // (Magnitude's agent.pause() stops the action loop but keeps browser alive)
+
+  // 2. Take screenshot
+  const screenshot = await adapter.screenshot();
+  const screenshotUrl = await this.uploadScreenshot(job.id, 'blocker', screenshot);
+
+  // 3. Update job status to 'paused'
+  await this.supabase
+    .from('gh_automation_jobs')
+    .update({
+      status: 'paused',
+      status_message: `Waiting for human: ${blocker.description}`,
+    })
+    .eq('id', job.id);
+
+  await this.logJobEvent(job.id, 'human_intervention_requested', {
+    blocker_type: blocker.type,
+    description: blocker.description,
+    screenshot_url: screenshotUrl,
+  });
+
+  // 4. Notify VALET via callback
+  if (job.callback_url) {
+    await callbackNotifier.notifyInteraction(job.callback_url, {
+      job_id: job.id,
+      valet_task_id: job.valet_task_id || null,
+      status: 'needs_human',
+      interaction: {
+        reason: blocker.type,
+        description: blocker.description,
+        screenshot_url: screenshotUrl,
+        current_url: await adapter.getCurrentUrl(),
+        paused_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 300_000).toISOString(),
+        timeout_seconds: 300,
+      },
+    });
+  }
+
+  // 5. Wait for resume signal (Postgres LISTEN) or timeout
+  const timeoutMs = 300_000; // 5 minutes
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve('timeout'), timeoutMs);
+
+    // Listen for resume notification from VALET
+    this.listenForResume(job.id, (action) => {
+      clearTimeout(timeout);
+      resolve(action === 'cancel' ? 'cancelled' : 'resumed');
+    });
+  });
+}
+```
+
+### VALET Status Response (Updated)
+
+The `/valet/status/:jobId` response now includes interaction info when paused:
+
+```jsonc
+{
+  "job_id": "abc-123",
+  "status": "paused",
+  "status_message": "Waiting for human: reCAPTCHA detected",
+  "interaction": {                        // NEW — only present when status=paused
+    "reason": "captcha",
+    "description": "reCAPTCHA v2 detected on application page",
+    "screenshot_url": "https://...",
+    "current_url": "https://company.workday.com/apply",
+    "paused_at": "2026-02-16T06:30:00Z",
+    "expires_at": "2026-02-16T06:35:00Z",
+    "timeout_seconds": 300
+  },
+  "progress": { "step": "filling_form", "progress_pct": 45 },
+  "timestamps": { ... }
+}
+```
+
+### Integration with Execution Modes
+
+| Mode         | HITL Behavior                                                   |
+| ------------ | --------------------------------------------------------------- |
+| **Pure AI**  | On blocker detection in agent thoughts → pause + notify         |
+| **Cookbook** | On step failure matching blocker patterns → pause + notify      |
+| **Hybrid**   | Cookbook fails → AI tries → AI detects blocker → pause + notify |
+
+### Error Codes Updated
+
+| Error Code        | Before       | After                                      |
+| ----------------- | ------------ | ------------------------------------------ |
+| `captcha_blocked` | Retry → fail | Pause → notify VALET → wait for human      |
+| `login_required`  | Retry → fail | Pause → notify VALET → wait for human      |
+| `2fa_required`    | N/A (new)    | Pause → notify VALET → wait for human      |
+| `bot_check`       | N/A (new)    | Pause → notify VALET → wait for human      |
+| `human_timeout`   | N/A (new)    | Human didn't respond within timeout → fail |
+| `human_cancelled` | N/A (new)    | Human chose to cancel → cancel             |
+
+### Database Changes
+
+```sql
+-- New columns for interaction tracking
+ALTER TABLE gh_automation_jobs
+  ADD COLUMN IF NOT EXISTS interaction_type TEXT DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS interaction_data JSONB DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ DEFAULT NULL;
+```
+
+### Implementation Order
+
+This feature spans Phase 2b and 2c:
+
+1. **Blocker detection** (DOM patterns + thought patterns) — Phase 2b
+2. **Pause + screenshot** — Phase 2b
+3. **Callback notification** (extend `CallbackNotifier`) — Phase 2b
+4. **Resume endpoint** (`POST /valet/resume/:jobId`) — Phase 2b
+5. **VALET status response** (include interaction info) — Phase 2b
+6. **Postgres LISTEN for resume signal** — Phase 2c
+7. **Timeout handling** — Phase 2c
+8. **CDP/VNC URL generation** (for browser handoff) — Phase 2d
+
+### VALET Action Items
+
+-   [ ] Handle `needs_human` callback — show notification to user
+-   [ ] Build browser viewer UI (connect to CDP or show screenshot)
+-   [ ] Add "I'm done" / "Cancel" buttons → call `POST /valet/resume/:jobId`
+-   [ ] Handle `human_timeout` → show "automation timed out waiting" message
+-   [ ] (Optional) Show live browser via CDP WebSocket or VNC
+
+---
+
+## Phase 3: Browser Operator Mode (Local Browser Connection)
+
+> Inspired by [Manus Browser Operator](https://manus.im/features/manus-browser-operator) — instead of launching a new browser, connect to the user's **existing browser** and operate within their authenticated sessions.
+
+### The Problem with Server-Side Browsers
+
+Today, GhostHands launches a fresh Patchright (Chromium) browser for every job. This causes:
+
+1. **No existing sessions** — user isn't logged into any ATS platforms
+2. **Bot detection** — new browser fingerprint triggers CAPTCHAs and blocks
+3. **IP mismatch** — server IP differs from user's usual login location
+4. **Credential management** — we must store and inject user passwords
+5. **No user visibility** — user can't see what's happening in real-time
+6. **2FA walls** — every login triggers 2FA because it's an unrecognized device
+
+These problems are the root cause of most HITL pauses. The Browser Operator approach eliminates them at the source.
+
+### The Solution: Two Browser Modes
+
+GhostHands will support **two browser modes**, selectable per job:
+
+#### Mode A: Server Browser (Current — Default)
+
+```
+VALET → GhostHands API → Worker → launches Patchright browser → executes task
+```
+
+-   Worker owns the browser lifecycle
+-   Browser runs on the server (headless or headed)
+-   Good for: batch jobs, scraping, non-authenticated tasks
+-   No user interaction needed (unless HITL triggers)
+
+#### Mode B: Browser Operator (New — User's Browser)
+
+```
+User's Browser ← WebSocket → GhostHands Worker → executes task in user's tabs
+```
+
+-   Worker connects to user's existing browser via Chrome DevTools Protocol (CDP)
+-   Browser stays on user's machine with their cookies, logins, IP
+-   Good for: authenticated tasks, sites with strong bot detection, user-supervised work
+-   User watches actions in real-time
+
+### Architecture
+
+```
+┌─────────────────────┐       ┌──────────────────────────┐
+│   User's Machine    │       │    GhostHands Server     │
+│                     │       │                          │
+│  ┌───────────────┐  │       │  ┌────────────────────┐  │
+│  │ Chrome/Edge   │  │  WSS  │  │  Worker             │  │
+│  │  + Extension  │◄─┼──────►│  │                    │  │
+│  │               │  │       │  │  BrowserOperator-  │  │
+│  │  CDP access   │  │       │  │  Adapter            │  │
+│  │  to all tabs  │  │       │  │  (extends           │  │
+│  └───────────────┘  │       │  │   BrowserAutomation │  │
+│                     │       │  │   Adapter)          │  │
+│  User sees every    │       │  └────────────────────┘  │
+│  action live        │       │                          │
+└─────────────────────┘       └──────────────────────────┘
+```
+
+### How It Works
+
+1. **User installs GhostHands Browser Extension** (Chrome/Edge)
+
+    - Extension requests: `debugger`, `cookies`, `tabs`, `scripting` permissions
+    - On install, generates a unique `operator_token`
+
+2. **User links their browser to VALET**
+
+    - Toggle "My Browser" in VALET settings
+    - Extension connects via WebSocket to `wss://api.ghosthands.com/operator`
+    - Reports: browser fingerprint, active sessions, available tabs
+
+3. **Job routing with `browser_mode`**
+
+    ```jsonc
+    POST /api/v1/gh/valet/apply
+    {
+      "valet_task_id": "...",
+      "target_url": "https://company.workday.com/apply",
+      "profile": { ... },
+      "browser_mode": "operator",        // NEW — "server" (default) or "operator"
+      "target_worker_id": "user-adam"     // route to user's connected browser
+    }
+    ```
+
+4. **Worker receives job, connects to user's browser**
+
+    - Instead of `startBrowserAgent()` with new browser, creates `BrowserOperatorAdapter`
+    - Adapter uses CDP over WebSocket to the extension
+    - Extension opens a dedicated tab, worker controls it
+    - Same Magnitude action loop, just different browser source
+
+5. **Task executes in user's browser**
+
+    - User's existing cookies, sessions, IP = no bot detection
+    - User watches in real-time (tab is visible)
+    - If blocker appears, user can solve it immediately (no HITL pause needed)
+
+6. **Task completes, browser stays open**
+    - Unlike server mode, browser is NOT closed after task
+    - Tab closes, but browser + sessions persist
+    - Next task reuses same authenticated state
+
+### BrowserOperatorAdapter
+
+New adapter that implements the existing `BrowserAutomationAdapter` interface:
+
+```typescript
+// src/adapters/browserOperator.ts
+
+export class BrowserOperatorAdapter implements BrowserAutomationAdapter {
+    type: AdapterType = "browser-operator";
+
+    constructor(
+        private wsConnection: WebSocket, // CDP over WebSocket to extension
+        private operatorToken: string
+    ) {}
+
+    async start(options: BrowserLaunchOptions): Promise<void> {
+        // DON'T launch a browser — connect to existing one via CDP
+        // Request extension to open a new tab
+        // Attach Playwright CDP session to that tab
+    }
+
+    async stop(): Promise<void> {
+        // DON'T close the browser — just close the task tab
+        // Disconnect CDP session
+    }
+
+    // act(), extract(), navigate(), screenshot() — same as MagnitudeAdapter
+    // but operating on the user's browser tab via CDP
+}
+```
+
+### CDP Connection Flow
+
+```typescript
+// Extension side (content script / background worker)
+chrome.debugger.attach({ tabId }, "1.3", () => {
+    // Forward CDP events to GhostHands server via WebSocket
+});
+
+// Worker side
+import { chromium } from "playwright";
+
+// Connect to browser via CDP endpoint exposed by extension
+const browser = await chromium.connectOverCDP(cdpEndpoint);
+const context = browser.contexts()[0]; // user's existing context
+const page = await context.newPage(); // new tab in user's browser
+```
+
+### Comparison: Server vs Operator Mode
+
+| Aspect                   | Server Browser           | Browser Operator              |
+| ------------------------ | ------------------------ | ----------------------------- |
+| **Browser lifecycle**    | Worker launches + kills  | User's browser persists       |
+| **Sessions/cookies**     | Fresh (no logins)        | User's existing sessions      |
+| **IP address**           | Server IP                | User's IP                     |
+| **Bot detection**        | High risk                | Low risk (trusted device)     |
+| **CAPTCHA frequency**    | Frequent                 | Rare                          |
+| **2FA triggers**         | Every login              | None (recognized device)      |
+| **User visibility**      | None (unless CDP viewer) | Full real-time                |
+| **HITL needed**          | Often                    | Rarely                        |
+| **Latency**              | Low (same machine)       | Higher (WebSocket hop)        |
+| **Batch capability**     | Excellent                | Limited (one browser)         |
+| **Requires user online** | No                       | Yes                           |
+| **Credential storage**   | Required                 | Not needed                    |
+| **Best for**             | Bulk jobs, scraping      | Authenticated ATS, supervised |
+
+### Synergy with HITL
+
+Browser Operator mode **dramatically reduces** the need for HITL pauses:
+
+| Blocker            | Server Mode           | Operator Mode                       |
+| ------------------ | --------------------- | ----------------------------------- |
+| CAPTCHA            | Pause → notify → wait | Rarely appears (trusted device)     |
+| 2FA                | Pause → notify → wait | Doesn't trigger (recognized device) |
+| Login required     | Pause → notify → wait | Already logged in                   |
+| Bot check          | Pause → notify → wait | Passes automatically                |
+| Screening question | Pause → notify → wait | User sees it live, answers inline   |
+
+When HITL IS needed in operator mode, it's instant — user is already watching.
+
+### Synergy with Hybrid Engine
+
+Browser Operator works with all execution modes:
+
+| Mode         | Server Browser           | Browser Operator                           |
+| ------------ | ------------------------ | ------------------------------------------ |
+| **Pure AI**  | AI drives server browser | AI drives user's browser tab               |
+| **Cookbook** | RPA on server browser    | RPA on user's browser tab                  |
+| **Hybrid**   | Cookbook → AI fallback   | Cookbook → AI fallback (in user's browser) |
+
+### Extension Capabilities & Invocation Patterns
+
+The extension is not just a CDP bridge — it's an **active assistant** that handles things the browser agent can't do alone.
+
+#### Core Capabilities
+
+| Capability              | Chrome API                                    | When Invoked                                      |
+| ----------------------- | --------------------------------------------- | ------------------------------------------------- |
+| **CDP tab control**     | `chrome.debugger`                             | Every task — primary control channel              |
+| **Tab management**      | `chrome.tabs`                                 | Open/close task tabs, detect active tabs          |
+| **Session detection**   | `chrome.cookies`                              | Pre-task: check if user is logged into target ATS |
+| **File access**         | `chrome.fileSystem` (MV2) or native messaging | Resume/cover letter uploads                       |
+| **Screenshot**          | `chrome.tabs.captureVisibleTab()`             | Progress snapshots, blocker detection             |
+| **Content extraction**  | Content script + Readability.js               | Page-to-markdown for AI context                   |
+| **Notifications**       | `chrome.notifications`                        | Task started, needs attention, completed          |
+| **Download management** | `chrome.downloads`                            | Intercept application confirmations               |
+| **Clipboard**           | `document.execCommand` via content script     | Paste operations that need OS clipboard           |
+
+#### Invocation Protocol
+
+The worker sends commands to the extension via WebSocket. The extension processes them and returns results.
+
+```typescript
+// Worker → Extension commands
+interface ExtensionCommand {
+  id: string;                    // correlation ID
+  command: string;
+  params: Record<string, any>;
+}
+
+// Key commands:
+{ command: 'openTab',     params: { url: 'https://...' } }
+{ command: 'closeTab',    params: { tabId: 123 } }
+{ command: 'screenshot',  params: { tabId: 123 } }
+{ command: 'readFile',    params: { path: '/Users/adam/resume.pdf' } }
+{ command: 'checkSession', params: { domain: 'myworkdayjobs.com' } }
+{ command: 'getClipboard', params: {} }
+{ command: 'setClipboard', params: { text: '...' } }
+{ command: 'notify',      params: { title: 'GhostHands', message: 'Task complete' } }
+```
+
+#### File Upload in Operator Mode
+
+This is the key extension invocation that solves the file picker problem:
+
+```
+Worker: "Upload resume to the file input at selector X"
+  │
+  ▼
+Worker → Extension: { command: 'readFile', path: job.input_data.resume_path }
+  │
+  ▼
+Extension: reads file from user's disk → sends buffer back via WebSocket
+  │
+  ▼
+Worker: uses FileUploadHelper.uploadBuffer(page, selector, buffer, 'resume.pdf')
+  │
+  ▼
+Playwright: intercepts file chooser at CDP level → file uploaded without OS dialog
+```
+
+The user's resume never leaves their machine — the extension reads it locally and the CDP filechooser API handles the upload within the browser process.
+
+#### When Extension is Invoked vs When CDP Handles It
+
+| Action                  | CDP (Playwright)      | Extension Needed          |
+| ----------------------- | --------------------- | ------------------------- |
+| Click, type, scroll     | Yes                   | No                        |
+| Navigate                | Yes                   | No                        |
+| Screenshot              | Yes                   | No                        |
+| File upload (input)     | Yes (`setInputFiles`) | No                        |
+| File upload (drag-drop) | Yes (dispatch event)  | No                        |
+| File from user's disk   | No                    | **Yes** (readFile)        |
+| Check login status      | No                    | **Yes** (cookies)         |
+| OS notification         | No                    | **Yes** (notifications)   |
+| Clipboard paste         | Partial               | **Yes** for OS clipboard  |
+| Download intercept      | Partial               | **Yes** (downloads API)   |
+| Popup/OAuth window      | Tricky                | **Yes** (tabs + debugger) |
+
+**Design principle:** Use CDP (Playwright) for everything it can handle. Only invoke the extension for capabilities that require Chrome APIs.
+
+### Security Considerations
+
+-   Extension NEVER sends cookies or passwords to server — CDP stays local
+-   Worker sends commands (click, type, navigate), extension executes them
+-   All WebSocket traffic is encrypted (WSS)
+-   Operator token is per-user, revocable from VALET settings
+-   Extension shows clear indicator when GhostHands is controlling a tab
+-   User can close tab at any time to immediately stop automation
+-   No `<all_urls>` permission — scoped to job's `target_url` domain only
+
+### Implementation Roadmap
+
+#### Phase 3a: CDP Connection + Adapter Factory (Week 9-10)
+
+1. **BrowserOperatorAdapter** — connect Playwright to existing browser via CDP
+2. **AdapterFactory** — create the right adapter based on job config (`browser_mode`)
+3. **Test with manual `--remote-debugging-port`** — verify all Magnitude actions work over CDP
+4. **Mode fallback** — operator requested but disconnected → error with clear message
+
+```typescript
+// src/adapters/factory.ts — new
+export function createAdapter(job: AutomationJob): BrowserAutomationAdapter {
+    if (job.browser_mode === "operator") {
+        return new BrowserOperatorAdapter(job.operator_cdp_url);
+    }
+    return new MagnitudeAdapter(); // default: server mode
+}
+```
+
+**Key discovery:** `AdapterStartOptions` already has `cdpUrl` support, and `MagnitudeAdapter.start()` already passes it to `startBrowserAgent({ browser: { cdp: url } })`. The BrowserOperatorAdapter may just manage the WebSocket-to-CDP bridge and delegate to MagnitudeAdapter.
+
+#### Phase 3b: Browser Extension MVP (Week 11-12)
+
+5. **Chrome extension manifest** (Manifest V3)
+6. **Background service worker** — WebSocket to GhostHands server, command handler
+7. **Tab management** — open/close task tabs on command
+8. **CDP bridge** — `chrome.debugger.attach()` + forward to server
+9. **File access** — `readFile` command for resume/document uploads
+10. **Session detection** — `checkSession` command (read cookies for target domain)
+11. **Extension popup** — connection status, active task, "stop" button
+12. **Notifications** — task started/completed/needs attention
+
+#### Phase 3c: VALET Integration (Week 13-14)
+
+13. **`browser_mode` field** in VALET schemas and job creation API
+14. **"My Browser" toggle** — extension linking flow
+15. **Operator status endpoint** — `GET /valet/operator/status/:userId`
+16. **Job routing** — operator jobs → user's connected browser
+17. **Live task view** — show real-time progress when operator mode active
+
+#### Phase 3d: Production Hardening (Week 15-16)
+
+18. **Reconnection handling** — WebSocket drops → auto-reconnect with state recovery
+19. **Multi-tab isolation** — concurrent tasks in separate tab groups
+20. **Domain scoping** — limit CDP access per job to target domain only
+21. **Clipboard + download commands** — remaining extension invocations
+22. **Extension auto-update** — version check + migration support
+23. **Metrics** — operator mode success rates vs server mode, HITL reduction stats
+
+### Files to Create (Phase 3)
+
+| File                                              | Action     | Description                                         |
+| ------------------------------------------------- | ---------- | --------------------------------------------------- |
+| `src/adapters/browserOperator.ts`                 | **NEW**    | BrowserOperatorAdapter — CDP over WebSocket         |
+| `src/adapters/factory.ts`                         | **NEW**    | AdapterFactory — create adapter based on job config |
+| `src/api/routes/operator.ts`                      | **NEW**    | WebSocket endpoint for extension connections        |
+| `src/api/schemas/valet.ts`                        | **MODIFY** | Add `browser_mode` to schemas                       |
+| `extension/manifest.json`                         | **NEW**    | Chrome extension manifest (MV3)                     |
+| `extension/background.ts`                         | **NEW**    | Service worker: WebSocket + command handler         |
+| `extension/content.ts`                            | **NEW**    | Content script: page extraction                     |
+| `extension/popup/`                                | **NEW**    | Extension popup UI                                  |
+| `__tests__/unit/adapters/browserOperator.test.ts` | **NEW**    | Adapter tests                                       |
+
+### VALET Action Items (Phase 3)
+
+-   [ ] Build extension settings UI ("My Browser" toggle)
+-   [ ] Extension onboarding flow (install link, token generation)
+-   [ ] Handle `browser_mode: "operator"` in job creation forms
+-   [ ] Show connection status (browser online/offline)
+-   [ ] Display live task progress when operator mode active
+-   [ ] "Stop automation" button → closes task tab
+-   [ ] Handle disconnected browser → show "browser offline" error
+
+---
+
+## Open Questions
+
+1. **Selector stability:** How often do ATS platforms change their DOM?
+2. **Multi-page forms:** Workday has 3-5 page applications. How do cookbooks handle page navigation?
+3. **Dynamic content:** Conditional fields (e.g., visa sponsorship → extra fields). How do cookbooks handle branching?
+4. **Cookbook sharing:** Per-user, per-org, or global? Global = fastest learning but privacy concerns.
+5. **Browser handoff:** CDP vs VNC vs web viewer? CDP is most powerful but requires WebSocket proxy. VNC is simpler but lower fidelity.
+6. **Interaction timeout:** 5 minutes default — is this enough? Should it be configurable per job?
+7. **Multi-blocker:** What if human solves CAPTCHA but then hits 2FA? Do we pause again?
+8. **Operator mode latency:** WebSocket hop adds ~50-100ms per command. Is this acceptable for real-time automation?
+9. **Extension store approval:** Chrome Web Store review for `debugger` permission is strict. What's the approval timeline?
+10. **Concurrent operator tasks:** Can one browser handle multiple task tabs simultaneously?
+11. **Browser compatibility:** Start with Chrome + Edge. Firefox CDP support is limited — defer or skip?
+
+---
+
+## References
+
+-   [CLAUDE.md](../CLAUDE.md) — ManualConnector spec, connector interface, cost targets
+-   [DEV-GUIDE-MAGNITUDE.md](./DEV-GUIDE-MAGNITUDE.md) — Developer guide for extending Magnitude
+-   [Team 3 Prompt](<archive/Prompt%20for%20Team%203_%20The%20Brain%20(Self-Learning%20Core).md>) — Original self-learning system design
+-   [supabase-migration.sql](../supabase-migration.sql) — gh_action_manuals table schema
+-   [Manus Browser Operator](https://manus.im/features/manus-browser-operator) — Hybrid cloud+local approach inspiration
+-   [Manus Browser Operator Blog](https://manus.im/blog/manus-browser-operator) — "Using Existing Browser Without Closing After Tasks"
+-   [Manus Architecture Analysis](https://mindgard.ai/blog/manus-rubra-full-browser-remote-control) — CDP + WebSocket architecture deep dive
+-   [Magnitude Docs](https://docs.magnitude.run) — Upstream BrowserAgent API

@@ -17,6 +17,13 @@ export interface CostSnapshot {
   outputCost: number;
   totalCost: number;
   actionCount: number;
+  // Mode tracking (Sprint 3)
+  mode?: 'cookbook' | 'magnitude' | 'hybrid';
+  cookbookSteps: number;
+  magnitudeSteps: number;
+  // Dual-model cost breakdown (Sprint 4)
+  imageCost: number;
+  reasoningCost: number;
 }
 
 export interface UserUsage {
@@ -66,9 +73,9 @@ export class ActionLimitExceededError extends Error {
 
 /** Per-task LLM budget (in USD) by quality preset */
 const TASK_BUDGET: Record<QualityPreset, number> = {
-  speed: 0.02,
-  balanced: 0.10,
-  quality: 0.30,
+  speed: 0.05,
+  balanced: 0.25,
+  quality: 0.50,
 };
 
 /** Per-job-type budget overrides (in USD) — bypasses quality preset when present */
@@ -107,6 +114,11 @@ export class CostTracker {
   private inputCost = 0;
   private outputCost = 0;
   private actionCount = 0;
+  private cookbookSteps = 0;
+  private magnitudeSteps = 0;
+  private currentMode: CostSnapshot['mode'] = undefined;
+  private _imageCost = 0;
+  private _reasoningCost = 0;
 
   private readonly jobId: string;
   private readonly taskBudget: number;
@@ -135,11 +147,21 @@ export class CostTracker {
     outputTokens: number;
     inputCost?: number;
     outputCost?: number;
+    /** Which model role produced this usage: 'image' or 'reasoning' */
+    role?: 'image' | 'reasoning';
   }): void {
     this.inputTokens += usage.inputTokens;
     this.outputTokens += usage.outputTokens;
     this.inputCost += usage.inputCost ?? 0;
     this.outputCost += usage.outputCost ?? 0;
+
+    // Track per-role cost breakdown
+    const callCost = (usage.inputCost ?? 0) + (usage.outputCost ?? 0);
+    if (usage.role === 'image') {
+      this._imageCost += callCost;
+    } else {
+      this._reasoningCost += callCost;
+    }
 
     const totalCost = this.inputCost + this.outputCost;
     if (totalCost > this.taskBudget) {
@@ -173,7 +195,26 @@ export class CostTracker {
       outputCost: this.outputCost,
       totalCost: this.inputCost + this.outputCost,
       actionCount: this.actionCount,
+      mode: this.currentMode,
+      cookbookSteps: this.cookbookSteps,
+      magnitudeSteps: this.magnitudeSteps,
+      imageCost: this._imageCost,
+      reasoningCost: this._reasoningCost,
     };
+  }
+
+  /** Record a step in the given mode. */
+  recordModeStep(mode: 'cookbook' | 'magnitude'): void {
+    if (mode === 'cookbook') {
+      this.cookbookSteps++;
+    } else {
+      this.magnitudeSteps++;
+    }
+  }
+
+  /** Set the current execution mode. */
+  setMode(mode: 'cookbook' | 'magnitude' | 'hybrid'): void {
+    this.currentMode = mode;
   }
 
   /** The dollar budget for this task. */

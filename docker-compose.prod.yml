@@ -12,11 +12,13 @@ services:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "packages/ghosthands/src/api/server.ts"]
     ports:
-      - "127.0.0.1:${GH_API_PORT:-3100}:3100"
+      - "${GH_API_PORT:-3100}:3100"
     env_file: .env
     environment:
       - NODE_ENV=production
       - GH_API_PORT=3100
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+      - SSL_CERT_DIR=/etc/ssl/certs
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:3100/health"]
       interval: 15s
@@ -35,14 +37,60 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # GhostHands Worker
-  worker:
+  # Deploy Server — receives deploy commands from VALET's DeployService
+  # Runs on port 8000, calls deploy.sh to execute deploys
+  deploy-server:
     image: ${ECR_IMAGE:-ghosthands:latest}
-    command: ["bun", "packages/ghosthands/src/workers/main.ts"]
+    command: ["bun", "/opt/ghosthands/scripts/deploy-server.ts"]
+    ports:
+      - "${GH_DEPLOY_PORT:-8000}:8000"
     env_file: .env
     environment:
       - NODE_ENV=production
-      - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-2}
+      - GH_DEPLOY_PORT=8000
+      - GH_API_HOST=api
+      - GH_API_PORT=3100
+      - GH_WORKER_HOST=worker
+      - GH_WORKER_PORT=3101
+      - GHOSTHANDS_DIR=/app
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+      - SSL_CERT_DIR=/etc/ssl/certs
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/opt/ghosthands:ro
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+    restart: unless-stopped
+    logging:
+      driver: ${LOG_DRIVER:-json-file}
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # GhostHands Worker (default instance, no target routing)
+  # For VALET-routed workers, start via docker run with GH_WORKER_ID:
+  #   docker run -d --env-file .env \
+  #     -e GH_WORKER_ID=<sandbox-uuid> -e DISPLAY=:99 \
+  #     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  #     ${ECR_IMAGE} bun packages/ghosthands/src/workers/main.ts
+  worker:
+    image: ${ECR_IMAGE:-ghosthands:latest}
+    command: ["bun", "packages/ghosthands/src/workers/main.ts"]
+    ports:
+      - "${GH_WORKER_PORT:-3101}:3101"
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-1}
+      - GH_WORKER_PORT=3101
+      - DISPLAY=:99
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+      - SSL_CERT_DIR=/etc/ssl/certs
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
     depends_on:
       api:
         condition: service_healthy

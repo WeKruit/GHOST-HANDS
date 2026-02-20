@@ -15,7 +15,8 @@ import {
 } from '../../src/workers/costControl';
 import {
   getTestSupabase,
-  cleanupTestData,
+  cleanupByJobType,
+  insertTestJobs,
   ensureTestUsage,
   ensureTestProfile,
   TEST_USER_ID,
@@ -24,13 +25,27 @@ import {
 
 const supabase = getTestSupabase();
 
+// Unique job_type to isolate from other parallel test files sharing the same DB
+const JOB_TYPE = 'cost_control_test';
+
+/**
+ * Targeted cleanup for cost control tests — cleans jobs + usage rows.
+ */
+async function cleanupCostTests() {
+  await cleanupByJobType(supabase, JOB_TYPE);
+  await supabase
+    .from('gh_user_usage')
+    .delete()
+    .in('user_id', [TEST_USER_ID, TEST_USER_ID_2]);
+}
+
 describe('Cost Controls', () => {
   beforeAll(async () => {
-    await cleanupTestData(supabase);
+    await cleanupCostTests();
   });
 
   afterAll(async () => {
-    await cleanupTestData(supabase);
+    await cleanupCostTests();
   });
 
   // ─── CostTracker: Per-task budget ───────────────────────────────
@@ -236,7 +251,7 @@ describe('Cost Controls', () => {
 
   describe('CostControlService - Preflight Budget Check', () => {
     beforeEach(async () => {
-      await cleanupTestData(supabase);
+      await cleanupCostTests();
     });
 
     it('should allow a job when user has sufficient budget', async () => {
@@ -297,7 +312,7 @@ describe('Cost Controls', () => {
 
   describe('CostControlService - Cost Recording', () => {
     beforeEach(async () => {
-      await cleanupTestData(supabase);
+      await cleanupCostTests();
     });
 
     it('should record job cost against user monthly usage', async () => {
@@ -354,8 +369,12 @@ describe('Cost Controls', () => {
         total_cost_usd: 0,
       });
 
+      // Create a real job so the FK constraint on gh_job_events.job_id is satisfied
+      const [job] = await insertTestJobs(supabase, { job_type: JOB_TYPE });
+      const jobId = job.id as string;
+
       const service = new CostControlService(supabase);
-      await service.recordJobCost(TEST_USER_ID, 'fake-job-event-1', {
+      await service.recordJobCost(TEST_USER_ID, jobId, {
         inputTokens: 1000, outputTokens: 500,
         inputCost: 0.01, outputCost: 0.005,
         totalCost: 0.015, actionCount: 5,
@@ -364,7 +383,7 @@ describe('Cost Controls', () => {
       const { data: events } = await supabase
         .from('gh_job_events')
         .select('*')
-        .eq('job_id', 'fake-job-event-1')
+        .eq('job_id', jobId)
         .eq('event_type', 'cost_recorded');
 
       expect(events).not.toBeNull();
@@ -468,7 +487,7 @@ describe('Cost Controls', () => {
     });
 
     it('should record partial cost when job is killed mid-execution (DB simulation)', async () => {
-      await cleanupTestData(supabase);
+      await cleanupCostTests();
       await ensureTestUsage(supabase, TEST_USER_ID, {
         tier: 'starter',
         total_cost_usd: 0,

@@ -28,11 +28,13 @@
         "job": "bun src/scripts/job.ts"
     },
     "dependencies": {
+        "@actionbookdev/sdk": "^0.3.0",
+        "@browserbasehq/stagehand": "^3.0.8",
+        "@supabase/supabase-js": "^2.95.3",
+        "eventemitter3": "^5.0.1",
+        "hono": "^4.0.0",
         "magnitude-core": "^0.3.1",
         "magnitude-extract": "^0.0.2",
-        "eventemitter3": "^5.0.1",
-        "@supabase/supabase-js": "^2.95.3",
-        "hono": "^4.0.0",
         "pg": "^8.13.0",
         "playwright": "npm:patchright@^1.52.0",
         "zod": "^3.24.4"

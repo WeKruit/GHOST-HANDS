@@ -18,6 +18,7 @@ import { vi } from 'vitest';
 
 const SUPABASE_URL = process.env.SUPABASE_URL ?? 'http://127.0.0.1:54321';
 const SUPABASE_SERVICE_KEY =
+  process.env.SUPABASE_SECRET_KEY ??
   process.env.SUPABASE_SERVICE_KEY ??
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU';
 
@@ -273,6 +274,27 @@ export class MockValetClient {
   }
 }
 
+/**
+ * Targeted cleanup: delete only test jobs with a specific job_type.
+ * Safer than cleanupTestData when running tests in parallel since it
+ * won't interfere with jobs created by other test files.
+ */
+export async function cleanupByJobType(
+  supabase: SupabaseClient,
+  jobType: string,
+): Promise<void> {
+  const { data: jobs } = await supabase
+    .from('gh_automation_jobs')
+    .select('id')
+    .eq('job_type', jobType);
+
+  if (jobs && jobs.length > 0) {
+    const ids = jobs.map((j: { id: string }) => j.id);
+    await supabase.from('gh_job_events').delete().in('job_id', ids);
+    await supabase.from('gh_automation_jobs').delete().in('id', ids);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Mock browser agent
 // ---------------------------------------------------------------------------
@@ -364,18 +386,36 @@ export function createMockAgent(behavior: MockAgentBehavior = {}) {
  * Simulates the worker-side flow: picks up a pending job and runs
  * a mock execution through the JobExecutor path, using direct DB
  * operations to simulate what `gh_pickup_next_job` RPC would do.
+ *
+ * The UPDATE filters on status='pending' and id=jobId, so concurrent
+ * callers that already changed the status will cause this UPDATE to
+ * be a no-op (0 rows affected). PostgREST doesn't report affected
+ * row count, so this function optimistically returns the job ID.
+ *
+ * For tests that need atomicity guarantees, verify the final DB state
+ * directly rather than relying on the return value.
+ *
+ * @param jobType Optional filter to only pick up jobs with a specific job_type.
+ *                Use this when running test files in parallel to avoid cross-file interference.
  */
 export async function simulateWorkerPickup(
   supabase: SupabaseClient,
   workerId: string = TEST_WORKER_ID,
+  jobType?: string,
 ): Promise<string | null> {
-  // Simulate FOR UPDATE SKIP LOCKED by selecting the oldest pending job
-  // and atomically claiming it. In the real system this is an RPC call.
-  const { data: jobs } = await supabase
+  // Select candidate jobs (oldest pending, highest priority first)
+  let query = supabase
     .from('gh_automation_jobs')
     .select('id')
     .eq('status', 'pending')
     .is('worker_id', null)
+    .eq('created_by', 'test');
+
+  if (jobType) {
+    query = query.eq('job_type', jobType);
+  }
+
+  const { data: jobs } = await query
     .order('priority', { ascending: false })
     .order('created_at', { ascending: true })
     .limit(1);
@@ -384,6 +424,9 @@ export async function simulateWorkerPickup(
 
   const jobId = jobs[0].id;
 
+  // Attempt to claim: UPDATE only if still pending.
+  // PostgreSQL guarantees this WHERE clause sees current row state,
+  // so only one concurrent caller can succeed on a given job.
   const { error } = await supabase
     .from('gh_automation_jobs')
     .update({
@@ -395,6 +438,16 @@ export async function simulateWorkerPickup(
     .eq('status', 'pending');
 
   if (error) return null;
+
+  // Verify the claim succeeded — PostgREST doesn't report affected row count,
+  // so a concurrent caller could also "succeed" on the same row. Read back to confirm.
+  const { data: claimed } = await supabase
+    .from('gh_automation_jobs')
+    .select('worker_id')
+    .eq('id', jobId)
+    .single();
+
+  if (!claimed || claimed.worker_id !== workerId) return null;
   return jobId;
 }
 

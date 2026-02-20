@@ -166,11 +166,13 @@ export class HealthChecker {
 
   private async checkLLMProvider(): Promise<HealthCheckResult> {
     // Check that at least one LLM provider has credentials configured
+    const hasSiliconFlow = !!process.env.SILICONFLOW_API_KEY;
+    const hasDeepSeek = !!process.env.DEEPSEEK_API_KEY;
     const hasAnthropic = !!process.env.ANTHROPIC_API_KEY;
     const hasOpenAI = !!process.env.OPENAI_API_KEY;
     const hasGoogle = !!process.env.GOOGLE_API_KEY;
 
-    if (!hasAnthropic && !hasOpenAI && !hasGoogle) {
+    if (!hasSiliconFlow && !hasDeepSeek && !hasAnthropic && !hasOpenAI && !hasGoogle) {
       return {
         name: 'llm_provider',
         status: 'unhealthy',
@@ -179,6 +181,8 @@ export class HealthChecker {
     }
 
     const providers: string[] = [];
+    if (hasSiliconFlow) providers.push('siliconflow');
+    if (hasDeepSeek) providers.push('deepseek');
     if (hasAnthropic) providers.push('anthropic');
     if (hasOpenAI) providers.push('openai');
     if (hasGoogle) providers.push('google');

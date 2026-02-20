@@ -22,6 +22,13 @@ export interface BrowserAutomationAdapter {
   /** Whether the adapter is currently active */
   isActive(): boolean;
 
+  /**
+   * Check if the underlying browser connection is still alive.
+   * Returns false if the browser process has exited, the CDP connection
+   * dropped, or all pages have been closed.
+   */
+  isConnected(): boolean;
+
   // -- Core Actions --
 
   /** Execute a natural-language action on the current page */
@@ -55,10 +62,28 @@ export interface BrowserAutomationAdapter {
   /** Access the underlying browser page for escape-hatch operations */
   get page(): Page;
 
+  /**
+   * Export the current browser session state (cookies + localStorage)
+   * as a JSON string from Playwright's context.storageState().
+   * Returns null if the browser context is unavailable.
+   */
+  getBrowserSession?(): Promise<string | null>;
+
   // -- Credentials --
 
   /** Register sensitive values that should not be sent to LLMs */
   registerCredentials(creds: Record<string, string>): void;
+
+  // -- Pause / Resume (HITL) --
+
+  /** Pause the automation agent (e.g. for human intervention) */
+  pause?(): Promise<void>;
+
+  /** Resume a paused automation agent */
+  resume?(context?: ResolutionContext): Promise<void>;
+
+  /** Whether the agent is currently paused */
+  isPaused?(): boolean;
 
   // -- Events --
 
@@ -82,8 +107,10 @@ export type AdapterEvent =
 export interface AdapterStartOptions {
   /** Initial URL to navigate to */
   url?: string;
-  /** LLM configuration */
+  /** LLM configuration (used for all roles unless imageLlm is also provided) */
   llm: LLMConfig;
+  /** Optional separate LLM for vision/screenshot tasks (must have vision: true) */
+  imageLlm?: LLMConfig;
   /** CDP WebSocket URL for connecting to existing browser */
   cdpUrl?: string;
   /** Browser launch options (ignored if cdpUrl provided) */
@@ -94,6 +121,8 @@ export interface AdapterStartOptions {
   systemPrompt?: string;
   /** Per-application budget limit in USD */
   budgetLimit?: number;
+  /** Pre-loaded browser session state (cookies + localStorage) from a previous run */
+  storageState?: Record<string, unknown>;
 }
 
 export interface ActionContext {
@@ -123,6 +152,76 @@ export interface ObservedElement {
   method: string;
   /** Arguments for the method */
   arguments: unknown[];
+}
+
+// -- HITL types --
+
+/** Context passed to adapter.resume() when the human provides credentials or codes */
+export interface ResolutionContext {
+  /** How the blocker was resolved */
+  resolutionType: 'manual' | 'code_entry' | 'credentials' | 'skip';
+  /** Credential data (2FA code, login creds, etc.) — NEVER log this */
+  resolutionData?: Record<string, unknown>;
+}
+
+export type BlockerCategory = 'captcha' | 'login' | '2fa' | 'bot_check' | 'rate_limited' | 'verification' | 'unknown';
+
+export interface ObservationBlocker {
+  /** Classification of the blocker */
+  category: BlockerCategory;
+  /** 0-1 confidence that this is actually a blocker */
+  confidence: number;
+  /** CSS selector that matched, if available */
+  selector?: string;
+  /** Human-readable description */
+  description: string;
+}
+
+export interface ObservationResult {
+  /** Observed interactive elements on the page */
+  elements: ObservedElement[];
+  /** Detected blockers (CAPTCHAs, login walls, etc.) */
+  blockers: ObservationBlocker[];
+  /** Current page URL at time of observation */
+  url: string;
+  /** Timestamp of the observation */
+  timestamp: number;
+  /** Screenshot buffer at time of observation, if captured */
+  screenshot?: Buffer;
+}
+
+/**
+ * Adapter interface with required HITL (Human-in-the-Loop) methods.
+ *
+ * Extends BrowserAutomationAdapter by making observe, pause, resume, and
+ * isPaused required rather than optional. All production adapters must
+ * implement this interface to support HITL workflows.
+ */
+export interface HitlCapableAdapter extends BrowserAutomationAdapter {
+  /** Inspect the page for interactive elements and blockers. Always defined. */
+  observe(instruction: string): Promise<ObservedElement[] | undefined>;
+
+  /** Pause execution for human intervention. Always defined. */
+  pause(): Promise<void>;
+
+  /** Resume execution after human intervention. Always defined. */
+  resume(context?: ResolutionContext): Promise<void>;
+
+  /** Whether the adapter is currently paused. Always defined. */
+  isPaused(): boolean;
+
+  /** Take a screenshot (already required on base, re-declared for clarity). */
+  screenshot(): Promise<Buffer>;
+
+  /** Get the current page URL (already required on base, re-declared for clarity). */
+  getCurrentUrl(): Promise<string>;
+
+  /**
+   * Perform a full observation that includes structured blocker detection.
+   * This is the HITL-specific enriched observation that returns both elements
+   * and blocker info in a single call.
+   */
+  observeWithBlockerDetection(instruction: string): Promise<ObservationResult>;
 }
 
 export interface TokenUsage {

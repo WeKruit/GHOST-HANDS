@@ -1,0 +1,2 @@
+[test]
+preload = ["./packages/ghosthands/test-env.ts"]
