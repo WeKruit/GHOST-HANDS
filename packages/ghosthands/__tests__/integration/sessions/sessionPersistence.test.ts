@@ -75,18 +75,14 @@ afterAll(async () => {
   // Keeping it avoids repeated fresh logins that trigger Google bot detection.
   // The session persists for future test runs — that's the whole point.
   for (const b of browsers) {
-    // Race against a timeout to avoid hanging if browser is stuck
-    await Promise.race([
-      b.close().catch(() => {}),
-      new Promise((r) => setTimeout(r, 3000)),
-    ]);
+    await b.close().catch(() => {});
   }
 });
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-async function launchBrowser(headless = false): Promise<Browser> {
-  const browser = await chromium.launch({ headless }); // headless: false for interactive login
+async function launchBrowser(): Promise<Browser> {
+  const browser = await chromium.launch({ headless: false }); // visible so you can watch
   browsers.push(browser);
   return browser;
 }
@@ -112,28 +108,17 @@ async function loginToGmail(context: BrowserContext): Promise<void> {
 
 async function isLoggedIntoGoogle(context: BrowserContext): Promise<boolean> {
   const page = await context.newPage();
-  try {
-    await page.goto('https://mail.google.com', {
-      waitUntil: 'domcontentloaded',
-      timeout: 15000,
-    });
-    // Wait until redirect settles on Gmail inbox or Google sign-in
-    await page.waitForURL(/mail\.google\.com\/mail|accounts\.google\.com/, {
-      timeout: 10000,
-    });
-  } catch {
-    // Navigation timeout — Gmail is unreachable or stuck in redirect loop
-    console.log('[Test] Session check: navigation timed out');
-    await page.close();
-    return false;
-  }
+  await page.goto('https://mail.google.com', { waitUntil: 'domcontentloaded' });
+
+  // Give it time to redirect
+  await page.waitForTimeout(5000);
 
   const url = page.url();
   console.log('[Test] Session check URL:', url);
-  await page.close();
 
   // If we land on Gmail inbox (not sign-in page), session is valid
-  return url.includes('mail.google.com/mail') && !url.includes('accounts.google.com');
+  const isLoggedIn = url.includes('mail.google.com/mail') && !url.includes('accounts.google.com');
+  return isLoggedIn;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
