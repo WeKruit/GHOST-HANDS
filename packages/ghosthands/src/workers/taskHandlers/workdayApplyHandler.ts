@@ -5,6 +5,15 @@ import type { TaskHandler, TaskContext, TaskResult, ValidationResult } from './t
 import { ProgressStep } from '../progressTracker.js';
 import type { BrowserAutomationAdapter } from '../../adapters/types.js';
 import type { WorkdayUserProfile } from './workdayTypes.js';
+import {
+  buildPersonalInfoPrompt,
+  buildFormPagePrompt,
+  buildExperiencePrompt,
+  buildVoluntaryDisclosurePrompt,
+  buildSelfIdentifyPrompt,
+  buildGenericPagePrompt,
+  buildGoogleSignInFallbackPrompt,
+} from './workdayPrompts.js';
 
 // --- Constants ---
 
@@ -510,13 +519,7 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
         default: {
           // Unknown Google page — use LLM as fallback but with strict instruction
           console.log('[WorkdayApply] Unknown Google page — using LLM fallback...');
-          await adapter.act(
-            `This is a Google sign-in page. Do exactly ONE of these actions, then STOP:
-1. If you see an existing account for "${email}", click on it.
-2. If you see an "Email or phone" field, type "${email}" and click "Next".
-3. If you see a "Password" field, type "${password}" and click "Next".
-Do NOT interact with CAPTCHAs, reCAPTCHAs, or image challenges. If you see one, STOP immediately.`,
-          );
+          await adapter.act(buildGoogleSignInFallbackPrompt(email, password));
           await adapter.page.waitForTimeout(2000);
           return;
         }
@@ -705,27 +708,7 @@ SCREENING QUESTIONS (if any appear on this page):
   ${qaList}
   For any question not listed, pick the most reasonable answer.`;
 
-    const fillPrompt = `ABSOLUTE RULE #1 — ZERO SCROLLING: You must NEVER scroll the page — not even 1 pixel. No mouse wheel, no scroll actions, no Page Down. I handle all scrolling myself.
-
-ABSOLUTE RULE #2 — FULLY VISIBLE ONLY: If ANY part of a field, dropdown button, question text, or input box is cut off at the top or bottom edge of the screen, it is NOT fully visible — DO NOT interact with it at all. Only touch fields where the ENTIRE element is within the viewport. When in doubt, skip it. IMPORTANT: if you already typed a value into a field but CANNOT see the text you typed (because the field is near the edge of the screen), DO NOT type again — the value is there, you just can't see it. Move on.
-
-ABSOLUTE RULE #3 — ONE ATTEMPT PER FIELD: You may type into a given field AT MOST ONCE. After you type a value and click elsewhere, that field is DONE. Do NOT go back and re-type. Even if the field appears empty after you typed, trust that your input was registered and move to the next field. Typing into the same field multiple times causes duplicate text (e.g. "WuWuWu" instead of "Wu").
-
-ABSOLUTE RULE #4 — NO TAB KEY: NEVER press the Tab key to move between fields. Instead, after filling a field, CLICK on empty whitespace to deselect, then CLICK directly on the next field you want to fill. Tab can jump to the wrong field (e.g. Middle Name instead of Last Name).
-
-ABSOLUTE RULE #5 — NEVER NAVIGATE: Do NOT click "Save and Continue", "Next", "Submit", "Back", or any button that navigates to another page. When you are done filling visible fields, simply STOP taking actions. I handle all navigation myself.
-
-Fill any EMPTY form fields that are FULLY visible on screen, from TOP to BOTTOM:
-1. If the field already has ANY value (even if formatted differently), SKIP IT entirely.
-2. Phone numbers like "(408) 555-1234" are CORRECTLY formatted by Workday — do NOT re-enter them.
-3. If the field is truly empty (blank/no text): CLICK on it, type/select the correct value, then CLICK on whitespace to deselect.
-4. DROPDOWNS: After clicking a dropdown, ALWAYS TYPE your desired answer first (e.g. type "No", "Yes", "Male", "Website") to filter the list, then click the matching option. The popup menu that appears after you click a dropdown ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions on the page. If typing doesn't produce a match, click whitespace to close, re-click the dropdown, and try typing a shorter keyword. NEVER use arrow keys. NEVER mouse-scroll inside dropdowns.
-5. DATE FIELDS (MM/DD/YYYY): Click on the MM (month) part FIRST, then type the full date as continuous digits with NO slashes (e.g. "02182026" for Feb 18, 2026). For "today's date" or "signature date", type "02182026" (which is 02/18/2026). For "expected graduation date" use 05012027.
-6. CHECKBOXES: If you see a required checkbox (e.g. "I acknowledge..." or Terms & Conditions), click on it to check it.
-
-If ALL visible fields already have values, STOP IMMEDIATELY — do nothing.
-
-${dataBlock}`;
+    const fillPrompt = buildPersonalInfoPrompt(dataBlock);
 
     await this.fillWithSmartScroll(adapter, fillPrompt, 'personal info');
   }
@@ -741,27 +724,7 @@ ${dataBlock}`;
   ): Promise<void> {
     console.log(`[WorkdayApply] Filling ${pageDescription} page...`);
 
-    const fillPrompt = `ABSOLUTE RULE #1 — ZERO SCROLLING: You must NEVER scroll the page — not even 1 pixel. No mouse wheel, no scroll actions, no Page Down. I handle all scrolling myself.
-
-ABSOLUTE RULE #2 — FULLY VISIBLE ONLY: If ANY part of a field, dropdown button, question text, or input box is cut off at the top or bottom edge of the screen, it is NOT fully visible — DO NOT interact with it at all. Only touch fields where the ENTIRE element is within the viewport. When in doubt, skip it. IMPORTANT: if you already typed a value into a field but CANNOT see the text you typed (because the field is near the edge of the screen), DO NOT type again — the value is there, you just can't see it. Move on.
-
-ABSOLUTE RULE #3 — ONE ATTEMPT PER FIELD: You may type into a given field AT MOST ONCE. After you type a value and click elsewhere, that field is DONE. Do NOT go back and re-type. Even if the field appears empty after you typed, trust that your input was registered and move to the next field.
-
-ABSOLUTE RULE #4 — NO TAB KEY: NEVER press the Tab key to move between fields. Instead, after filling a field, CLICK on empty whitespace to deselect, then CLICK directly on the next field you want to fill. Tab can jump to the wrong field.
-
-ABSOLUTE RULE #5 — NEVER NAVIGATE: Do NOT click "Save and Continue", "Next", "Submit", "Back", or any button that navigates to another page. When you are done filling visible fields, simply STOP taking actions. I handle all navigation myself.
-
-You are on a "${pageDescription}" form page. Fill any EMPTY questions/fields that are FULLY visible on screen, from top to bottom:
-1. If the field already has ANY value (even if formatted differently), SKIP IT.
-2. Phone numbers like "(408) 555-1234" are CORRECTLY formatted — do NOT re-enter them.
-3. If truly empty: CLICK on it, read the label, type or select the correct answer.
-4. DROPDOWNS: After clicking a dropdown, ALWAYS TYPE your desired answer first (e.g. type "No", "Yes", "Website") to filter the list, then click the matching option. The popup menu that appears after you click a dropdown ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions. If typing doesn't produce a match, click whitespace to close, re-click the dropdown, and try typing a shorter keyword. NEVER use arrow keys. NEVER mouse-scroll inside dropdowns.
-5. DATE FIELDS (MM/DD/YYYY): Click on the MM part FIRST, then type continuous digits (e.g. "02182026"). For "today's date" or "signature date", type "02182026". For "expected graduation date" use 05012027.
-6. CHECKBOXES: If you see a required checkbox (e.g. "I acknowledge..." or Terms & Conditions), click on it to check it.
-
-If ALL visible fields already have values, STOP IMMEDIATELY — do nothing.
-
-${dataPrompt}`;
+    const fillPrompt = buildFormPagePrompt(pageDescription, dataPrompt);
 
     await this.fillWithSmartScroll(adapter, fillPrompt, pageDescription);
   }
@@ -871,29 +834,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
 `;
     }
 
-    const fillPrompt = `ABSOLUTE RULE #1 — ZERO SCROLLING: You must NEVER scroll the page — not even 1 pixel. No mouse wheel, no scroll actions, no Page Down. I handle all scrolling myself.
-
-ABSOLUTE RULE #2 — FULLY VISIBLE ONLY: If ANY part of a field, dropdown button, question text, or input box is cut off at the top or bottom edge of the screen, it is NOT fully visible — DO NOT interact with it at all. Only touch fields where the ENTIRE element is within the viewport. When in doubt, skip it. IMPORTANT: if you already typed a value into a field but CANNOT see the text you typed (because the field is near the edge of the screen), DO NOT type again — the value is there, you just can't see it. Move on.
-
-ABSOLUTE RULE #3 — ONE ATTEMPT PER FIELD: You may type into a given field AT MOST ONCE. After you type a value and click elsewhere, that field is DONE. Do NOT go back and re-type. Even if the field appears empty after you typed, trust that your input was registered and move to the next field.
-
-ABSOLUTE RULE #4 — NO TAB KEY: NEVER press the Tab key to move between fields. Instead, after filling a field, CLICK on empty whitespace to deselect, then CLICK directly on the next field you want to fill. Tab can jump to the wrong field (e.g. Middle Name instead of Last Name).
-
-ABSOLUTE RULE #5 — NEVER NAVIGATE: Do NOT click "Save and Continue", "Next", "Submit", "Back", or any button that navigates to another page. When you are done filling visible fields, simply STOP taking actions. I handle all navigation myself.
-
-This is the "My Experience" page. Fill any EMPTY fields/sections that are FULLY visible on screen.
-
-IMPORTANT INTERACTION PATTERNS:
-1. "Add" BUTTONS: ONLY click "Add" under "Work Experience" and "Education" sections. Do NOT click "Add" under "Websites" or "Certifications" — those must stay empty. If the form fields are already expanded (you can see Job Title, Company, etc.), do NOT click Add again.
-2. DROPDOWNS (e.g. Degree): Click the dropdown button, then TYPE your desired value to filter the list, then click the matching option from the dropdown.
-3. TYPEAHEAD FIELDS (e.g. Field of Study, Skills): Type the value, WAIT 2-3 seconds for the autocomplete suggestions to load, then press Enter to select the first match.
-4. DATE FIELDS (MM/YYYY): The date has TWO boxes side by side — MM on the LEFT, YYYY on the RIGHT. Click on the LEFT box (MM) first. Then type the digits continuously (e.g. "012026"). Workday auto-advances from MM to YYYY. NEVER click on the right/YYYY box directly.
-5. CHECKBOXES: Click directly on the checkbox or its label text.
-6. After filling each field, CLICK on empty whitespace to deselect before moving to the next field.
-
-If ALL visible fields already have values, STOP IMMEDIATELY — do nothing.
-
-${dataBlock}`;
+    const fillPrompt = buildExperiencePrompt(dataBlock);
 
     // Custom scroll+LLM loop: ALWAYS invoke LLM each round because fields
     // are behind "Add" buttons that hasEmptyVisibleFields() can't detect.
@@ -952,28 +893,7 @@ ${dataBlock}`;
   ): Promise<void> {
     console.log('[WorkdayApply] Filling voluntary self-identification page...');
 
-    const fillPrompt = `ABSOLUTE RULE #1 — ZERO SCROLLING: You must NEVER scroll the page — not even 1 pixel. No mouse wheel, no scroll actions, no Page Down. I handle all scrolling myself.
-
-ABSOLUTE RULE #2 — FULLY VISIBLE ONLY: If ANY part of a field, dropdown button, question text, or input box is cut off at the top or bottom edge of the screen, it is NOT fully visible — DO NOT interact with it at all. Only touch fields where the ENTIRE element is within the viewport. When in doubt, skip it. IMPORTANT: if you already typed a value into a field but CANNOT see the text you typed (because the field is near the edge of the screen), DO NOT type again — the value is there, you just can't see it. Move on.
-
-ABSOLUTE RULE #3 — ONE ATTEMPT PER FIELD: You may type into a given field AT MOST ONCE. After you type a value and click elsewhere, that field is DONE. Do NOT go back and re-type. Even if the field appears empty after you typed, trust that your input was registered and move to the next field.
-
-ABSOLUTE RULE #4 — NO TAB KEY: NEVER press the Tab key to move between fields. Instead, after filling a field, CLICK on empty whitespace to deselect, then CLICK directly on the next field you want to fill. Tab can jump to the wrong field.
-
-ABSOLUTE RULE #5 — NEVER NAVIGATE: Do NOT click "Save and Continue", "Next", "Submit", "Back", or any button that navigates to another page. When you are done filling visible fields, simply STOP taking actions. I handle all navigation myself.
-
-This is a voluntary self-identification page. Fill any UNANSWERED questions that are FULLY visible on screen:
-1. If a dropdown already has an answer selected, SKIP IT.
-2. If empty: CLICK the dropdown, then TYPE the desired answer to filter:
-   - Gender → type "Male"
-   - Race/Ethnicity → type "Asian"
-   - Veteran Status → type "not a protected"
-   - Disability → type "do not wish"
-   The popup menu that appears ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions.
-3. If typing doesn't produce a match, click whitespace to close, re-click the dropdown, and try a shorter keyword. NEVER use arrow keys. NEVER mouse-scroll inside dropdowns.
-4. CHECKBOXES: If you see a required checkbox (e.g. "I acknowledge..." or Terms & Conditions), click on it to check it.
-
-If ALL visible questions already have answers, STOP IMMEDIATELY.`;
+    const fillPrompt = buildVoluntaryDisclosurePrompt();
 
     await this.fillWithSmartScroll(adapter, fillPrompt, 'voluntary disclosure');
   }
@@ -984,26 +904,7 @@ If ALL visible questions already have answers, STOP IMMEDIATELY.`;
   ): Promise<void> {
     console.log('[WorkdayApply] Filling self-identification page...');
 
-    const fillPrompt = `ABSOLUTE RULE #1 — ZERO SCROLLING: You must NEVER scroll the page — not even 1 pixel. No mouse wheel, no scroll actions, no Page Down. I handle all scrolling myself.
-
-ABSOLUTE RULE #2 — FULLY VISIBLE ONLY: If ANY part of a field, dropdown button, question text, or input box is cut off at the top or bottom edge of the screen, it is NOT fully visible — DO NOT interact with it at all. Only touch fields where the ENTIRE element is within the viewport. When in doubt, skip it. IMPORTANT: if you already typed a value into a field but CANNOT see the text you typed (because the field is near the edge of the screen), DO NOT type again — the value is there, you just can't see it. Move on.
-
-ABSOLUTE RULE #3 — ONE ATTEMPT PER FIELD: You may type into a given field AT MOST ONCE. After you type a value and click elsewhere, that field is DONE. Do NOT go back and re-type. Even if the field appears empty after you typed, trust that your input was registered and move to the next field.
-
-ABSOLUTE RULE #4 — NO TAB KEY: NEVER press the Tab key to move between fields. Instead, after filling a field, CLICK on empty whitespace to deselect, then CLICK directly on the next field you want to fill. Tab can jump to the wrong field.
-
-ABSOLUTE RULE #5 — NEVER NAVIGATE: Do NOT click "Save and Continue", "Next", "Submit", "Back", or any button that navigates to another page. When you are done filling visible fields, simply STOP taking actions. I handle all navigation myself.
-
-This is a self-identification page (often about disability status). Fill any UNANSWERED questions that are FULLY visible on screen:
-1. If a field/dropdown already has an answer selected, SKIP IT.
-2. If empty: CLICK the dropdown, then TYPE the desired answer to filter:
-   - Disability Status → type "do not wish"
-   - Any other question → type "Decline"
-   The popup menu that appears ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions.
-3. If typing doesn't produce a match, click whitespace to close, re-click the dropdown, and try a shorter keyword. NEVER use arrow keys. NEVER mouse-scroll inside dropdowns.
-4. CHECKBOXES: If you see a required checkbox (e.g. "I acknowledge..." or Terms & Conditions), click on it to check it.
-
-If ALL visible questions already have answers, STOP IMMEDIATELY.`;
+    const fillPrompt = buildSelfIdentifyPrompt();
 
     await this.fillWithSmartScroll(adapter, fillPrompt, 'self-identify');
   }
@@ -1014,25 +915,7 @@ If ALL visible questions already have answers, STOP IMMEDIATELY.`;
   ): Promise<void> {
     console.log('[WorkdayApply] Handling generic/unknown page...');
 
-    const fillPrompt = `ABSOLUTE RULE #1 — ZERO SCROLLING: You must NEVER scroll the page — not even 1 pixel. No mouse wheel, no scroll actions, no Page Down. I handle all scrolling myself.
-
-ABSOLUTE RULE #2 — FULLY VISIBLE ONLY: If ANY part of a field, dropdown button, question text, or input box is cut off at the top or bottom edge of the screen, it is NOT fully visible — DO NOT interact with it at all. Only touch fields where the ENTIRE element is within the viewport. When in doubt, skip it. IMPORTANT: if you already typed a value into a field but CANNOT see the text you typed (because the field is near the edge of the screen), DO NOT type again — the value is there, you just can't see it. Move on.
-
-ABSOLUTE RULE #3 — ONE ATTEMPT PER FIELD: You may type into a given field AT MOST ONCE. After you type a value and click elsewhere, that field is DONE. Do NOT go back and re-type. Even if the field appears empty after you typed, trust that your input was registered and move to the next field.
-
-ABSOLUTE RULE #4 — NO TAB KEY: NEVER press the Tab key to move between fields. Instead, after filling a field, CLICK on empty whitespace to deselect, then CLICK directly on the next field you want to fill. Tab can jump to the wrong field.
-
-ABSOLUTE RULE #5 — NEVER NAVIGATE: Do NOT click "Save and Continue", "Next", "Submit", "Back", or any button that navigates to another page. When you are done filling visible fields, simply STOP taking actions. I handle all navigation myself.
-
-Look at this page. Fill any EMPTY form fields that are FULLY visible, from top to bottom:
-1. If a field already has ANY value, SKIP IT — do not re-enter or "fix" it.
-2. If truly empty: CLICK the field, type/select the correct value, CLICK whitespace to deselect.
-3. DROPDOWNS: After clicking a dropdown, ALWAYS TYPE your desired answer first to filter the list, then click the match. The popup menu ALWAYS belongs to the dropdown you just clicked. NEVER use arrow keys. NEVER mouse-scroll inside dropdowns.
-4. CHECKBOXES: If you see a required checkbox (e.g. "I acknowledge..." or Terms & Conditions), click on it to check it.
-
-If ALL fields already have values or no form fields exist, STOP IMMEDIATELY.
-
-${dataPrompt}`;
+    const fillPrompt = buildGenericPagePrompt(dataPrompt);
 
     await this.fillWithSmartScroll(adapter, fillPrompt, 'generic');
   }
