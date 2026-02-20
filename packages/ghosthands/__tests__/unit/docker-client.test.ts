@@ -17,21 +17,22 @@ import {
   pruneImages,
   dockerClient,
   DockerApiError,
+  setFetchImpl,
   type ContainerCreateConfig,
   type ContainerInspect,
   type ContainerListItem,
-} from '../lib/docker-client';
+} from '../../../../scripts/lib/docker-client';
 
 /**
  * Mock Response object that mimics a standard Fetch Response.
  */
-class MockResponse {
+class MockResponse implements Partial<Response> {
   readonly ok: boolean;
   readonly status: number;
   readonly headers: Headers;
+  readonly body: ReadableStream | null;
   private _body: string | null;
   private _jsonBody: unknown;
-  private _streamBody: ReadableStream | null;
 
   constructor(
     options: { ok: boolean; status: number; body?: string | unknown; streamBody?: ReadableStream },
@@ -39,7 +40,7 @@ class MockResponse {
     this.ok = options.ok;
     this.status = options.status;
     this.headers = new Headers();
-    this._streamBody = options.streamBody ?? null;
+    this.body = options.streamBody ?? null;
 
     if (options.streamBody === undefined && typeof options.body === 'string') {
       this._body = options.body;
@@ -60,10 +61,6 @@ class MockResponse {
   async json(): Promise<unknown> {
     return this._jsonBody ?? JSON.parse(this._body ?? '{}');
   }
-
-  get body(): ReadableStream | null {
-    return this._streamBody;
-  }
 }
 
 // Track all fetch calls
@@ -79,13 +76,11 @@ const mockFetch = vi.fn<typeof fetch>(async (input, init = {}) => {
 beforeEach(() => {
   fetchCalls.length = 0;
   mockFetch.mockClear();
-  // @ts-expect-error — global fetch mocking
-  global.fetch = mockFetch;
+  setFetchImpl(mockFetch);
 });
 
 afterEach(() => {
-  // @ts-expect-error — restore global fetch
-  delete global.fetch;
+  setFetchImpl(fetch);
 });
 
 describe('pullImage', () => {
@@ -98,7 +93,7 @@ describe('pullImage', () => {
     });
 
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 200, streamBody: mockStream }) as unknown as Response,
+      new MockResponse({ ok: true, status: 200, streamBody: mockStream }) as Response,
     );
 
     await pullImage('alpine', 'latest');
@@ -116,7 +111,7 @@ describe('pullImage', () => {
     });
 
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 200, streamBody: mockStream }) as unknown as Response,
+      new MockResponse({ ok: true, status: 200, streamBody: mockStream }) as Response,
     );
 
     const auth = btoa(JSON.stringify({ username: 'user', password: 'pass' }));
@@ -139,7 +134,7 @@ describe('pullImage', () => {
     });
 
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 200, streamBody: mockStream }) as unknown as Response,
+      new MockResponse({ ok: true, status: 200, streamBody: mockStream }) as Response,
     );
 
     await expect(pullImage('alpine', 'latest')).resolves.not.toThrow();
@@ -151,7 +146,7 @@ describe('pullImage', () => {
         ok: false,
         status: 500,
         body: { message: 'Internal server error' },
-      }) as unknown as Response,
+      }) as Response,
     );
 
     await expect(pullImage('alpine', 'latest')).rejects.toThrow(DockerApiError);
@@ -166,7 +161,7 @@ describe('pullImage', () => {
     });
 
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 200, streamBody: mockStream }) as unknown as Response,
+      new MockResponse({ ok: true, status: 200, streamBody: mockStream }) as Response,
     );
 
     await pullImage('my.registry.com/my-image', 'special/tag');
@@ -179,7 +174,7 @@ describe('pullImage', () => {
 describe('stopContainer', () => {
   test('requests container stop', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 204, body: '' }) as unknown as Response,
+      new MockResponse({ ok: true, status: 204, body: '' }) as Response,
     );
 
     await stopContainer('my-container', 30);
@@ -191,7 +186,7 @@ describe('stopContainer', () => {
 
   test('uses default timeout of 30 seconds', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 204, body: '' }) as unknown as Response,
+      new MockResponse({ ok: true, status: 204, body: '' }) as Response,
     );
 
     await stopContainer('my-container');
@@ -201,7 +196,7 @@ describe('stopContainer', () => {
 
   test('ignores 304 (already stopped)', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: false, status: 304, body: '' }) as unknown as Response,
+      new MockResponse({ ok: false, status: 304, body: '' }) as Response,
     );
 
     await expect(stopContainer('my-container')).resolves.not.toThrow();
@@ -209,7 +204,7 @@ describe('stopContainer', () => {
 
   test('ignores 404 (container not found)', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: false, status: 404, body: { message: 'No such container' } }) as unknown as Response,
+      new MockResponse({ ok: false, status: 404, body: { message: 'No such container' } }) as Response,
     );
 
     await expect(stopContainer('my-container')).resolves.not.toThrow();
@@ -217,7 +212,7 @@ describe('stopContainer', () => {
 
   test('throws DockerApiError on other errors', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: false, status: 500, body: { message: 'Server error' } }) as unknown as Response,
+      new MockResponse({ ok: false, status: 500, body: { message: 'Server error' } }) as Response,
     );
 
     await expect(stopContainer('my-container')).rejects.toThrow(DockerApiError);
@@ -225,7 +220,7 @@ describe('stopContainer', () => {
 
   test('encodes container name correctly', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 204, body: '' }) as unknown as Response,
+      new MockResponse({ ok: true, status: 204, body: '' }) as Response,
     );
 
     await stopContainer('my/special-container');
@@ -237,7 +232,7 @@ describe('stopContainer', () => {
 describe('removeContainer', () => {
   test('requests container removal with force', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 204, body: '' }) as unknown as Response,
+      new MockResponse({ ok: true, status: 204, body: '' }) as Response,
     );
 
     await removeContainer('my-container');
@@ -249,7 +244,7 @@ describe('removeContainer', () => {
 
   test('ignores 404 (container not found)', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: false, status: 404, body: { message: 'No such container' } }) as unknown as Response,
+      new MockResponse({ ok: false, status: 404, body: { message: 'No such container' } }) as Response,
     );
 
     await expect(removeContainer('my-container')).resolves.not.toThrow();
@@ -257,7 +252,7 @@ describe('removeContainer', () => {
 
   test('throws DockerApiError on other errors', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: false, status: 409, body: { message: 'Conflict' } }) as unknown as Response,
+      new MockResponse({ ok: false, status: 409, body: { message: 'Conflict' } }) as Response,
     );
 
     await expect(removeContainer('my-container')).rejects.toThrow(DockerApiError);
@@ -290,7 +285,7 @@ describe('createContainer', () => {
         ok: true,
         status: 201,
         body: { Id: 'abc123def456' },
-      }) as unknown as Response,
+      }) as Response,
     );
 
     const containerId = await createContainer('test-container', mockConfig);
@@ -304,7 +299,7 @@ describe('createContainer', () => {
 
   test('sends config as JSON body', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 201, body: { Id: 'container-id' } }) as unknown as Response,
+      new MockResponse({ ok: true, status: 201, body: { Id: 'container-id' } }) as Response,
     );
 
     await createContainer('test-container', mockConfig);
@@ -319,7 +314,7 @@ describe('createContainer', () => {
 
   test('throws DockerApiError on failure', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: false, status: 500, body: { message: 'Create failed' } }) as unknown as Response,
+      new MockResponse({ ok: false, status: 500, body: { message: 'Create failed' } }) as Response,
     );
 
     await expect(createContainer('test-container', mockConfig)).rejects.toThrow(DockerApiError);
@@ -332,7 +327,7 @@ describe('createContainer', () => {
     };
 
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 201, body: { Id: 'minimal-id' } }) as unknown as Response,
+      new MockResponse({ ok: true, status: 201, body: { Id: 'minimal-id' } }) as Response,
     );
 
     const id = await createContainer('minimal', minimalConfig);
@@ -343,7 +338,7 @@ describe('createContainer', () => {
 describe('startContainer', () => {
   test('requests container start', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 204, body: '' }) as unknown as Response,
+      new MockResponse({ ok: true, status: 204, body: '' }) as Response,
     );
 
     await startContainer('my-container');
@@ -355,7 +350,7 @@ describe('startContainer', () => {
 
   test('ignores 304 (already running)', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: false, status: 304, body: '' }) as unknown as Response,
+      new MockResponse({ ok: false, status: 304, body: '' }) as Response,
     );
 
     await expect(startContainer('my-container')).resolves.not.toThrow();
@@ -363,7 +358,7 @@ describe('startContainer', () => {
 
   test('throws DockerApiError on failure', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: false, status: 500, body: { message: 'Start failed' } }) as unknown as Response,
+      new MockResponse({ ok: false, status: 500, body: { message: 'Start failed' } }) as Response,
     );
 
     await expect(startContainer('my-container')).rejects.toThrow(DockerApiError);
@@ -388,7 +383,7 @@ describe('inspectContainer', () => {
 
   test('requests container inspection', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 200, body: mockInspect }) as unknown as Response,
+      new MockResponse({ ok: true, status: 200, body: mockInspect }) as Response,
     );
 
     const result = await inspectContainer('my-container');
@@ -401,7 +396,7 @@ describe('inspectContainer', () => {
 
   test('throws DockerApiError on 404', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: false, status: 404, body: { message: 'No such container' } }) as unknown as Response,
+      new MockResponse({ ok: false, status: 404, body: { message: 'No such container' } }) as Response,
     );
 
     await expect(inspectContainer('nonexistent')).rejects.toThrow(DockerApiError);
@@ -409,7 +404,7 @@ describe('inspectContainer', () => {
 
   test('returns typed ContainerInspect', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 200, body: mockInspect }) as unknown as Response,
+      new MockResponse({ ok: true, status: 200, body: mockInspect }) as Response,
     );
 
     const result = await inspectContainer('my-container');
@@ -443,7 +438,7 @@ describe('listContainers', () => {
 
   test('requests container list', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 200, body: mockContainers }) as unknown as Response,
+      new MockResponse({ ok: true, status: 200, body: mockContainers }) as Response,
     );
 
     const result = await listContainers();
@@ -456,7 +451,7 @@ describe('listContainers', () => {
 
   test('includes stopped containers when all=true', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 200, body: mockContainers }) as unknown as Response,
+      new MockResponse({ ok: true, status: 200, body: mockContainers }) as Response,
     );
 
     await listContainers(true);
@@ -466,7 +461,7 @@ describe('listContainers', () => {
 
   test('excludes stopped containers by default', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 200, body: [] }) as unknown as Response,
+      new MockResponse({ ok: true, status: 200, body: [] }) as Response,
     );
 
     await listContainers();
@@ -476,7 +471,7 @@ describe('listContainers', () => {
 
   test('returns empty array when no containers', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 200, body: [] }) as unknown as Response,
+      new MockResponse({ ok: true, status: 200, body: [] }) as Response,
     );
 
     const result = await listContainers();
@@ -487,7 +482,7 @@ describe('listContainers', () => {
 describe('pruneImages', () => {
   test('requests image prune', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 200, body: { SpaceReclaimed: 1024 * 1024 } }) as unknown as Response,
+      new MockResponse({ ok: true, status: 200, body: { SpaceReclaimed: 1024 * 1024 } }) as Response,
     );
 
     const result = await pruneImages();
@@ -501,7 +496,7 @@ describe('pruneImages', () => {
 
   test('handles missing SpaceReclaimed', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: true, status: 200, body: {} }) as unknown as Response,
+      new MockResponse({ ok: true, status: 200, body: {} }) as Response,
     );
 
     const result = await pruneImages();
@@ -510,7 +505,7 @@ describe('pruneImages', () => {
 
   test('throws DockerApiError on failure', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: false, status: 500, body: { message: 'Prune failed' } }) as unknown as Response,
+      new MockResponse({ ok: false, status: 500, body: { message: 'Prune failed' } }) as Response,
     );
 
     await expect(pruneImages()).rejects.toThrow(DockerApiError);
@@ -548,7 +543,7 @@ describe('DockerApiError', () => {
 describe('error handling for various status codes', () => {
   const setupMock = (status: number, body: unknown = { message: 'Error' }) => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: status < 300, status, body }) as unknown as Response,
+      new MockResponse({ ok: status < 300, status, body }) as Response,
     );
   };
 
@@ -570,7 +565,7 @@ describe('error handling for various status codes', () => {
 
   test('handles non-JSON error response', async () => {
     mockFetch.mockResolvedValueOnce(
-      new MockResponse({ ok: false, status: 500, body: 'Plain text error' }) as unknown as Response,
+      new MockResponse({ ok: false, status: 500, body: 'Plain text error' }) as Response,
     );
 
     await expect(listContainers()).rejects.toThrow(DockerApiError);

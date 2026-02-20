@@ -38,6 +38,10 @@
         "vitest": "^4.0.18",
       },
     },
+    "scripts": {
+      "name": "@wekruit/scripts",
+      "version": "1.0.0",
+    },
   },
   "packages": {
     "@actionbookdev/sdk": ["@actionbookdev/sdk@0.3.0", "", { "dependencies": { "zod": "^3.25.6", "zod-to-json-schema": "^3.22.5" } }, "sha512-xZI+dXDN+ogI2fG6A/nEahsQankRVokwWKHYbKh2Jcyv4oomubwo1Ck8y6Xwj3kkESCmAB31v5/fN5Nld2Q8JA=="],
@@ -485,6 +489,8 @@
     "@vitest/spy": ["@vitest/spy@4.0.18", "", {}, "sha512-cbQt3PTSD7P2OARdVW3qWER5EGq7PHlvE+QfzSC0lbwO+xnt7+XH06ZzFjFRgzUX//JmpxrCu92VdwvEPlWSNw=="],
 
     "@vitest/utils": ["@vitest/utils@4.0.18", "", { "dependencies": { "@vitest/pretty-format": "4.0.18", "tinyrainbow": "^3.0.3" } }, "sha512-msMRKLMVLWygpK3u2Hybgi4MNjcYJvwTb0Ru09+fOyCXIgT5raYP041DRRdiJiI3k/2U6SEbAETB3YtBrUkCFA=="],
+
+    "@wekruit/scripts": ["@wekruit/scripts@workspace:scripts"],
 
     "abort-controller": ["abort-controller@3.0.0", "", { "dependencies": { "event-target-shim": "^5.0.0" } }, "sha512-h8lQ8tacZYnR3vNQTgibj+tODHI5/+l06Au2Pcriv/Gmet0eaj4TwWH41sO9wnHDiQsEj19q0drzdWdeAHtweg=="],
 
