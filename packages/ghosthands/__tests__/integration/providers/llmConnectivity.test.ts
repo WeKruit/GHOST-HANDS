@@ -301,23 +301,10 @@ describe('LLM provider connectivity', () => {
 
       // TLS tests do NOT require an API key -- they only verify the
       // SSL certificate chain is valid and the server is reachable.
-      // Providers that are unreachable (geo-restricted, DNS failure, etc.)
-      // are logged as warnings rather than test failures.
       test(
         `${provider.name} (${host}:${port}) — TLS handshake succeeds`,
         async () => {
-          let result;
-          try {
-            result = await tlsHandshake(host, port);
-          } catch (err) {
-            const msg = (err as Error).message || String(err);
-            console.warn(
-              `    ⚠ ${host}:${port} — TLS handshake failed (skipping): ${msg}`,
-            );
-            // Network-level failures (unreachable host, DNS, timeout) are
-            // not test failures — the provider may be geo-restricted or down.
-            return;
-          }
+          const result = await tlsHandshake(host, port);
 
           // The server's certificate must be authorized by the system CA store
           expect(result.authorized).toBe(true);
@@ -364,15 +351,7 @@ describe('LLM provider connectivity', () => {
     test(
       'TLS handshake completes with authorized=true',
       async () => {
-        let result;
-        try {
-          result = await tlsHandshake(SF_HOST, SF_PORT);
-        } catch (err) {
-          console.warn(
-            `    ⚠ ${SF_HOST}:${SF_PORT} — TLS handshake failed (skipping): ${(err as Error).message}`,
-          );
-          return;
-        }
+        const result = await tlsHandshake(SF_HOST, SF_PORT);
         expect(result.authorized).toBe(true);
       },
       NETWORK_TIMEOUT_MS + 5_000,
@@ -382,54 +361,50 @@ describe('LLM provider connectivity', () => {
       'certificate is trusted and matches hostname',
       async () => {
         // Use a raw TLS socket to inspect the peer certificate.
-        let certInfo;
-        try {
-          certInfo = await new Promise<{
-            authorized: boolean;
-            subject: Record<string, string> | null;
-            altNames: string;
-            issuer: Record<string, string> | null;
-            fingerprint256: string;
-          }>(
-            (resolve, reject) => {
-              const socket = tls.connect(
-                {
-                  host: SF_HOST,
-                  port: SF_PORT,
-                  rejectUnauthorized: true,
-                  servername: SF_HOST,
-                  timeout: NETWORK_TIMEOUT_MS,
-                  checkServerIdentity: (hostname: string, cert: tls.PeerCertificate) => {
-                    if (!cert || !cert.subject) return undefined;
-                    return tls.checkServerIdentity(hostname, cert);
-                  },
+        // Note: Bun's TLS implementation does not always populate the full
+        // issuerCertificate chain (unlike Node.js). The primary trust signal
+        // is socket.authorized == true from the handshake test above.
+        // Here we verify the leaf certificate identity.
+        const certInfo = await new Promise<{
+          authorized: boolean;
+          subject: Record<string, string> | null;
+          altNames: string;
+          issuer: Record<string, string> | null;
+          fingerprint256: string;
+        }>(
+          (resolve, reject) => {
+            const socket = tls.connect(
+              {
+                host: SF_HOST,
+                port: SF_PORT,
+                rejectUnauthorized: true,
+                servername: SF_HOST,
+                timeout: NETWORK_TIMEOUT_MS,
+                checkServerIdentity: (hostname: string, cert: tls.PeerCertificate) => {
+                  if (!cert || !cert.subject) return undefined;
+                  return tls.checkServerIdentity(hostname, cert);
                 },
-                () => {
-                  const peerCert = socket.getPeerCertificate(true);
-                  const result = {
-                    authorized: socket.authorized,
-                    subject: peerCert?.subject ?? null,
-                    altNames: peerCert?.subjectaltname ?? '',
-                    issuer: peerCert?.issuer ?? null,
-                    fingerprint256: peerCert?.fingerprint256 ?? '',
-                  };
-                  socket.end();
-                  resolve(result);
-                },
-              );
-              socket.on('error', reject);
-              socket.on('timeout', () => {
-                socket.destroy();
-                reject(new Error('TLS timeout'));
-              });
-            },
-          );
-        } catch (err) {
-          console.warn(
-            `    ⚠ ${SF_HOST}:${SF_PORT} — cert check failed (skipping): ${(err as Error).message}`,
-          );
-          return;
-        }
+              },
+              () => {
+                const peerCert = socket.getPeerCertificate(true);
+                const result = {
+                  authorized: socket.authorized,
+                  subject: peerCert?.subject ?? null,
+                  altNames: peerCert?.subjectaltname ?? '',
+                  issuer: peerCert?.issuer ?? null,
+                  fingerprint256: peerCert?.fingerprint256 ?? '',
+                };
+                socket.end();
+                resolve(result);
+              },
+            );
+            socket.on('error', reject);
+            socket.on('timeout', () => {
+              socket.destroy();
+              reject(new Error('TLS timeout'));
+            });
+          },
+        );
 
         // Connection must be authorized by the system CA store
         expect(certInfo.authorized).toBe(true);
@@ -488,10 +463,6 @@ describe('LLM provider connectivity', () => {
 
           console.log(
             `    GET ${url} -> HTTP ${res.status} (TLS OK)`,
-          );
-        } catch (err) {
-          console.warn(
-            `    ⚠ ${url} — HTTPS fetch failed (skipping): ${(err as Error).message}`,
           );
         } finally {
           clearTimeout(timeout);
