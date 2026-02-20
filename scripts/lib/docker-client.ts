@@ -313,7 +313,7 @@ export async function removeContainer(nameOrId: string): Promise<void> {
   const path = `/containers/${encodeURIComponent(nameOrId)}?force=true&v=true`;
 
   const response = await dockerFetch(path, {
-    method: 'POST',
+    method: 'DELETE',
   });
 
   // Ignore 404 (doesn't exist)
