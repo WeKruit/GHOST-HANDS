@@ -17,6 +17,7 @@ COPY package.json bun.lock turbo.json ./
 
 # Copy package.json for workspace resolution
 COPY packages/ghosthands/package.json packages/ghosthands/
+COPY scripts/package.json scripts/
 
 # Install dependencies (magnitude-core and magnitude-extract come from npm)
 RUN bun install --frozen-lockfile
@@ -26,6 +27,7 @@ FROM deps AS build
 
 # Copy source
 COPY packages/ packages/
+COPY scripts/ scripts/
 COPY tsconfig.base.json ./
 
 # Build
