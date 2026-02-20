@@ -551,101 +551,15 @@ export class JobExecutor {
 
       // 9a. Wire up event tracking with cost control + progress for Magnitude path
       const thoughtThrottle = new ThoughtThrottle(2000);
-
-      adapter.on('thought', (thought: string) => {
-        progress.recordThought(thought);
-        if (thoughtThrottle.shouldEmit()) {
-          this.logJobEvent(job.id, JOB_EVENT_TYPES.THOUGHT, {
-            content: thought.slice(0, 500),
-          });
-        }
-      });
-
-      // Track state for periodic blocker checks, URL monitoring, and failure escalation
-      let lastBlockerCheckTime = Date.now();
-      let consecutiveActionFailures = 0;
       const targetDomain = new URL(job.target_url).hostname;
-      let lastKnownUrl = job.target_url;
+      const blockerState = {
+        lastCheckTime: Date.now(),
+        consecutiveFailures: 0,
+        lastKnownUrl: job.target_url,
+      };
 
-      adapter.on('actionStarted', async (action: { variant: string }) => {
-        // Track consecutive failures: incremented on start, reset on actionDone
-        consecutiveActionFailures++;
-        costTracker.recordAction(); // throws ActionLimitExceededError if over limit
-        costTracker.recordModeStep('magnitude');
-        progress.onActionStarted(action.variant);
-        this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_STARTED, {
-          action: action.variant,
-          action_count: costTracker.getSnapshot().actionCount,
-        });
-
-        // If repeated action failures, check for blockers before continuing
-        if (consecutiveActionFailures >= CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK && adapter) {
-          try {
-            const blocked = await this.checkForBlockers(job, adapter, costTracker);
-            if (blocked) {
-              // HITL handled — the blocker was likely the root cause of failures
-            }
-          } catch {
-            // Non-fatal
-          }
-        }
-      });
-
-      adapter.on('actionDone', async (action: { variant: string }) => {
-        progress.onActionDone(action.variant);
-        consecutiveActionFailures = 0; // Reset on successful action
-        this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
-          action: action.variant,
-          action_count: costTracker.getSnapshot().actionCount,
-        });
-
-        // Periodic blocker check after actions (throttled)
-        const now = Date.now();
-        if (now - lastBlockerCheckTime >= BLOCKER_CHECK_INTERVAL_MS) {
-          lastBlockerCheckTime = now;
-          try {
-            // URL change detection — check if page navigated to a non-target domain
-            const currentUrl = await adapter!.getCurrentUrl();
-            if (currentUrl !== lastKnownUrl) {
-              lastKnownUrl = currentUrl;
-              try {
-                const currentDomain = new URL(currentUrl).hostname;
-                if (currentDomain !== targetDomain) {
-                  await this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
-                    from_domain: targetDomain,
-                    to_url: currentUrl,
-                  });
-                }
-              } catch {
-                // Invalid URL — skip domain comparison
-              }
-            }
-
-            // Use detectBlocker (DOM-only) for speed, not detectWithAdapter (which calls observe/LLM)
-            const blocked = await this.checkForBlockers(job, adapter!, costTracker);
-            if (blocked) {
-              // checkForBlockers already handled HITL flow internally
-            }
-          } catch (err) {
-            if ((err as Error).message?.includes('Blocker detected')) throw err;
-            // Detection errors are non-fatal
-          }
-        }
-      });
-
-      adapter.on('tokensUsed', (usage: TokenUsage) => {
-        costTracker.recordTokenUsage({
-          inputTokens: usage.inputTokens,
-          outputTokens: usage.outputTokens,
-          inputCost: usage.inputCost,
-          outputCost: usage.outputCost,
-        }); // throws BudgetExceededError if over budget
-        this.logJobEvent(job.id, JOB_EVENT_TYPES.TOKENS_USED, {
-          model: (usage as any).model || 'unknown',
-          input_tokens: usage.inputTokens,
-          output_tokens: usage.outputTokens,
-          cost_usd: usage.inputCost + usage.outputCost,
-        });
+      this.wireAdapterEvents(adapter, {
+        job, costTracker, progress, thoughtThrottle, blockerState, targetDomain,
       });
 
       // Start periodic blocker check timer (catches blockers even when adapter is stuck)
@@ -742,89 +656,12 @@ export class JobExecutor {
 
           // Re-wire event handlers on the new adapter
           thoughtThrottle.reset();
-          adapter.on('thought', (thought: string) => {
-            progress.recordThought(thought);
-            if (thoughtThrottle.shouldEmit()) {
-              this.logJobEvent(job.id, JOB_EVENT_TYPES.THOUGHT, {
-                content: thought.slice(0, 500),
-              });
-            }
-          });
-          adapter.on('actionStarted', async (action: { variant: string }) => {
-            consecutiveActionFailures++;
-            costTracker.recordAction();
-            progress.onActionStarted(action.variant);
-            this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_STARTED, {
-              action: action.variant,
-              action_count: costTracker.getSnapshot().actionCount,
-            });
+          blockerState.lastCheckTime = Date.now();
+          blockerState.consecutiveFailures = 0;
+          blockerState.lastKnownUrl = job.target_url;
 
-            if (consecutiveActionFailures >= CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK && adapter) {
-              try {
-                const blocked = await this.checkForBlockers(job, adapter, costTracker);
-                if (blocked) {
-                  // HITL handled
-                }
-              } catch {
-                // Non-fatal
-              }
-            }
-          });
-          // Reset blocker check state after crash recovery
-          lastBlockerCheckTime = Date.now();
-          consecutiveActionFailures = 0;
-          lastKnownUrl = job.target_url;
-
-          adapter.on('actionDone', async (action: { variant: string }) => {
-            progress.onActionDone(action.variant);
-            consecutiveActionFailures = 0;
-            this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
-              action: action.variant,
-              action_count: costTracker.getSnapshot().actionCount,
-            });
-
-            // Periodic blocker check after actions (throttled)
-            const now = Date.now();
-            if (now - lastBlockerCheckTime >= BLOCKER_CHECK_INTERVAL_MS) {
-              lastBlockerCheckTime = now;
-              try {
-                const currentUrl = await adapter!.getCurrentUrl();
-                if (currentUrl !== lastKnownUrl) {
-                  lastKnownUrl = currentUrl;
-                  try {
-                    const currentDomain = new URL(currentUrl).hostname;
-                    if (currentDomain !== targetDomain) {
-                      await this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
-                        from_domain: targetDomain,
-                        to_url: currentUrl,
-                      });
-                    }
-                  } catch {
-                    // Invalid URL — skip domain comparison
-                  }
-                }
-                const blocked = await this.checkForBlockers(job, adapter!, costTracker);
-                if (blocked) {
-                  // checkForBlockers already handled HITL flow
-                }
-              } catch (err) {
-                if ((err as Error).message?.includes('Blocker detected')) throw err;
-              }
-            }
-          });
-          adapter.on('tokensUsed', (usage: TokenUsage) => {
-            costTracker.recordTokenUsage({
-              inputTokens: usage.inputTokens,
-              outputTokens: usage.outputTokens,
-              inputCost: usage.inputCost,
-              outputCost: usage.outputCost,
-            });
-            this.logJobEvent(job.id, JOB_EVENT_TYPES.TOKENS_USED, {
-              model: (usage as any).model || 'unknown',
-              input_tokens: usage.inputTokens,
-              output_tokens: usage.outputTokens,
-              cost_usd: usage.inputCost + usage.outputCost,
-            });
+          this.wireAdapterEvents(adapter, {
+            job, costTracker, progress, thoughtThrottle, blockerState, targetDomain,
           });
 
           await this.logJobEvent(job.id, 'browser_crash_recovered', {
@@ -1215,6 +1052,104 @@ export class JobExecutor {
         })
         .eq('id', job.id);
     }
+  }
+
+  // --- Adapter Event Wiring ---
+
+  /**
+   * Wire adapter event handlers for cost tracking, progress, and blocker detection.
+   * Used both for initial Magnitude-path setup and after crash recovery.
+   */
+  private wireAdapterEvents(
+    adapter: BrowserAutomationAdapter,
+    opts: {
+      job: AutomationJob;
+      costTracker: CostTracker;
+      progress: ProgressTracker;
+      thoughtThrottle: ThoughtThrottle;
+      blockerState: { lastCheckTime: number; consecutiveFailures: number; lastKnownUrl: string };
+      targetDomain: string;
+    },
+  ): void {
+    const { job, costTracker, progress, thoughtThrottle, blockerState, targetDomain } = opts;
+
+    adapter.on('thought', (thought: string) => {
+      progress.recordThought(thought);
+      if (thoughtThrottle.shouldEmit()) {
+        this.logJobEvent(job.id, JOB_EVENT_TYPES.THOUGHT, {
+          content: thought.slice(0, 500),
+        });
+      }
+    });
+
+    adapter.on('actionStarted', async (action: { variant: string }) => {
+      blockerState.consecutiveFailures++;
+      costTracker.recordAction(); // throws ActionLimitExceededError if over limit
+      costTracker.recordModeStep('magnitude');
+      progress.onActionStarted(action.variant);
+      this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_STARTED, {
+        action: action.variant,
+        action_count: costTracker.getSnapshot().actionCount,
+      });
+
+      if (blockerState.consecutiveFailures >= CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK && adapter) {
+        try {
+          await this.checkForBlockers(job, adapter, costTracker);
+        } catch {
+          // Non-fatal
+        }
+      }
+    });
+
+    adapter.on('actionDone', async (action: { variant: string }) => {
+      progress.onActionDone(action.variant);
+      blockerState.consecutiveFailures = 0;
+      this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
+        action: action.variant,
+        action_count: costTracker.getSnapshot().actionCount,
+      });
+
+      const now = Date.now();
+      if (now - blockerState.lastCheckTime >= BLOCKER_CHECK_INTERVAL_MS) {
+        blockerState.lastCheckTime = now;
+        try {
+          const currentUrl = await adapter.getCurrentUrl();
+          if (currentUrl !== blockerState.lastKnownUrl) {
+            blockerState.lastKnownUrl = currentUrl;
+            try {
+              const currentDomain = new URL(currentUrl).hostname;
+              if (currentDomain !== targetDomain) {
+                await this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
+                  from_domain: targetDomain,
+                  to_url: currentUrl,
+                });
+              }
+            } catch {
+              // Invalid URL — skip domain comparison
+            }
+          }
+          await this.checkForBlockers(job, adapter, costTracker);
+        } catch (err) {
+          if ((err as Error).message?.includes('Blocker detected')) throw err;
+          // Detection errors are non-fatal
+        }
+      }
+    });
+
+    adapter.on('tokensUsed', (usage: TokenUsage) => {
+      costTracker.recordTokenUsage({
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        inputCost: usage.inputCost,
+        outputCost: usage.outputCost,
+      }); // throws BudgetExceededError if over budget
+      this.logJobEvent(job.id, JOB_EVENT_TYPES.TOKENS_USED, {
+        model: (usage as any).model || 'unknown',
+        input_tokens: usage.inputTokens,
+        output_tokens: usage.outputTokens,
+        cost_usd: usage.inputCost + usage.outputCost,
+      });
+    });
   }
 
   // --- Blocker Detection ---
