@@ -167,6 +167,98 @@ describe('BlockerDetector', () => {
     });
   });
 
+  // ── Audio CAPTCHA detection ───────────────────────────────────────
+
+  describe('audio CAPTCHA detection', () => {
+    test('detects .rc-audiochallenge selector', async () => {
+      const page = createMockPage(
+        { '.rc-audiochallenge': { visible: true } },
+      );
+      const result = await detector.detectBlocker(page);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('captcha');
+      expect(result!.confidence).toBe(0.95);
+      expect(result!.selector).toBe('.rc-audiochallenge');
+    });
+
+    test('detects #audio-source selector', async () => {
+      const page = createMockPage(
+        { '#audio-source': { visible: true } },
+      );
+      const result = await detector.detectBlocker(page);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('captcha');
+      expect(result!.confidence).toBe(0.9);
+    });
+
+    test('detects audio[src*="captcha"] selector', async () => {
+      const page = createMockPage(
+        { 'audio[src*="captcha"]': { visible: true } },
+      );
+      const result = await detector.detectBlocker(page);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('captcha');
+      expect(result!.confidence).toBe(0.85);
+    });
+
+    test('detects button[aria-label*="audio"] selector (lower confidence)', async () => {
+      const page = createMockPage(
+        { 'button[aria-label*="audio"]': { visible: true } },
+      );
+      const result = await detector.detectBlocker(page);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('captcha');
+      expect(result!.confidence).toBe(0.7);
+    });
+
+    test('detects "press play and type what you hear" text', async () => {
+      const page = createMockPage({}, 'Press play and type what you hear.');
+      const result = await detector.detectBlocker(page);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('captcha');
+      expect(result!.confidence).toBe(0.9);
+    });
+
+    test('detects "listen and type the numbers" text', async () => {
+      const page = createMockPage({}, 'Listen and type the numbers you hear.');
+      const result = await detector.detectBlocker(page);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('captcha');
+      expect(result!.confidence).toBe(0.9);
+    });
+
+    test('detects "audio challenge" text as captcha', async () => {
+      const page = createMockPage({}, 'Complete the audio challenge to continue.');
+      const result = await detector.detectBlocker(page);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('captcha');
+      expect(result!.confidence).toBe(0.85);
+    });
+
+    test('detects "switch to audio" text (lower confidence)', async () => {
+      const page = createMockPage({}, 'Switch to audio if you cannot solve the visual challenge.');
+      const result = await detector.detectBlocker(page);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('captcha');
+      expect(result!.confidence).toBe(0.7);
+    });
+
+    test('does NOT false-positive on regular audio elements', async () => {
+      const page = createMockPage({}, 'Listen to our company podcast. Play audio interview with CEO.');
+      const result = await detector.detectBlocker(page);
+
+      expect(result).toBeNull();
+    });
+  });
+
   // ── Login detection ─────────────────────────────────────────────────
 
   describe('login detection', () => {
@@ -357,6 +449,37 @@ describe('BlockerDetector', () => {
 
       expect(result).not.toBeNull();
       expect(result!.confidence).toBe(0.8);
+    });
+  });
+
+  // ── Observe classification: audio CAPTCHA ─────────────────────────
+
+  describe('classifyObservedElements — audio CAPTCHA', () => {
+    test('classifies "audio challenge" observed element as captcha', () => {
+      const result = detector.classifyObservedElements([
+        { description: 'Audio challenge play button', selector: '#recaptcha-audio-button', method: 'click', arguments: [] },
+      ]);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('captcha');
+    });
+
+    test('classifies "press play type" observed element as captcha', () => {
+      const result = detector.classifyObservedElements([
+        { description: 'Press play and type what you hear', selector: '.rc-audiochallenge-instructions', method: 'click', arguments: [] },
+      ]);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('captcha');
+    });
+
+    test('classifies "listen type numbers" observed element as captcha', () => {
+      const result = detector.classifyObservedElements([
+        { description: 'Listen and type the numbers', selector: '.audio-captcha-prompt', method: 'click', arguments: [] },
+      ]);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe('captcha');
     });
   });
 });
