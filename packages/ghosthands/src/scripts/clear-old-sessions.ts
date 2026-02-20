@@ -7,7 +7,7 @@
  */
 import { createClient } from '@supabase/supabase-js';
 
-const TEST_USER_ID = '00000000-0000-0000-0000-000000000001';
+const TEST_USER_ID = process.env.GH_TEST_USER_ID || '00000000-0000-0000-0000-000000000001';
 
 async function main() {
   const supabaseUrl = process.env.SUPABASE_URL;

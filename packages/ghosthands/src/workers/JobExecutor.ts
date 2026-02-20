@@ -54,6 +54,7 @@ const ERROR_CLASSIFICATIONS: Array<{ pattern: RegExp; code: string }> = [
   { pattern: /budget.?exceeded/i, code: 'budget_exceeded' },
   { pattern: /action.?limit.?exceeded/i, code: 'action_limit_exceeded' },
   { pattern: /captcha/i, code: 'captcha_blocked' },
+  { pattern: /2fa|two.?factor|verification code|authenticator/i, code: '2fa_required' },
   { pattern: /login|sign.?in/i, code: 'login_required' },
   { pattern: /timeout/i, code: 'timeout' },
   { pattern: /rate.?limit/i, code: 'rate_limited' },
@@ -85,6 +86,7 @@ const CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK = 3; // Check for blockers after
 const HITL_ELIGIBLE_ERRORS = new Set([
   'captcha_blocked',
   'login_required',
+  '2fa_required',
 ]);
 
 // --- Platform detection ---
@@ -1085,7 +1087,7 @@ export class JobExecutor {
             // Blocker resolved (or detection didn't find one after error classification).
             // Try direct HITL as fallback since the error was classified as captcha/login.
             const resumed = await this.requestHumanIntervention(job, adapter, {
-              type: errorCode === 'captcha_blocked' ? 'captcha' : 'login',
+              type: errorCode === 'captcha_blocked' ? 'captcha' : errorCode === '2fa_required' ? '2fa' : 'login',
               confidence: 0.9,
               details: errorMessage,
               source: 'dom',

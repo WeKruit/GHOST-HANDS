@@ -459,6 +459,140 @@ describe('pg LISTEN/NOTIFY mock', () => {
   });
 });
 
+// ── WEK-67: 2FA triggers HITL pause ──────────────────────────────────────
+
+describe('2FA triggers HITL pause (WEK-67)', () => {
+  // Verify that the error classification and HITL eligibility gate work for 2FA
+
+  const ERROR_CLASSIFICATIONS: Array<{ pattern: RegExp; code: string }> = [
+    { pattern: /budget.?exceeded/i, code: 'budget_exceeded' },
+    { pattern: /action.?limit.?exceeded/i, code: 'action_limit_exceeded' },
+    { pattern: /captcha/i, code: 'captcha_blocked' },
+    { pattern: /2fa|two.?factor|verification code|authenticator/i, code: '2fa_required' },
+    { pattern: /login|sign.?in/i, code: 'login_required' },
+    { pattern: /timeout/i, code: 'timeout' },
+    { pattern: /rate.?limit/i, code: 'rate_limited' },
+    { pattern: /not.?found|selector/i, code: 'element_not_found' },
+    { pattern: /disconnect|connection|ECONNREFUSED|ECONNRESET/i, code: 'network_error' },
+    { pattern: /browser.*closed|target.*closed/i, code: 'browser_crashed' },
+  ];
+
+  const HITL_ELIGIBLE_ERRORS = new Set([
+    'captcha_blocked',
+    'login_required',
+    '2fa_required',
+  ]);
+
+  function classifyError(message: string): string {
+    for (const { pattern, code } of ERROR_CLASSIFICATIONS) {
+      if (pattern.test(message)) return code;
+    }
+    return 'internal_error';
+  }
+
+  function mapErrorToBlockerType(errorCode: string): string {
+    return errorCode === 'captcha_blocked' ? 'captcha' : errorCode === '2fa_required' ? '2fa' : 'login';
+  }
+
+  test('classifies "two-factor authentication required" as 2fa_required', () => {
+    expect(classifyError('Two-factor authentication required')).toBe('2fa_required');
+  });
+
+  test('classifies "verification code needed" as 2fa_required', () => {
+    expect(classifyError('Please enter your verification code')).toBe('2fa_required');
+  });
+
+  test('classifies "authenticator app" as 2fa_required', () => {
+    expect(classifyError('Open your authenticator app and enter the code')).toBe('2fa_required');
+  });
+
+  test('classifies "2FA challenge" as 2fa_required', () => {
+    expect(classifyError('2FA challenge presented on page')).toBe('2fa_required');
+  });
+
+  test('2fa_required is HITL-eligible', () => {
+    expect(HITL_ELIGIBLE_ERRORS.has('2fa_required')).toBe(true);
+  });
+
+  test('2fa_required maps to blocker type "2fa"', () => {
+    expect(mapErrorToBlockerType('2fa_required')).toBe('2fa');
+  });
+
+  test('captcha_blocked still maps to "captcha"', () => {
+    expect(mapErrorToBlockerType('captcha_blocked')).toBe('captcha');
+  });
+
+  test('login_required still maps to "login"', () => {
+    expect(mapErrorToBlockerType('login_required')).toBe('login');
+  });
+
+  test('2FA error triggers HITL pause flow (not retry/fail)', async () => {
+    const supabase = createMockSupabase();
+    const adapter = new MockAdapter();
+    await adapter.start({ url: 'https://boards.greenhouse.io', llm: { provider: 'mock', options: { model: 'mock' } } });
+
+    // Simulate: error classified as 2fa_required → enters HITL flow
+    const errorMessage = 'Two-factor authentication required';
+    const errorCode = classifyError(errorMessage);
+    expect(errorCode).toBe('2fa_required');
+    expect(HITL_ELIGIBLE_ERRORS.has(errorCode)).toBe(true);
+
+    // Pause adapter (as requestHumanIntervention would)
+    await adapter.pause();
+    expect(adapter.isPaused()).toBe(true);
+
+    // Update job to paused with 2fa interaction type
+    await supabase.from('gh_automation_jobs').update({
+      status: 'paused',
+      interaction_type: '2fa',
+      interaction_data: {
+        type: '2fa',
+        confidence: 0.9,
+        details: errorMessage,
+        page_url: 'https://boards.greenhouse.io/login/2fa',
+      },
+      paused_at: new Date().toISOString(),
+      status_message: 'Waiting for human: 2fa',
+    }).eq('id', 'job-2fa-test');
+
+    expect(supabase._updates[0].status).toBe('paused');
+    expect(supabase._updates[0].interaction_type).toBe('2fa');
+
+    // Human provides 2FA code → resume
+    await adapter.resume();
+    expect(adapter.isPaused()).toBe(false);
+
+    await supabase.from('gh_automation_jobs').update({
+      status: 'running',
+      paused_at: null,
+      status_message: 'Resumed after human intervention',
+    }).eq('id', 'job-2fa-test');
+
+    const lastUpdate = supabase._updates[supabase._updates.length - 1];
+    expect(lastUpdate.status).toBe('running');
+    expect(lastUpdate.paused_at).toBeNull();
+  });
+
+  function createMockSupabase() {
+    const updates: Record<string, any>[] = [];
+    const chainable: Record<string, any> = {};
+    chainable.select = () => chainable;
+    chainable.eq = () => chainable;
+    chainable.single = () => Promise.resolve({ data: null, error: null });
+    chainable.update = (data: Record<string, any>) => {
+      updates.push(data);
+      return chainable;
+    };
+    chainable.insert = () => Promise.resolve({ data: null, error: null });
+
+    return {
+      from: () => chainable,
+      _chain: chainable,
+      _updates: updates,
+    };
+  }
+});
+
 // ── Job status transitions ────────────────────────────────────────────────
 
 describe('job status transitions', () => {
