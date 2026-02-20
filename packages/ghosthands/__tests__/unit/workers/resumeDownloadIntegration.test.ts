@@ -35,21 +35,24 @@ describe('ResumeDownloader', () => {
 
   test('downloads from a URL and returns a local file path', async () => {
     // Mock global fetch
+    const originalFetch = globalThis.fetch;
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       headers: new Headers({ 'content-type': 'application/pdf', 'content-length': '100' }),
       arrayBuffer: () => Promise.resolve(Buffer.from('fake-pdf-content').buffer),
     });
-    vi.stubGlobal('fetch', mockFetch);
+    globalThis.fetch = mockFetch;
 
-    const result = await downloader.download(
-      { download_url: 'https://example.com/resumes/resume.pdf' },
-      'job-def'
-    );
-    expect(result).toMatch(/job-def.*\.pdf$/);
-
-    vi.unstubAllGlobals();
-    await downloader.cleanup(result);
+    try {
+      const result = await downloader.download(
+        { download_url: 'https://example.com/resumes/resume.pdf' },
+        'job-def'
+      );
+      expect(result).toMatch(/job-def.*\.pdf$/);
+      await downloader.cleanup(result);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   test('throws on empty resume ref', async () => {
@@ -72,8 +75,8 @@ describe('ResumeDownloader', () => {
   });
 
   test('cleanup does not throw when file does not exist', async () => {
-    // Should not throw
-    await expect(downloader.cleanup('/tmp/nonexistent-file.pdf')).resolves.not.toThrow();
+    // Should not throw — cleanup silently ignores missing files
+    await downloader.cleanup('/tmp/nonexistent-file.pdf');
   });
 });
 
