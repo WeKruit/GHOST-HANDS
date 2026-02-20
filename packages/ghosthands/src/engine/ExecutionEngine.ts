@@ -42,6 +42,8 @@ export interface ExecutionParams {
   costTracker: CostTracker;
   progress: ProgressTracker;
   logEvent: (eventType: string, metadata: Record<string, any>) => Promise<void>;
+  /** Local file path to downloaded resume, passed through to cookbook steps */
+  resumeFilePath?: string | null;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────
