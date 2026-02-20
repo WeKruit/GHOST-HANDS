@@ -14,7 +14,6 @@ import { taskHandlerRegistry } from './taskHandlers/registry.js';
 import { callbackNotifier } from './callbackNotifier.js';
 import type { TaskContext, TaskResult } from './taskHandlers/types.js';
 import { SessionManager } from '../sessions/SessionManager.js';
-import { createEncryptionFromEnv } from '../db/encryption.js';
 import { BlockerDetector, type BlockerResult, type BlockerType } from '../detection/BlockerDetector.js';
 import { ExecutionEngine } from '../engine/ExecutionEngine.js';
 import { ManualStore } from '../engine/ManualStore.js';
@@ -50,7 +49,7 @@ export interface JobExecutorOptions {
 
 // --- Error classification ---
 
-const ERROR_CLASSIFICATIONS: Array<{ pattern: RegExp; code: string }> = [
+export const ERROR_CLASSIFICATIONS: Array<{ pattern: RegExp; code: string }> = [
   { pattern: /budget.?exceeded/i, code: 'budget_exceeded' },
   { pattern: /action.?limit.?exceeded/i, code: 'action_limit_exceeded' },
   { pattern: /captcha/i, code: 'captcha_blocked' },
@@ -83,11 +82,19 @@ const PERIODIC_BLOCKER_CHECK_MS = 30_000; // Periodic timer-based blocker check 
 const CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK = 3; // Check for blockers after this many consecutive action failures
 
 /** Error codes that should trigger HITL instead of immediate retry */
-const HITL_ELIGIBLE_ERRORS = new Set([
+export const HITL_ELIGIBLE_ERRORS = new Set([
   'captcha_blocked',
   'login_required',
   '2fa_required',
 ]);
+
+/** Classify an error message into an error code using ERROR_CLASSIFICATIONS. */
+export function classifyError(message: string): string {
+  for (const { pattern, code } of ERROR_CLASSIFICATIONS) {
+    if (pattern.test(message)) return code;
+  }
+  return 'internal_error';
+}
 
 // --- Platform detection ---
 
@@ -358,17 +365,14 @@ export class JobExecutor {
       }
 
       // 8.5. Inject stored browser session (e.g. Google auth cookies)
-      try {
-        const encryption = createEncryptionFromEnv();
-        const localSessionMgr = new SessionManager({ supabase: this.supabase, encryption });
-
+      if (this.sessionManager) try {
         // Load Google session for Sign-in-with-Google flows
         // Try multiple Google-related domains since the session may be stored under any of them
         const googleDomains = ['accounts.google.com', 'mail.google.com', 'google.com'];
         let googleSessionInjected = false;
         for (const domain of googleDomains) {
           if (googleSessionInjected) break;
-          const googleSession = await localSessionMgr.loadSession(job.user_id, domain);
+          const googleSession = await this.sessionManager.loadSession(job.user_id, domain);
           if (googleSession) {
             const cookies = (googleSession as any).cookies || [];
             if (cookies.length > 0) {
@@ -381,7 +385,7 @@ export class JobExecutor {
 
         // Also try loading session for the target domain
         const injTargetDomain = new URL(job.target_url).hostname;
-        const targetSession = await localSessionMgr.loadSession(job.user_id, injTargetDomain);
+        const targetSession = await this.sessionManager.loadSession(job.user_id, injTargetDomain);
         if (targetSession) {
           const cookies = (targetSession as any).cookies || [];
           if (cookies.length > 0) {
@@ -769,21 +773,19 @@ export class JobExecutor {
       const finalCost = costTracker.getSnapshot();
 
       // 12.5. Save fresh session cookies back to DB after successful auth
-      try {
-        const encryption = createEncryptionFromEnv();
-        const sessionManager = new SessionManager({ supabase: this.supabase, encryption });
+      if (this.sessionManager) try {
         const freshState = await adapter.page.context().storageState();
         // Save Google session (use mail.google.com for consistency with session persistence test)
-        await sessionManager.saveSession(
+        await this.sessionManager.saveSession(
           job.user_id,
           'mail.google.com',
           freshState as unknown as Record<string, unknown>,
         );
         // Save target domain session
-        const targetDomain = new URL(job.target_url).hostname;
-        await sessionManager.saveSession(
+        const saveDomain = new URL(job.target_url).hostname;
+        await this.sessionManager.saveSession(
           job.user_id,
-          targetDomain,
+          saveDomain,
           freshState as unknown as Record<string, unknown>,
         );
         console.log(`[JobExecutor] Saved fresh session cookies for user ${job.user_id}`);
@@ -1829,10 +1831,7 @@ export class JobExecutor {
   // --- Error classification ---
 
   private classifyError(message: string): string {
-    for (const { pattern, code } of ERROR_CLASSIFICATIONS) {
-      if (pattern.test(message)) return code;
-    }
-    return 'internal_error';
+    return classifyError(message);
   }
 
   // --- Browser crash detection & recovery ---

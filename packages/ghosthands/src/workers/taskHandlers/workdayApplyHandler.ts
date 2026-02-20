@@ -17,8 +17,6 @@ import {
 
 // --- Constants ---
 
-const PHONE_2FA_TIMEOUT_MS = 180_000; // 3 minutes
-const PHONE_2FA_POLL_INTERVAL_MS = 5_000;
 const PAGE_TRANSITION_WAIT_MS = 3_000;
 const MAX_FORM_PAGES = 15; // safety limit to avoid infinite loops
 
@@ -567,35 +565,42 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
   private async handleVerificationCode(adapter: BrowserAutomationAdapter): Promise<void> {
     console.log('[WorkdayApply] Verification code required. Checking Gmail for code...');
 
-    // Open Gmail in a new approach — navigate to it
-    const currentUrl = await adapter.getCurrentUrl();
+    // Open Gmail in a NEW TAB (same browser context preserves auth cookies).
+    // This avoids navigating away from the application page, which would:
+    //   - lose in-progress form state
+    //   - violate domain lockdown on the adapter's page
+    const gmailPage = await adapter.page.context().newPage();
+    let code: string | null = null;
 
-    // Navigate to Gmail to get the verification code
-    await adapter.navigate('https://mail.google.com');
-    await this.waitForPageLoad(adapter);
+    try {
+      await gmailPage.goto('https://mail.google.com', { waitUntil: 'domcontentloaded' });
+      await gmailPage.waitForTimeout(3000);
 
-    // Extract the verification code from the latest email
-    const codeResult = await adapter.extract(
-      'Find the most recent email that contains a verification code, security code, or one-time password (OTP). Extract the numeric or alphanumeric code from it.',
-      z.object({
-        code: z.string(),
-        found: z.boolean(),
-      }),
-    );
+      // Extract verification code from the page text using regex
+      const bodyText = await gmailPage.evaluate(() => document.body.innerText);
+      // Match common verification code formats: 4-8 digit numbers or alphanumeric codes
+      const codeMatch = bodyText.match(
+        /(?:verification|security|confirm|one-time|otp|2fa)\s*(?:code|pin|number)[:\s]*(\d{4,8})/i,
+      ) ?? bodyText.match(
+        /(\d{4,8})\s*(?:is your|is the)\s*(?:verification|security|confirm)/i,
+      );
 
-    if (!codeResult.found || !codeResult.code) {
+      if (codeMatch) {
+        code = codeMatch[1];
+      }
+    } finally {
+      await gmailPage.close();
+    }
+
+    if (!code) {
       throw new Error('Could not find verification code in Gmail');
     }
 
-    console.log(`[WorkdayApply] Found verification code: ${codeResult.code}`);
+    console.log(`[WorkdayApply] Found verification code: ${code}`);
 
-    // Go back to the verification page
-    await adapter.navigate(currentUrl);
-    await this.waitForPageLoad(adapter);
-
-    // Enter the code
+    // Enter the code on the original page (which was never navigated away from)
     const enterResult = await adapter.act(
-      `Enter the verification code "${codeResult.code}" into the verification code input field and click the "Next", "Verify", "Continue", or "Submit" button.`,
+      `Enter the verification code "${code}" into the verification code input field and click the "Next", "Verify", "Continue", or "Submit" button.`,
     );
 
     if (!enterResult.success) {
@@ -607,58 +612,27 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
 
   private async handlePhone2FA(adapter: BrowserAutomationAdapter): Promise<void> {
     const currentUrl = await adapter.getCurrentUrl();
-    // Any Google /challenge/ page needs manual intervention — just poll URL changes
-    const isGoogleChallenge = currentUrl.includes('accounts.google.com') && currentUrl.includes('/challenge/');
 
-    console.log('\n' + '='.repeat(70));
-    console.log('[WorkdayApply] MANUAL ACTION REQUIRED');
+    // Determine the challenge type for the error message so JobExecutor's
+    // error classification routes it to the correct HITL blocker type:
+    //   - "captcha" in message → captcha_blocked → HITL with type 'captcha'
+    //   - "2fa" in message    → 2fa_required    → HITL with type '2fa'
+    //   - "login" in message  → login_required  → HITL with type 'login'
+    let challengeDesc: string;
     if (currentUrl.includes('recaptcha')) {
-      console.log('[WorkdayApply] Type: CAPTCHA — solve the image challenge in the browser.');
-    } else if (currentUrl.includes('ipp')) {
-      console.log('[WorkdayApply] Type: SMS/Phone verification — check your phone and approve or enter the code.');
+      challengeDesc = 'Captcha challenge requires human intervention';
+    } else if (currentUrl.includes('ipp') || currentUrl.includes('/challenge/')) {
+      challengeDesc = '2FA phone verification requires human intervention';
     } else {
-      console.log('[WorkdayApply] Type: Google security challenge — complete it in the browser.');
-    }
-    console.log(`[WorkdayApply] URL: ${currentUrl}`);
-    console.log(`[WorkdayApply] Waiting up to ${PHONE_2FA_TIMEOUT_MS / 1000} seconds...`);
-    console.log('='.repeat(70) + '\n');
-
-    const startTime = Date.now();
-    const startUrl = currentUrl;
-
-    while (Date.now() - startTime < PHONE_2FA_TIMEOUT_MS) {
-      await new Promise(resolve => setTimeout(resolve, PHONE_2FA_POLL_INTERVAL_MS));
-
-      const nowUrl = await adapter.getCurrentUrl();
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-
-      // If URL changed, the challenge was solved
-      if (nowUrl !== startUrl) {
-        console.log(`[WorkdayApply] Challenge resolved after ${elapsed}s. Continuing...`);
-        return;
-      }
-
-      // For Google challenges, just poll URL changes (don't waste LLM calls)
-      if (isGoogleChallenge) {
-        console.log(`[WorkdayApply] Still waiting for manual action... (${elapsed}s elapsed)`);
-        continue;
-      }
-
-      // For non-Google 2FA, also check if the page content changed
-      const pageCheck = await adapter.extract(
-        'Is there still a 2FA/two-factor authentication prompt on this page asking the user to approve on their phone?',
-        z.object({ still_waiting: z.boolean() }),
-      );
-
-      if (!pageCheck.still_waiting) {
-        console.log(`[WorkdayApply] Challenge resolved after ${elapsed}s. Continuing...`);
-        return;
-      }
-
-      console.log(`[WorkdayApply] Still waiting for manual action... (${elapsed}s elapsed)`);
+      challengeDesc = '2FA security challenge requires human intervention';
     }
 
-    throw new Error('Phone 2FA timed out after 3 minutes. Please try again.');
+    console.log(`[WorkdayApply] ${challengeDesc} at ${currentUrl}`);
+
+    // Throw to trigger JobExecutor's HITL flow (pause → screenshot → VALET
+    // callback → wait for resume via pg LISTEN/NOTIFY). This replaces the
+    // previous console.log + URL-polling approach that only worked locally.
+    throw new Error(challengeDesc);
   }
 
   private async handleAccountCreation(
