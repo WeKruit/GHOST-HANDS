@@ -204,17 +204,6 @@ describe('BlockerDetector', () => {
       expect(result!.confidence).toBe(0.85);
     });
 
-    test('detects button[aria-label*="audio"] selector (lower confidence)', async () => {
-      const page = createMockPage(
-        { 'button[aria-label*="audio"]': { visible: true } },
-      );
-      const result = await detector.detectBlocker(page);
-
-      expect(result).not.toBeNull();
-      expect(result!.type).toBe('captcha');
-      expect(result!.confidence).toBe(0.7);
-    });
-
     test('detects "press play and type what you hear" text', async () => {
       const page = createMockPage({}, 'Press play and type what you hear.');
       const result = await detector.detectBlocker(page);

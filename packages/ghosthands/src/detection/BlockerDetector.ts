@@ -54,7 +54,6 @@ const SELECTOR_PATTERNS: Omit<DOMMatch, 'details'>[] = [
   { type: 'captcha', selector: '.rc-audiochallenge', confidence: 0.95 },
   { type: 'captcha', selector: '#audio-source', confidence: 0.9 },
   { type: 'captcha', selector: 'audio[src*="captcha"]', confidence: 0.85 },
-  { type: 'captcha', selector: 'button[aria-label*="audio"]', confidence: 0.7 },
 
   // -- Login --
   { type: 'login', selector: 'form[action*="login"]', confidence: 0.8 },
