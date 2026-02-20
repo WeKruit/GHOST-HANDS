@@ -75,12 +75,12 @@ export type WorkdayUserProfile = z.infer<typeof WorkdayUserProfileSchema>;
 
 /**
  * Fabricated test user profile for development and testing.
- * Matches the test Gmail account fiticala@gmail.com.
+ * Email is read from TEST_GMAIL_EMAIL env var.
  */
 export const TEST_WORKDAY_PROFILE: WorkdayUserProfile = {
   first_name: 'Happy',
   last_name: 'Wu',
-  email: 'fiticala@gmail.com',
+  email: process.env.TEST_GMAIL_EMAIL || '',
   phone: '4085551234',
   phone_device_type: 'Mobile',
   phone_country_code: '+1',
