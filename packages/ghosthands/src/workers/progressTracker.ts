@@ -69,6 +69,10 @@ export interface ProgressEventData {
   started_at: string;
   elapsed_ms: number;
   eta_ms: number | null;
+  // Mode tracking (Sprint 3)
+  execution_mode?: 'cookbook' | 'magnitude';
+  manual_id?: string;
+  step_cost_cents?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +153,8 @@ export class ProgressTracker {
   private lastEmitTime = 0;
   private latestThought: string | undefined;
   private pendingEmit: ProgressEventData | null = null;
+  private executionMode?: 'cookbook' | 'magnitude';
+  private manualId?: string;
 
   constructor(opts: ProgressTrackerOptions) {
     this.jobId = opts.jobId;
@@ -167,6 +173,12 @@ export class ProgressTracker {
   /** Record a thought from the agent (used for heuristic step inference). */
   recordThought(thought: string): void {
     this.latestThought = thought;
+  }
+
+  /** Set the current execution mode for progress events. */
+  setExecutionMode(mode: 'cookbook' | 'magnitude', manualId?: string): void {
+    this.executionMode = mode;
+    this.manualId = manualId;
   }
 
   /** Called when an action starts. Infers the step and emits progress. */
@@ -207,6 +219,8 @@ export class ProgressTracker {
       started_at: new Date(this.startedAt).toISOString(),
       elapsed_ms: elapsedMs,
       eta_ms: this.estimateEta(elapsedMs),
+      ...(this.executionMode && { execution_mode: this.executionMode }),
+      ...(this.manualId && { manual_id: this.manualId }),
     };
   }
 

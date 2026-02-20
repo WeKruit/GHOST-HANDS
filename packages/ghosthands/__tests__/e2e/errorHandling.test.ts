@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import {
   getTestSupabase,
-  cleanupTestData,
+  cleanupByJobType,
   insertTestJobs,
   MockValetClient,
   simulateWorkerPickup,
@@ -20,26 +20,39 @@ import {
 const supabase = getTestSupabase();
 const valet = new MockValetClient(supabase);
 
+// Unique job_type to isolate from other parallel test files sharing the same DB
+const JOB_TYPE = 'error_handling_test';
+
 describe('Error Handling', () => {
   beforeAll(async () => {
-    await cleanupTestData(supabase);
+    await cleanupByJobType(supabase, JOB_TYPE);
   });
 
   afterAll(async () => {
-    await cleanupTestData(supabase);
+    await cleanupByJobType(supabase, JOB_TYPE);
   });
 
   beforeEach(async () => {
-    await cleanupTestData(supabase);
+    await cleanupByJobType(supabase, JOB_TYPE);
   });
 
   // ─── Job failure ─────────────────────────────────────────────────
 
   it('should mark a job as failed with error code and details', async () => {
-    const job = await valet.createJob();
+    const job = await valet.createJob({ job_type: JOB_TYPE });
     const jobId = job.id as string;
 
-    await simulateWorkerPickup(supabase);
+    // Claim directly by ID to avoid cross-file interference
+    await supabase
+      .from('gh_automation_jobs')
+      .update({
+        status: 'queued',
+        worker_id: TEST_WORKER_ID,
+        last_heartbeat: new Date().toISOString(),
+      })
+      .eq('id', jobId)
+      .eq('status', 'pending');
+
     await simulateJobExecution(supabase, jobId, 'failed', {
       error_code: 'captcha_blocked',
       error_details: { message: 'Captcha detected on page' },
@@ -55,10 +68,19 @@ describe('Error Handling', () => {
   });
 
   it('should log a job_failed event on failure', async () => {
-    const job = await valet.createJob();
+    const job = await valet.createJob({ job_type: JOB_TYPE });
     const jobId = job.id as string;
 
-    await simulateWorkerPickup(supabase);
+    await supabase
+      .from('gh_automation_jobs')
+      .update({
+        status: 'queued',
+        worker_id: TEST_WORKER_ID,
+        last_heartbeat: new Date().toISOString(),
+      })
+      .eq('id', jobId)
+      .eq('status', 'pending');
+
     await simulateJobExecution(supabase, jobId, 'failed', {
       error_code: 'timeout',
     });
@@ -76,10 +98,19 @@ describe('Error Handling', () => {
     const [job] = await insertTestJobs(supabase, {
       max_retries: 3,
       retry_count: 0,
+      job_type: JOB_TYPE,
     });
     const jobId = job.id as string;
 
-    await simulateWorkerPickup(supabase);
+    await supabase
+      .from('gh_automation_jobs')
+      .update({
+        status: 'queued',
+        worker_id: TEST_WORKER_ID,
+        last_heartbeat: new Date().toISOString(),
+      })
+      .eq('id', jobId)
+      .eq('status', 'pending');
 
     // Simulate a retry: the executor marks the job as pending with incremented retry_count
     await supabase
@@ -106,6 +137,7 @@ describe('Error Handling', () => {
     const [job] = await insertTestJobs(supabase, {
       max_retries: 5,
       retry_count: 0,
+      job_type: JOB_TYPE,
     });
     const jobId = job.id as string;
 
@@ -132,10 +164,20 @@ describe('Error Handling', () => {
     const [job] = await insertTestJobs(supabase, {
       max_retries: 2,
       retry_count: 2, // Already at max
+      job_type: JOB_TYPE,
     });
     const jobId = job.id as string;
 
-    await simulateWorkerPickup(supabase);
+    await supabase
+      .from('gh_automation_jobs')
+      .update({
+        status: 'queued',
+        worker_id: TEST_WORKER_ID,
+        last_heartbeat: new Date().toISOString(),
+      })
+      .eq('id', jobId)
+      .eq('status', 'pending');
+
     await simulateJobExecution(supabase, jobId, 'failed', {
       error_code: 'timeout',
       error_details: { message: 'Max retries exhausted' },
@@ -161,10 +203,20 @@ describe('Error Handling', () => {
     ];
 
     for (const scenario of errorScenarios) {
-      const [job] = await insertTestJobs(supabase, {});
+      const [job] = await insertTestJobs(supabase, { job_type: JOB_TYPE });
       const jobId = job.id as string;
 
-      await simulateWorkerPickup(supabase);
+      // Claim directly by ID to avoid picking up a stale job from another iteration
+      await supabase
+        .from('gh_automation_jobs')
+        .update({
+          status: 'queued',
+          worker_id: TEST_WORKER_ID,
+          last_heartbeat: new Date().toISOString(),
+        })
+        .eq('id', jobId)
+        .eq('status', 'pending');
+
       await simulateJobExecution(supabase, jobId, 'failed', {
         error_code: scenario.code,
         error_details: { message: scenario.details },
@@ -177,7 +229,7 @@ describe('Error Handling', () => {
       await supabase.from('gh_job_events').delete().eq('job_id', jobId);
       await supabase.from('gh_automation_jobs').delete().eq('id', jobId);
     }
-  });
+  }, 15000); // 15s timeout for 7 sequential DB round-trips
 
   // ─── Manual retry (POST /jobs/:id/retry simulation) ─────────────
 
@@ -187,6 +239,7 @@ describe('Error Handling', () => {
       completed_at: new Date().toISOString(),
       error_code: 'timeout',
       retry_count: 1,
+      job_type: JOB_TYPE,
     });
     const jobId = job.id as string;
 
@@ -217,6 +270,7 @@ describe('Error Handling', () => {
     const [job] = await insertTestJobs(supabase, {
       status: 'completed',
       completed_at: new Date().toISOString(),
+      job_type: JOB_TYPE,
     });
     const jobId = job.id as string;
 
@@ -256,10 +310,19 @@ describe('Error Handling', () => {
   // ─── Partial cost recording on failure ──────────────────────────
 
   it('should record partial cost data even on job failure', async () => {
-    const [job] = await insertTestJobs(supabase, {});
+    const [job] = await insertTestJobs(supabase, { job_type: JOB_TYPE });
     const jobId = job.id as string;
 
-    await simulateWorkerPickup(supabase);
+    await supabase
+      .from('gh_automation_jobs')
+      .update({
+        status: 'queued',
+        worker_id: TEST_WORKER_ID,
+        last_heartbeat: new Date().toISOString(),
+      })
+      .eq('id', jobId)
+      .eq('status', 'pending');
+
     await simulateJobExecution(supabase, jobId, 'failed', {
       error_code: 'timeout',
       action_count: 3,
@@ -270,7 +333,7 @@ describe('Error Handling', () => {
     const failed = await valet.getJob(jobId);
     expect(failed!.action_count).toBe(3);
     expect(failed!.total_tokens).toBe(500);
-    expect(failed!.llm_cost_cents).toBe(0); // llm_cost_cents not in failed update path unless set
+    expect(failed!.llm_cost_cents).toBe(1); // partial cost should be recorded even on failure
   });
 
   // ─── Heartbeat timeout (stuck job recovery) ─────────────────────
@@ -283,6 +346,7 @@ describe('Error Handling', () => {
       worker_id: 'dead-worker',
       last_heartbeat: staleHeartbeat,
       started_at: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      job_type: JOB_TYPE,
     });
 
     // Simulate recovery logic from JobPoller.recoverStuckJobs
@@ -294,6 +358,7 @@ describe('Error Handling', () => {
         worker_id: null,
         error_details: { recovered_by: TEST_WORKER_ID, reason: 'stuck_job_recovery' },
       })
+      .eq('job_type', JOB_TYPE)
       .in('status', ['queued', 'running'])
       .lt(
         'last_heartbeat',

@@ -34,8 +34,17 @@ RUN bun run build
 # Stage 3: Production runtime
 FROM oven/bun:1.2-debian AS runtime
 
+# Build metadata (set via --build-arg in CI)
+ARG COMMIT_SHA="unknown"
+ARG BUILD_TIME="unknown"
+ARG IMAGE_TAG="unknown"
+ENV COMMIT_SHA=${COMMIT_SHA}
+ENV BUILD_TIME=${BUILD_TIME}
+ENV IMAGE_TAG=${IMAGE_TAG}
+
 # Install system dependencies for Patchright/Chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     curl \
     libnss3 \
     libnspr4 \
@@ -57,7 +66,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libwayland-client0 \
     fonts-noto-color-emoji \
     fonts-liberation \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# BAML runtime uses vendored OpenSSL (native-tls-vendored) via openssl-probe.
+# The vendored OpenSSL's default OPENSSLDIR is /usr/local/ssl (from openssl-src
+# crate), which does NOT exist in Debian images. We:
+#   1. Set SSL_CERT_FILE/DIR env vars (openssl-probe reads these first)
+#   2. Symlink /usr/local/ssl → Debian cert paths (belt-and-suspenders fallback)
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_DIR=/etc/ssl/certs
+RUN mkdir -p /usr/local/ssl && \
+    ln -s /etc/ssl/certs/ca-certificates.crt /usr/local/ssl/cert.pem && \
+    ln -s /etc/ssl/certs /usr/local/ssl/certs
 
 WORKDIR /app
 
@@ -72,12 +93,13 @@ COPY --from=build /app/packages/ghosthands/package.json ./packages/ghosthands/
 # Note: bun hoists all dependencies to root node_modules/, so
 # packages/ghosthands/node_modules/ typically doesn't exist.
 
-# Install Patchright browser binaries (Chromium only)
-RUN bunx patchright install chromium
-
-# Create non-root user
+# Create non-root user first so browser install goes to the right home dir
 RUN groupadd -r ghosthands && useradd -r -g ghosthands -m ghosthands
+
+# Install Patchright browser binaries (Chromium only) as ghosthands user
+# Must run AFTER creating the user so browsers install to /home/ghosthands/.cache/
 USER ghosthands
+RUN bunx patchright install chromium
 
 # Default: start API server
 EXPOSE 3100

@@ -2,8 +2,9 @@ import { Hono } from 'hono';
 import pg from 'pg';
 import { validateBody } from '../middleware/index.js';
 import { rateLimitMiddleware } from '../../security/rateLimit.js';
-import { ValetApplySchema, ValetTaskSchema } from '../schemas/valet.js';
-import type { ValetApplyInput, ValetTaskInput } from '../schemas/valet.js';
+import { ValetApplySchema, ValetTaskSchema, ValetResumeSchema, ValetDeregisterSchema } from '../schemas/valet.js';
+import type { ValetApplyInput, ValetTaskInput, ValetResumeInput, ValetDeregisterInput } from '../schemas/valet.js';
+import { callbackNotifier } from '../../workers/callbackNotifier.js';
 
 type AppVariables = {
   validatedBody: unknown;
@@ -75,15 +76,17 @@ export function createValetRoutes(pool: pg.Pool) {
       resume_ref: body.resume || null,
     };
 
-    // Insert job — uses core columns; VALET-specific columns (callback_url,
-    // valet_task_id, resume_ref) are stored in metadata as backup until the
-    // DB migration adds them as dedicated columns.
+    // Insert job — includes VALET-specific columns (callback_url, valet_task_id)
+    // added in migration 005. Also stored in metadata as backup.
+    // execution_mode column added in migration 011.
+    // worker_affinity column added in migration 013.
     const result = await pool.query(`
       INSERT INTO gh_automation_jobs (
         user_id, created_by, job_type, target_url, task_description,
         input_data, priority, max_retries, timeout_seconds,
-        tags, idempotency_key, metadata, target_worker_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        tags, idempotency_key, metadata, target_worker_id,
+        callback_url, valet_task_id, execution_mode, worker_affinity
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
       RETURNING id, status, created_at
     `, [
       body.valet_user_id,
@@ -96,6 +99,8 @@ export function createValetRoutes(pool: pg.Pool) {
         qa_overrides: body.qa_answers || {},
         tier: body.quality === 'quality' ? 'pro' : body.quality === 'speed' ? 'free' : 'starter',
         platform: body.platform || 'other',
+        ...(body.model ? { model: body.model } : {}),
+        ...(body.image_model ? { image_model: body.image_model } : {}),
       }),
       body.priority,
       3,
@@ -104,6 +109,10 @@ export function createValetRoutes(pool: pg.Pool) {
       body.idempotency_key || null,
       JSON.stringify(metadata),
       body.target_worker_id || null,
+      body.callback_url || null,
+      body.valet_task_id,
+      body.execution_mode,
+      body.worker_affinity,
     ]);
 
     const job = result.rows[0];
@@ -144,12 +153,21 @@ export function createValetRoutes(pool: pg.Pool) {
       callback_url: body.callback_url || null,
     };
 
+    // Store model/image_model in input_data so JobExecutor reads them
+    const inputData = {
+      ...body.input_data,
+      ...(body.model ? { model: body.model } : {}),
+      ...(body.image_model ? { image_model: body.image_model } : {}),
+    };
+
+    // worker_affinity column added in migration 013.
     const result = await pool.query(`
       INSERT INTO gh_automation_jobs (
         user_id, created_by, job_type, target_url, task_description,
         input_data, priority, max_retries, timeout_seconds,
-        tags, idempotency_key, metadata, target_worker_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        tags, idempotency_key, metadata, target_worker_id,
+        callback_url, valet_task_id, execution_mode, worker_affinity
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
       RETURNING id, status, created_at
     `, [
       body.valet_user_id,
@@ -157,7 +175,7 @@ export function createValetRoutes(pool: pg.Pool) {
       body.job_type,
       body.target_url,
       body.task_description,
-      JSON.stringify(body.input_data),
+      JSON.stringify(inputData),
       body.priority,
       3,
       body.timeout_seconds,
@@ -165,6 +183,10 @@ export function createValetRoutes(pool: pg.Pool) {
       body.idempotency_key || null,
       JSON.stringify(metadata),
       body.target_worker_id || null,
+      body.callback_url || null,
+      body.valet_task_id,
+      body.execution_mode,
+      body.worker_affinity,
     ]);
 
     const job = result.rows[0];
@@ -177,6 +199,227 @@ export function createValetRoutes(pool: pg.Pool) {
     }, 201);
   });
 
+  // ─── POST /valet/resume/:jobId — Resume a paused job ─────────
+
+  valet.post('/resume/:jobId', rateLimitMiddleware(), validateBody(ValetResumeSchema), async (c) => {
+    const jobId = c.req.param('jobId');
+    const body = c.get('validatedBody') as ValetResumeInput;
+
+    // Verify job exists and is paused
+    const { rows } = await pool.query(
+      'SELECT id, status FROM gh_automation_jobs WHERE id = $1::UUID',
+      [jobId]
+    );
+
+    if (rows.length === 0) {
+      return c.json({ error: 'not_found', message: 'Job not found' }, 404);
+    }
+
+    if (rows[0].status !== 'paused') {
+      return c.json({
+        error: 'invalid_state',
+        message: `Job is not paused (current status: ${rows[0].status})`,
+      }, 409);
+    }
+
+    // Store resolution data in interaction_data JSONB before firing NOTIFY
+    // so the JobExecutor can read credentials/codes when it wakes up
+    if (body.resolution_type || body.resolution_data) {
+      await pool.query(`
+        UPDATE gh_automation_jobs
+        SET interaction_data = COALESCE(interaction_data, '{}'::jsonb) || $2::jsonb,
+            updated_at = NOW()
+        WHERE id = $1::UUID
+      `, [jobId, JSON.stringify({
+        resolution_type: body.resolution_type || 'manual',
+        resolution_data: body.resolution_data || null,
+        resolved_by: body.resolved_by,
+        resolved_at: new Date().toISOString(),
+      })]);
+    }
+
+    // Fire NOTIFY so the listening JobExecutor picks up the resume signal
+    await pool.query("SELECT pg_notify('gh_job_resume', $1)", [jobId]);
+
+    // Update job status back to running
+    await pool.query(`
+      UPDATE gh_automation_jobs
+      SET status = 'running',
+          paused_at = NULL,
+          status_message = $2,
+          updated_at = NOW()
+      WHERE id = $1::UUID
+    `, [jobId, `Resumed by ${body.resolved_by}${body.resolution_notes ? ': ' + body.resolution_notes : ''}`]);
+
+    return c.json({
+      job_id: jobId,
+      status: 'running',
+      resolved_by: body.resolved_by,
+      resolution_type: body.resolution_type || 'manual',
+    });
+  });
+
+  // ─── POST /valet/workers/deregister — Deregister a worker ──────
+  // Called by VALET when terminating a sandbox to mark the worker offline
+  // and optionally cancel its active jobs.
+
+  valet.post('/workers/deregister', rateLimitMiddleware(), validateBody(ValetDeregisterSchema), async (c) => {
+    const body = c.get('validatedBody') as ValetDeregisterInput;
+
+    // Find worker(s) matching the target_worker_id
+    const { rows: workers } = await pool.query(
+      `SELECT worker_id, current_job_id FROM gh_worker_registry WHERE target_worker_id = $1`,
+      [body.target_worker_id]
+    );
+
+    if (workers.length === 0) {
+      return c.json({
+        error: 'not_found',
+        message: `No workers found with target_worker_id: ${body.target_worker_id}`,
+      }, 404);
+    }
+
+    // Mark all matching workers as offline
+    const workerIds = workers.map((w: any) => w.worker_id);
+    await pool.query(
+      `UPDATE gh_worker_registry SET status = 'offline', current_job_id = NULL, last_heartbeat = NOW()
+       WHERE target_worker_id = $1`,
+      [body.target_worker_id]
+    );
+
+    const cancelledJobIds: string[] = [];
+
+    // Optionally cancel active jobs for these workers
+    if (body.cancel_active_jobs) {
+      const { rows: cancelledJobs } = await pool.query(`
+        UPDATE gh_automation_jobs
+        SET status = 'failed',
+            error_code = 'worker_deregistered',
+            error_details = jsonb_build_object(
+              'message', 'Worker was deregistered by VALET',
+              'reason', $2::TEXT,
+              'target_worker_id', $3::TEXT
+            ),
+            completed_at = NOW(),
+            updated_at = NOW()
+        WHERE worker_id = ANY($1::TEXT[])
+          AND status IN ('queued', 'running', 'paused')
+        RETURNING id, callback_url, valet_task_id
+      `, [workerIds, body.reason || 'sandbox_terminated', body.target_worker_id]);
+
+      for (const job of cancelledJobs) {
+        cancelledJobIds.push(job.id);
+        // Send failed callback to VALET for each cancelled job
+        if (job.callback_url) {
+          callbackNotifier.notifyCompletion(job.callback_url, {
+            job_id: job.id,
+            valet_task_id: job.valet_task_id || null,
+            status: 'failed',
+            error_code: 'worker_deregistered',
+            error_message: body.reason || 'Worker sandbox terminated by VALET',
+            completed_at: new Date().toISOString(),
+          }).catch(() => {});
+        }
+      }
+    }
+
+    return c.json({
+      deregistered_workers: workerIds,
+      cancelled_job_ids: cancelledJobIds,
+      reason: body.reason || null,
+    });
+  });
+
+  // ─── GET /valet/sessions/:userId — List stored sessions ───────
+
+  valet.get('/sessions/:userId', async (c) => {
+    const userId = c.req.param('userId');
+
+    const { rows } = await pool.query(`
+      SELECT domain, last_used_at, created_at, updated_at, expires_at
+      FROM gh_browser_sessions
+      WHERE user_id = $1::UUID
+      ORDER BY last_used_at DESC
+    `, [userId]);
+
+    return c.json({
+      user_id: userId,
+      sessions: rows.map((r) => ({
+        domain: r.domain,
+        last_used_at: r.last_used_at,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+        expires_at: r.expires_at,
+      })),
+      count: rows.length,
+    });
+  });
+
+  // ─── DELETE /valet/sessions/:userId/:domain — Clear one session ──
+
+  valet.delete('/sessions/:userId/:domain', async (c) => {
+    const userId = c.req.param('userId');
+    const domain = decodeURIComponent(c.req.param('domain'));
+
+    const { rowCount } = await pool.query(`
+      DELETE FROM gh_browser_sessions
+      WHERE user_id = $1::UUID AND domain = $2
+    `, [userId, domain]);
+
+    if (rowCount === 0) {
+      return c.json({ error: 'not_found', message: 'No session found for this user/domain' }, 404);
+    }
+
+    return c.json({ user_id: userId, domain, deleted: true });
+  });
+
+  // ─── DELETE /valet/sessions/:userId — Clear all sessions ────────
+
+  valet.delete('/sessions/:userId', async (c) => {
+    const userId = c.req.param('userId');
+
+    const { rowCount } = await pool.query(`
+      DELETE FROM gh_browser_sessions
+      WHERE user_id = $1::UUID
+    `, [userId]);
+
+    return c.json({
+      user_id: userId,
+      deleted_count: rowCount ?? 0,
+    });
+  });
+
+  // ─── Helpers for status endpoint ──────────────────────────────
+
+  function buildManualInfo(meta: Record<string, any>) {
+    const engine = meta?.engine || {};
+    if (!engine.manual_id) return null;
+    return {
+      id: engine.manual_id,
+      status: engine.manual_status || 'ai_only',
+      health_score: engine.health_score ?? null,
+      fallback_reason: engine.fallback_reason ?? null,
+    };
+  }
+
+  function buildCostBreakdown(job: Record<string, any>) {
+    const resultCost = job.result_data?.cost;
+    if (!resultCost) return null;
+
+    const meta = typeof job.metadata === 'string' ? JSON.parse(job.metadata) : (job.metadata || {});
+    const modeCosts = meta?.cost_breakdown || {};
+
+    return {
+      total_cost_usd: resultCost.total_cost_usd ?? 0,
+      action_count: resultCost.action_count ?? 0,
+      total_tokens: (resultCost.input_tokens ?? 0) + (resultCost.output_tokens ?? 0),
+      cookbook_steps: modeCosts.cookbook_steps ?? 0,
+      magnitude_steps: modeCosts.magnitude_steps ?? 0,
+      cookbook_cost_usd: modeCosts.cookbook_cost_usd ?? 0,
+      magnitude_cost_usd: modeCosts.magnitude_cost_usd ?? 0,
+    };
+  }
+
   // ─── GET /valet/status/:jobId — VALET-compatible status ───────
 
   valet.get('/status/:jobId', async (c) => {
@@ -185,8 +428,10 @@ export function createValetRoutes(pool: pg.Pool) {
     const { rows } = await pool.query(`
       SELECT id, status, status_message, result_data, result_summary,
              error_code, error_details, screenshot_urls,
+             interaction_type, interaction_data, paused_at,
              started_at, completed_at, created_at,
-             metadata
+             metadata, callback_url, valet_task_id,
+             execution_mode, browser_mode, final_mode, worker_id
       FROM gh_automation_jobs WHERE id = $1::UUID
     `, [jobId]);
 
@@ -197,11 +442,14 @@ export function createValetRoutes(pool: pg.Pool) {
     const job = rows[0];
     const meta = typeof job.metadata === 'string' ? JSON.parse(job.metadata) : (job.metadata || {});
 
+    const interactionInfo = job.interaction_data as Record<string, any> | null;
+
     return c.json({
       job_id: job.id,
-      valet_task_id: meta.valet_task_id || null,
+      valet_task_id: job.valet_task_id || meta.valet_task_id || null,
       status: job.status,
       status_message: job.status_message,
+      worker_id: job.worker_id || null,
       progress: meta.progress || null,
       result: job.status === 'completed' ? {
         data: job.result_data,
@@ -212,6 +460,18 @@ export function createValetRoutes(pool: pg.Pool) {
         code: job.error_code,
         details: job.error_details,
       } : null,
+      interaction: job.status === 'paused' && interactionInfo ? {
+        type: job.interaction_type,
+        screenshot_url: interactionInfo.screenshot_url || null,
+        page_url: interactionInfo.page_url || null,
+        paused_at: job.paused_at,
+        timeout_seconds: 300,
+      } : null,
+      execution_mode: job.execution_mode || 'auto',
+      browser_mode: job.browser_mode || 'server',
+      final_mode: job.final_mode || null,
+      manual: buildManualInfo(meta),
+      cost_breakdown: buildCostBreakdown(job),
       timestamps: {
         created_at: job.created_at,
         started_at: job.started_at,

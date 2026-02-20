@@ -23,6 +23,7 @@ export class JobPoller {
     private running = false;
     private pollTimer: ReturnType<typeof setInterval> | null = null;
     private pickupInFlight = false;
+    private _currentJobId: string | null = null;
 
     constructor(opts: JobPollerOptions) {
         this.supabase = opts.supabase;
@@ -132,6 +133,10 @@ export class JobPoller {
         return this.running;
     }
 
+    get currentJobId(): string | null {
+        return this._currentJobId;
+    }
+
     /**
      * Atomic job pickup using FOR UPDATE SKIP LOCKED via Postgres function.
      * Multiple workers can safely call this concurrently without contention.
@@ -156,6 +161,7 @@ export class JobPoller {
             if (!job) return; // No jobs available
 
             this.activeJobs++;
+            this._currentJobId = job.id;
             console.log(
                 `[JobPoller] Picked up job ${job.id} (type=${job.job_type}, active=${this.activeJobs}/${this.maxConcurrent})`
             );
@@ -171,6 +177,7 @@ export class JobPoller {
                 })
                 .finally(() => {
                     this.activeJobs--;
+                    this._currentJobId = null;
                     console.log(
                         `[JobPoller] Job ${job.id} finished (active=${this.activeJobs}/${this.maxConcurrent})`
                     );

@@ -1,122 +1,179 @@
-import { SupabaseClient } from '@supabase/supabase-js';
+/**
+ * Session Persistence Manager
+ *
+ * Manages browser session state (cookies, localStorage) per user and domain,
+ * enabling session reuse across job runs to avoid repeated logins and CAPTCHAs.
+ *
+ * Session data is encrypted at rest using AES-256-GCM via CredentialEncryption.
+ */
+
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { CredentialEncryption } from '../db/encryption.js';
 
-export interface SessionManagerOptions {
+// ── Types ──────────────────────────────────────────────────────────────────
+
+export interface SessionManagerConfig {
   supabase: SupabaseClient;
   encryption: CredentialEncryption;
 }
 
-/**
- * Manages encrypted browser sessions (Playwright storageState) in the
- * gh_browser_sessions table. Allows workers to reuse authenticated
- * sessions across job runs, avoiding repeated logins and 2FA.
- */
+export interface StoredSession {
+  /** Parsed Playwright storageState JSON */
+  storageState: Record<string, unknown>;
+  /** Domain this session applies to */
+  domain: string;
+  /** When this session was last used */
+  lastUsedAt: string;
+}
+
+const TABLE = 'gh_browser_sessions';
+
+// ── Implementation ─────────────────────────────────────────────────────────
+
 export class SessionManager {
   private supabase: SupabaseClient;
   private encryption: CredentialEncryption;
 
-  constructor(opts: SessionManagerOptions) {
-    this.supabase = opts.supabase;
-    this.encryption = opts.encryption;
+  constructor(config: SessionManagerConfig) {
+    this.supabase = config.supabase;
+    this.encryption = config.encryption;
   }
 
   /**
-   * Save (upsert) a browser session for a given user and domain.
-   * The storageState is encrypted at rest using AES-256-GCM.
-   */
-  async saveSession(
-    userId: string,
-    domain: string,
-    storageState: Record<string, unknown>,
-  ): Promise<void> {
-    const plaintext = JSON.stringify(storageState);
-    const { ciphertext, keyId } = this.encryption.encrypt(plaintext);
-
-    const { error } = await this.supabase
-      .from('gh_browser_sessions')
-      .upsert(
-        {
-          user_id: userId,
-          domain: this.normalizeDomain(domain),
-          session_data: ciphertext,
-          encryption_key_id: keyId,
-          last_used_at: new Date().toISOString(),
-        },
-        { onConflict: 'user_id,domain' },
-      );
-
-    if (error) {
-      throw new Error(`SessionManager.saveSession failed: ${error.message}`);
-    }
-  }
-
-  /**
-   * Load a stored browser session for a given user and domain.
-   * Returns the decrypted Playwright storageState, or null if not found.
+   * Load a stored browser session for a user + target URL or bare domain.
+   *
+   * Returns the decrypted Playwright storageState object, or null if no
+   * session exists or the session has expired.
    */
   async loadSession(
     userId: string,
-    domain: string,
+    targetUrl: string,
   ): Promise<Record<string, unknown> | null> {
+    const domain = SessionManager.extractDomain(targetUrl);
+
     const { data, error } = await this.supabase
-      .from('gh_browser_sessions')
+      .from(TABLE)
       .select('session_data, expires_at')
       .eq('user_id', userId)
-      .eq('domain', this.normalizeDomain(domain))
-      .maybeSingle();
+      .eq('domain', domain)
+      .single();
 
-    if (error) {
-      console.warn(`[SessionManager] loadSession query failed: ${error.message}`);
+    if (error || !data) {
       return null;
     }
 
-    if (!data) return null;
-
-    // Check expiry
+    // Check if session has expired
     if (data.expires_at && new Date(data.expires_at) < new Date()) {
-      console.log(`[SessionManager] Session expired for ${domain}, deleting`);
-      await this.deleteSession(userId, domain);
-      return null;
-    }
-
-    try {
-      const plaintext = this.encryption.decrypt(data.session_data);
-      const state = JSON.parse(plaintext);
-
-      // Touch last_used_at
+      // Clean up the expired session
       await this.supabase
-        .from('gh_browser_sessions')
-        .update({ last_used_at: new Date().toISOString() })
+        .from(TABLE)
+        .delete()
         .eq('user_id', userId)
-        .eq('domain', this.normalizeDomain(domain));
-
-      return state;
-    } catch (err) {
-      console.warn(`[SessionManager] Failed to decrypt session for ${domain}:`, err);
+        .eq('domain', domain);
       return null;
     }
-  }
 
-  /**
-   * Delete a stored session.
-   */
-  async deleteSession(userId: string, domain: string): Promise<void> {
-    await this.supabase
-      .from('gh_browser_sessions')
-      .delete()
-      .eq('user_id', userId)
-      .eq('domain', this.normalizeDomain(domain));
-  }
-
-  /**
-   * Normalize domain to a consistent format (lowercase, no protocol).
-   */
-  private normalizeDomain(domain: string): string {
+    // Decrypt session data
+    let plaintext: string;
     try {
-      const url = new URL(domain.includes('://') ? domain : `https://${domain}`);
-      return url.hostname.toLowerCase();
+      plaintext = this.encryption.decrypt(data.session_data);
     } catch {
-      return domain.toLowerCase();
+      // Decryption failed -- key rotated or data corrupted. Delete stale row.
+      await this.supabase
+        .from(TABLE)
+        .delete()
+        .eq('user_id', userId)
+        .eq('domain', domain);
+      return null;
+    }
+
+    // Update last_used_at timestamp
+    await this.supabase
+      .from(TABLE)
+      .update({ last_used_at: new Date().toISOString() })
+      .eq('user_id', userId)
+      .eq('domain', domain);
+
+    return JSON.parse(plaintext);
+  }
+
+  /**
+   * Save (upsert) browser session state for a user + target URL or bare domain.
+   *
+   * The storageState JSON is encrypted before storage.
+   */
+  async saveSession(
+    userId: string,
+    targetUrl: string,
+    storageState: Record<string, unknown>,
+  ): Promise<void> {
+    const domain = SessionManager.extractDomain(targetUrl);
+    const plaintext = JSON.stringify(storageState);
+    const { ciphertext, keyId } = this.encryption.encrypt(plaintext);
+
+    const now = new Date().toISOString();
+
+    await this.supabase
+      .from(TABLE)
+      .upsert(
+        {
+          user_id: userId,
+          domain,
+          session_data: ciphertext,
+          encryption_key_id: String(keyId),
+          last_used_at: now,
+          updated_at: now,
+        },
+        { onConflict: 'user_id,domain' },
+      );
+  }
+
+  /**
+   * Delete session(s) for a user.
+   *
+   * If domain is provided, only that session is deleted.
+   * Otherwise all sessions for the user are removed.
+   */
+  async clearSession(userId: string, domain?: string): Promise<void> {
+    let query = this.supabase
+      .from(TABLE)
+      .delete()
+      .eq('user_id', userId);
+
+    if (domain) {
+      query = query.eq('domain', domain);
+    }
+
+    await query;
+  }
+
+  /**
+   * Delete all expired sessions across all users.
+   * Intended to be called periodically (e.g. cron or worker loop).
+   */
+  async cleanExpiredSessions(): Promise<number> {
+    const now = new Date().toISOString();
+
+    const { data } = await this.supabase
+      .from(TABLE)
+      .delete()
+      .lt('expires_at', now)
+      .select('id');
+
+    return data?.length ?? 0;
+  }
+
+  /**
+   * Extract the hostname from a URL or bare domain.
+   * Accepts both full URLs (https://mail.google.com/...) and
+   * bare domains (mail.google.com).
+   * Exported as static for testability.
+   */
+  static extractDomain(url: string): string {
+    try {
+      return new URL(url.includes('://') ? url : `https://${url}`).hostname.toLowerCase();
+    } catch {
+      return url.toLowerCase();
     }
   }
 }

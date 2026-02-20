@@ -50,6 +50,39 @@ export function createMonitoringRoutes(opts: MonitoringRoutesOptions) {
     });
   });
 
+  // --- /workers (fleet-wide worker list) ---
+  app.get('/workers', async (c) => {
+    const { data, error } = await opts.supabase
+      .from('gh_worker_registry')
+      .select('*')
+      .order('registered_at', { ascending: false });
+
+    if (error) {
+      return c.json({ error: 'db_error', message: error.message }, 500);
+    }
+
+    const now = Date.now();
+    const workers = (data || []).map((w: any) => ({
+      worker_id: w.worker_id,
+      status: w.status,
+      target_worker_id: w.target_worker_id,
+      ec2_instance_id: w.ec2_instance_id,
+      ec2_ip: w.ec2_ip,
+      current_job_id: w.current_job_id,
+      registered_at: w.registered_at,
+      last_heartbeat: w.last_heartbeat,
+      jobs_completed: w.jobs_completed,
+      jobs_failed: w.jobs_failed,
+      uptime_seconds: Math.floor((now - new Date(w.registered_at).getTime()) / 1000),
+    }));
+
+    return c.json({
+      count: workers.length,
+      workers,
+      timestamp: new Date().toISOString(),
+    });
+  });
+
   // --- /dashboard (aggregated data for UI) ---
   app.get('/dashboard', async (c) => {
     const metrics = getMetrics();

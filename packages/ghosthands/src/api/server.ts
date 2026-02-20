@@ -8,6 +8,7 @@ import { errorHandler } from './middleware/error-handler.js';
 import { strictCSP } from './middleware/csp.js';
 import { JobController } from './controllers/jobs.js';
 import { health } from './routes/health.js';
+import { models } from './routes/models.js';
 import { createJobRoutes } from './routes/jobs.js';
 import { createValetRoutes } from './routes/valet.js';
 import { createUsageRoutes } from './routes/usage.js';
@@ -45,6 +46,10 @@ export function createApp() {
   // ─── Health Check (no auth required) ───────────────────────────
 
   app.route('/health', health);
+
+  // ─── Models Catalog (no auth required) ─────────────────────────
+
+  app.route('/api/v1/gh/models', models);
 
   // ─── Monitoring Routes (no auth required) ──────────────────────
 
