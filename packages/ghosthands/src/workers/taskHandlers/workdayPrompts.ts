@@ -12,7 +12,7 @@
 
 export const WORKDAY_BASE_RULES = `ABSOLUTE RULE #1 — ZERO SCROLLING: You must NEVER scroll the page — not even 1 pixel. No mouse wheel, no scroll actions, no Page Down. I handle all scrolling myself.
 
-ABSOLUTE RULE #2 — FULLY VISIBLE ONLY: If ANY part of a field, dropdown button, question text, or input box is cut off at the top or bottom edge of the screen, it is NOT fully visible — DO NOT interact with it at all. Only touch fields where the ENTIRE element is within the viewport. When in doubt, skip it. IMPORTANT: if you already typed a value into a field but CANNOT see the text you typed (because the field is near the edge of the screen), DO NOT type again — the value is there, you just can't see it. Move on.
+ABSOLUTE RULE #2 — FULLY VISIBLE ONLY: Before interacting with ANY field, check that you can see the ENTIRE perimeter of its input box — all four edges (top, bottom, left, right) must be fully visible on screen. If even one edge of the box is cut off or hidden by the top or bottom of the screen, that field is OFF LIMITS. Do not click it, do not type in it, do not try to expand it, do not click anywhere near it — pretend it does not exist. Only interact with fields where you can see the complete box with space around it. When you run out of fully visible fields, STOP immediately and do nothing more. I will scroll the page for you and call you again.
 
 ABSOLUTE RULE #3 — ONE ATTEMPT PER FIELD: You may type into a given field AT MOST ONCE. After you type a value and click elsewhere, that field is DONE. Do NOT go back and re-type. Even if the field appears empty after you typed, trust that your input was registered and move to the next field. Typing into the same field multiple times causes duplicate text (e.g. "WuWuWu" instead of "Wu").
 
@@ -30,7 +30,13 @@ export const FIELD_FILL_RULES = `1. If the field already has ANY value (even if 
 3. If the field is truly empty (blank/no text): CLICK on it, type/select the correct value, then CLICK on whitespace to deselect.`;
 
 /** How to interact with dropdown fields. */
-export const DROPDOWN_RULES = `DROPDOWNS: After clicking a dropdown, ALWAYS TYPE your desired answer first (e.g. type "No", "Yes", "Male", "Website") to filter the list, then click the matching option. The popup menu that appears after you click a dropdown ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions on the page. If typing doesn't produce a match, click whitespace to close, re-click the dropdown, and try typing a shorter keyword. NEVER use arrow keys. NEVER mouse-scroll inside dropdowns.`;
+export const DROPDOWN_RULES = `DROPDOWNS: Fill ONLY ONE dropdown per turn. After completing one dropdown, STOP and do nothing more — I will call you again for the next one. Follow these steps:
+  Step 1: CLICK the dropdown button to open it.
+  Step 2: TYPE your desired answer (e.g. "No", "Yes", "Male", "Website"). You MUST type — never skip this step.
+  Step 3: WAIT 3 seconds. Do nothing during this time — let the dropdown filter and update.
+  Step 4: A dropdown LIST appears BELOW the button you clicked. Look inside that list for the option with a SOLID BLUE FILLED BACKGROUND — this is your match. Do NOT click the dropdown button again. The blue-filled option is BELOW the button, inside the popup list. Click that blue-filled option. Then click on empty whitespace to deselect.
+  Step 5: STOP. You are done for this turn. Do not fill any more fields — I will call you again.
+  TRUST THE DROPDOWN: When you click a dropdown and options appear, those options ALWAYS belong to the dropdown you just clicked — even if the popup visually overlaps with other questions above or below. Do NOT second-guess which question the options belong to. Be confident and click your answer. NEVER use arrow keys. NEVER mouse-scroll inside dropdowns.`;
 
 /** How to interact with date fields. */
 export const DATE_FIELD_RULES = (todayDate: string, todayFormatted: string) =>
@@ -97,8 +103,8 @@ This is the "My Experience" page. Fill any EMPTY fields/sections that are FULLY 
 IMPORTANT INTERACTION PATTERNS:
 1. "Add" BUTTONS: ONLY click "Add" under "Work Experience" and "Education" sections. Do NOT click "Add" under "Websites" or "Certifications" — those must stay empty. If the form fields are already expanded (you can see Job Title, Company, etc.), do NOT click Add again.
 2. ${DROPDOWN_RULES}
-3. TYPEAHEAD FIELDS (e.g. Field of Study, Skills): Type the value, WAIT 2-3 seconds for the autocomplete suggestions to load, then press Enter to select the first match.
-4. DATE FIELDS (MM/YYYY): The date has TWO boxes side by side — MM on the LEFT, YYYY on the RIGHT. Click on the LEFT box (MM) first. Then type the digits continuously (e.g. "012026"). Workday auto-advances from MM to YYYY. NEVER click on the right/YYYY box directly.
+3. TYPEAHEAD FIELDS (e.g. Field of Study, Skills): Type the value, then press Enter to trigger the dropdown. WAIT 2-3 seconds for the suggestions to load. Then CLICK on the matching option in the dropdown list. If the correct option is not visible, click the dropdown scrollbar to scroll through the options until you find it.
+4. DATE FIELDS (MM/YYYY): Look for the text "MM" on screen — it is a tiny input box. Click DIRECTLY on the letters "MM". Do NOT click the calendar icon (📅) or the box showing "YYYY". After clicking "MM", type the digits continuously (e.g. "012026") and Workday auto-advances to YYYY. If the date shows "1900" or an error, do this recovery: click on the "MM" box, press Delete 6 times to clear it, then type the date digits again.
 5. ${CHECKBOX_RULES}
 6. After filling each field, CLICK on empty whitespace to deselect before moving to the next field.
 
