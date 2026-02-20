@@ -144,14 +144,14 @@ describe('CostTracker cost calculation', () => {
   });
 
   test('throws BudgetExceededError when cost exceeds task budget', () => {
-    // 'quality' preset has $0.30 budget
+    // 'quality' preset has $0.50 budget
     // Simulate a large usage that exceeds it
     expect(() => {
       tracker.recordTokenUsage({
         inputTokens: 100_000,
         outputTokens: 50_000,
-        inputCost: 0.20,
-        outputCost: 0.15,
+        inputCost: 0.30,
+        outputCost: 0.25,
       });
     }).toThrow(BudgetExceededError);
   });
