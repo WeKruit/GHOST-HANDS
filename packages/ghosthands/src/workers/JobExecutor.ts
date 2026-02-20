@@ -169,12 +169,18 @@ export class JobExecutor {
     });
 
     try {
-      // 0. Pre-flight budget check
-      const preflight = await costService.preflightBudgetCheck(
-        job.user_id,
-        qualityPreset,
-        job.job_type,
-      );
+      // 0. Pre-flight budget check (skip in development)
+      const isDev = (process.env.NODE_ENV || 'development') === 'development';
+      const preflight = isDev
+        ? { allowed: true, remainingBudget: Infinity, taskBudget: 0 }
+        : await costService.preflightBudgetCheck(
+            job.user_id,
+            qualityPreset,
+            job.job_type,
+          );
+      if (isDev) {
+        console.log(`[JobExecutor] Skipping budget preflight (NODE_ENV=development)`);
+      }
       if (!preflight.allowed) {
         await this.updateJobStatus(job.id, 'failed', preflight.reason);
         await this.logJobEvent(job.id, 'budget_preflight_failed', {
