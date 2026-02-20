@@ -170,12 +170,17 @@ ${dataPrompt}`;
 
 /**
  * Build the prompt for the Google sign-in LLM fallback.
+ *
+ * SECURITY: This prompt is sent to an LLM provider. Never include passwords
+ * or other credentials here — LLM providers log prompts and completions.
+ * Password entry is handled via direct DOM manipulation (page.fill) in the
+ * workdayApplyHandler, never through LLM instructions.
  */
-export function buildGoogleSignInFallbackPrompt(email: string, password: string): string {
+export function buildGoogleSignInFallbackPrompt(email: string): string {
   return `This is a Google sign-in page. Do exactly ONE of these actions, then STOP:
 1. If you see an existing account for "${email}", click on it.
 2. If you see an "Email or phone" field, type "${email}" and click "Next".
-3. If you see a "Password" field, type "${password}" and click "Next".
+3. If you see a "Password" field, STOP immediately — do NOT type anything into it.
 Do NOT interact with CAPTCHAs, reCAPTCHAs, or image challenges. If you see one, STOP immediately.`;
 }
 

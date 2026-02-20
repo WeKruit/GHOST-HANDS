@@ -18,7 +18,7 @@
 
 import { Client as PgClient } from 'pg';
 import { createClient } from '@supabase/supabase-js';
-import { TEST_WORKDAY_PROFILE, TEST_QA_OVERRIDES } from '../workers/taskHandlers/workdayTypes.js';
+import { TEST_WORKDAY_PROFILE, TEST_QA_OVERRIDES } from '../../__tests__/fixtures/workdayTestData.js';
 
 // --- Config ---
 
