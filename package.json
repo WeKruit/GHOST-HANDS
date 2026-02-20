@@ -16,6 +16,7 @@
   },
   "packageManager": "bun@1.2.8^",
   "devDependencies": {
+    "@aws-sdk/client-ecr": "^3.709.0",
     "turbo": "^2.4.4",
     "typescript": "5.8.2",
     "vitest": "^4.0.18"
