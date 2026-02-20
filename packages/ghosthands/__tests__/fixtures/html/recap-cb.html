@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<head><title>reCAPTCHA Checkbox Demo</title></head>
+<body>
+  <h1>Sign up</h1>
+  <form action="/register">
+    <input type="text" name="email" placeholder="Email" />
+    <div class="g-recaptcha" data-sitekey="fake-key"></div>
+    <iframe src="https://www.google.com/recaptcha/api2/anchor?k=fake" width="300" height="78"></iframe>
+    <button type="submit">Register</button>
+  </form>
+  <p>Please complete the security check to proceed.</p>
+</body>
+</html>
