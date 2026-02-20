@@ -69,21 +69,21 @@ describe('CostTracker getSnapshot() failure edge cases', () => {
 
   test('BudgetExceededError includes cost snapshot at time of exceeded budget', () => {
     const tracker = new CostTracker({ jobId: 'budget-err-1', qualityPreset: 'speed' });
-    // speed preset has $0.02 budget
+    // speed preset has $0.05 budget
 
     try {
       tracker.recordTokenUsage({
         inputTokens: 50000,
         outputTokens: 20000,
-        inputCost: 0.015,
-        outputCost: 0.01,
+        inputCost: 0.035,
+        outputCost: 0.025,
       });
       // Should have thrown
       expect(true).toBe(false);
     } catch (err) {
       expect(err).toBeInstanceOf(BudgetExceededError);
       const budgetErr = err as BudgetExceededError;
-      expect(budgetErr.costSnapshot.totalCost).toBeCloseTo(0.025, 4);
+      expect(budgetErr.costSnapshot.totalCost).toBeCloseTo(0.06, 4);
       expect(budgetErr.costSnapshot.inputTokens).toBe(50000);
       expect(budgetErr.costSnapshot.outputTokens).toBe(20000);
       expect(budgetErr.jobId).toBe('budget-err-1');
@@ -324,14 +324,14 @@ describe('Cost recording on all exit paths', () => {
 
   test('budget exceeded: includes the cost that triggered the limit', () => {
     const tracker = new CostTracker({ jobId: 'budget-exceed-1', qualityPreset: 'speed' });
-    // speed budget = $0.02
+    // speed budget = $0.05
 
     // First call within budget
     tracker.recordTokenUsage({
       inputTokens: 5000,
       outputTokens: 1000,
-      inputCost: 0.008,
-      outputCost: 0.004,
+      inputCost: 0.020,
+      outputCost: 0.010,
     });
     tracker.recordAction();
 
@@ -341,8 +341,8 @@ describe('Cost recording on all exit paths', () => {
       tracker.recordTokenUsage({
         inputTokens: 8000,
         outputTokens: 3000,
-        inputCost: 0.010,
-        outputCost: 0.005,
+        inputCost: 0.015,
+        outputCost: 0.010,
       });
     } catch (err) {
       if (err instanceof BudgetExceededError) {
@@ -351,7 +351,7 @@ describe('Cost recording on all exit paths', () => {
     }
 
     expect(budgetSnapshot).not.toBeNull();
-    expect(budgetSnapshot.totalCost).toBeCloseTo(0.027, 4);
+    expect(budgetSnapshot.totalCost).toBeCloseTo(0.055, 4);
     expect(budgetSnapshot.inputTokens).toBe(13000);
     expect(budgetSnapshot.outputTokens).toBe(4000);
 

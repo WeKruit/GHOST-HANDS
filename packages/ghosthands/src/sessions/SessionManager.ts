@@ -170,10 +170,7 @@ export class SessionManager {
    * Exported as static for testability.
    */
   static extractDomain(url: string): string {
-    try {
-      return new URL(url.includes('://') ? url : `https://${url}`).hostname.toLowerCase();
-    } catch {
-      return url.toLowerCase();
-    }
+    const parsed = new URL(url.includes('://') ? url : `https://${url}`);
+    return parsed.hostname.toLowerCase();
   }
 }
