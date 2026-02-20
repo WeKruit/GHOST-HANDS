@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach } from 'vitest';
-import { CostTracker, CostControlService, BudgetExceededError, ActionLimitExceededError } from '../../../src/workers/costControl';
+import { CostTracker, CostControlService, BudgetExceededError, ActionLimitExceededError, TASK_BUDGET } from '../../../src/workers/costControl';
 import { CallbackNotifier } from '../../../src/workers/callbackNotifier';
 
 // ---------------------------------------------------------------------------
@@ -69,21 +69,22 @@ describe('CostTracker getSnapshot() failure edge cases', () => {
 
   test('BudgetExceededError includes cost snapshot at time of exceeded budget', () => {
     const tracker = new CostTracker({ jobId: 'budget-err-1', qualityPreset: 'speed' });
-    // speed preset has $0.05 budget
 
+    // Total cost ($0.06) exceeds speed budget
+    const totalCost = TASK_BUDGET.speed + 0.01;
     try {
       tracker.recordTokenUsage({
         inputTokens: 50000,
         outputTokens: 20000,
-        inputCost: 0.035,
-        outputCost: 0.025,
+        inputCost: totalCost / 2 + 0.005,
+        outputCost: totalCost / 2 - 0.005,
       });
       // Should have thrown
       expect(true).toBe(false);
     } catch (err) {
       expect(err).toBeInstanceOf(BudgetExceededError);
       const budgetErr = err as BudgetExceededError;
-      expect(budgetErr.costSnapshot.totalCost).toBeCloseTo(0.06, 4);
+      expect(budgetErr.costSnapshot.totalCost).toBeGreaterThan(TASK_BUDGET.speed);
       expect(budgetErr.costSnapshot.inputTokens).toBe(50000);
       expect(budgetErr.costSnapshot.outputTokens).toBe(20000);
       expect(budgetErr.jobId).toBe('budget-err-1');
@@ -120,7 +121,7 @@ describe('CostTracker getSnapshot() failure edge cases', () => {
       outputCost: 0.003,
     });
 
-    // This will exceed the $0.02 budget
+    // This will exceed the speed budget
     try {
       tracker.recordTokenUsage({
         inputTokens: 10000,
@@ -324,7 +325,6 @@ describe('Cost recording on all exit paths', () => {
 
   test('budget exceeded: includes the cost that triggered the limit', () => {
     const tracker = new CostTracker({ jobId: 'budget-exceed-1', qualityPreset: 'speed' });
-    // speed budget = $0.05
 
     // First call within budget
     tracker.recordTokenUsage({

@@ -72,19 +72,19 @@ export class ActionLimitExceededError extends Error {
 // ---------------------------------------------------------------------------
 
 /** Per-task LLM budget (in USD) by quality preset */
-const TASK_BUDGET: Record<QualityPreset, number> = {
+export const TASK_BUDGET: Record<QualityPreset, number> = {
   speed: 0.05,
   balanced: 0.25,
   quality: 0.50,
 };
 
 /** Per-job-type budget overrides (in USD) — bypasses quality preset when present */
-const JOB_TYPE_BUDGET_OVERRIDES: Record<string, number> = {
+export const JOB_TYPE_BUDGET_OVERRIDES: Record<string, number> = {
   workday_apply: 2.00,
 };
 
 /** Per-user monthly budget (in USD) by subscription tier */
-const MONTHLY_BUDGET: Record<BudgetTier, number> = {
+export const MONTHLY_BUDGET: Record<BudgetTier, number> = {
   free: 0.50,
   starter: 20.00,
   pro: 10.00,
@@ -93,10 +93,10 @@ const MONTHLY_BUDGET: Record<BudgetTier, number> = {
 };
 
 /** Default max actions per job */
-const DEFAULT_MAX_ACTIONS = 50;
+export const DEFAULT_MAX_ACTIONS = 50;
 
 /** Per-job-type action limits (override default) */
-const JOB_TYPE_ACTION_LIMITS: Record<string, number> = {
+export const JOB_TYPE_ACTION_LIMITS: Record<string, number> = {
   apply: 50,
   scrape: 30,
   fill_form: 40,
