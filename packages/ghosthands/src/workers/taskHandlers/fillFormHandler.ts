@@ -15,9 +15,15 @@ export class FillFormHandler implements TaskHandler {
   async execute(ctx: TaskContext): Promise<TaskResult> {
     const { job, adapter } = ctx;
 
+    const actData: Record<string, any> = {
+      ...(job.input_data.user_data || job.input_data.form_data),
+    };
+    if (ctx.resumeFilePath) {
+      actData._resumeFilePath = ctx.resumeFilePath;
+    }
     const actResult = await adapter.act(job.task_description, {
       prompt: ctx.dataPrompt,
-      data: job.input_data.user_data || job.input_data.form_data,
+      data: actData,
     });
 
     if (!actResult.success) {

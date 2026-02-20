@@ -23,6 +23,9 @@ import { StagehandObserver } from '../engine/StagehandObserver.js';
 import type { MagnitudeAdapter } from '../adapters/magnitude.js';
 import { ThoughtThrottle, JOB_EVENT_TYPES } from '../events/JobEventTypes.js';
 import { ResumeDownloader, type ResumeRef } from './resumeDownloader.js';
+import { getLogger } from '../monitoring/logger.js';
+
+const logger = getLogger({ service: 'job-executor' });
 
 // Re-export AutomationJob from the canonical location for backward compat
 export type { AutomationJob } from './taskHandlers/types.js';
@@ -297,14 +300,14 @@ export class JobExecutor {
       if (resumeRef) {
         try {
           resumeFilePath = await this.resumeDownloader.download(resumeRef, job.id);
-          await this.logJobEvent(job.id, 'resume_downloaded', {
+          await this.logJobEvent(job.id, JOB_EVENT_TYPES.RESUME_DOWNLOADED, {
             source: resumeRef.storage_path ? 'supabase' : resumeRef.download_url ? 'url' : 's3',
             file_path: resumeFilePath,
           });
-          console.log(`[JobExecutor] Resume downloaded for job ${job.id}: ${resumeFilePath}`);
+          logger.info('Resume downloaded', { jobId: job.id, filePath: resumeFilePath });
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
-          await this.logJobEvent(job.id, 'resume_download_failed', {
+          await this.logJobEvent(job.id, JOB_EVENT_TYPES.RESUME_DOWNLOAD_FAILED, {
             error: errMsg,
           });
           throw new Error(`Resume download failed: ${errMsg}`);
@@ -395,6 +398,7 @@ export class JobExecutor {
         costTracker,
         progress,
         logEvent: logEventFn,
+        resumeFilePath,
       });
 
       // Track TraceRecorder for Magnitude path (manual training)

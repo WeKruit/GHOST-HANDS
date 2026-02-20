@@ -21,9 +21,13 @@ export class ApplyHandler implements TaskHandler {
     const { job, adapter, progress } = ctx;
 
     // Execute the browser automation
+    const actData: Record<string, any> = { ...job.input_data.user_data };
+    if (ctx.resumeFilePath) {
+      actData._resumeFilePath = ctx.resumeFilePath;
+    }
     const actResult = await adapter.act(job.task_description, {
       prompt: ctx.dataPrompt,
-      data: job.input_data.user_data,
+      data: actData,
     });
 
     if (!actResult.success) {
