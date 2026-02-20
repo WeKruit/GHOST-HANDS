@@ -3,19 +3,21 @@
  *
  * Unit tests for the container config definitions (scripts/lib/container-configs.ts).
  * Tests service definitions, env file parsing, and startup/shutdown ordering.
+ *
+ * IMPORTANT: We do NOT use vi.mock('fs') because Bun's test runner runs all
+ * test files in the same process, and vi.mock leaks across files — breaking
+ * config/models.test.ts and api/models.test.ts which also use fs.readFileSync.
+ *
+ * Instead:
+ * - loadEnvFile tests use real temp files (tests actual parsing logic)
+ * - getServiceConfigs tests spy on loadEnvFile (avoids needing /opt/ghosthands/.env)
  */
 
-import { describe, test, expect, vi, beforeEach } from 'vitest';
-
-// Mock fs module — only readFileSync is used by container-configs
-const mockReadFileSync = vi.fn();
-vi.mock('fs', () => ({
-  readFileSync: (...args: unknown[]) => mockReadFileSync(...args),
-  // Provide stubs for any other fs functions that might be imported
-  default: {
-    readFileSync: (...args: unknown[]) => mockReadFileSync(...args),
-  },
-}));
+import { describe, test, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import * as containerConfigs from '../../../../scripts/lib/container-configs';
 
 import {
   loadEnvFile,
@@ -23,47 +25,59 @@ import {
   type ServiceDefinition,
 } from '../../../../scripts/lib/container-configs';
 
-/**
- * Helper: sets up readFileSync mock to return given content.
- */
-function mockEnvFile(content: string): void {
-  mockReadFileSync.mockReturnValue(content);
+// -- Temp file helpers for loadEnvFile tests --
+
+let tmpDir: string;
+
+function writeTmpEnv(content: string): string {
+  const envPath = path.join(tmpDir, '.env');
+  fs.writeFileSync(envPath, content, 'utf-8');
+  return envPath;
 }
 
-/**
- * Sample .env content for service config tests.
- */
-const SAMPLE_ENV = `# Database config
-DATABASE_URL=postgres://localhost/db
-SUPABASE_URL=https://example.supabase.co
-GH_SERVICE_SECRET=test-secret`;
+// -- Mock env vars for getServiceConfigs tests --
+
+const SAMPLE_ENV_VARS = [
+  'DATABASE_URL=postgres://localhost/db',
+  'SUPABASE_URL=https://example.supabase.co',
+  'GH_SERVICE_SECRET=test-secret',
+];
 
 describe('Container Configs Module', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gh-configs-test-'));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    try {
+      fs.rmSync(tmpDir, { recursive: true });
+    } catch {
+      // ignore cleanup errors
+    }
   });
 
   describe('loadEnvFile', () => {
     test('parses KEY=VALUE lines from env file', () => {
-      mockReadFileSync.mockReturnValue('KEY1=value1\nKEY2=value2\n');
+      const envPath = writeTmpEnv('KEY1=value1\nKEY2=value2\n');
 
-      const result = loadEnvFile('/some/path/.env');
+      const result = loadEnvFile(envPath);
       expect(result).toEqual(['KEY1=value1', 'KEY2=value2']);
     });
 
     test('filters out comment lines starting with #', () => {
-      mockReadFileSync.mockReturnValue(
+      const envPath = writeTmpEnv(
         '# comment\nKEY1=value1\n# another comment\nKEY2=value2\n',
       );
 
-      const result = loadEnvFile('/some/path/.env');
+      const result = loadEnvFile(envPath);
       expect(result).toEqual(['KEY1=value1', 'KEY2=value2']);
     });
 
     test('filters out empty lines', () => {
-      mockReadFileSync.mockReturnValue('KEY1=value1\n\n\nKEY2=value2\n\n');
+      const envPath = writeTmpEnv('KEY1=value1\n\n\nKEY2=value2\n\n');
 
-      const result = loadEnvFile('/some/path/.env');
+      const result = loadEnvFile(envPath);
       expect(result).toEqual(['KEY1=value1', 'KEY2=value2']);
     });
 
@@ -77,9 +91,9 @@ describe('Container Configs Module', () => {
         'KEY3=value with spaces',
       ].join('\n');
 
-      mockReadFileSync.mockReturnValue(content);
+      const envPath = writeTmpEnv(content);
 
-      const result = loadEnvFile('/some/path/.env');
+      const result = loadEnvFile(envPath);
       expect(result).toEqual([
         'KEY1=value1',
         'KEY2=value2',
@@ -88,43 +102,28 @@ describe('Container Configs Module', () => {
     });
 
     test('trims whitespace from lines', () => {
-      mockReadFileSync.mockReturnValue('  KEY1=value1  \n  KEY2=value2  \n');
+      const envPath = writeTmpEnv('  KEY1=value1  \n  KEY2=value2  \n');
 
-      const result = loadEnvFile('/some/path/.env');
+      const result = loadEnvFile(envPath);
       expect(result).toEqual(['KEY1=value1', 'KEY2=value2']);
     });
 
     test('returns empty array for file with only comments and blanks', () => {
-      mockReadFileSync.mockReturnValue('# just comments\n\n# nothing else\n');
+      const envPath = writeTmpEnv('# just comments\n\n# nothing else\n');
 
-      const result = loadEnvFile('/some/path/.env');
+      const result = loadEnvFile(envPath);
       expect(result).toEqual([]);
     });
 
-    test('throws descriptive error when file does not exist', () => {
-      mockReadFileSync.mockImplementation(() => {
-        const error = new Error(
-          "ENOENT: no such file or directory, open '/missing/.env'",
-        ) as NodeJS.ErrnoException;
-        error.code = 'ENOENT';
-        throw error;
-      });
-
-      expect(() => loadEnvFile('/missing/.env')).toThrow('ENOENT');
-    });
-
-    test('passes correct path and encoding to readFileSync', () => {
-      mockReadFileSync.mockReturnValue('KEY=val');
-
-      loadEnvFile('/opt/ghosthands/.env');
-
-      expect(mockReadFileSync).toHaveBeenCalledWith('/opt/ghosthands/.env', 'utf-8');
+    test('throws error when file does not exist', () => {
+      expect(() => loadEnvFile('/nonexistent/path/.env')).toThrow();
     });
   });
 
   describe('getServiceConfigs', () => {
     beforeEach(() => {
-      mockEnvFile(SAMPLE_ENV);
+      // Spy on loadEnvFile to avoid needing /opt/ghosthands/.env
+      vi.spyOn(containerConfigs, 'loadEnvFile').mockReturnValue(SAMPLE_ENV_VARS);
     });
 
     test('returns exactly 3 services', () => {
