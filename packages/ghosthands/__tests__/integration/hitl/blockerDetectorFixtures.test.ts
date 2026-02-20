@@ -9,6 +9,9 @@
  *
  * NOTE: Fixture filenames avoid "captcha" to prevent the URL-pattern detector
  * from matching file:// paths (which wouldn't happen in production).
+ *
+ * Requires: Chromium binary (npx playwright install chromium).
+ * Skips gracefully in CI environments without a browser installed.
  */
 
 import { describe, expect, test, beforeAll, afterAll } from 'bun:test';
@@ -20,9 +23,17 @@ const FIXTURES_DIR = path.resolve(__dirname, '../../fixtures/html');
 
 let browser: Browser;
 let detector: BlockerDetector;
+let skip = false;
 
 beforeAll(async () => {
-  browser = await chromium.launch({ headless: true });
+  try {
+    browser = await chromium.launch({ headless: true });
+  } catch {
+    // No Chromium binary (CI without `playwright install`) — skip all fixture tests
+    console.log('[BlockerDetector fixtures] Skipping: Chromium not available');
+    skip = true;
+    return;
+  }
   detector = new BlockerDetector();
 });
 
@@ -44,6 +55,7 @@ describe('fixture: reCAPTCHA checkbox', () => {
   let page: Page;
 
   beforeAll(async () => {
+    if (skip) return;
     page = await loadFixture('recap-cb.html');
   });
 
@@ -52,6 +64,7 @@ describe('fixture: reCAPTCHA checkbox', () => {
   });
 
   test('detects reCAPTCHA as captcha blocker', async () => {
+    if (skip) return;
     const result = await detector.detectBlocker(page);
 
     expect(result).not.toBeNull();
@@ -60,6 +73,7 @@ describe('fixture: reCAPTCHA checkbox', () => {
   });
 
   test('source is DOM-based', async () => {
+    if (skip) return;
     const result = await detector.detectBlocker(page);
     expect(result!.source).toBe('dom');
   });
@@ -71,6 +85,7 @@ describe('fixture: reCAPTCHA audio challenge', () => {
   let page: Page;
 
   beforeAll(async () => {
+    if (skip) return;
     page = await loadFixture('recap-aud.html');
   });
 
@@ -79,6 +94,7 @@ describe('fixture: reCAPTCHA audio challenge', () => {
   });
 
   test('detects audio CAPTCHA as captcha blocker', async () => {
+    if (skip) return;
     const result = await detector.detectBlocker(page);
 
     expect(result).not.toBeNull();
@@ -86,6 +102,7 @@ describe('fixture: reCAPTCHA audio challenge', () => {
   });
 
   test('confidence is high (multiple signals)', async () => {
+    if (skip) return;
     const result = await detector.detectBlocker(page);
     // .rc-audiochallenge (0.95), #audio-source (0.9), text patterns — should pick highest
     expect(result!.confidence).toBeGreaterThanOrEqual(0.85);
@@ -98,6 +115,7 @@ describe('fixture: hCaptcha audio', () => {
   let page: Page;
 
   beforeAll(async () => {
+    if (skip) return;
     page = await loadFixture('hcap-audio.html');
   });
 
@@ -106,6 +124,7 @@ describe('fixture: hCaptcha audio', () => {
   });
 
   test('detects hCaptcha audio as captcha blocker', async () => {
+    if (skip) return;
     const result = await detector.detectBlocker(page);
 
     expect(result).not.toBeNull();
@@ -113,6 +132,7 @@ describe('fixture: hCaptcha audio', () => {
   });
 
   test('high confidence from .h-captcha selector', async () => {
+    if (skip) return;
     const result = await detector.detectBlocker(page);
     expect(result!.confidence).toBeGreaterThanOrEqual(0.85);
   });
@@ -124,6 +144,7 @@ describe('fixture: clean job posting (no blocker)', () => {
   let page: Page;
 
   beforeAll(async () => {
+    if (skip) return;
     page = await loadFixture('clean-job-posting.html');
   });
 
@@ -132,6 +153,7 @@ describe('fixture: clean job posting (no blocker)', () => {
   });
 
   test('does NOT detect a blocker on a clean job page with audio/video', async () => {
+    if (skip) return;
     const result = await detector.detectBlocker(page);
     expect(result).toBeNull();
   });
@@ -143,6 +165,7 @@ describe('fixture: Cloudflare challenge', () => {
   let page: Page;
 
   beforeAll(async () => {
+    if (skip) return;
     page = await loadFixture('cf-challenge.html');
   });
 
@@ -151,6 +174,7 @@ describe('fixture: Cloudflare challenge', () => {
   });
 
   test('detects Cloudflare challenge page', async () => {
+    if (skip) return;
     const result = await detector.detectBlocker(page);
 
     expect(result).not.toBeNull();
@@ -167,6 +191,7 @@ describe('fixture: login wall', () => {
   let page: Page;
 
   beforeAll(async () => {
+    if (skip) return;
     page = await loadFixture('login-wall.html');
   });
 
@@ -175,6 +200,7 @@ describe('fixture: login wall', () => {
   });
 
   test('detects login wall', async () => {
+    if (skip) return;
     const result = await detector.detectBlocker(page);
 
     expect(result).not.toBeNull();
@@ -182,6 +208,7 @@ describe('fixture: login wall', () => {
   });
 
   test('high confidence from multiple signals', async () => {
+    if (skip) return;
     const result = await detector.detectBlocker(page);
     // form[action*="signin"], input[type="password"], #login-form, text patterns
     expect(result!.confidence).toBeGreaterThanOrEqual(0.8);
@@ -194,6 +221,7 @@ describe('fixture: 2FA prompt', () => {
   let page: Page;
 
   beforeAll(async () => {
+    if (skip) return;
     page = await loadFixture('2fa-prompt.html');
   });
 
@@ -202,6 +230,7 @@ describe('fixture: 2FA prompt', () => {
   });
 
   test('detects 2FA prompt', async () => {
+    if (skip) return;
     const result = await detector.detectBlocker(page);
 
     expect(result).not.toBeNull();
@@ -209,6 +238,7 @@ describe('fixture: 2FA prompt', () => {
   });
 
   test('confidence is meaningful', async () => {
+    if (skip) return;
     const result = await detector.detectBlocker(page);
     expect(result!.confidence).toBeGreaterThanOrEqual(0.7);
   });
