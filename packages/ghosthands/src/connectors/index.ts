@@ -4,3 +4,5 @@
 
 export { ActionBookConnector } from './actionbookConnector';
 export type { AgentConnector } from './actionbookConnector';
+export { AdsPowerClient } from './AdsPowerClient';
+export type { AdsPowerConfig, AdsPowerBrowserResult } from './AdsPowerClient';

@@ -113,7 +113,9 @@ export interface AdapterStartOptions {
   imageLlm?: LLMConfig;
   /** CDP WebSocket URL for connecting to existing browser */
   cdpUrl?: string;
-  /** Browser launch options (ignored if cdpUrl provided) */
+  /** Pre-connected BrowserContext (e.g. from AdsPower via Patchright). Takes precedence over cdpUrl. */
+  browserContext?: import('playwright').BrowserContext;
+  /** Browser launch options (ignored if cdpUrl or browserContext provided) */
   browserOptions?: BrowserLaunchOptions;
   /** Connectors to pass to the underlying agent (Magnitude-specific) */
   connectors?: any[];
