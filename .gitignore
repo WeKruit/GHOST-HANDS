@@ -10,6 +10,8 @@ coverage/
 dist/
 build/
 *.tsbuildinfo
+build-out.txt
+build-err.txt
 
 # Environment variables
 .env
