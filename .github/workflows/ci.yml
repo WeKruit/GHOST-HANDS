@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, staging]
   pull_request:
-    branches: [main]
+    branches: [main, staging]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -59,7 +59,7 @@ jobs:
           GH_ENCRYPTION_KEY: ${{ secrets.GH_ENCRYPTION_KEY }}
 
   # ─── Docker build (main + staging branches) ────────────────────
-  # Staging: tags as staging-<sha>
+  # Staging: tags as staging-<sha> + mutable staging
   # Main:    tags as <sha> + latest
 
   docker:
@@ -80,10 +80,12 @@ jobs:
             echo "image_tag=staging-${{ github.sha }}" >> "$GITHUB_OUTPUT"
             echo "environment=staging" >> "$GITHUB_OUTPUT"
             echo "tag_latest=false" >> "$GITHUB_OUTPUT"
+            echo "tag_staging=true" >> "$GITHUB_OUTPUT"
           else
             echo "image_tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
             echo "environment=production" >> "$GITHUB_OUTPUT"
             echo "tag_latest=true" >> "$GITHUB_OUTPUT"
+            echo "tag_staging=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Configure AWS credentials
@@ -103,10 +105,14 @@ jobs:
           ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
           IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
           TAG_LATEST: ${{ steps.meta.outputs.tag_latest }}
+          TAG_STAGING: ${{ steps.meta.outputs.tag_staging }}
         run: |
           TAGS="-t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           if [ "$TAG_LATEST" = "true" ]; then
             TAGS="$TAGS -t $ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          fi
+          if [ "$TAG_STAGING" = "true" ]; then
+            TAGS="$TAGS -t $ECR_REGISTRY/$ECR_REPOSITORY:staging"
           fi
 
           docker build \
@@ -120,9 +126,11 @@ jobs:
           if [ "$TAG_LATEST" = "true" ]; then
             docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           fi
+          if [ "$TAG_STAGING" = "true" ]; then
+            docker push $ECR_REGISTRY/$ECR_REPOSITORY:staging
+          fi
 
   # ─── Deploy: Staging ──────────────────────────────────────────
-  # Triggers on both staging branch (direct) and main branch (promotion)
 
   deploy-staging:
     name: Deploy Staging
@@ -181,6 +189,41 @@ jobs:
             echo "Staging deploy notification sent."
           else
             echo "::warning::VALET staging webhook returned HTTP ${HTTP_STATUS}."
+          fi
+
+      - name: Update Kasm workspace image
+        if: env.KASM_API_URL != ''
+        env:
+          KASM_API_URL: ${{ secrets.KASM_API_URL }}
+          KASM_API_KEY: ${{ secrets.KASM_API_KEY }}
+          KASM_API_SECRET: ${{ secrets.KASM_API_SECRET }}
+          KASM_IMAGE_ID: ${{ secrets.KASM_IMAGE_ID }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ needs.docker.outputs.image_tag }}
+        run: |
+          echo "Updating Kasm workspace image to ${IMAGE_TAG}"
+
+          HTTP_STATUS=$(curl -s -o /tmp/kasm_response.txt -w "%{http_code}" \
+            -X POST "${KASM_API_URL}/api/public/update_image" \
+            -H "Content-Type: application/json" \
+            --max-time 30 \
+            -d "{
+              \"api_key\": \"${KASM_API_KEY}\",
+              \"api_key_secret\": \"${KASM_API_SECRET}\",
+              \"target_image\": {
+                \"image_id\": \"${KASM_IMAGE_ID}\",
+                \"docker_registry\": \"${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}\"
+              }
+            }")
+
+          echo "Kasm responded with HTTP ${HTTP_STATUS}"
+          cat /tmp/kasm_response.txt
+
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "Kasm workspace image updated to ${IMAGE_TAG}."
+          else
+            echo "::warning::Kasm API returned HTTP ${HTTP_STATUS}."
           fi
 
   # ─── Deploy: Production ───────────────────────────────────────
@@ -242,4 +285,39 @@ jobs:
             echo "Production deploy notification sent."
           else
             echo "::warning::VALET production webhook returned HTTP ${HTTP_STATUS}."
+          fi
+
+      - name: Update Kasm workspace image
+        if: env.KASM_API_URL != ''
+        env:
+          KASM_API_URL: ${{ secrets.KASM_API_URL }}
+          KASM_API_KEY: ${{ secrets.KASM_API_KEY }}
+          KASM_API_SECRET: ${{ secrets.KASM_API_SECRET }}
+          KASM_IMAGE_ID: ${{ secrets.KASM_IMAGE_ID }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ needs.docker.outputs.image_tag }}
+        run: |
+          echo "Updating Kasm workspace image to ${IMAGE_TAG}"
+
+          HTTP_STATUS=$(curl -s -o /tmp/kasm_response.txt -w "%{http_code}" \
+            -X POST "${KASM_API_URL}/api/public/update_image" \
+            -H "Content-Type: application/json" \
+            --max-time 30 \
+            -d "{
+              \"api_key\": \"${KASM_API_KEY}\",
+              \"api_key_secret\": \"${KASM_API_SECRET}\",
+              \"target_image\": {
+                \"image_id\": \"${KASM_IMAGE_ID}\",
+                \"docker_registry\": \"${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}\"
+              }
+            }")
+
+          echo "Kasm responded with HTTP ${HTTP_STATUS}"
+          cat /tmp/kasm_response.txt
+
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "Kasm workspace image updated to ${IMAGE_TAG}."
+          else
+            echo "::warning::Kasm API returned HTTP ${HTTP_STATUS}."
           fi
