@@ -3,6 +3,7 @@ import { writeFile, unlink, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
+import { getLogger } from '../monitoring/logger.js';
 
 export interface ResumeRef {
   storage_path?: string;
@@ -91,7 +92,7 @@ export class ResumeDownloader {
     const localPath = this.buildTempPath(jobId, extension);
     await writeFile(localPath, buffer);
 
-    console.log(`[ResumeDownloader] Downloaded resume from Supabase: ${storagePath} -> ${localPath}`);
+    getLogger().info('Downloaded resume from Supabase', { storagePath, localPath });
     return localPath;
   }
 
@@ -126,7 +127,7 @@ export class ResumeDownloader {
       const localPath = this.buildTempPath(jobId, extension);
       await writeFile(localPath, buffer);
 
-      console.log(`[ResumeDownloader] Downloaded resume from URL -> ${localPath}`);
+      getLogger().info('Downloaded resume from URL', { localPath });
       return localPath;
     } catch (err) {
       clearTimeout(timeoutId);
