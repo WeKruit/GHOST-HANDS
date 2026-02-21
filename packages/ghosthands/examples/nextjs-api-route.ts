@@ -30,7 +30,7 @@ const client = new GhostHandsClient(
 // const client = new GhostHandsClient({
 //   mode: 'db',
 //   supabaseUrl: process.env.SUPABASE_URL!,
-//   supabaseKey: process.env.SUPABASE_SERVICE_KEY!,
+//   supabaseKey: process.env.SUPABASE_SECRET_KEY!,
 // });
 
 // API mode with Realtime support:
@@ -38,7 +38,7 @@ const client = new GhostHandsClient(
 //   apiUrl: process.env.GHOSTHANDS_API_URL!,
 //   apiKey: process.env.GHOSTHANDS_API_KEY!,
 //   supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL!,
-//   supabaseKey: process.env.SUPABASE_SERVICE_KEY!,
+//   supabaseKey: process.env.SUPABASE_SECRET_KEY!,
 // });
 
 // ---------------------------------------------------------------------------
@@ -256,7 +256,7 @@ export async function subscribeExample(jobId: string) {
 
   const supabase = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!,
   );
 
   function useJobUpdates(userId: string) {

@@ -18,7 +18,7 @@
 
 import { Client as PgClient } from 'pg';
 import { createClient } from '@supabase/supabase-js';
-import { TEST_WORKDAY_PROFILE, TEST_QA_OVERRIDES } from '../workers/taskHandlers/workdayTypes.js';
+import { TEST_WORKDAY_PROFILE, TEST_QA_OVERRIDES } from '../../__tests__/fixtures/workdayTestData.js';
 
 // --- Config ---
 
@@ -74,7 +74,7 @@ async function main() {
   }
 
   const supabaseUrl = process.env.SUPABASE_URL;
-  const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
+  const supabaseKey = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
 
   if (supabaseUrl && supabaseKey) {
     const supabase = createClient(supabaseUrl, supabaseKey);

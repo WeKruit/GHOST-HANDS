@@ -34,7 +34,7 @@ bun install
 
 # 2. Configure
 cp .env.example .env
-# Fill in SUPABASE_URL, SUPABASE_SERVICE_KEY, DATABASE_URL, GH_SERVICE_SECRET
+# Fill in SUPABASE_URL, SUPABASE_SECRET_KEY, DATABASE_URL, GH_SERVICE_SECRET
 
 # 3. Run migrations
 cd packages/ghosthands

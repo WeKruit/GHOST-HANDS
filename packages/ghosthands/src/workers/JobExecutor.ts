@@ -196,7 +196,7 @@ export class JobExecutor {
             job.job_type,
           );
       if (isDev) {
-        console.log(`[JobExecutor] Skipping budget preflight (NODE_ENV=development)`);
+        getLogger().debug('Skipping budget preflight', { nodeEnv: 'development' });
       }
       if (!preflight.allowed) {
         await this.updateJobStatus(job.id, 'failed', preflight.reason);
@@ -232,7 +232,7 @@ export class JobExecutor {
             action_count: 0,
             total_tokens: 0,
           }).catch((err) => {
-            console.warn(`[JobExecutor] Preflight failure callback failed for job ${job.id}:`, err);
+            getLogger().warn('Preflight failure callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           });
         }
         return;
@@ -259,7 +259,7 @@ export class JobExecutor {
           undefined,
           this.workerId,
         ).catch((err) => {
-          console.warn(`[JobExecutor] Running callback failed for job ${job.id}:`, err);
+          getLogger().warn('Running callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });
       }
 
@@ -299,7 +299,7 @@ export class JobExecutor {
               action_count: 0,
               total_tokens: 0,
             }).catch((err) => {
-              console.warn(`[JobExecutor] Validation failure callback failed for job ${job.id}:`, err);
+              getLogger().warn('Validation failure callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
             });
           }
           return;
@@ -346,7 +346,7 @@ export class JobExecutor {
             });
           }
         } catch (err) {
-          console.warn(`[JobExecutor] Session load failed for job ${job.id}:`, err);
+          getLogger().warn('Session load failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         }
       }
 
@@ -381,7 +381,7 @@ export class JobExecutor {
           }
         } catch (err) {
           // Observer is optional — don't fail the job if it can't attach
-          console.warn(`[JobExecutor] StagehandObserver init failed for job ${job.id}:`, err);
+          getLogger().warn('StagehandObserver init failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           observer = undefined;
         }
       }
@@ -404,7 +404,7 @@ export class JobExecutor {
             const cookies = (googleSession as any).cookies || [];
             if (cookies.length > 0) {
               await adapter.page.context().addCookies(cookies);
-              console.log(`[JobExecutor] Injected ${cookies.length} Google session cookies (from ${domain}) for user ${job.user_id}`);
+              getLogger().info('Injected Google session cookies', { count: cookies.length, domain, userId: job.user_id });
               googleSessionInjected = true;
             }
           }
@@ -417,18 +417,18 @@ export class JobExecutor {
           const cookies = (targetSession as any).cookies || [];
           if (cookies.length > 0) {
             await adapter.page.context().addCookies(cookies);
-            console.log(`[JobExecutor] Injected ${cookies.length} ${injTargetDomain} session cookies`);
+            getLogger().info('Injected target domain session cookies', { count: cookies.length, domain: injTargetDomain });
           }
         }
         // Reload page after cookie injection so Workday SSO picks up the Google session
         if (googleSessionInjected) {
-          console.log(`[JobExecutor] Reloading page after session injection...`);
+          getLogger().info('Reloading page after session injection');
           await adapter.page.reload({ waitUntil: 'networkidle' }).catch(() => {});
           await adapter.page.waitForTimeout(2000);
         }
       } catch (err) {
         // Session injection failure is non-fatal — worker can still try fresh login
-        console.warn(`[JobExecutor] Session injection failed (non-fatal):`, err);
+        getLogger().warn('Session injection failed (non-fatal)', { error: err instanceof Error ? err.message : String(err) });
       }
 
       // 8a. Auto-attach resume to file inputs via Playwright filechooser event.
@@ -508,7 +508,7 @@ export class JobExecutor {
           const screenshotUrl = await this.uploadScreenshot(job.id, 'final', screenshotBuffer);
           screenshotUrls.push(screenshotUrl);
         } catch (err) {
-          console.warn(`[JobExecutor] Screenshot failed for job ${job.id}:`, err);
+          getLogger().warn('Screenshot failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         }
 
         // Save browser session
@@ -520,7 +520,7 @@ export class JobExecutor {
               await this.sessionManager.saveSession(job.user_id, job.target_url, sessionState);
             }
           } catch (err) {
-            console.warn(`[JobExecutor] Session save failed for job ${job.id}:`, err);
+            getLogger().warn('Session save failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           }
         }
 
@@ -562,7 +562,9 @@ export class JobExecutor {
           cookbook_steps: engineResult.cookbookSteps,
         });
 
-        await costService.recordJobCost(job.user_id, job.id, finalCost);
+        await costService.recordJobCost(job.user_id, job.id, finalCost).catch((err) => {
+          getLogger().warn('Failed to record cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+        });
 
         if (job.callback_url) {
           callbackNotifier.notifyFromJob({
@@ -578,11 +580,11 @@ export class JobExecutor {
             action_count: finalCost.actionCount,
             total_tokens: finalCost.inputTokens + finalCost.outputTokens,
           }).catch((err) => {
-            console.warn(`[JobExecutor] Callback notification failed for job ${job.id}:`, err);
+            getLogger().warn('Callback notification failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           });
         }
 
-        console.log(`[JobExecutor] Job ${job.id} completed via cookbook (steps=${engineResult.cookbookSteps}, cost=$${finalCost.totalCost.toFixed(4)})`);
+        getLogger().info('Job completed via cookbook', { jobId: job.id, cookbookSteps: engineResult.cookbookSteps, costUsd: finalCost.totalCost });
         return;
       }
 
@@ -655,9 +657,9 @@ export class JobExecutor {
           }
 
           crashRecoveryAttempts++;
-          console.warn(
-            `[JobExecutor] Browser crash detected for job ${job.id}, recovery attempt ${crashRecoveryAttempts}/${MAX_CRASH_RECOVERIES}`,
-          );
+          getLogger().warn('Browser crash detected', {
+            jobId: job.id, attempt: crashRecoveryAttempts, maxAttempts: MAX_CRASH_RECOVERIES,
+          });
 
           await this.logJobEvent(job.id, 'browser_crash_detected', {
             attempt: crashRecoveryAttempts,
@@ -696,7 +698,7 @@ export class JobExecutor {
                 (adapter as MagnitudeAdapter).setObserver(observer);
               }
             } catch (err) {
-              console.warn(`[JobExecutor] StagehandObserver re-attach failed after crash recovery for job ${job.id}:`, err);
+              getLogger().warn('StagehandObserver re-attach failed after crash recovery', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
               observer = undefined;
             }
           }
@@ -747,7 +749,7 @@ export class JobExecutor {
               url_pattern: ManualStore.urlToPattern(job.target_url),
             });
           } catch (err) {
-            console.warn(`[JobExecutor] Manual save failed for job ${job.id}:`, err);
+            getLogger().warn('Manual save failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           }
         }
       }
@@ -793,7 +795,7 @@ export class JobExecutor {
         );
         screenshotUrls.push(screenshotUrl);
       } catch (err) {
-        console.warn(`[JobExecutor] Screenshot failed for job ${job.id}:`, err);
+        getLogger().warn('Screenshot failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       }
 
       // 11.5. Save browser session for future reuse
@@ -808,7 +810,7 @@ export class JobExecutor {
             });
           }
         } catch (err) {
-          console.warn(`[JobExecutor] Session save failed for job ${job.id}:`, err);
+          getLogger().warn('Session save failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         }
       }
 
@@ -831,9 +833,9 @@ export class JobExecutor {
           saveDomain,
           freshState as unknown as Record<string, unknown>,
         );
-        console.log(`[JobExecutor] Saved fresh session cookies for user ${job.user_id}`);
+        getLogger().info('Saved fresh session cookies', { userId: job.user_id });
       } catch (err) {
-        console.warn(`[JobExecutor] Session save failed (non-fatal):`, err);
+        getLogger().warn('Session save failed (non-fatal)', { error: err instanceof Error ? err.message : String(err) });
       }
 
       // 13. Handle awaiting_user_review vs completed
@@ -872,14 +874,16 @@ export class JobExecutor {
           cost_cents: Math.round(finalCost.totalCost * 100),
         });
 
-        await costService.recordJobCost(job.user_id, job.id, finalCost);
+        await costService.recordJobCost(job.user_id, job.id, finalCost).catch((err) => {
+          getLogger().warn('Failed to record cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+        });
 
-        console.log(`[JobExecutor] Job ${job.id} awaiting user review (actions=${finalCost.actionCount}, cost=$${finalCost.totalCost.toFixed(4)})`);
+        getLogger().info('Job awaiting user review', { jobId: job.id, actionCount: finalCost.actionCount, costUsd: finalCost.totalCost });
 
         // Keep heartbeat running and browser open — wait indefinitely
         // The worker process must stay alive for the browser to remain open
-        console.log(`[JobExecutor] Browser is open for manual review. Heartbeat continues.`);
-        console.log(`[JobExecutor] Press Ctrl+C to shut down the worker when done.`);
+        getLogger().info('Browser is open for manual review, heartbeat continues');
+        getLogger().info('Press Ctrl+C to shut down the worker when done');
 
         // Block indefinitely — the user will Ctrl+C when done
         await new Promise<void>(() => {
@@ -932,8 +936,10 @@ export class JobExecutor {
         magnitude_steps: finalCost.actionCount,
       });
 
-      // 14. Record cost against user's monthly usage
-      await costService.recordJobCost(job.user_id, job.id, finalCost);
+      // 14. Record cost against user's monthly usage (best-effort, don't fail the job)
+      await costService.recordJobCost(job.user_id, job.id, finalCost).catch((err) => {
+        getLogger().warn('Failed to record cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+      });
 
       // 15. Fire VALET callback if configured
       if (job.callback_url) {
@@ -951,11 +957,11 @@ export class JobExecutor {
           total_tokens: finalCost.inputTokens + finalCost.outputTokens,
         };
         callbackNotifier.notifyFromJob(jobRow).catch((err) => {
-          console.warn(`[JobExecutor] Callback notification failed for job ${job.id}:`, err);
+          getLogger().warn('Callback notification failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });
       }
 
-      console.log(`[JobExecutor] Job ${job.id} completed via ${handler.type} handler (actions=${finalCost.actionCount}, tokens=${finalCost.inputTokens + finalCost.outputTokens}, cost=$${finalCost.totalCost.toFixed(4)})`);
+      getLogger().info('Job completed via handler', { jobId: job.id, handler: handler.type, actionCount: finalCost.actionCount, totalTokens: finalCost.inputTokens + finalCost.outputTokens, costUsd: finalCost.totalCost });
     } catch (error: unknown) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorCode = this.classifyError(errorMessage);
@@ -977,17 +983,17 @@ export class JobExecutor {
             if (resumed) {
               const hitlSnapshot = costTracker.getSnapshot();
               await costService.recordJobCost(job.user_id, job.id, hitlSnapshot).catch((err) => {
-                console.warn(`[JobExecutor] Failed to record HITL partial cost for job ${job.id}:`, err);
+                getLogger().warn('Failed to record HITL partial cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
               });
-              console.log(`[JobExecutor] Job ${job.id} resumed after HITL intervention`);
+              getLogger().info('Job resumed after HITL intervention', { jobId: job.id });
               return;
             }
           } else {
             // checkForBlockers handled the HITL flow but the blocker couldn't be resolved
-            console.warn(`[JobExecutor] Job ${job.id} blocked and HITL could not resolve`);
+            getLogger().warn('Job blocked and HITL could not resolve', { jobId: job.id });
           }
         } catch (hitlErr) {
-          console.warn(`[JobExecutor] HITL intervention failed for job ${job.id}:`, hitlErr);
+          getLogger().warn('HITL intervention failed', { jobId: job.id, error: hitlErr instanceof Error ? hitlErr.message : String(hitlErr) });
           // Fall through to normal error handling
         }
       }
@@ -999,7 +1005,7 @@ export class JobExecutor {
 
       // Always record cost on failure (even zero cost for consistent accounting)
       await costService.recordJobCost(job.user_id, job.id, snapshot).catch((err) => {
-        console.warn(`[JobExecutor] Failed to record cost for job ${job.id}:`, err);
+        getLogger().warn('Failed to record cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       });
 
       // Fire VALET callback on failure too
@@ -1016,7 +1022,7 @@ export class JobExecutor {
           action_count: snapshot.actionCount,
           total_tokens: snapshot.inputTokens + snapshot.outputTokens,
         }).catch((err) => {
-          console.warn(`[JobExecutor] Callback notification failed for job ${job.id}:`, err);
+          getLogger().warn('Callback notification failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });
       }
     } finally {
@@ -1057,7 +1063,7 @@ export class JobExecutor {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorCode = this.classifyError(errorMessage);
 
-    console.error(`[JobExecutor] Job ${job.id} failed (code=${errorCode}): ${errorMessage}`);
+    getLogger().error('Job failed', { jobId: job.id, errorCode, errorMessage });
 
     await this.logJobEvent(job.id, 'job_failed', {
       error_code: errorCode,
@@ -1092,7 +1098,7 @@ export class JobExecutor {
         })
         .eq('id', job.id);
 
-      console.log(`[JobExecutor] Job ${job.id} re-queued for retry ${job.retry_count + 1}/${job.max_retries} (backoff=${backoffSeconds}s)`);
+      getLogger().info('Job re-queued for retry', { jobId: job.id, retryCount: job.retry_count + 1, maxRetries: job.max_retries, backoffSeconds });
     } else {
       await this.supabase
         .from('gh_automation_jobs')
@@ -1236,7 +1242,7 @@ export class JobExecutor {
       blockerResult = await this.blockerDetector.detectWithAdapter(adapter);
     } catch (err) {
       // Detection failure should not crash the job
-      console.warn(`[JobExecutor] Blocker detection failed for job ${job.id}:`, err);
+      getLogger().warn('Blocker detection failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       return false;
     }
 
@@ -1275,9 +1281,10 @@ export class JobExecutor {
           return false;
         }
 
-        console.warn(
-          `[JobExecutor] Job ${job.id} still blocked after resume (attempt ${attempt}/${MAX_POST_RESUME_CHECKS}): ${stillBlocked.type} (${stillBlocked.confidence})`,
-        );
+        getLogger().warn('Job still blocked after resume', {
+          jobId: job.id, attempt, maxAttempts: MAX_POST_RESUME_CHECKS,
+          blockerType: stillBlocked.type, confidence: stillBlocked.confidence,
+        });
 
         if (attempt < MAX_POST_RESUME_CHECKS) {
           // Re-pause and wait for another human intervention
@@ -1316,7 +1323,7 @@ export class JobExecutor {
       const screenshotBuffer = await adapter.screenshot();
       screenshotUrl = await this.uploadScreenshot(job.id, 'blocker', screenshotBuffer);
     } catch (err) {
-      console.warn(`[JobExecutor] HITL screenshot failed for job ${job.id}:`, err);
+      getLogger().warn('HITL screenshot failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
     }
 
     const pageUrl = await adapter.getCurrentUrl();
@@ -1384,7 +1391,7 @@ export class JobExecutor {
           total_tokens: costSnapshot.inputTokens + costSnapshot.outputTokens,
         } : undefined,
       ).catch((err) => {
-        console.warn(`[JobExecutor] HITL callback failed for job ${job.id}:`, err);
+        getLogger().warn('HITL callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       });
     }
 
@@ -1424,7 +1431,7 @@ export class JobExecutor {
 
       if (job.callback_url) {
         callbackNotifier.notifyResumed(job.id, job.callback_url, job.valet_task_id, this.workerId).catch((err) => {
-          console.warn(`[JobExecutor] Resume callback failed for job ${job.id}:`, err);
+          getLogger().warn('Resume callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });
       }
       return true;
@@ -1497,7 +1504,7 @@ export class JobExecutor {
       return this.readAndClearResolutionData(jobId);
     } catch (err) {
       client.release();
-      console.warn(`[JobExecutor] PG LISTEN failed for job ${jobId}, falling back to polling:`, err);
+      getLogger().warn('PG LISTEN failed, falling back to polling', { jobId, error: err instanceof Error ? err.message : String(err) });
       return this.waitForResumeViaPolling(jobId, timeoutSeconds);
     }
   }
@@ -1574,7 +1581,7 @@ export class JobExecutor {
 
       return { resumed: true, resolutionType, resolutionData };
     } catch (err) {
-      console.warn(`[JobExecutor] Failed to read resolution data for job ${jobId}:`, err);
+      getLogger().warn('Failed to read resolution data', { jobId, error: err instanceof Error ? err.message : String(err) });
       // Still resumed, just without resolution data
       return { resumed: true, resolutionType: 'manual' };
     }
@@ -1590,7 +1597,7 @@ export class JobExecutor {
           .update({ last_heartbeat: new Date().toISOString() })
           .eq('id', jobId);
       } catch (err) {
-        console.warn(`[JobExecutor] Heartbeat failed for job ${jobId}:`, err);
+        getLogger().warn('Heartbeat failed', { jobId, error: err instanceof Error ? err.message : String(err) });
       }
     }, HEARTBEAT_INTERVAL_MS);
   }
@@ -1630,7 +1637,7 @@ export class JobExecutor {
       });
     } catch (err) {
       // Event logging failures should not crash the job
-      console.warn(`[JobExecutor] Event log failed (${eventType}):`, err);
+      getLogger().warn('Event log failed', { eventType, error: err instanceof Error ? err.message : String(err) });
     }
   }
 
@@ -1802,7 +1809,7 @@ export class JobExecutor {
         const el = await page.$(selector);
         if (el && await el.isVisible()) {
           await el.fill(code);
-          console.log(`[JobExecutor] Injected 2FA code via selector: ${selector}`);
+          getLogger().debug('Injected 2FA code via selector', { selector });
           await this.logJobEvent(jobId, JOB_EVENT_TYPES.CREDENTIAL_INJECTION_SUCCEEDED, {
             injection_type: 'code_entry',
             selector,
@@ -1818,7 +1825,7 @@ export class JobExecutor {
         // Selector may not be valid on this page, try next
       }
     }
-    console.warn('[JobExecutor] Could not find 2FA code input field — resuming without injection');
+    getLogger().warn('Could not find 2FA code input field, resuming without injection');
     await this.logJobEvent(jobId, JOB_EVENT_TYPES.CREDENTIAL_INJECTION_FAILED, {
       injection_type: 'code_entry',
       reason: 'no_matching_input_field',
@@ -1870,7 +1877,7 @@ export class JobExecutor {
           const el = await page.$(sel);
           if (el && await el.isVisible()) {
             await el.fill(username);
-            console.log(`[JobExecutor] Injected username via selector: ${sel}`);
+            getLogger().debug('Injected username via selector', { selector: sel });
             usernameInjected = true;
             break;
           }
@@ -1890,7 +1897,7 @@ export class JobExecutor {
           const el = await page.$(sel);
           if (el && await el.isVisible()) {
             await el.fill(password);
-            console.log(`[JobExecutor] Injected password via selector: ${sel}`);
+            getLogger().debug('Injected password via selector', { selector: sel });
             passwordInjected = true;
             break;
           }
@@ -1980,7 +1987,7 @@ export class JobExecutor {
 
       return newAdapter;
     } catch (err) {
-      console.error(`[JobExecutor] Crash recovery failed for job ${job.id}:`, err);
+      getLogger().error('Crash recovery failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       return null;
     }
   }
