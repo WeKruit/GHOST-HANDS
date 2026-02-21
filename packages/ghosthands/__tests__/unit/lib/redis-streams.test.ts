@@ -227,40 +227,40 @@ describe('null / undefined Redis client', () => {
   };
 
   test('xaddEvent returns null when Redis client is null', async () => {
-    const result = await xaddEvent(null as any, 'job-1', sampleEvent);
+    const result = await xaddEvent(null, 'job-1', sampleEvent);
     expect(result).toBeNull();
   });
 
   test('xaddEvent returns null when Redis client is undefined', async () => {
-    const result = await xaddEvent(undefined as any, 'job-1', sampleEvent);
+    const result = await xaddEvent(undefined, 'job-1', sampleEvent);
     expect(result).toBeNull();
   });
 
   test('setStreamTTL resolves without throwing when Redis client is null', async () => {
-    await expect(setStreamTTL(null as any, 'job-1')).resolves.toBeUndefined();
+    await expect(setStreamTTL(null, 'job-1')).resolves.toBeUndefined();
   });
 
   test('setStreamTTL resolves without throwing when Redis client is undefined', async () => {
-    await expect(setStreamTTL(undefined as any, 'job-1')).resolves.toBeUndefined();
+    await expect(setStreamTTL(undefined, 'job-1')).resolves.toBeUndefined();
   });
 
   test('xtrimStream returns 0 when Redis client is null', async () => {
-    const result = await xtrimStream(null as any, 'job-1');
+    const result = await xtrimStream(null, 'job-1');
     expect(result).toBe(0);
   });
 
   test('xtrimStream returns 0 when Redis client is undefined', async () => {
-    const result = await xtrimStream(undefined as any, 'job-1');
+    const result = await xtrimStream(undefined, 'job-1');
     expect(result).toBe(0);
   });
 
   test('deleteStream returns 0 when Redis client is null', async () => {
-    const result = await deleteStream(null as any, 'job-1');
+    const result = await deleteStream(null, 'job-1');
     expect(result).toBe(0);
   });
 
   test('deleteStream returns 0 when Redis client is undefined', async () => {
-    const result = await deleteStream(undefined as any, 'job-1');
+    const result = await deleteStream(undefined, 'job-1');
     expect(result).toBe(0);
   });
 });
