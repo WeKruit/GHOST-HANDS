@@ -430,5 +430,3 @@ main().catch((err) => {
   logger.error('Fatal error', { error: err instanceof Error ? err.message : String(err) });
   process.exit(1);
 });
-
-export { fetchEc2InstanceId, completeLifecycleAction } from './asg-lifecycle.js';
