@@ -5,6 +5,9 @@ import { JobPoller } from './JobPoller.js';
 import { PgBossConsumer } from './PgBossConsumer.js';
 import { JobExecutor } from './JobExecutor.js';
 import { registerBuiltinHandlers } from './taskHandlers/index.js';
+import { getLogger } from '../monitoring/logger.js';
+
+const logger = getLogger({ service: 'Worker' });
 
 /**
  * GhostHands Worker Entry Point
@@ -51,11 +54,11 @@ function requireEnv(name: string): string {
 
 async function main(): Promise<void> {
   const dispatchMode = process.env.JOB_DISPATCH_MODE === 'queue' ? 'queue' : 'legacy';
-  console.log(`[Worker] Starting with ID: ${WORKER_ID} (dispatch=${dispatchMode})`);
+  logger.info('Starting worker', { workerId: WORKER_ID, dispatchMode });
 
   // Register all built-in task handlers
   registerBuiltinHandlers();
-  console.log(`[Worker] Task handlers registered`);
+  logger.info('Task handlers registered');
 
   // Validate required environment variables
   const supabaseUrl = requireEnv('SUPABASE_URL');
@@ -74,9 +77,9 @@ async function main(): Promise<void> {
     connectionString: dbUrl,
   });
 
-  console.log(`[Worker] Connecting to Postgres...`);
+  logger.info('Connecting to Postgres...');
   await pgDirect.connect();
-  console.log(`[Worker] Postgres connection established`);
+  logger.info('Postgres connection established');
 
   // CONVENTION: Single-task-per-worker. Each worker processes one job at a time.
   // This simplifies concurrency, avoids browser session conflicts, and makes
@@ -109,19 +112,22 @@ async function main(): Promise<void> {
     else if (poller) await poller.stop();
   };
 
-  // Two-phase shutdown handler:
-  // - First signal: graceful shutdown (drain active jobs, release claimed jobs)
-  // - Second signal: force release jobs and exit immediately
+  // Separate flags:
+  //   draining — set by /worker/drain HTTP endpoint (stop accepting new jobs)
+  //   shuttingDown — set by SIGTERM/SIGINT signal handler (full shutdown)
+  // This prevents the drain endpoint from causing SIGTERM to force-kill immediately.
+  let draining = false;
   let shuttingDown = false;
+
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) {
       // Second signal -- force shutdown
-      console.log(`[Worker] Received second ${signal}, forcing shutdown...`);
-      console.log(`[Worker] Force-releasing claimed jobs...`);
+      logger.warn('Received second signal, forcing shutdown', { signal, workerId: WORKER_ID });
+      logger.info('Force-releasing claimed jobs...');
       try {
         await releaseJobs();
       } catch (err) {
-        console.error(`[Worker] Force release failed:`, err);
+        logger.error('Force release failed', { error: err instanceof Error ? err.message : String(err) });
       }
       if (boss) {
         try { await boss.stop({ graceful: false }); } catch { /* ignore */ }
@@ -131,14 +137,12 @@ async function main(): Promise<void> {
       } catch {
         // Connection may already be closed
       }
-      console.log(`[Worker] ${WORKER_ID} force-killed`);
+      logger.info('Worker force-killed', { workerId: WORKER_ID });
       process.exit(1);
     }
 
     shuttingDown = true;
-    console.log(`[Worker] Received ${signal}, starting graceful shutdown...`);
-    console.log(`[Worker] Press Ctrl-C again to force-kill immediately`);
-    console.log(`[Worker] Draining ${getActiveJobCount()} active job(s)...`);
+    logger.info('Starting graceful shutdown', { signal, workerId: WORKER_ID, activeJobs: getActiveJobCount() });
 
     await stopJobProcessor();
     if (boss) {
@@ -152,7 +156,7 @@ async function main(): Promise<void> {
       // Connection may already be closed
     }
 
-    console.log(`[Worker] ${WORKER_ID} shut down gracefully`);
+    logger.info('Worker shut down gracefully', { workerId: WORKER_ID });
     process.exit(0);
   };
 
@@ -161,11 +165,11 @@ async function main(): Promise<void> {
 
   // Handle uncaught errors to prevent silent crashes
   process.on('unhandledRejection', (reason) => {
-    console.error(`[Worker] Unhandled rejection:`, reason);
+    logger.error('Unhandled rejection', { error: reason instanceof Error ? reason.message : String(reason) });
   });
 
   process.on('uncaughtException', (error) => {
-    console.error(`[Worker] Uncaught exception:`, error);
+    logger.error('Uncaught exception', { error: error instanceof Error ? error.message : String(error) });
     // Give time for logs to flush, then exit
     setTimeout(() => process.exit(1), 1000);
   });
@@ -201,17 +205,24 @@ async function main(): Promise<void> {
       if (!verify.rows[0]) {
         throw new Error(`Worker registration verification failed for ${WORKER_ID}`);
       }
-      console.log(`[Worker] Registered in gh_worker_registry (status: ${verify.rows[0].status})`);
+      logger.info('Registered in gh_worker_registry', { status: verify.rows[0].status, workerId: WORKER_ID });
       break; // Success
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (attempt < MAX_REGISTRATION_RETRIES) {
         const backoffMs = Math.pow(2, attempt) * 1000; // 2s, 4s
-        console.error(`[Worker] Registration attempt ${attempt}/${MAX_REGISTRATION_RETRIES} failed: ${errMsg} — retrying in ${backoffMs}ms`);
+        logger.error('Registration attempt failed', {
+          attempt,
+          maxAttempts: MAX_REGISTRATION_RETRIES,
+          error: errMsg,
+          retryInMs: backoffMs,
+        });
         await new Promise((r) => setTimeout(r, backoffMs));
       } else {
-        console.error(`[Worker] Registration failed after ${MAX_REGISTRATION_RETRIES} attempts: ${errMsg}`);
-        console.error(`[Worker] Cannot start without registry entry — exiting`);
+        logger.error('Registration failed after all retries', {
+          attempts: MAX_REGISTRATION_RETRIES,
+          error: errMsg,
+        });
         process.exit(1);
       }
     }
@@ -221,15 +232,16 @@ async function main(): Promise<void> {
   const HEARTBEAT_INTERVAL_MS = 30_000;
   const heartbeatTimer = setInterval(async () => {
     try {
+      const heartbeatStatus = shuttingDown ? 'draining' : draining ? 'draining' : 'active';
       await pgDirect.query(`
         UPDATE gh_worker_registry
         SET last_heartbeat = NOW(),
             current_job_id = $2::UUID,
             status = $3
         WHERE worker_id = $1
-      `, [WORKER_ID, getCurrentJobId(), shuttingDown ? 'draining' : 'active']);
+      `, [WORKER_ID, getCurrentJobId(), heartbeatStatus]);
     } catch (err) {
-      console.warn(`[Worker] Heartbeat update failed:`, err instanceof Error ? err.message : err);
+      logger.warn('Heartbeat update failed', { error: err instanceof Error ? err.message : String(err) });
     }
   }, HEARTBEAT_INTERVAL_MS);
 
@@ -242,9 +254,9 @@ async function main(): Promise<void> {
         SET status = 'offline', current_job_id = NULL, last_heartbeat = NOW()
         WHERE worker_id = $1
       `, [WORKER_ID]);
-      console.log(`[Worker] Marked offline in gh_worker_registry`);
+      logger.info('Marked offline in gh_worker_registry', { workerId: WORKER_ID });
     } catch (err) {
-      console.warn(`[Worker] Failed to deregister:`, err instanceof Error ? err.message : err);
+      logger.warn('Failed to deregister', { error: err instanceof Error ? err.message : String(err) });
     }
   };
 
@@ -258,12 +270,12 @@ async function main(): Promise<void> {
     });
 
     boss.on('error', (err: Error) => {
-      console.error(`[Worker] pg-boss error:`, err.message);
+      logger.error('pg-boss error', { error: err.message });
     });
 
-    console.log(`[Worker] Starting pg-boss...`);
+    logger.info('Starting pg-boss...');
     await boss.start();
-    console.log(`[Worker] pg-boss started`);
+    logger.info('pg-boss started');
 
     consumer = new PgBossConsumer({
       boss,
@@ -307,7 +319,7 @@ async function main(): Promise<void> {
             active_jobs: getActiveJobCount(),
             max_concurrent: maxConcurrent,
             is_running: getIsRunning(),
-            is_draining: shuttingDown,
+            is_draining: draining || shuttingDown,
             dispatch_mode: dispatchMode,
             uptime_ms: Date.now() - startTime,
             timestamp: new Date().toISOString(),
@@ -315,10 +327,11 @@ async function main(): Promise<void> {
         }
 
         if (url.pathname === '/worker/health') {
-          const idle = getActiveJobCount() === 0 && !shuttingDown;
+          const isDraining = draining || shuttingDown;
+          const idle = getActiveJobCount() === 0 && !isDraining;
           return Response.json(
             {
-              status: idle ? 'idle' : shuttingDown ? 'draining' : 'busy',
+              status: idle ? 'idle' : isDraining ? 'draining' : 'busy',
               active_jobs: getActiveJobCount(),
               deploy_safe: idle,
             },
@@ -327,9 +340,9 @@ async function main(): Promise<void> {
         }
 
         if (url.pathname === '/worker/drain' && req.method === 'POST') {
-          if (!shuttingDown) {
-            console.log(`[Worker] Drain requested via HTTP — stopping job pickup`);
-            shuttingDown = true;
+          if (!draining) {
+            logger.info('Drain requested via HTTP — stopping job pickup', { workerId: WORKER_ID });
+            draining = true;
             // Update registry status to draining
             pgDirect.query(
               `UPDATE gh_worker_registry SET status = 'draining' WHERE worker_id = $1`,
@@ -337,7 +350,7 @@ async function main(): Promise<void> {
             ).catch(() => {});
             // Stop accepting new jobs but let active ones finish
             stopJobProcessor().then(() => {
-              console.log(`[Worker] Drain complete — all jobs finished`);
+              logger.info('Drain complete — all jobs finished', { workerId: WORKER_ID });
             });
           }
           return Response.json({
@@ -350,18 +363,17 @@ async function main(): Promise<void> {
         return Response.json({ error: 'not_found' }, { status: 404 });
       },
     });
-    console.log(`[Worker] Status server on port ${workerPort}`);
+    logger.info('Status server started', { port: workerPort });
   }
 
-  console.log(`[Worker] ${WORKER_ID} running (maxConcurrent=${maxConcurrent}, dispatch=${dispatchMode})`);
-  if (dispatchMode === 'queue') {
-    console.log(`[Worker] Consuming jobs from pg-boss queues`);
-  } else {
-    console.log(`[Worker] Listening for jobs on gh_job_created channel`);
-  }
+  logger.info('Worker running', {
+    workerId: WORKER_ID,
+    maxConcurrent,
+    dispatchMode,
+  });
 }
 
 main().catch((err) => {
-  console.error(`[Worker] Fatal error:`, err);
+  logger.error('Fatal error', { error: err instanceof Error ? err.message : String(err) });
   process.exit(1);
 });
