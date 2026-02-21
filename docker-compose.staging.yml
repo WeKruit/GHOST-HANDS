@@ -1,4 +1,12 @@
 # docker-compose.staging.yml
+#
+# NOTE: This compose file is used for INITIAL EC2 SETUP only.
+# Subsequent deploys are handled by the deploy-server via Docker API.
+# To bootstrap a fresh EC2 instance:
+#   docker compose -f docker-compose.staging.yml up -d
+#
+# For manual operations, use scripts/deploy.sh or deploy-server API.
+#
 # Staging deployment for GhostHands — identical to prod but with staging-specific defaults
 #
 # Differences from production:
@@ -15,7 +23,7 @@ services:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "packages/ghosthands/src/api/server.ts"]
     ports:
-      - "127.0.0.1:${GH_API_PORT:-3100}:3100"
+      - "0.0.0.0:${GH_API_PORT:-3100}:3100"
     env_file: .env
     environment:
       - NODE_ENV=production
@@ -46,7 +54,7 @@ services:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "scripts/deploy-server.ts"]
     ports:
-      - "${GH_DEPLOY_PORT:-8000}:8000"
+      - "0.0.0.0:${GH_DEPLOY_PORT:-8000}:8000"
     env_file: .env
     environment:
       - NODE_ENV=production
@@ -54,7 +62,7 @@ services:
       - GH_DEPLOY_PORT=8000
       - GH_API_PORT=3100
       - GH_WORKER_PORT=3101
-      - GHOSTHANDS_DIR=/app
+      - GHOSTHANDS_DIR=/opt/ghosthands
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
       - SSL_CERT_DIR=/etc/ssl/certs
     volumes:
@@ -77,7 +85,7 @@ services:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "packages/ghosthands/src/workers/main.ts"]
     ports:
-      - "127.0.0.1:${GH_WORKER_PORT:-3101}:3101"
+      - "0.0.0.0:${GH_WORKER_PORT:-3101}:3101"
     env_file: .env
     environment:
       - NODE_ENV=production

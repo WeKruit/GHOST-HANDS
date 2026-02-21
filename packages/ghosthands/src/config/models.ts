@@ -18,6 +18,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { getLogger } from '../monitoring/logger.js';
 
 // -- Types --
 
@@ -145,6 +146,7 @@ function resolveAlias(config: ModelsConfig, input: string): string {
  * Build the LLMClient config for a resolved model.
  */
 function buildLLMClient(config: ModelsConfig, alias: string): ResolvedModel {
+    const logger = getLogger();
     const entry = config.models[alias];
     const provider = config.providers[entry.provider];
 
@@ -152,11 +154,7 @@ function buildLLMClient(config: ModelsConfig, alias: string): ResolvedModel {
     const apiKey = process.env[provider.envKey] || '';
 
     if (!apiKey) {
-        console.warn(
-            `Warning: ${provider.envKey} is not set.\n` +
-            `  Provider: ${provider.name}\n` +
-            `  Docs: ${provider.docs}\n`
-        );
+        logger.warn('API key not set', { envKey: provider.envKey, provider: provider.name, docs: provider.docs });
     }
 
     // Anthropic uses its native provider; everything else goes through openai-generic
@@ -221,34 +219,39 @@ export function loadModelConfig(override?: string): ResolvedModel {
  */
 export function listModels(): void {
     const config = loadConfig();
+    const logger = getLogger();
 
-    console.log('Available models:\n');
+    const presets = Object.entries(config.presets).map(
+        ([name, preset]) => `    ${name.padEnd(12)} -> ${preset.model.padEnd(14)} ${preset.description}`
+    );
 
-    console.log('  Presets:');
-    for (const [name, preset] of Object.entries(config.presets)) {
-        console.log(`    ${name.padEnd(12)} -> ${preset.model.padEnd(14)} ${preset.description}`);
-    }
-
-    console.log('\n  Models:');
-    for (const [alias, entry] of Object.entries(config.models)) {
+    const models = Object.entries(config.models).map(([alias, entry]) => {
         const provider = config.providers[entry.provider];
         const vision = entry.vision ? 'vision' : 'text  ';
         const cost = `$${entry.cost.input.toFixed(2)}/$${entry.cost.output.toFixed(2)} per M tokens`;
-        console.log(`    ${alias.padEnd(18)} ${vision}  ${provider.name.padEnd(18)} ${cost}`);
-    }
+        return `    ${alias.padEnd(18)} ${vision}  ${provider.name.padEnd(18)} ${cost}`;
+    });
 
-    console.log(`\n  Default: ${config.default}`);
+    logger.info('Available models', {
+        presets: presets.join('\n'),
+        models: models.join('\n'),
+        default: config.default,
+    });
 }
 
 /**
  * Print the resolved model info to console.
  */
 export function printModelInfo(resolved: ResolvedModel): void {
-    console.log(`Model: ${resolved.alias} (${resolved.model})`);
-    console.log(`Provider: ${resolved.providerName}${resolved.baseUrl ? ` (${resolved.baseUrl})` : ''}`);
-    console.log(`Vision: ${resolved.vision ? 'yes' : 'no'}`);
-    console.log(`Cost: $${resolved.cost.input.toFixed(2)} input / $${resolved.cost.output.toFixed(2)} output per M tokens`);
-    if (!resolved.vision) {
-        console.log('Note: This model has no vision support; browser automation uses accessibility tree only.');
-    }
+    const logger = getLogger();
+    logger.info('Resolved model', {
+        alias: resolved.alias,
+        model: resolved.model,
+        provider: resolved.providerName,
+        baseUrl: resolved.baseUrl,
+        vision: resolved.vision,
+        costInputPerMTokens: resolved.cost.input,
+        costOutputPerMTokens: resolved.cost.output,
+        ...(resolved.vision ? {} : { note: 'No vision support; browser automation uses accessibility tree only' }),
+    });
 }

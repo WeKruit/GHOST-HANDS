@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+<head><title>Sign In</title></head>
+<body>
+  <h1>Sign in to continue</h1>
+  <form action="/api/signin" method="POST" id="login-form" data-testid="login-form">
+    <label for="email">Email</label>
+    <input type="email" id="email" name="email" />
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" />
+    <button type="submit">Sign In</button>
+  </form>
+  <p>Your session has expired. Please sign in to continue.</p>
+</body>
+</html>

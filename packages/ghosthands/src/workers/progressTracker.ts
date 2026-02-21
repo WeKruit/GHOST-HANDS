@@ -1,4 +1,5 @@
 import { SupabaseClient } from '@supabase/supabase-js';
+import { getLogger } from '../monitoring/logger.js';
 
 // ---------------------------------------------------------------------------
 // Progress lifecycle steps for a job application flow
@@ -15,6 +16,7 @@ export const ProgressStep = {
   REVIEWING: 'reviewing',
   SUBMITTING: 'submitting',
   EXTRACTING_RESULTS: 'extracting_results',
+  AWAITING_USER_REVIEW: 'awaiting_user_review',
   COMPLETED: 'completed',
   FAILED: 'failed',
 } as const;
@@ -33,6 +35,7 @@ const STEP_ORDER: ProgressStep[] = [
   ProgressStep.REVIEWING,
   ProgressStep.SUBMITTING,
   ProgressStep.EXTRACTING_RESULTS,
+  ProgressStep.AWAITING_USER_REVIEW,
   ProgressStep.COMPLETED,
 ];
 
@@ -48,6 +51,7 @@ const STEP_DESCRIPTIONS: Record<ProgressStep, string> = {
   [ProgressStep.REVIEWING]: 'Reviewing submission',
   [ProgressStep.SUBMITTING]: 'Submitting application',
   [ProgressStep.EXTRACTING_RESULTS]: 'Extracting confirmation details',
+  [ProgressStep.AWAITING_USER_REVIEW]: 'Waiting for user to review and submit',
   [ProgressStep.COMPLETED]: 'Application complete',
   [ProgressStep.FAILED]: 'Job failed',
 };
@@ -258,24 +262,12 @@ export class ProgressTracker {
       });
     } catch (err) {
       // Progress logging should never crash the job
-      console.warn(`[ProgressTracker] Event write failed for job ${this.jobId}:`, err);
+      getLogger().warn('Event write failed', { jobId: this.jobId, error: err instanceof Error ? err.message : String(err) });
     }
 
-    // Also update progress_pct + status_message on the job row itself
-    // (this is what Supabase Realtime picks up for the frontend)
-    try {
-      await this.supabase
-        .from('gh_automation_jobs')
-        .update({
-          status_message: snapshot.description,
-          metadata: {
-            progress: snapshot,
-          },
-        })
-        .eq('id', this.jobId);
-    } catch (err) {
-      console.warn(`[ProgressTracker] Job row update failed for job ${this.jobId}:`, err);
-    }
+    // NOTE: Previously also updated gh_automation_jobs.metadata.progress here,
+    // but this was duplicate storage. gh_job_events is now the single source
+    // of truth for progress data (WEK-71 progress dedup).
   }
 
   /** Emit progress, but throttled to avoid DB write storms. */

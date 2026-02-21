@@ -40,7 +40,7 @@ export class SessionManager {
   }
 
   /**
-   * Load a stored browser session for a user + target URL.
+   * Load a stored browser session for a user + target URL or bare domain.
    *
    * Returns the decrypted Playwright storageState object, or null if no
    * session exists or the session has expired.
@@ -98,7 +98,7 @@ export class SessionManager {
   }
 
   /**
-   * Save (upsert) browser session state for a user + target URL.
+   * Save (upsert) browser session state for a user + target URL or bare domain.
    *
    * The storageState JSON is encrypted before storage.
    */
@@ -164,10 +164,13 @@ export class SessionManager {
   }
 
   /**
-   * Extract the hostname from a URL.
+   * Extract the hostname from a URL or bare domain.
+   * Accepts both full URLs (https://mail.google.com/...) and
+   * bare domains (mail.google.com).
    * Exported as static for testability.
    */
   static extractDomain(url: string): string {
-    return new URL(url).hostname;
+    const parsed = new URL(url.includes('://') ? url : `https://${url}`);
+    return parsed.hostname.toLowerCase();
   }
 }

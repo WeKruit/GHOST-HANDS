@@ -39,8 +39,8 @@ bun run test
 
 **Environment requirements:**
 - Unit tests: None (all external services mocked)
-- Integration tests: `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` in `packages/ghosthands/.env`
-- E2E tests: Same as integration + local Supabase (or remote with service key)
+- Integration tests: `SUPABASE_URL`, `SUPABASE_SECRET_KEY` in `packages/ghosthands/.env`
+- E2E tests: Same as integration + local Supabase (or remote with secret key)
 
 **Vitest config** (`vitest.config.ts`):
 ```typescript
@@ -526,14 +526,14 @@ it('full lifecycle: create -> pickup -> run -> complete -> verify', async () => 
   run: bun run test:integration
   env:
     SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-    SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+    SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
   # Requires live Supabase, ~30-60 seconds
 
 - name: E2E Tests
   run: bun run test:e2e
   env:
     SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-    SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+    SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
   # Sequential, ~2-5 minutes
 ```
 

@@ -45,10 +45,10 @@ The worker uses the **Supabase JS client** to update job status, log events, and
 | Variable               | Description                                                                                                                      |
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | `SUPABASE_URL`         | Project URL, e.g. `https://xxxx.supabase.co`                                                                                     |
-| `SUPABASE_ANON_KEY`    | Publishable key (dashboard: Project Settings → API → anon public)                                                                |
-| `SUPABASE_SERVICE_KEY` | Secret key (dashboard: Project Settings → API → service_role). **Required** – worker needs it to bypass RLS and manage all jobs. |
+| `SUPABASE_PUBLISHABLE_KEY` | Publishable key (dashboard: Project Settings → API → anon public). Legacy name `SUPABASE_ANON_KEY` accepted as fallback.         |
+| `SUPABASE_SECRET_KEY`      | Secret key (dashboard: Project Settings → API → service_role). **Required** -- worker needs it to bypass RLS and manage all jobs. Legacy name `SUPABASE_SERVICE_KEY` accepted as fallback. |
 
-If you see `Invalid API key` when the worker runs, the JWT keys are wrong or rotated. Create new keys in the Supabase dashboard and update `.env`. Newer projects may use key formats like `sb_publishable_...` and `sb_secret_...` – use the **secret** one for `SUPABASE_SERVICE_KEY`.
+If you see `Invalid API key` when the worker runs, the JWT keys are wrong or rotated. Create new keys in the Supabase dashboard and update `.env`. Newer projects use key formats like `sb_publishable_...` and `sb_secret_...` -- use the **secret** one for `SUPABASE_SECRET_KEY`.
 
 ### 2.3 Model selection (required)
 
@@ -180,8 +180,8 @@ All of these read from `packages/ghosthands/.env` (Bun loads it when you run fro
 
 ### Worker picks up jobs but they “finish” immediately with no browser
 
--   **Cause**: Supabase client can’t authenticate (e.g. invalid or rotated `SUPABASE_SERVICE_KEY`).
--   **Fix**: Update `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `SUPABASE_SERVICE_KEY` in `.env` from the Supabase dashboard, then restart the worker.
+-   **Cause**: Supabase client can’t authenticate (e.g. invalid or rotated `SUPABASE_SECRET_KEY`).
+-   **Fix**: Update `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, and `SUPABASE_SECRET_KEY` in `.env` from the Supabase dashboard, then restart the worker.
 
 ### Jobs are picked up by a different worker / I never see “Picked up job”
 
@@ -219,7 +219,7 @@ All of these read from `packages/ghosthands/.env` (Bun loads it when you run fro
 
 -   [ ] `packages/ghosthands/.env` created from `.env.example`
 -   [ ] `DATABASE_URL` / `SUPABASE_DIRECT_URL` (or `DATABASE_DIRECT_URL`) set and valid
--   [ ] `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_KEY` set and valid (no “Invalid API key”)
+-   [ ] `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` set and valid (no “Invalid API key”)
 -   [ ] `GH_MODEL` set to a **vision** model (e.g. `qwen-72b`)
 -   [ ] API key for that model set (e.g. `SILICONFLOW_API_KEY`)
 -   [ ] Migrations run: `bun src/scripts/run-migration.ts` and verify

@@ -62,7 +62,10 @@ async function main(): Promise<void> {
 
   // Validate required environment variables
   const supabaseUrl = requireEnv('SUPABASE_URL');
-  const supabaseServiceKey = process.env.SUPABASE_SECRET_KEY || requireEnv('SUPABASE_SERVICE_KEY');
+  const supabaseServiceKey = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
+  if (!supabaseServiceKey) {
+    throw new Error('Missing required environment variable: SUPABASE_SECRET_KEY');
+  }
   // Prefer transaction-mode pooler (port 6543) to avoid session pool limits.
   // LISTEN/NOTIFY won't work through transaction pooler, but fallback polling handles it.
   const dbUrl = process.env.DATABASE_URL || process.env.SUPABASE_DIRECT_URL || requireEnv('DATABASE_DIRECT_URL');
@@ -77,7 +80,7 @@ async function main(): Promise<void> {
     connectionString: dbUrl,
   });
 
-  logger.info('Connecting to Postgres...');
+  logger.info('Connecting to Postgres');
   await pgDirect.connect();
   logger.info('Postgres connection established');
 
@@ -123,7 +126,7 @@ async function main(): Promise<void> {
     if (shuttingDown) {
       // Second signal -- force shutdown
       logger.warn('Received second signal, forcing shutdown', { signal, workerId: WORKER_ID });
-      logger.info('Force-releasing claimed jobs...');
+      logger.info('Force-releasing claimed jobs');
       try {
         await releaseJobs();
       } catch (err) {

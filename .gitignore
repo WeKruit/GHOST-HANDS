@@ -8,7 +8,10 @@ coverage/
 
 # Build output
 dist/
+build/
 *.tsbuildinfo
+build-out.txt
+build-err.txt
 
 # Environment variables
 .env
@@ -44,6 +47,17 @@ test-results/
 
 # Turbo
 .turbo/
+
+# Documents and resumes (may contain PII)
+*.pdf
+*.doc
+*.docx
+*.resume*
+resumeTemp*
+
+# Test data files (may contain PII)
+test-user-data*
+test-*-data*
 
 # Magnitude source (backup of upstream monorepo)
 magnitude-source/
