@@ -23,6 +23,7 @@
     "vitest": "^4.0.18"
   },
   "dependencies": {
+    "@aws-sdk/client-auto-scaling": "^3.750.0",
     "patchright": "^1.52.5"
   }
 }
