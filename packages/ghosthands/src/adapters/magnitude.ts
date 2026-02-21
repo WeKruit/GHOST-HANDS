@@ -83,14 +83,22 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
       llmConfig = buildLlmConfig(options.llm);
     }
 
+    // Priority: browserContext > cdpUrl > browserOptions
+    let browserConfig: any;
+    if (options.browserContext) {
+      browserConfig = { context: options.browserContext };
+    } else if (options.cdpUrl) {
+      browserConfig = { cdp: options.cdpUrl };
+    } else {
+      browserConfig = options.browserOptions as any;
+    }
+
     this.agent = await startBrowserAgent({
       url: options.url,
       llm: llmConfig,
       connectors: options.connectors,
       prompt: options.systemPrompt,
-      browser: options.cdpUrl
-        ? { cdp: options.cdpUrl }
-        : options.browserOptions as any,
+      browser: browserConfig,
     });
 
     // Wire Magnitude events to adapter events
