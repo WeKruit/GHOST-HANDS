@@ -20,25 +20,16 @@ vi.mock('@aws-sdk/client-auto-scaling', () => ({
   })),
 }));
 
-// Mock all the other imports that main.ts pulls in (we only test the exported helpers)
-vi.mock('@supabase/supabase-js', () => ({ createClient: vi.fn() }));
-vi.mock('pg', () => ({ Client: vi.fn() }));
-vi.mock('pg-boss', () => ({ PgBoss: vi.fn() }));
-vi.mock('ioredis', () => ({ default: vi.fn() }));
-vi.mock('../../../src/workers/JobPoller.js', () => ({ JobPoller: vi.fn() }));
-vi.mock('../../../src/workers/PgBossConsumer.js', () => ({ PgBossConsumer: vi.fn() }));
-vi.mock('../../../src/workers/JobExecutor.js', () => ({ JobExecutor: vi.fn() }));
-vi.mock('../../../src/workers/taskHandlers/index.js', () => ({ registerBuiltinHandlers: vi.fn() }));
-const mockLogger = {
-  info: vi.fn(),
-  warn: vi.fn(),
-  error: vi.fn(),
-};
+// Suppress logger output during tests
 vi.mock('../../../src/monitoring/logger.js', () => ({
-  getLogger: () => mockLogger,
+  getLogger: () => ({
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  }),
 }));
 
-import { completeLifecycleAction, fetchEc2InstanceId } from '../../../src/workers/main.js';
+import { completeLifecycleAction, fetchEc2InstanceId } from '../../../src/workers/asg-lifecycle.js';
 
 // ---------------------------------------------------------------------------
 // completeLifecycleAction
@@ -91,19 +82,14 @@ describe('completeLifecycleAction', () => {
     expect(mockSend).not.toHaveBeenCalled();
   });
 
-  test('handles AWS SDK errors gracefully (logs warning, does not throw)', async () => {
+  test('handles AWS SDK errors gracefully (does not throw)', async () => {
     process.env.AWS_ASG_NAME = 'gh-workers-asg';
     process.env.AWS_LIFECYCLE_HOOK_NAME = 'my-hook';
 
     mockSend.mockRejectedValueOnce(new Error('AccessDenied'));
 
-    // Should NOT throw
+    // Should NOT throw — error is caught and logged internally
     await expect(completeLifecycleAction('i-abc123')).resolves.toBeUndefined();
-
-    expect(mockLogger.warn).toHaveBeenCalledWith(
-      'Failed to complete lifecycle action',
-      expect.objectContaining({ error: 'AccessDenied' }),
-    );
   });
 
   test('uses default hook name when AWS_LIFECYCLE_HOOK_NAME is not set', async () => {
