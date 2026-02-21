@@ -265,21 +265,9 @@ export class ProgressTracker {
       getLogger().warn('Event write failed', { jobId: this.jobId, error: err instanceof Error ? err.message : String(err) });
     }
 
-    // Also update progress_pct + status_message on the job row itself
-    // (this is what Supabase Realtime picks up for the frontend)
-    try {
-      await this.supabase
-        .from('gh_automation_jobs')
-        .update({
-          status_message: snapshot.description,
-          metadata: {
-            progress: snapshot,
-          },
-        })
-        .eq('id', this.jobId);
-    } catch (err) {
-      getLogger().warn('Job row update failed', { jobId: this.jobId, error: err instanceof Error ? err.message : String(err) });
-    }
+    // NOTE: Previously also updated gh_automation_jobs.metadata.progress here,
+    // but this was duplicate storage. gh_job_events is now the single source
+    // of truth for progress data (WEK-71 progress dedup).
   }
 
   /** Emit progress, but throttled to avoid DB write storms. */

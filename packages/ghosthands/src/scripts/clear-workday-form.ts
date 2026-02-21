@@ -18,7 +18,7 @@ import { createEncryptionFromEnv } from '../db/encryption.js';
 const DEFAULT_URL =
   'https://workday.wd5.myworkdayjobs.com/en-US/Workday/job/USA%2C-GA%2C-Atlanta/Software-Application-Engineer----US-Federal-_JR-0104403-1/apply/applyManually';
 
-const TEST_USER_ID = '00000000-0000-0000-0000-000000000001';
+const TEST_USER_ID = process.env.GH_TEST_USER_ID || '00000000-0000-0000-0000-000000000001';
 
 function parseUrl(): string {
   const arg = process.argv.find((a) => a.startsWith('--url='));
