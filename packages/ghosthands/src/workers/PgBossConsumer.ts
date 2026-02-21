@@ -78,7 +78,7 @@ export class PgBossConsumer {
       // Queue may already exist — that's fine
     });
 
-    const targetedQueue = `${QUEUE_APPLY_JOB}:${this.workerId}`;
+    const targetedQueue = `${QUEUE_APPLY_JOB}/${this.workerId}`;
     await this.boss.createQueue(targetedQueue, queueOptions).catch(() => {
       // Queue may already exist — that's fine
     });
