@@ -36,6 +36,7 @@
         "magnitude-core": "^0.3.1",
         "magnitude-extract": "^0.0.2",
         "pg": "^8.13.0",
+        "pg-boss": "^12.13.0",
         "playwright": "npm:patchright@^1.52.0",
         "zod": "^3.24.4"
     },
