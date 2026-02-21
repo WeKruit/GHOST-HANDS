@@ -7,7 +7,7 @@ import { PgBossConsumer } from './PgBossConsumer.js';
 import { JobExecutor } from './JobExecutor.js';
 import { registerBuiltinHandlers } from './taskHandlers/index.js';
 import { getLogger } from '../monitoring/logger.js';
-import { fetchEc2InstanceId, completeLifecycleAction } from './asg-lifecycle.js';
+import { fetchEc2InstanceId, fetchEc2Ip, completeLifecycleAction } from './asg-lifecycle.js';
 
 const logger = getLogger({ service: 'Worker' });
 
@@ -224,7 +224,7 @@ async function main(): Promise<void> {
   // Auto-detect EC2 instance ID from the metadata service (IMDSv2).
   // Falls back to EC2_INSTANCE_ID env var or 'unknown' for local dev.
   ec2InstanceId = await fetchEc2InstanceId();
-  const ec2Ip = process.env.EC2_IP || 'unknown';
+  const ec2Ip = await fetchEc2Ip();
 
   // ── Worker Registry ────────────────────────────────────────────
   // UPSERT into gh_worker_registry so the fleet monitoring endpoint
@@ -236,16 +236,20 @@ async function main(): Promise<void> {
   const MAX_REGISTRATION_RETRIES = 3;
   for (let attempt = 1; attempt <= MAX_REGISTRATION_RETRIES; attempt++) {
     try {
+      const metadata = JSON.stringify({
+        ...(process.env.AWS_ASG_NAME ? { asg_name: process.env.AWS_ASG_NAME } : {}),
+      });
       await pgDirect.query(`
-        INSERT INTO gh_worker_registry (worker_id, status, target_worker_id, ec2_instance_id, ec2_ip, registered_at, last_heartbeat)
-        VALUES ($1, 'active', $2, $3, $4, NOW(), NOW())
+        INSERT INTO gh_worker_registry (worker_id, status, target_worker_id, ec2_instance_id, ec2_ip, registered_at, last_heartbeat, metadata)
+        VALUES ($1, 'active', $2, $3, $4, NOW(), NOW(), $5::jsonb)
         ON CONFLICT (worker_id) DO UPDATE SET
           status = 'active',
           target_worker_id = COALESCE($2, gh_worker_registry.target_worker_id),
-          ec2_instance_id = COALESCE($3, gh_worker_registry.ec2_instance_id),
-          ec2_ip = COALESCE($4, gh_worker_registry.ec2_ip),
+          ec2_instance_id = $3,
+          ec2_ip = $4,
+          metadata = $5::jsonb,
           last_heartbeat = NOW()
-      `, [WORKER_ID, targetWorkerId, ec2InstanceId, ec2Ip]);
+      `, [WORKER_ID, targetWorkerId, ec2InstanceId, ec2Ip, metadata]);
 
       // Verify the registration actually persisted
       const verify = await pgDirect.query(
@@ -278,8 +282,10 @@ async function main(): Promise<void> {
     }
   }
 
-  // Heartbeat every 30s — updates last_heartbeat and current_job_id
+  // Heartbeat every 30s — updates last_heartbeat and current_job_id.
+  // Also marks stale workers (no heartbeat in 5 min) as offline.
   const HEARTBEAT_INTERVAL_MS = 30_000;
+  const STALE_THRESHOLD_MINUTES = 5;
   const heartbeatTimer = setInterval(async () => {
     try {
       const heartbeatStatus = shuttingDown ? 'draining' : draining ? 'draining' : 'active';
@@ -290,6 +296,22 @@ async function main(): Promise<void> {
             status = $3
         WHERE worker_id = $1
       `, [WORKER_ID, getCurrentJobId(), heartbeatStatus]);
+
+      // Self-cleaning: mark stale workers as offline (excludes self)
+      const staleResult = await pgDirect.query(`
+        UPDATE gh_worker_registry
+        SET status = 'offline', current_job_id = NULL
+        WHERE status = 'active'
+          AND last_heartbeat < NOW() - INTERVAL '${STALE_THRESHOLD_MINUTES} minutes'
+          AND worker_id != $1
+        RETURNING worker_id
+      `, [WORKER_ID]);
+      if (staleResult.rowCount && staleResult.rowCount > 0) {
+        logger.info('Marked stale workers offline', {
+          count: staleResult.rowCount,
+          workers: staleResult.rows.map((r: { worker_id: string }) => r.worker_id),
+        });
+      }
     } catch (err) {
       logger.warn('Heartbeat update failed', { error: err instanceof Error ? err.message : String(err) });
     }
