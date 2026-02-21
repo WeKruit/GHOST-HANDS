@@ -27,7 +27,7 @@ export const TEST_WORKDAY_PROFILE: WorkdayUserProfile = {
     zip: '95112',
     country: 'United States of America',
   },
-  linkedin_url: 'www.linkedin.com/in/spencerwang1',
+  linkedin_url: 'www.linkedin.com/in/happy-wu-test-54321',
   website_url: '',
   current_company: 'WeKruit',
   current_title: 'Software developer',
