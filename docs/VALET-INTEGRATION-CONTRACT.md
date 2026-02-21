@@ -16,18 +16,19 @@
 4. [API Endpoints](#4-api-endpoints)
 5. [Callback System (Push Notifications)](#5-callback-system-push-notifications)
 6. [Real-Time Subscriptions](#6-real-time-subscriptions)
-7. [Database Schema](#7-database-schema)
-8. [Execution Modes & Cost Tracking](#8-execution-modes--cost-tracking)
-9. [Session Management](#9-session-management)
-10. [HITL (Human-in-the-Loop)](#10-hitl-human-in-the-loop)
-11. [UI Visualization Guide](#11-ui-visualization-guide)
-12. [Job Management (Cancel, Retry, Events)](#12-job-management-cancel-retry-events)
-13. [Monitoring & Health](#13-monitoring--health)
-14. [Worker Fleet & Deployment](#14-worker-fleet--deployment)
-15. [Error Codes & Retry Logic](#15-error-codes--retry-logic)
-16. [Migration Checklist](#16-migration-checklist)
-17. [curl Examples](#17-curl-examples)
-18. [Known Limitations](#18-known-limitations)
+7. [Redis Streams (SSE)](#7-redis-streams-sse)
+8. [Database Schema](#8-database-schema)
+9. [Execution Modes & Cost Tracking](#9-execution-modes--cost-tracking)
+10. [Session Management](#10-session-management)
+11. [HITL (Human-in-the-Loop)](#11-hitl-human-in-the-loop)
+12. [UI Visualization Guide](#12-ui-visualization-guide)
+13. [Job Management (Cancel, Retry, Events)](#13-job-management-cancel-retry-events)
+14. [Monitoring & Health](#14-monitoring--health)
+15. [Worker Fleet & Deployment](#15-worker-fleet--deployment)
+16. [Error Codes & Retry Logic](#16-error-codes--retry-logic)
+17. [Migration Checklist](#17-migration-checklist)
+18. [curl Examples](#18-curl-examples)
+19. [Known Limitations](#19-known-limitations)
 
 ---
 
@@ -38,6 +39,7 @@ GhostHands is a browser automation service that executes jobs (apply to jobs, fi
 1. **Callbacks (push):** GhostHands POSTs to `callback_url` on every status change
 2. **Polling (pull):** VALET calls `GET /valet/status/:jobId`
 3. **Real-time (stream):** Supabase Realtime subscriptions on `gh_automation_jobs` and `gh_job_events`
+4. **Redis Streams (SSE):** Low-latency progress events via Redis Streams, consumed by VALET's SSE endpoint
 
 ### Architecture
 
@@ -850,9 +852,99 @@ const eventChannel = supabase
 
 ---
 
-## 7. Database Schema
+## 7. Redis Streams (SSE)
 
-### 7.1 Tables
+For the lowest-latency progress updates, GhostHands publishes progress events to **Redis Streams**. VALET consumes these via `XREAD BLOCK` to power its Server-Sent Events (SSE) endpoint. Database writes to `gh_job_events` remain as the permanent audit trail.
+
+### 7.1 Prerequisites
+
+- **Redis** must be available and configured via the `REDIS_URL` environment variable on both GH workers and the VALET API server.
+- If `REDIS_URL` is not set, ProgressTracker falls back to database-only writes (no streaming). The system is fully functional without Redis — it just loses the sub-second SSE latency.
+
+### 7.2 Stream Key Pattern
+
+Each job gets its own Redis Stream:
+
+```
+gh:events:{jobId}
+```
+
+Example: `gh:events:550e8400-e29b-41d4-a716-446655440000`
+
+### 7.3 Event Fields
+
+ProgressTracker publishes the following fields to each stream entry (all serialized as strings):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `step` | string | Current lifecycle step (e.g. `navigating`, `filling`, `submitting`) |
+| `progress_pct` | number | 0-100 progress percentage |
+| `description` | string | Human-readable description of current activity |
+| `action_index` | number | Current action number (1-based) |
+| `total_actions_estimate` | number | Estimated total actions for the job |
+| `current_action` | string | Current action being executed (optional) |
+| `started_at` | string | ISO-8601 timestamp when the job started |
+| `elapsed_ms` | number | Milliseconds elapsed since job start |
+| `eta_ms` | number \| null | Estimated milliseconds remaining (null if unknown) |
+| `execution_mode` | string | Current mode: `cookbook` or `magnitude` (optional) |
+| `manual_id` | string | Manual UUID if using cookbook mode (optional) |
+| `step_cost_cents` | number | Cost of the current step in cents (optional) |
+| `timestamp` | string | ISO-8601 timestamp of this event |
+
+### 7.4 Publishing (GhostHands Side)
+
+GH ProgressTracker calls `xaddEvent(redis, jobId, fields)` on every progress update. Each call:
+
+1. Builds the stream key: `gh:events:{jobId}`
+2. Flattens the event fields to string key-value pairs
+3. Calls `XADD <key> MAXLEN ~ 1000 * <field> <value> ...`
+4. The `MAXLEN ~ 1000` cap prevents unbounded stream growth
+
+After job completion (success or failure), `setStreamTTL(redis, jobId, 86400)` sets a 24-hour TTL on the stream key so it auto-expires.
+
+### 7.5 Consuming (VALET Side)
+
+VALET's SSE endpoint uses `XREAD BLOCK` to consume events in real time:
+
+```typescript
+// VALET SSE handler pseudocode
+const streamKey = `gh:events:${jobId}`;
+let lastId = '0-0'; // Start from beginning, or '$' for new events only
+
+while (jobIsActive) {
+  const result = await redis.xread('BLOCK', 2000, 'COUNT', 10, 'STREAMS', streamKey, lastId);
+
+  if (result) {
+    for (const [, entries] of result) {
+      for (const [id, fields] of entries) {
+        lastId = id;
+        // Send fields as SSE event to client
+        res.write(`data: ${JSON.stringify(parseFields(fields))}\n\n`);
+      }
+    }
+  }
+}
+```
+
+### 7.6 Cleanup & TTL
+
+- **During execution:** Streams are capped at ~1000 entries via `MAXLEN ~ 1000` on every `XADD`.
+- **After completion:** `setStreamTTL(redis, jobId, 86400)` sets a 24-hour expiry. After 24h, Redis automatically deletes the stream key.
+- **Manual cleanup:** `deleteStream(redis, jobId)` can be called to immediately remove a stream.
+- **Trim:** `xtrimStream(redis, jobId, maxLen)` can trim a stream to a specific length.
+
+### 7.7 Fallback Behavior
+
+If Redis is not configured (`REDIS_URL` not set):
+- ProgressTracker writes events only to the `gh_job_events` database table
+- VALET falls back to Supabase Realtime subscriptions (Section 6) or polling (Section 4.3)
+- No data is lost — the database is always the source of truth
+
+---
+
+## 8. Database Schema
+
+### 8.1 Tables
 
 All GhostHands tables use the `gh_` prefix (shared Supabase with VALET).
 
@@ -865,7 +957,7 @@ All GhostHands tables use the `gh_` prefix (shared Supabase with VALET).
 | `gh_user_usage` | Monthly cost tracking per user |
 | `gh_user_credentials` | Encrypted platform credentials |
 
-### 7.2 Key Columns on `gh_automation_jobs`
+### 8.2 Key Columns on `gh_automation_jobs`
 
 | Column | Type | Source | Description |
 |--------|------|--------|-------------|
@@ -878,7 +970,7 @@ All GhostHands tables use the `gh_` prefix (shared Supabase with VALET).
 | `browser_mode` | TEXT | Migration 011 | Browser context: server, operator |
 | `final_mode` | TEXT | Migration 011 | Actual mode used: cookbook, magnitude, hybrid |
 
-### 7.3 Migrations (apply in order)
+### 8.3 Migrations (apply in order)
 
 | # | File | Description |
 |---|------|-------------|
@@ -891,9 +983,9 @@ All GhostHands tables use the `gh_` prefix (shared Supabase with VALET).
 
 ---
 
-## 8. Execution Modes & Cost Tracking
+## 9. Execution Modes & Cost Tracking
 
-### 8.1 Mode Selection Flow
+### 9.1 Mode Selection Flow
 
 ```
 Job submitted
@@ -911,7 +1003,7 @@ Found manual?
         ↓ success → save trace as new manual for next time
 ```
 
-### 8.2 Cost Comparison
+### 9.2 Cost Comparison
 
 | Mode | Avg Cost | Avg Time | LLM Tokens | Description |
 |------|----------|----------|------------|-------------|
@@ -919,7 +1011,7 @@ Found manual?
 | Magnitude | $0.02 | ~8s | ~8,000 | Full AI agent exploration |
 | Hybrid | $0.015 | ~6s | ~6,000 | Partial cookbook + AI fallback |
 
-### 8.3 Cost Breakdown in Responses
+### 9.3 Cost Breakdown in Responses
 
 The `cost_breakdown` object appears in both status responses and callback payloads:
 
@@ -960,7 +1052,7 @@ savings_pct = (1 - total_cost_usd / estimated_full_ai_cost) * 100
 
 ---
 
-## 9. Session Management
+## 10. Session Management
 
 Browser sessions are automatically managed by GhostHands workers. VALET does not need to pass session data — it's loaded/saved transparently.
 
@@ -973,7 +1065,7 @@ See [Section 4.5-4.7](#45-list-sessions--get-valetsessionsuserid) for details.
 
 ---
 
-## 10. HITL (Human-in-the-Loop)
+## 11. HITL (Human-in-the-Loop)
 
 When automation hits a blocker it can't solve (CAPTCHA, login, 2FA, bot check):
 
@@ -1005,9 +1097,9 @@ GhostHands → VALET: { status: "completed", ... }
 
 ---
 
-## 11. UI Visualization Guide
+## 12. UI Visualization Guide
 
-### 11.1 Mode Badge
+### 12.1 Mode Badge
 
 Show the current execution mode:
 
@@ -1019,7 +1111,7 @@ Show the current execution mode:
 
 **Data source:** `progress.execution_mode` from Realtime, or `final_mode` from status API.
 
-### 11.2 Action Timeline
+### 12.2 Action Timeline
 
 A scrolling list of actions, color-coded by mode:
 
@@ -1046,7 +1138,7 @@ With fallback:
 
 **Data source:** `gh_job_events` via Realtime (`step_started`, `step_completed`, `mode_switched`).
 
-### 11.3 Thinking Feed
+### 12.3 Thinking Feed
 
 Shows the AI agent's current reasoning (visible in Magnitude mode):
 
@@ -1057,7 +1149,7 @@ Shows the AI agent's current reasoning (visible in Magnitude mode):
 
 **Data source:** `progress.current_action` from Realtime job updates.
 
-### 11.4 Cost Breakdown Panel
+### 12.4 Cost Breakdown Panel
 
 ```
 ┌─────────────────────────────────────────┐
@@ -1074,7 +1166,7 @@ Shows the AI agent's current reasoning (visible in Magnitude mode):
 
 **Data source:** `cost_breakdown` from status API or callback payload.
 
-### 11.5 Blocker / HITL UI
+### 12.5 Blocker / HITL UI
 
 When `needs_human` callback arrives:
 1. Show notification: "Your automation needs help"
@@ -1086,13 +1178,13 @@ When `needs_human` callback arrives:
 
 ---
 
-## 12. Job Management (Cancel, Retry, Events)
+## 13. Job Management (Cancel, Retry, Events)
 
 These endpoints use the **jobs API** (not the `/valet/` prefix). They require the same `X-GH-Service-Key` auth.
 
 **Base path:** `/api/v1/gh/jobs`
 
-### 12.1 Cancel Job — `POST /jobs/:id/cancel`
+### 13.1 Cancel Job — `POST /jobs/:id/cancel`
 
 Cancel a pending, queued, running, or paused job.
 
@@ -1110,7 +1202,7 @@ Cancel a pending, queued, running, or paused job.
 
 **Cancellable statuses:** `pending`, `queued`, `running`, `paused`
 
-### 12.2 Retry Job — `POST /jobs/:id/retry`
+### 13.2 Retry Job — `POST /jobs/:id/retry`
 
 Re-queue a failed or cancelled job. Creates a new attempt with `retry_count` incremented.
 
@@ -1128,7 +1220,7 @@ Re-queue a failed or cancelled job. Creates a new attempt with `retry_count` inc
 
 **Retryable statuses:** `failed`, `cancelled`
 
-### 12.3 Get Job Events — `GET /jobs/:id/events`
+### 13.3 Get Job Events — `GET /jobs/:id/events`
 
 Returns the full event log for a job (mode_selected, step_started, step_completed, etc.).
 
@@ -1167,7 +1259,7 @@ Returns the full event log for a job (mode_selected, step_started, step_complete
 }
 ```
 
-### 12.4 List Jobs — `GET /jobs`
+### 13.4 List Jobs — `GET /jobs`
 
 List all jobs with filtering.
 
@@ -1181,19 +1273,19 @@ List all jobs with filtering.
 | `offset` | number | 0 | Pagination offset |
 | `sort` | string | `-created_at` | Sort field (prefix `-` for DESC) |
 
-### 12.5 Batch Create — `POST /jobs/batch`
+### 13.5 Batch Create — `POST /jobs/batch`
 
 Create multiple jobs in a single request.
 
 ---
 
-## 13. Monitoring & Health
+## 14. Monitoring & Health
 
 Monitoring endpoints are **public** (no auth required) — designed for load balancers, uptime monitors, and ops dashboards.
 
 **Base path:** `/api/v1/gh/monitoring`
 
-### 13.1 Simple Health — `GET /health`
+### 14.1 Simple Health — `GET /health`
 
 Lightweight health check for load balancers.
 
@@ -1208,7 +1300,7 @@ Lightweight health check for load balancers.
 }
 ```
 
-### 13.2 Detailed Health — `GET /monitoring/health`
+### 14.2 Detailed Health — `GET /monitoring/health`
 
 Checks database, worker heartbeats, LLM providers, and storage.
 
@@ -1233,7 +1325,7 @@ Checks database, worker heartbeats, LLM providers, and storage.
 | `degraded` | 200 | Some checks failing but service is operational |
 | `unhealthy` | 503 | Critical failure, service should be restarted |
 
-### 13.3 Metrics — `GET /monitoring/metrics`
+### 14.3 Metrics — `GET /monitoring/metrics`
 
 Prometheus-format metrics for scraping.
 
@@ -1257,7 +1349,7 @@ gh_worker_active_jobs{worker="worker-1"} 2
 gh_llm_cost_usd_total 45.67
 ```
 
-### 13.4 Metrics JSON — `GET /monitoring/metrics/json`
+### 14.4 Metrics JSON — `GET /monitoring/metrics/json`
 
 Same metrics in JSON format:
 
@@ -1270,7 +1362,7 @@ Same metrics in JSON format:
 }
 ```
 
-### 13.5 Alerts — `GET /monitoring/alerts`
+### 14.5 Alerts — `GET /monitoring/alerts`
 
 Active alerts and stuck job detection.
 
@@ -1290,7 +1382,7 @@ Active alerts and stuck job detection.
 }
 ```
 
-### 13.6 Dashboard — `GET /monitoring/dashboard`
+### 14.6 Dashboard — `GET /monitoring/dashboard`
 
 Aggregated view combining health + metrics + alerts:
 
@@ -1305,11 +1397,11 @@ Aggregated view combining health + metrics + alerts:
 
 ---
 
-## 14. Worker Fleet & Deployment
+## 15. Worker Fleet & Deployment
 
 VALET manages GhostHands worker lifecycle across EC2 instances via the deploy script. Each EC2 instance runs one compose stack (API + default worker) plus zero or more targeted workers.
 
-### 14.1 Architecture
+### 15.1 Architecture
 
 ```
 EC2 Instance
@@ -1321,7 +1413,7 @@ EC2 Instance
 └── scripts/deploy.sh
 ```
 
-### 14.2 Deploy Script Commands
+### 15.2 Deploy Script Commands
 
 VALET calls `scripts/deploy.sh` on each EC2 instance via SSH:
 
@@ -1336,7 +1428,7 @@ VALET calls `scripts/deploy.sh` on each EC2 instance via SSH:
 | `stop-worker <id>` | Stop a targeted worker (35s drain) | Yes (35s) |
 | `list-workers` | List all targeted worker containers | No |
 
-### 14.3 Rolling Update Procedure
+### 15.3 Rolling Update Procedure
 
 VALET should follow this sequence per EC2 instance:
 
@@ -1361,7 +1453,7 @@ VALET should follow this sequence per EC2 instance:
 
 **For zero-downtime across the fleet,** VALET should do a rolling update: drain + deploy one instance at a time, waiting for health confirmation before moving to the next.
 
-### 14.4 Targeted Workers
+### 15.4 Targeted Workers
 
 Targeted workers are standalone Docker containers that VALET manages for routing specific jobs to specific workers (e.g., for sandbox isolation or user affinity).
 
@@ -1390,7 +1482,7 @@ ssh ec2-host "./scripts/deploy.sh stop-worker user-abc-123"
 
 Only the worker with `GH_WORKER_ID=user-abc-123` will pick up this job.
 
-### 14.5 Graceful Shutdown Behavior
+### 15.5 Graceful Shutdown Behavior
 
 When a worker receives SIGTERM (from `docker stop` or `deploy.sh`):
 
@@ -1408,7 +1500,7 @@ On a second SIGTERM (force):
 - Callback URL and valet_task_id are preserved on the job row — the new worker will send callbacks to the same URL
 - Active jobs may lose in-progress state (browser session is saved on completion only)
 
-### 14.6 Stuck Job Recovery
+### 15.6 Stuck Job Recovery
 
 Jobs can get stuck if a worker crashes without cleanup. The system handles this automatically:
 
@@ -1416,7 +1508,7 @@ Jobs can get stuck if a worker crashes without cleanup. The system handles this 
 2. **Monitoring alert:** `GET /monitoring/alerts` reports stuck jobs
 3. **Manual recovery:** Run `bun src/scripts/release-stuck-jobs.ts` to force-release stuck jobs
 
-### 14.7 Required Environment Variables (per instance)
+### 15.7 Required Environment Variables (per instance)
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -1430,7 +1522,7 @@ Jobs can get stuck if a worker crashes without cleanup. The system handles this 
 | `GH_CREDENTIAL_KEY` | Yes | AES-256 encryption key (64 hex chars) |
 | `GH_SERVICE_KEY` | Yes | API authentication key |
 
-### 14.8 Deploy Script Output Parsing
+### 15.8 Deploy Script Output Parsing
 
 The deploy script outputs machine-readable key=value pairs VALET can parse:
 
@@ -1459,10 +1551,10 @@ WORKER_ID=user-abc-123
 
 ---
 
-## 15. Error Codes & Retry Logic
+## 16. Error Codes & Retry Logic
 
 
-### 12.1 Error Codes
+### 16.1 Error Codes
 
 | Code | Description | Retryable? | VALET UI Suggestion |
 |------|-------------|------------|---------------------|
@@ -1479,7 +1571,7 @@ WORKER_ID=user-abc-123
 | `validation_error` | Input data invalid | No | "Invalid input. Check profile data." |
 | `internal_error` | Unexpected error | Yes | "Something went wrong. Will retry." |
 
-### 12.2 Retry Behavior
+### 16.2 Retry Behavior
 
 - Retryable errors are retried up to `max_retries` times (default 3)
 - Exponential backoff: 5s, 10s, 20s, 40s, 60s (capped at 60s)
@@ -1488,7 +1580,7 @@ WORKER_ID=user-abc-123
 
 ---
 
-## 16. Migration Checklist
+## 17. Migration Checklist
 
 Apply these migrations **in order** on Supabase:
 
@@ -1534,7 +1626,7 @@ Apply these migrations **in order** on Supabase:
 
 ---
 
-## 17. curl Examples
+## 18. curl Examples
 
 ### Create a job
 
@@ -1616,7 +1708,7 @@ curl https://gh.example.com/api/v1/gh/valet/sessions/$USER_ID \
 
 ---
 
-## 18. Known Limitations
+## 19. Known Limitations
 
 1. **HITL resume is fire-and-forget:** When a job resumes after HITL, the remaining execution happens in the original handler call. If the handler already threw (common), the resumed job is logged as "resumed" but the actual continued execution needs a job restart.
 

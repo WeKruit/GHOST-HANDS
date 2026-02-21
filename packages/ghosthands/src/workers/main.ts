@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import { Client as PgClient } from 'pg';
 import { PgBoss } from 'pg-boss';
+import Redis from 'ioredis';
 import { JobPoller } from './JobPoller.js';
 import { PgBossConsumer } from './PgBossConsumer.js';
 import { JobExecutor } from './JobExecutor.js';
@@ -89,9 +90,32 @@ async function main(): Promise<void> {
   // cost tracking + HITL deterministic. Scale horizontally by adding workers.
   const maxConcurrent = 1;
 
+  // ── Redis for real-time progress streaming ─────────────────────
+  // Optional: if REDIS_URL is set, ProgressTracker publishes to Redis Streams
+  // for consumption by VALET SSE endpoint. Falls back to DB-only if not configured.
+  let redis: Redis | undefined;
+  const redisUrl = process.env.REDIS_URL;
+  if (redisUrl) {
+    try {
+      redis = new Redis(redisUrl, {
+        maxRetriesPerRequest: 3,
+        lazyConnect: true,
+        ...(redisUrl.startsWith('rediss://') && { tls: {} }),
+      });
+      await redis.connect();
+      logger.info('Redis connected for real-time streaming');
+    } catch (err) {
+      logger.warn('Redis connection failed — progress will use DB only', { error: err instanceof Error ? err.message : String(err) });
+      redis = undefined;
+    }
+  } else {
+    logger.info('No REDIS_URL configured — progress will use DB only');
+  }
+
   const executor = new JobExecutor({
     supabase,
     workerId: WORKER_ID,
+    ...(redis && { redis }),
   });
 
   // ── Dispatch mode: pg-boss queue vs legacy LISTEN/NOTIFY poller ──
@@ -152,6 +176,16 @@ async function main(): Promise<void> {
       try { await boss.stop({ graceful: true, timeout: 10_000 }); } catch { /* ignore */ }
     }
     await deregisterWorker();
+
+    // Close Redis connection
+    if (redis) {
+      try {
+        await redis.quit();
+        logger.info('Redis connection closed');
+      } catch {
+        // Connection may already be closed
+      }
+    }
 
     try {
       await pgDirect.end();
