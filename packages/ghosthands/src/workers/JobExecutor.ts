@@ -47,6 +47,8 @@ export interface JobExecutorOptions {
   sessionManager?: SessionManager;
   /** Postgres pool for LISTEN/NOTIFY (HITL resume signals) */
   pgPool?: pg.Pool;
+  /** Optional Redis client for real-time progress streaming via Redis Streams. */
+  redis?: import('ioredis').default;
   /** Timeout in seconds for human intervention (default: 300 = 5 minutes) */
   hitlTimeoutSeconds?: number;
 }
@@ -146,6 +148,7 @@ export class JobExecutor {
   private workerId: string;
   private sessionManager: SessionManager | null;
   private pgPool: pg.Pool | null;
+  private redis: import('ioredis').default | null;
   private hitlTimeoutSeconds: number;
   private blockerDetector = new BlockerDetector();
   private resumeDownloader: ResumeDownloader;
@@ -155,6 +158,7 @@ export class JobExecutor {
     this.workerId = opts.workerId;
     this.sessionManager = opts.sessionManager ?? null;
     this.pgPool = opts.pgPool ?? null;
+    this.redis = opts.redis ?? null;
     this.hitlTimeoutSeconds = opts.hitlTimeoutSeconds ?? DEFAULT_HITL_TIMEOUT_SECONDS;
     this.resumeDownloader = new ResumeDownloader(opts.supabase);
   }
@@ -177,12 +181,13 @@ export class JobExecutor {
 
     const costService = new CostControlService(this.supabase);
 
-    // Initialize progress tracker
+    // Initialize progress tracker (with optional Redis Streams for real-time SSE)
     const progress = new ProgressTracker({
       jobId: job.id,
       supabase: this.supabase,
       workerId: this.workerId,
       estimatedTotalActions: costTracker.getActionLimit(),
+      ...(this.redis && { redis: this.redis }),
     });
 
     try {
@@ -193,7 +198,6 @@ export class JobExecutor {
         : await costService.preflightBudgetCheck(
             job.user_id,
             qualityPreset,
-            job.job_type,
           );
       if (isDev) {
         getLogger().debug('Skipping budget preflight', { nodeEnv: 'development' });
