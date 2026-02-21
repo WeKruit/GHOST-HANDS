@@ -2,6 +2,7 @@ import { createClient } from '@supabase/supabase-js';
 import { Client as PgClient } from 'pg';
 import { PgBoss } from 'pg-boss';
 import Redis from 'ioredis';
+import { AutoScalingClient, CompleteLifecycleActionCommand } from '@aws-sdk/client-auto-scaling';
 import { JobPoller } from './JobPoller.js';
 import { PgBossConsumer } from './PgBossConsumer.js';
 import { JobExecutor } from './JobExecutor.js';
@@ -9,6 +10,54 @@ import { registerBuiltinHandlers } from './taskHandlers/index.js';
 import { getLogger } from '../monitoring/logger.js';
 
 const logger = getLogger({ service: 'Worker' });
+
+/**
+ * Fetch the EC2 instance ID from the Instance Metadata Service (IMDSv2).
+ * Returns the instance ID string, or falls back to EC2_INSTANCE_ID env var / 'unknown'.
+ */
+async function fetchEc2InstanceId(): Promise<string> {
+  try {
+    // IMDSv2: get token first
+    const tokenRes = await fetch('http://169.254.169.254/latest/api/token', {
+      method: 'PUT',
+      headers: { 'X-aws-ec2-metadata-token-ttl-seconds': '21600' },
+      signal: AbortSignal.timeout(1000),
+    });
+    const token = await tokenRes.text();
+
+    const idRes = await fetch('http://169.254.169.254/latest/meta-data/instance-id', {
+      headers: { 'X-aws-ec2-metadata-token': token },
+      signal: AbortSignal.timeout(1000),
+    });
+    return await idRes.text();
+  } catch {
+    return process.env.EC2_INSTANCE_ID || 'unknown';
+  }
+}
+
+/**
+ * Complete an ASG lifecycle action to signal that this instance is ready
+ * to be terminated. Called during graceful shutdown when ASG_NAME is set.
+ */
+async function completeLifecycleAction(instanceId: string): Promise<void> {
+  const asgName = process.env.AWS_ASG_NAME;
+  const hookName = process.env.AWS_LIFECYCLE_HOOK_NAME || 'ghosthands-drain-hook';
+
+  if (!asgName || instanceId === 'unknown') return;
+
+  try {
+    const client = new AutoScalingClient({ region: process.env.AWS_REGION || 'us-east-1' });
+    await client.send(new CompleteLifecycleActionCommand({
+      AutoScalingGroupName: asgName,
+      LifecycleHookName: hookName,
+      InstanceId: instanceId,
+      LifecycleActionResult: 'CONTINUE',
+    }));
+    console.log(`[ASG] Completed lifecycle action for ${instanceId}`);
+  } catch (err) {
+    console.warn(`[ASG] Failed to complete lifecycle action: ${err}`);
+  }
+}
 
 /**
  * GhostHands Worker Entry Point
@@ -177,6 +226,10 @@ async function main(): Promise<void> {
     }
     await deregisterWorker();
 
+    // Complete ASG lifecycle action if configured (signals ASG that
+    // this instance is ready to be terminated)
+    await completeLifecycleAction(ec2InstanceId);
+
     // Close Redis connection
     if (redis) {
       try {
@@ -211,14 +264,18 @@ async function main(): Promise<void> {
     setTimeout(() => process.exit(1), 1000);
   });
 
+  // ── EC2 Instance Metadata ────────────────────────────────────────
+  // Auto-detect EC2 instance ID from the metadata service (IMDSv2).
+  // Falls back to EC2_INSTANCE_ID env var or 'unknown' for local dev.
+  const ec2InstanceId = await fetchEc2InstanceId();
+  const ec2Ip = process.env.EC2_IP || 'unknown';
+
   // ── Worker Registry ────────────────────────────────────────────
   // UPSERT into gh_worker_registry so the fleet monitoring endpoint
   // and VALET deregistration know about this worker.
   // Registration MUST succeed before polling starts — if it fails after
   // retries, exit so Docker restarts the container.
   const targetWorkerId = process.env.GH_WORKER_ID || null;
-  const ec2InstanceId = process.env.EC2_INSTANCE_ID || 'unknown';
-  const ec2Ip = process.env.EC2_IP || 'unknown';
 
   const MAX_REGISTRATION_RETRIES = 3;
   for (let attempt = 1; attempt <= MAX_REGISTRATION_RETRIES; attempt++) {
@@ -353,11 +410,14 @@ async function main(): Promise<void> {
         if (url.pathname === '/worker/status') {
           return Response.json({
             worker_id: WORKER_ID,
+            ec2_instance_id: ec2InstanceId,
+            ec2_ip: ec2Ip,
             active_jobs: getActiveJobCount(),
             max_concurrent: maxConcurrent,
             is_running: getIsRunning(),
             is_draining: draining || shuttingDown,
             dispatch_mode: dispatchMode,
+            asg_name: process.env.AWS_ASG_NAME || null,
             uptime_ms: Date.now() - startTime,
             timestamp: new Date().toISOString(),
           });
@@ -414,3 +474,5 @@ main().catch((err) => {
   logger.error('Fatal error', { error: err instanceof Error ? err.message : String(err) });
   process.exit(1);
 });
+
+export { fetchEc2InstanceId, completeLifecycleAction };
