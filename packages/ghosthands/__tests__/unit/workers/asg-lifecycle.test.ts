@@ -1,5 +1,5 @@
 /**
- * WEK-87: ASG Lifecycle Hook Tests
+ * WEK-96: ASG Lifecycle Hook Tests
  *
  * Unit tests for completeLifecycleAction and fetchEc2InstanceId
  * exported from workers/main.ts. All tests mock the AWS SDK and
@@ -29,12 +29,13 @@ vi.mock('../../../src/workers/JobPoller.js', () => ({ JobPoller: vi.fn() }));
 vi.mock('../../../src/workers/PgBossConsumer.js', () => ({ PgBossConsumer: vi.fn() }));
 vi.mock('../../../src/workers/JobExecutor.js', () => ({ JobExecutor: vi.fn() }));
 vi.mock('../../../src/workers/taskHandlers/index.js', () => ({ registerBuiltinHandlers: vi.fn() }));
+const mockLogger = {
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+};
 vi.mock('../../../src/monitoring/logger.js', () => ({
-  getLogger: () => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  }),
+  getLogger: () => mockLogger,
 }));
 
 import { completeLifecycleAction, fetchEc2InstanceId } from '../../../src/workers/main.js';
@@ -94,16 +95,15 @@ describe('completeLifecycleAction', () => {
     process.env.AWS_ASG_NAME = 'gh-workers-asg';
     process.env.AWS_LIFECYCLE_HOOK_NAME = 'my-hook';
 
-    const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     mockSend.mockRejectedValueOnce(new Error('AccessDenied'));
 
     // Should NOT throw
     await expect(completeLifecycleAction('i-abc123')).resolves.toBeUndefined();
 
-    expect(consoleSpy).toHaveBeenCalledWith(
-      expect.stringContaining('[ASG] Failed to complete lifecycle action'),
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      'Failed to complete lifecycle action',
+      expect.objectContaining({ error: 'AccessDenied' }),
     );
-    consoleSpy.mockRestore();
   });
 
   test('uses default hook name when AWS_LIFECYCLE_HOOK_NAME is not set', async () => {

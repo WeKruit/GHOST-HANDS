@@ -319,7 +319,7 @@ aws autoscaling put-lifecycle-hook \
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| `lifecycle-hook-name` | `gh-worker-termination` | Matches `AWS_ASG_LIFECYCLE_HOOK_NAME` env var in worker |
+| `lifecycle-hook-name` | `gh-worker-termination` | Matches `AWS_LIFECYCLE_HOOK_NAME` env var in worker |
 | `lifecycle-transition` | `autoscaling:EC2_INSTANCE_TERMINATING` | Fires before instance termination |
 | `heartbeat-timeout` | 300s | Max time to wait for worker to drain |
 | `default-result` | `ABANDON` | If worker fails to signal, cancel termination to avoid data loss |
@@ -341,11 +341,11 @@ If the worker fails to call `complete-lifecycle-action` within 300s (e.g. crash)
 
 ### Important: Hook Name Must Match
 
-The env var `AWS_ASG_LIFECYCLE_HOOK_NAME` on the worker must match the `--lifecycle-hook-name` used here. The code defaults to `gh-worker-termination` if the env var is not set:
+The env var `AWS_LIFECYCLE_HOOK_NAME` on the worker must match the `--lifecycle-hook-name` used here. The code defaults to `gh-worker-termination` if the env var is not set:
 
 ```typescript
 // main.ts line 317
-const asgLifecycleHookName = process.env.AWS_ASG_LIFECYCLE_HOOK_NAME || 'gh-worker-termination';
+const asgLifecycleHookName = process.env.AWS_LIFECYCLE_HOOK_NAME || 'gh-worker-termination';
 ```
 
 ---
@@ -568,7 +568,7 @@ LOCAL_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
   echo "EC2_INSTANCE_ID=${INSTANCE_ID}"
   echo "EC2_IP=${LOCAL_IP}"
   echo "AWS_ASG_NAME=gh-worker-asg"
-  echo "AWS_ASG_LIFECYCLE_HOOK_NAME=gh-worker-termination"
+  echo "AWS_LIFECYCLE_HOOK_NAME=gh-worker-termination"
   echo "AWS_REGION=${REGION}"
 } >> "$APP_DIR/.env"
 
@@ -652,7 +652,7 @@ These are appended to `.env` automatically by `user-data.sh` and should NOT be i
 | `EC2_INSTANCE_ID` | IMDSv2 | EC2 instance ID (e.g. `i-0abc123def456`) |
 | `EC2_IP` | IMDSv2 | Instance private IP |
 | `AWS_ASG_NAME` | UserData | ASG name (`gh-worker-asg`) |
-| `AWS_ASG_LIFECYCLE_HOOK_NAME` | UserData | Lifecycle hook name (`gh-worker-termination`) |
+| `AWS_LIFECYCLE_HOOK_NAME` | UserData | Lifecycle hook name (`gh-worker-termination`) |
 | `AWS_REGION` | UserData | AWS region (e.g. `us-east-1`) |
 | `ECR_IMAGE` | UserData | Full ECR image URI for docker-compose |
 
@@ -763,7 +763,7 @@ ssh -i ~/.ssh/valet-worker.pem ec2-user@<instance-ip> \
 ### Lifecycle hook timeout
 
 1. Check worker shutdown logs: `docker logs gh-worker | grep -i shutdown`
-2. Verify `AWS_ASG_NAME` and `AWS_ASG_LIFECYCLE_HOOK_NAME` are set in `.env`
+2. Verify `AWS_ASG_NAME` and `AWS_LIFECYCLE_HOOK_NAME` are set in `.env`
 3. Verify IAM role has `autoscaling:CompleteLifecycleAction`
 4. Increase `heartbeat-timeout` if workers need more drain time:
    ```bash

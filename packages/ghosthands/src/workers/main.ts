@@ -53,9 +53,9 @@ async function completeLifecycleAction(instanceId: string): Promise<void> {
       InstanceId: instanceId,
       LifecycleActionResult: 'CONTINUE',
     }));
-    console.log(`[ASG] Completed lifecycle action for ${instanceId}`);
+    logger.info('Completed lifecycle action', { instanceId });
   } catch (err) {
-    console.warn(`[ASG] Failed to complete lifecycle action: ${err}`);
+    logger.warn('Failed to complete lifecycle action', { error: err instanceof Error ? err.message : String(err) });
   }
 }
 
@@ -195,6 +195,10 @@ async function main(): Promise<void> {
   let draining = false;
   let shuttingDown = false;
 
+  // Declare early so shutdown closure can reference it safely (avoids TDZ if
+  // SIGTERM arrives while fetchEc2InstanceId() is still in-flight).
+  let ec2InstanceId: string = 'unknown';
+
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) {
       // Second signal -- force shutdown
@@ -267,7 +271,7 @@ async function main(): Promise<void> {
   // ── EC2 Instance Metadata ────────────────────────────────────────
   // Auto-detect EC2 instance ID from the metadata service (IMDSv2).
   // Falls back to EC2_INSTANCE_ID env var or 'unknown' for local dev.
-  const ec2InstanceId = await fetchEc2InstanceId();
+  ec2InstanceId = await fetchEc2InstanceId();
   const ec2Ip = process.env.EC2_IP || 'unknown';
 
   // ── Worker Registry ────────────────────────────────────────────
