@@ -47,3 +47,4 @@ test-results/
 
 # Magnitude source (backup of upstream monorepo)
 magnitude-source/
+.env.backup

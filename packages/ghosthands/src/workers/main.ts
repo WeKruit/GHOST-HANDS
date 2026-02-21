@@ -64,8 +64,11 @@ async function main(): Promise<void> {
   });
 
   // PostgreSQL connection for job pickup queries and LISTEN/NOTIFY (if session mode)
+  // keepAlive prevents Supabase session pooler from dropping idle connections
   const pgDirect = new PgClient({
     connectionString: dbUrl,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
   });
 
   console.log(`[Worker] Connecting to Postgres...`);

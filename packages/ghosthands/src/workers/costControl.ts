@@ -74,8 +74,8 @@ export class ActionLimitExceededError extends Error {
 /** Per-task LLM budget (in USD) by quality preset */
 const TASK_BUDGET: Record<QualityPreset, number> = {
   speed: 0.05,
-  balanced: 0.25,
-  quality: 0.50,
+  balanced: 0.50,
+  quality: 1.00,
 };
 
 /** Per-user monthly budget (in USD) by subscription tier */
@@ -434,14 +434,16 @@ export function resolveQualityPreset(
     inputData?.quality_preset ??
     inputData?.tier;
 
-  // Map tier names to quality presets
+  // Map tier names and VALET quality values to quality presets
   const TIER_TO_PRESET: Record<string, QualityPreset> = {
     speed: 'speed',
+    fast: 'speed',        // VALET sends "fast"
     free: 'speed',
     starter: 'balanced',
     balanced: 'balanced',
     pro: 'quality',
     quality: 'quality',
+    thorough: 'quality',  // VALET sends "thorough"
     premium: 'quality',
   };
 

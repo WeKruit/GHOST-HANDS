@@ -55,7 +55,7 @@ async function main() {
         $1::jsonb,
         $2,
         'pending',
-        120, 1, 1,
+        300, 1, 1,
         $3
       )
       RETURNING id, status, target_url, task_description, target_worker_id
