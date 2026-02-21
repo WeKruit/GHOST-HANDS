@@ -4,19 +4,25 @@ import { getLogger } from '../monitoring/logger.js';
 const logger = getLogger({ service: 'ASGLifecycle' });
 
 /**
+ * Fetch an IMDSv2 token with a 6-hour TTL.
+ * Reused by both fetchEc2InstanceId and fetchEc2Ip.
+ */
+async function getImdsToken(): Promise<string> {
+  const res = await fetch('http://169.254.169.254/latest/api/token', {
+    method: 'PUT',
+    headers: { 'X-aws-ec2-metadata-token-ttl-seconds': '21600' },
+    signal: AbortSignal.timeout(1000),
+  });
+  return res.text();
+}
+
+/**
  * Fetch the EC2 instance ID from the Instance Metadata Service (IMDSv2).
  * Returns the instance ID string, or falls back to EC2_INSTANCE_ID env var / 'unknown'.
  */
 export async function fetchEc2InstanceId(): Promise<string> {
   try {
-    // IMDSv2: get token first
-    const tokenRes = await fetch('http://169.254.169.254/latest/api/token', {
-      method: 'PUT',
-      headers: { 'X-aws-ec2-metadata-token-ttl-seconds': '21600' },
-      signal: AbortSignal.timeout(1000),
-    });
-    const token = await tokenRes.text();
-
+    const token = await getImdsToken();
     const idRes = await fetch('http://169.254.169.254/latest/meta-data/instance-id', {
       headers: { 'X-aws-ec2-metadata-token': token },
       signal: AbortSignal.timeout(1000),
@@ -24,6 +30,23 @@ export async function fetchEc2InstanceId(): Promise<string> {
     return await idRes.text();
   } catch {
     return process.env.EC2_INSTANCE_ID || 'unknown';
+  }
+}
+
+/**
+ * Fetch the EC2 public IPv4 address from the Instance Metadata Service (IMDSv2).
+ * Returns the IP string, or falls back to EC2_IP env var / 'local'.
+ */
+export async function fetchEc2Ip(): Promise<string> {
+  try {
+    const token = await getImdsToken();
+    const ipRes = await fetch('http://169.254.169.254/latest/meta-data/public-ipv4', {
+      headers: { 'X-aws-ec2-metadata-token': token },
+      signal: AbortSignal.timeout(1000),
+    });
+    return await ipRes.text();
+  } catch {
+    return process.env.EC2_IP || 'local';
   }
 }
 

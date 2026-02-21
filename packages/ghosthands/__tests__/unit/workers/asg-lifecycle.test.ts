@@ -30,7 +30,7 @@ vi.mock('../../../src/monitoring/logger.js', () => ({
   }),
 }));
 
-import { completeLifecycleAction, fetchEc2InstanceId } from '../../../src/workers/asg-lifecycle.js';
+import { completeLifecycleAction, fetchEc2InstanceId, fetchEc2Ip } from '../../../src/workers/asg-lifecycle.js';
 
 // ---------------------------------------------------------------------------
 // completeLifecycleAction
@@ -147,5 +147,49 @@ describe('fetchEc2InstanceId', () => {
 
     const result = await fetchEc2InstanceId();
     expect(result).toBe('unknown');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fetchEc2Ip
+// ---------------------------------------------------------------------------
+
+describe('fetchEc2Ip', () => {
+  const originalEnv = process.env;
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env = { ...originalEnv };
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    process.env = originalEnv;
+  });
+
+  test('returns public IP from metadata service on success', async () => {
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce({ text: async () => 'mock-token' } as Response)
+      .mockResolvedValueOnce({ text: async () => '1.2.3.4' } as Response);
+
+    const result = await fetchEc2Ip();
+    expect(result).toBe('1.2.3.4');
+  });
+
+  test('falls back to EC2_IP env var when metadata fails', async () => {
+    process.env.EC2_IP = '10.0.0.1';
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('timeout'));
+
+    const result = await fetchEc2Ip();
+    expect(result).toBe('10.0.0.1');
+  });
+
+  test('returns "local" when metadata fails and no env var', async () => {
+    delete process.env.EC2_IP;
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('timeout'));
+
+    const result = await fetchEc2Ip();
+    expect(result).toBe('local');
   });
 });
