@@ -1,0 +1,1452 @@
+import { z } from 'zod';
+import path from 'node:path';
+import fs from 'node:fs';
+import type { BrowserAutomationAdapter } from '../../../adapters/types.js';
+import type { PlatformConfig, PageState, PageType } from './types.js';
+import type { WorkdayUserProfile } from '../workdayTypes.js';
+import {
+  WORKDAY_BASE_RULES,
+  buildPersonalInfoPrompt,
+  buildFormPagePrompt,
+  buildExperiencePrompt,
+  buildVoluntaryDisclosurePrompt,
+  buildSelfIdentifyPrompt,
+  buildGenericPagePrompt,
+  buildGoogleSignInFallbackPrompt,
+} from '../workdayPrompts.js';
+
+// ---------------------------------------------------------------------------
+// Workday page state schema (extends base with voluntary_disclosure, self_identify)
+// ---------------------------------------------------------------------------
+
+const WorkdayPageStateSchema = z.object({
+  page_type: z.enum([
+    'job_listing', 'login', 'google_signin', 'verification_code', 'phone_2fa',
+    'account_creation', 'personal_info', 'experience', 'resume_upload',
+    'questions', 'voluntary_disclosure', 'self_identify',
+    'review', 'confirmation', 'error', 'unknown',
+  ]),
+  page_title: z.string().optional().default(''),
+  has_apply_button: z.boolean().optional().default(false),
+  has_next_button: z.boolean().optional().default(false),
+  has_submit_button: z.boolean().optional().default(false),
+  has_sign_in_with_google: z.boolean().optional().default(false),
+  error_message: z.string().optional().default(''),
+});
+
+// ---------------------------------------------------------------------------
+// Workday-specific fuzzy matching (5-pass: exact, contains, reverse, word, stem)
+// ---------------------------------------------------------------------------
+
+function findBestDropdownAnswer(
+  label: string,
+  qaMap: Record<string, string>,
+): string | null {
+  if (!label) return null;
+
+  const labelLower = label.toLowerCase().replace(/\*/g, '').trim();
+  if (labelLower.length < 2) return null;
+
+  // Pass 1: Exact match (case-insensitive)
+  for (const [q, a] of Object.entries(qaMap)) {
+    if (q.toLowerCase() === labelLower) return a;
+  }
+
+  // Pass 2: Label contains the Q&A key
+  for (const [q, a] of Object.entries(qaMap)) {
+    if (labelLower.includes(q.toLowerCase())) return a;
+  }
+
+  // Pass 3: Q&A key contains the label (short labels like "Gender", "State")
+  for (const [q, a] of Object.entries(qaMap)) {
+    if (q.toLowerCase().includes(labelLower) && labelLower.length > 3) return a;
+  }
+
+  // Pass 4: Significant word overlap (for rephrased questions)
+  const labelWords = new Set(labelLower.split(/\s+/).filter(w => w.length > 3));
+  let bestMatch: { answer: string; overlap: number } | null = null;
+
+  for (const [q, a] of Object.entries(qaMap)) {
+    const qWords = q.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+    const overlap = qWords.filter(w => labelWords.has(w)).length;
+    if (overlap >= 3 && (!bestMatch || overlap > bestMatch.overlap)) {
+      bestMatch = { answer: a, overlap };
+    }
+  }
+
+  if (bestMatch) return bestMatch.answer;
+
+  // Pass 5: Stem-based overlap
+  const stem = (word: string) =>
+    word.replace(/(ating|ting|ing|tion|sion|ment|ness|able|ible|ed|ly|er|est|ies|es|s)$/i, '');
+  const labelStems = new Set(
+    labelLower.split(/\s+/).filter(w => w.length > 3).map(stem),
+  );
+  bestMatch = null;
+
+  for (const [q, a] of Object.entries(qaMap)) {
+    const qStems = q.toLowerCase().split(/\s+/).filter(w => w.length > 3).map(stem);
+    const overlap = qStems.filter(s => labelStems.has(s)).length;
+    if (overlap >= 2 && (!bestMatch || overlap > bestMatch.overlap)) {
+      bestMatch = { answer: a, overlap };
+    }
+  }
+
+  if (bestMatch) return bestMatch.answer;
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// WorkdayPlatformConfig
+// ---------------------------------------------------------------------------
+
+export class WorkdayPlatformConfig implements PlatformConfig {
+  readonly platformId = 'workday';
+  readonly displayName = 'Workday';
+  readonly pageStateSchema = WorkdayPageStateSchema as z.ZodType<PageState>;
+  readonly baseRules = WORKDAY_BASE_RULES;
+  readonly needsCustomExperienceHandler = true;
+  readonly authDomains = ['accounts.google.com', 'myworkdayjobs.com'];
+
+  // =========================================================================
+  // Page Detection
+  // =========================================================================
+
+  detectPageByUrl(url: string): PageState | null {
+    // Google SSO detection
+    if (url.includes('accounts.google.com')) {
+      if (url.includes('/pwd') || url.includes('/identifier')) {
+        return { page_type: 'google_signin', page_title: 'Google Sign-In (password)' };
+      }
+      if (url.includes('/challenge/')) {
+        const challengeType = url.includes('recaptcha') ? 'CAPTCHA'
+          : url.includes('ipp') ? 'Phone/SMS verification'
+          : url.includes('dp') ? 'Device prompt'
+          : 'Google challenge';
+        return { page_type: 'phone_2fa', page_title: `${challengeType} (manual solve required)` };
+      }
+      return { page_type: 'google_signin', page_title: 'Google Sign-In' };
+    }
+
+    return null;
+  }
+
+  async detectPageByDOM(adapter: BrowserAutomationAdapter): Promise<PageState | null> {
+    const domSignals = await adapter.page.evaluate(() => {
+      const bodyText = document.body.innerText.toLowerCase();
+      const html = document.body.innerHTML.toLowerCase();
+      return {
+        hasSignInWithGoogle: bodyText.includes('sign in with google') || bodyText.includes('continue with google') || html.includes('google') && bodyText.includes('sign in'),
+        hasSignIn: bodyText.includes('sign in') || bodyText.includes('log in'),
+        hasApplyButton: bodyText.includes('apply') && !bodyText.includes('application questions'),
+        hasSubmitApplication: bodyText.includes('submit application') || bodyText.includes('submit your application'),
+      };
+    });
+
+    if (domSignals.hasSignInWithGoogle || (domSignals.hasSignIn && !domSignals.hasApplyButton && !domSignals.hasSubmitApplication)) {
+      return { page_type: 'login', page_title: 'Workday Sign-In', has_sign_in_with_google: domSignals.hasSignInWithGoogle };
+    }
+
+    return null;
+  }
+
+  buildClassificationPrompt(urlHints: string[]): string {
+    const urlContext = urlHints.length > 0 ? `URL context: ${urlHints.join(' ')} ` : '';
+    return `${urlContext}Analyze the current page and determine what type of page this is in a Workday job application process.
+
+CLASSIFICATION RULES (check in this order):
+1. If the page has a "Sign in with Google" button, OR shows login/sign-in options (even if "Create Account" is also present) → classify as "login".
+2. If the page heading/title contains "Application Questions" or "Additional Questions" or you see screening questions (radio buttons, dropdowns, text inputs asking about eligibility, availability, referral source, etc.) → classify as "questions".
+3. If the page shows a summary of the entire application with a prominent "Submit" or "Submit Application" button → classify as "review".
+4. If the page heading says "My Experience" or "Work Experience" or asks for resume upload → classify as "experience" or "resume_upload".
+5. If the page asks for name, email, phone, address fields → classify as "personal_info".
+6. If the page heading says "Voluntary Disclosures" and asks about gender, race/ethnicity, veteran status → classify as "voluntary_disclosure".
+7. If the page heading says "Self Identify" or "Self-Identification" or asks specifically about disability status (e.g. "Please indicate if you have a disability") → classify as "self_identify".
+8. If the page asks about gender, race/ethnicity, veteran status, disability but doesn't match rules 6 or 7 → classify as "voluntary_disclosure".
+9. If you see ONLY a "Create Account" or "Sign Up" form with no sign-in option → classify as "account_creation".
+
+IMPORTANT: Pages titled "Application Questions (1 of N)" or "(2 of N)" are ALWAYS "questions", never "experience".
+IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify as "login" (NOT "account_creation").`;
+  }
+
+  async classifyByDOMFallback(adapter: BrowserAutomationAdapter): Promise<PageType> {
+    const currentUrl = await adapter.getCurrentUrl();
+
+    // URL-based fallback for Workday login pages
+    if (currentUrl.includes('myworkdayjobs.com') && (currentUrl.includes('login') || currentUrl.includes('signin'))) {
+      return 'login';
+    }
+
+    return adapter.page.evaluate(() => {
+      const bodyText = document.body.innerText.toLowerCase();
+      const headings = Array.from(document.querySelectorAll('h1, h2, h3, [data-automation-id*="pageHeader"], [data-automation-id*="stepTitle"]'));
+      const headingText = headings.map(h => (h.textContent || '').toLowerCase()).join(' ');
+
+      // REVIEW page detection FIRST (review contains all section headings as summary)
+      const hasSelectOneDropdowns = Array.from(document.querySelectorAll('button')).some(b => (b.textContent || '').trim() === 'Select One');
+      const hasFormInputs = document.querySelectorAll('input[type="text"]:not([readonly]), textarea:not([readonly]), input[type="email"], input[type="tel"]').length > 0;
+      if (headingText.includes('review')) return 'review' as PageType;
+
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+      const buttonTexts = buttons.map(b => (b.textContent || '').trim().toLowerCase());
+      const hasSubmitButton = buttonTexts.some(t => t === 'submit' || t === 'submit application');
+      const hasSaveAndContinue = buttonTexts.some(t => t.includes('save and continue'));
+      if (hasSubmitButton && !hasSaveAndContinue && !hasSelectOneDropdowns && !hasFormInputs) return 'review' as PageType;
+
+      const allText = headingText + ' ' + bodyText.substring(0, 2000);
+      if (allText.includes('application questions') || allText.includes('additional questions')) return 'questions' as PageType;
+      if (allText.includes('voluntary disclosures') || allText.includes('voluntary self')) return 'voluntary_disclosure' as PageType;
+      if (allText.includes('self identify') || allText.includes('self-identify') || allText.includes('disability status')) return 'self_identify' as PageType;
+      if (allText.includes('my experience') || allText.includes('work experience') || allText.includes('resume')) return 'experience' as PageType;
+      if (allText.includes('my information') || allText.includes('personal info')) return 'personal_info' as PageType;
+      return 'unknown' as PageType;
+    });
+  }
+
+  // =========================================================================
+  // Form Filling — Prompts & Data
+  // =========================================================================
+
+  buildDataPrompt(profile: Record<string, any>, qaOverrides: Record<string, string>): string {
+    const p = profile as WorkdayUserProfile;
+    const parts: string[] = [
+      'FIELD-TO-VALUE MAPPING — read each field label and match it to the correct value:',
+      '',
+      '--- NAME FIELDS ---',
+      `If the label says "First Name" or "Legal First Name" → type: ${p.first_name}`,
+      `If the label says "Last Name" or "Legal Last Name" → type: ${p.last_name}`,
+      '',
+      '--- CONTACT FIELDS ---',
+      `If the label says "Email" or "Email Address" → type: ${p.email}`,
+      `If the label says "Phone Number" or "Phone" → type: ${p.phone}`,
+      `If the label says "Phone Device Type" → select: ${p.phone_device_type || 'Mobile'}`,
+      `If the label says "Country Phone Code" or "Phone Country Code" → select: ${p.phone_country_code || '+1'} (United States)`,
+      '',
+      '--- ADDRESS FIELDS ---',
+      `If the label says "Country" or "Country/Territory" → select from dropdown: ${p.address.country}`,
+      `If the label says "Address Line 1" or "Street" → type: ${p.address.street}`,
+      `If the label says "City" → type: ${p.address.city}`,
+      `If the label says "State" or "State/Province" → select from dropdown: ${p.address.state}`,
+      `If the label says "Postal Code" or "ZIP" or "ZIP Code" → type: ${p.address.zip}`,
+    ];
+
+    if (p.linkedin_url) {
+      parts.push('');
+      parts.push('--- LINKS ---');
+      parts.push(`If the label says "LinkedIn" → type: ${p.linkedin_url}`);
+      if (p.website_url) parts.push(`If the label says "Website" → type: ${p.website_url}`);
+    }
+
+    if (p.education?.length > 0) {
+      const edu = p.education[0];
+      parts.push('');
+      parts.push('--- EDUCATION ---');
+      parts.push(`School/University → ${edu.school}`);
+      parts.push(`Degree → ${edu.degree}`);
+      parts.push(`Field of Study → ${edu.field_of_study}`);
+      if (edu.gpa) parts.push(`GPA → ${edu.gpa}`);
+      parts.push(`Start Date → ${edu.start_date}`);
+      parts.push(`End Date → ${edu.end_date}`);
+    }
+
+    // Q&A overrides for screening questions
+    if (Object.keys(qaOverrides).length > 0) {
+      parts.push('');
+      parts.push('--- SCREENING QUESTIONS — match the question text and select/type the answer ---');
+      for (const [question, answer] of Object.entries(qaOverrides)) {
+        parts.push(`If the question asks "${question}" → answer: ${answer}`);
+      }
+    }
+
+    parts.push('');
+    parts.push('--- GENERAL RULES ---');
+    parts.push(`Work Authorization → ${p.work_authorization}`);
+    parts.push(`Visa Sponsorship → ${p.visa_sponsorship}`);
+    parts.push('For self-identification: Gender → select "Male". Race/Ethnicity → select "Asian (Not Hispanic or Latino)". Veteran Status → select "I am not a protected veteran". Disability → select "I do not wish to answer".');
+    parts.push('For any question not listed above, select the most reasonable/common answer.');
+    parts.push('DROPDOWN TECHNIQUE: After clicking a dropdown, ALWAYS TYPE your desired answer first (e.g. "No", "Yes", "Male", "Website") to filter the list. If a matching option appears, click it. If typing does not produce a match, click whitespace to close the dropdown, then re-click it and try typing a shorter keyword. The popup menu that appears after clicking a dropdown ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions. NEVER use arrow keys inside dropdowns. NEVER mouse scroll inside dropdowns.');
+    parts.push('NESTED DROPDOWNS: Some dropdowns have sub-menus. After selecting a category (e.g. "Website"), a second list appears with specific options (e.g. "workday.com"). Select the sub-option. Do NOT click any back arrow or "← Category" button — that navigates backwards.');
+    parts.push('DATE FIELDS: Workday date fields have separate MM/DD/YYYY parts. ALWAYS click on the MM (month) part FIRST, then type the full date as continuous digits WITHOUT slashes or dashes (e.g. for 02/18/2026, click on MM and type "02182026"). Workday auto-advances from month to day to year. For "today\'s date" or "signature date", type "02182026" (which is 02/18/2026). For "expected graduation date", use 05012027.');
+    parts.push('NEVER click "Submit Application" or "Submit".');
+
+    return parts.join('\n');
+  }
+
+  buildQAMap(profile: Record<string, any>, qaOverrides: Record<string, string>): Record<string, string> {
+    const p = profile as WorkdayUserProfile;
+    return {
+      // Self-identification (voluntary disclosure) defaults
+      'Gender': p.gender || 'I do not wish to answer',
+      'Race/Ethnicity': p.race_ethnicity || 'I do not wish to answer',
+      'Race': p.race_ethnicity || 'I do not wish to answer',
+      'Ethnicity': p.race_ethnicity || 'I do not wish to answer',
+      'Veteran Status': p.veteran_status || 'I am not a protected veteran',
+      'Are you a protected veteran': p.veteran_status || 'I am not a protected veteran',
+      'Disability': p.disability_status || 'I do not wish to answer',
+      'Disability Status': p.disability_status || 'I do not wish to answer',
+      'Please indicate if you have a disability': p.disability_status || 'I do not wish to answer',
+      // Contact info dropdowns
+      'Country': p.address.country,
+      'Country/Territory': p.address.country,
+      'State': p.address.state,
+      'State/Province': p.address.state,
+      'Phone Device Type': p.phone_device_type || 'Mobile',
+      'Phone Type': p.phone_device_type || 'Mobile',
+      // Text field answers
+      'Please enter your name': `${p.first_name} ${p.last_name}`,
+      'Please enter your name:': `${p.first_name} ${p.last_name}`,
+      'Enter your name': `${p.first_name} ${p.last_name}`,
+      'Your name': `${p.first_name} ${p.last_name}`,
+      'Full name': `${p.first_name} ${p.last_name}`,
+      'Signature': `${p.first_name} ${p.last_name}`,
+      'Name': `${p.first_name} ${p.last_name}`,
+      'What is your desired salary?': 'Open to discussion',
+      'Desired salary': 'Open to discussion',
+      // User-provided Q&A overrides take highest priority
+      ...qaOverrides,
+    };
+  }
+
+  buildPagePrompt(pageType: PageType, dataBlock: string): string {
+    switch (pageType) {
+      case 'personal_info':
+        return buildPersonalInfoPrompt(dataBlock);
+      case 'questions':
+        return buildFormPagePrompt('application questions', dataBlock);
+      case 'voluntary_disclosure':
+        return buildVoluntaryDisclosurePrompt();
+      case 'self_identify':
+        return buildSelfIdentifyPrompt();
+      default:
+        return buildGenericPagePrompt(dataBlock);
+    }
+  }
+
+  // =========================================================================
+  // Programmatic DOM Helpers
+  // =========================================================================
+
+  /**
+   * Workday dropdown filler — 8-strategy label finder + click option with
+   * type-to-filter and arrow-scroll fallback.
+   */
+  async fillDropdownsProgrammatically(
+    adapter: BrowserAutomationAdapter,
+    qaMap: Record<string, string>,
+  ): Promise<number> {
+    // Scan page for all unfilled dropdowns with "Select One" buttons.
+    // Uses string-based evaluate to avoid Bun/esbuild __name injection.
+    const dropdownInfos: Array<{ index: number; label: string }> = await adapter.page.evaluate(`
+      (() => {
+        var results = [];
+        var buttons = document.querySelectorAll('button');
+        var idx = 0;
+
+        for (var i = 0; i < buttons.length; i++) {
+          var btn = buttons[i];
+          var text = (btn.textContent || '').trim();
+          if (text !== 'Select One') continue;
+
+          var rect = btn.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+
+          btn.setAttribute('data-gh-dropdown-idx', String(idx));
+
+          var labelText = '';
+
+          // Strategy 1: aria-label on the button or a close ancestor
+          if (!labelText) {
+            var ariaLabel = btn.getAttribute('aria-label');
+            if (!ariaLabel || ariaLabel === 'Select One') {
+              var ariaParent = btn.closest('[aria-label]');
+              if (ariaParent) ariaLabel = ariaParent.getAttribute('aria-label');
+            }
+            if (ariaLabel && ariaLabel !== 'Select One') {
+              labelText = ariaLabel;
+            }
+          }
+
+          // Strategy 2: Walk up to find a <label> tag
+          if (!labelText) {
+            var node = btn.parentElement;
+            for (var d = 0; d < 10 && node; d++) {
+              var lbl = node.querySelector('label');
+              if (lbl && (lbl.textContent || '').trim() && (lbl.textContent || '').trim() !== 'Select One') {
+                labelText = (lbl.textContent || '').trim();
+                break;
+              }
+              node = node.parentElement;
+            }
+          }
+
+          // Strategy 3: data-automation-id labels (Workday-specific)
+          if (!labelText) {
+            var daParent = btn.closest('[data-automation-id]');
+            if (daParent) {
+              var labelEls = daParent.querySelectorAll('[data-automation-id*="formLabel"], [data-automation-id*="label"], [data-automation-id*="questionText"]');
+              for (var le = 0; le < labelEls.length; le++) {
+                var t = (labelEls[le].textContent || '').trim();
+                if (t && t !== 'Select One' && t.length > 3) {
+                  labelText = t;
+                  break;
+                }
+              }
+            }
+          }
+
+          // Strategy 4: Find nearest ancestor with exactly one "Select One" button
+          if (!labelText) {
+            var ancestor = btn.parentElement;
+            for (var up = 0; up < 12 && ancestor; up++) {
+              var selectBtns = ancestor.querySelectorAll('button');
+              var selectOneCount = 0;
+              for (var sb = 0; sb < selectBtns.length; sb++) {
+                if ((selectBtns[sb].textContent || '').trim() === 'Select One') selectOneCount++;
+              }
+              if (selectOneCount === 1) {
+                var fullText = (ancestor.textContent || '').trim();
+                var cleaned = fullText
+                  .replace(/Select One/g, '')
+                  .replace(/Required/gi, '')
+                  .replace(/[*]/g, '')
+                  .trim();
+                if (cleaned.length > 8) {
+                  labelText = cleaned;
+                  break;
+                }
+              }
+              ancestor = ancestor.parentElement;
+            }
+          }
+
+          // Strategy 5: Walk up and check preceding siblings
+          if (!labelText) {
+            var container = btn.parentElement;
+            for (var u = 0; u < 8 && container; u++) {
+              var prev = container.previousElementSibling;
+              if (prev) {
+                var pt = (prev.textContent || '').trim();
+                if (pt && pt.length > 5 && pt !== 'Select One' && pt !== 'Required') {
+                  labelText = pt;
+                  break;
+                }
+              }
+              container = container.parentElement;
+            }
+          }
+
+          // Strategy 6: Look at text in parent divs (up to 6 levels)
+          if (!labelText) {
+            var parentNode = btn.parentElement;
+            for (var p = 0; p < 6 && parentNode; p++) {
+              var childNodes = parentNode.childNodes;
+              for (var cn = 0; cn < childNodes.length; cn++) {
+                var child = childNodes[cn];
+                if (child === btn) continue;
+                if (child.contains && child.contains(btn)) continue;
+                var candidateText = '';
+                if (child.nodeType === 3) {
+                  candidateText = (child.textContent || '').trim();
+                } else if (child.nodeType === 1) {
+                  var tag = (child.tagName || '').toLowerCase();
+                  if (tag === 'button' || tag === 'input' || tag === 'select') continue;
+                  candidateText = (child.textContent || '').trim();
+                }
+                if (candidateText && candidateText.length > 5
+                    && candidateText !== 'Select One'
+                    && candidateText !== 'Required') {
+                  labelText = candidateText;
+                  break;
+                }
+              }
+              if (labelText) break;
+              parentNode = parentNode.parentElement;
+            }
+          }
+
+          // Strategy 7: aria-describedby / aria-labelledby + relaxed ancestor walk
+          if (!labelText) {
+            var describedBy = btn.getAttribute('aria-describedby') || btn.getAttribute('aria-labelledby');
+            if (describedBy) {
+              var ids = describedBy.split(/\\s+/);
+              for (var di = 0; di < ids.length; di++) {
+                var el = document.getElementById(ids[di]);
+                if (el) {
+                  var txt = (el.textContent || '').trim();
+                  if (txt && txt.length > 5 && txt !== 'Select One') {
+                    labelText = txt;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+          if (!labelText) {
+            var anc = btn.parentElement;
+            for (var w = 0; w < 15 && anc; w++) {
+              var ancText = (anc.textContent || '');
+              var stripped = ancText
+                .replace(/Select One/g, '')
+                .replace(/Required/gi, '')
+                .replace(/[*]/g, '')
+                .trim();
+              if (stripped.length > 15 && stripped.length < 2000) {
+                var sentences = stripped.split(/[.?!\\n]/).filter(function(s) { return s.trim().length > 10; });
+                if (sentences.length > 0) {
+                  labelText = sentences[0].trim();
+                  break;
+                }
+              }
+              anc = anc.parentElement;
+            }
+          }
+
+          // Strategy 8: Positional — find text blocks geometrically above the button
+          if (!labelText) {
+            var btnRect = btn.getBoundingClientRect();
+            var bestDist = 9999;
+            var bestText = '';
+            var textEls = document.querySelectorAll('p, div, span, label, h1, h2, h3, h4, h5, li');
+            for (var te = 0; te < textEls.length; te++) {
+              var tel = textEls[te];
+              if (tel.contains(btn) || tel === btn) continue;
+              if (tel.closest('[role="listbox"]')) continue;
+              var telRect = tel.getBoundingClientRect();
+              if (telRect.bottom > btnRect.top) continue;
+              var dist = btnRect.top - telRect.bottom;
+              if (dist > 300) continue;
+              var telText = (tel.textContent || '').trim();
+              if (!telText || telText.length < 10 || telText === 'Select One' || telText === 'Required') continue;
+              if (tel.children.length > 5) continue;
+              if (dist < bestDist) {
+                bestDist = dist;
+                bestText = telText;
+              }
+            }
+            if (bestText) {
+              labelText = bestText;
+            }
+          }
+
+          // Clean up label text
+          labelText = labelText
+            .replace(/\\s*\\*\\s*/g, ' ')
+            .replace(/\\s*Required\\s*/gi, '')
+            .replace(/\\s+/g, ' ')
+            .replace(/Select One/g, '')
+            .trim();
+          if (labelText.length > 200) {
+            labelText = labelText.substring(0, 200).trim();
+          }
+
+          results.push({ index: idx, label: labelText });
+          idx++;
+        }
+
+        return results;
+      })()
+    `);
+
+    if (dropdownInfos.length === 0) return 0;
+
+    console.log(`[Workday] [Programmatic] Found ${dropdownInfos.length} unfilled dropdown(s):`);
+    for (const info of dropdownInfos) {
+      console.log(`  [${info.index}] label="${info.label || '(empty)'}"`);
+    }
+
+    let filled = 0;
+
+    for (const info of dropdownInfos) {
+      const answer = findBestDropdownAnswer(info.label, qaMap);
+      if (!answer) {
+        console.log(`[Workday] [Programmatic] No answer matched for: "${info.label}"`);
+        continue;
+      }
+
+      // Verify the button still shows "Select One"
+      const btn = adapter.page.locator(`button[data-gh-dropdown-idx="${info.index}"]`);
+      const stillUnfilled = await btn.textContent().catch(() => '');
+      if (!stillUnfilled?.includes('Select One')) continue;
+
+      console.log(`[Workday] [Programmatic] Filling: "${info.label}" → "${answer}"`);
+
+      await btn.scrollIntoViewIfNeeded();
+      await adapter.page.waitForTimeout(200);
+      await btn.click();
+      await adapter.page.waitForTimeout(600);
+
+      let clicked = await this.clickDropdownOption(adapter, answer);
+
+      // Retry with dispatchEvent if wrong dropdown opened
+      if (!clicked) {
+        await adapter.page.keyboard.press('Escape');
+        await adapter.page.waitForTimeout(300);
+
+        console.log(`[Workday] [Programmatic] Retrying with dispatchEvent for: "${info.label}"`);
+        await adapter.page.evaluate((idx: string) => {
+          const el = document.querySelector(`button[data-gh-dropdown-idx="${idx}"]`);
+          if (el) {
+            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          }
+        }, String(info.index));
+        await adapter.page.waitForTimeout(600);
+
+        clicked = await this.clickDropdownOption(adapter, answer);
+      }
+
+      if (clicked) {
+        filled++;
+        await adapter.page.waitForTimeout(500);
+      } else {
+        await adapter.page.keyboard.press('Escape');
+        await adapter.page.waitForTimeout(300);
+        console.warn(`[Workday] [Programmatic] Option "${answer}" not found for "${info.label}"`);
+      }
+    }
+
+    // Clean up temporary attributes
+    await adapter.page.evaluate(() => {
+      document.querySelectorAll('[data-gh-dropdown-idx]').forEach(el => {
+        el.removeAttribute('data-gh-dropdown-idx');
+      });
+    });
+
+    return filled;
+  }
+
+  /**
+   * Workday segmented date fields (MM/DD/YYYY) — click MM, type full digits,
+   * Workday auto-advances through segments.
+   */
+  async fillDateFieldsProgrammatically(
+    adapter: BrowserAutomationAdapter,
+    _qaMap: Record<string, string>,
+  ): Promise<number> {
+    const dateFields = await adapter.page.evaluate(`
+      (() => {
+        var results = [];
+        var dateInputs = document.querySelectorAll(
+          'input[placeholder*="MM"], input[data-automation-id*="dateSectionMonth"], input[aria-label*="Month"], input[aria-label*="date"]'
+        );
+        for (var i = 0; i < dateInputs.length; i++) {
+          var inp = dateInputs[i];
+          var rect = inp.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+          if (inp.value && inp.value.trim() !== '' && inp.value !== 'MM') continue;
+          inp.setAttribute('data-gh-date-idx', String(i));
+          var label = '';
+          var ancestor = inp.parentElement;
+          for (var up = 0; up < 8 && ancestor; up++) {
+            var labels = ancestor.querySelectorAll('label, [data-automation-id*="formLabel"]');
+            for (var l = 0; l < labels.length; l++) {
+              var t = (labels[l].textContent || '').trim();
+              if (t && t.length > 3) { label = t; break; }
+            }
+            if (label) break;
+            var allText = (ancestor.textContent || '').trim();
+            if (allText.length > 5 && allText.length < 200 && !allText.includes('Select One')) {
+              label = allText.replace(/MM.*YYYY/g, '').replace(/[*]/g, '').replace(/Required/gi, '').trim();
+              if (label.length > 5) break;
+              label = '';
+            }
+            ancestor = ancestor.parentElement;
+          }
+          results.push({ index: i, label: label });
+        }
+        return results;
+      })()
+    `) as Array<{ index: number; label: string }>;
+
+    if (dateFields.length === 0) return 0;
+
+    const now = new Date();
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const dd = String(now.getDate()).padStart(2, '0');
+    const yyyy = String(now.getFullYear());
+    const todayDigits = `${mm}${dd}${yyyy}`;
+
+    let filled = 0;
+    for (const field of dateFields) {
+      const labelLower = field.label.toLowerCase();
+      let dateValue = todayDigits;
+
+      if (labelLower.includes('graduation') || labelLower.includes('expected')) {
+        dateValue = '05012027';
+      } else if (labelLower.includes('start')) {
+        dateValue = '08012023';
+      } else if (labelLower.includes('end')) {
+        dateValue = '05012027';
+      }
+
+      console.log(`[Workday] [Date] Filling "${field.label || 'date field'}" → ${dateValue.substring(0, 2)}/${dateValue.substring(2, 4)}/${dateValue.substring(4)}`);
+
+      const clicked = await adapter.page.evaluate((idx: string) => {
+        const el = document.querySelector(`input[data-gh-date-idx="${idx}"]`) as HTMLInputElement;
+        if (!el) return false;
+        el.scrollIntoView({ block: 'center' });
+        el.focus();
+        el.click();
+        return true;
+      }, String(field.index));
+
+      if (!clicked) {
+        console.warn(`[Workday] [Date] Could not find date input ${field.index}`);
+        continue;
+      }
+
+      await adapter.page.waitForTimeout(300);
+      await adapter.page.keyboard.type(dateValue, { delay: 80 });
+      await adapter.page.waitForTimeout(200);
+      await adapter.page.keyboard.press('Tab');
+      await adapter.page.waitForTimeout(200);
+      filled++;
+    }
+
+    // Clean up temporary attributes
+    await adapter.page.evaluate(() => {
+      document.querySelectorAll('[data-gh-date-idx]').forEach(el => {
+        el.removeAttribute('data-gh-date-idx');
+      });
+    });
+
+    return filled;
+  }
+
+  async checkRequiredCheckboxes(adapter: BrowserAutomationAdapter): Promise<number> {
+    const checked = await adapter.page.evaluate(`
+      (() => {
+        var count = 0;
+        var checkboxes = document.querySelectorAll('input[type="checkbox"]');
+        for (var i = 0; i < checkboxes.length; i++) {
+          var cb = checkboxes[i];
+          if (cb.checked) continue;
+          var rect = cb.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+          var parent = cb.closest('div, label, fieldset');
+          var parentText = (parent ? parent.textContent : '').toLowerCase();
+          if (parentText.includes('acknowledge') || parentText.includes('terms') ||
+              parentText.includes('agree') || parentText.includes('privacy') ||
+              parentText.includes('i have read')) {
+            cb.click();
+            count++;
+          }
+        }
+        return count;
+      })()
+    `) as number;
+
+    if (checked > 0) {
+      console.log(`[Workday] [Checkbox] Checked ${checked} required checkbox(es)`);
+    }
+    return checked;
+  }
+
+  async hasEmptyVisibleFields(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    const result = await adapter.page.evaluate(() => {
+      const emptyFields: string[] = [];
+
+      // Check text inputs and textareas
+      const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+        'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="number"], input:not([type]), textarea'
+      );
+      for (const input of inputs) {
+        const rect = input.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (input.disabled || input.readOnly) continue;
+        if (input.type === 'hidden') continue;
+        if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+
+        // Skip Workday date segments
+        const placeholder = input.placeholder?.toUpperCase() || '';
+        if (placeholder === 'MM' || placeholder === 'DD' || placeholder === 'YYYY') continue;
+
+        // Skip inputs inside dropdowns
+        if (input.closest('[role="listbox"], [role="combobox"], [data-automation-id*="dropdown"], [data-automation-id*="selectWidget"]')) continue;
+
+        if (rect.width < 20 || rect.height < 10) continue;
+        if (input.getAttribute('aria-hidden') === 'true') continue;
+
+        const style = window.getComputedStyle(input);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+
+        // Skip optional internal Workday fields
+        const automationId = input.getAttribute('data-automation-id') || '';
+        const fieldName = input.name || input.id || '';
+        const fieldLabel = input.getAttribute('aria-label') || '';
+        const fieldIdentifier = (automationId + ' ' + fieldName + ' ' + fieldLabel).toLowerCase();
+        if (fieldIdentifier.includes('extension') || fieldIdentifier.includes('countryphone') ||
+            fieldIdentifier.includes('country-phone') || fieldIdentifier.includes('phonecode') ||
+            fieldIdentifier.includes('middlename') || fieldIdentifier.includes('middle-name') ||
+            fieldIdentifier.includes('middle name')) continue;
+
+        if (!input.value || input.value.trim() === '') {
+          emptyFields.push(`input:"${fieldLabel || automationId || fieldName || 'text'}"`);
+        }
+      }
+
+      // Check for unfilled dropdowns ("Select One" buttons)
+      const buttons = document.querySelectorAll('button');
+      for (const btn of buttons) {
+        const text = btn.textContent?.trim();
+        if (text !== 'Select One') continue;
+        const rect = btn.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+        emptyFields.push(`dropdown:"Select One"`);
+      }
+
+      // Check for unchecked required checkboxes
+      const checkboxes = document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
+      for (const cb of checkboxes) {
+        if (cb.checked) continue;
+        const rect = cb.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+        const parent = cb.closest('div, label, fieldset');
+        const parentText = (parent?.textContent || '').toLowerCase();
+        if (parentText.includes('acknowledge') || parentText.includes('terms') ||
+            parentText.includes('agree') || parentText.includes('privacy') ||
+            parentText.includes('required') || parentText.includes('*')) {
+          emptyFields.push(`checkbox:"${parentText.substring(0, 60)}..."`);
+        }
+      }
+
+      // Check for unanswered radio button groups
+      const radioGroups = new Set<string>();
+      document.querySelectorAll<HTMLInputElement>('input[type="radio"]').forEach(r => {
+        if (r.name) radioGroups.add(r.name);
+      });
+      for (const groupName of radioGroups) {
+        const radios = document.querySelectorAll<HTMLInputElement>(`input[type="radio"][name="${groupName}"]`);
+        const anyChecked = Array.from(radios).some(r => r.checked);
+        if (!anyChecked) {
+          for (const r of radios) {
+            const rect = r.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0 && rect.bottom >= 0 && rect.top <= window.innerHeight) {
+              emptyFields.push(`radio:${groupName}`);
+              break;
+            }
+          }
+        }
+      }
+
+      return emptyFields;
+    });
+
+    if (result.length > 0) {
+      console.log(`[Workday] [EmptyCheck] Found ${result.length} empty field(s): ${result.join(', ')}`);
+      return true;
+    }
+    return false;
+  }
+
+  async centerNextEmptyField(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    const centered = await adapter.page.evaluate(() => {
+      // 1. Empty text inputs / textareas
+      const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+        'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input:not([type]), textarea'
+      );
+      for (const inp of inputs) {
+        if (inp.disabled || inp.readOnly) continue;
+        if (inp.type === 'hidden') continue;
+        const rect = inp.getBoundingClientRect();
+        if (rect.width < 20 || rect.height < 10) continue;
+        // Skip date segment inputs
+        const ph = (inp.placeholder || '').toUpperCase();
+        if (ph === 'MM' || ph === 'DD' || ph === 'YYYY') continue;
+        // Skip internal dropdown inputs
+        if (inp.closest('[role="listbox"], [data-automation-id*="dropdown"], [data-automation-id*="selectWidget"]')) continue;
+        // Skip hidden via CSS
+        const style = window.getComputedStyle(inp);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+        if (inp.getAttribute('aria-hidden') === 'true') continue;
+        // Skip optional internal fields
+        const ident = ((inp.getAttribute('data-automation-id') || '') + ' ' + (inp.name || '') + ' ' + (inp.getAttribute('aria-label') || '')).toLowerCase();
+        if (ident.includes('extension') || ident.includes('countryphone') || ident.includes('phonecode') || ident.includes('middlename') || ident.includes('middle name') || ident.includes('middle-name')) continue;
+
+        if (!inp.value || inp.value.trim() === '') {
+          inp.scrollIntoView({ block: 'center', behavior: 'instant' });
+          return true;
+        }
+      }
+
+      // 2. Unfilled dropdowns ("Select One" buttons)
+      const buttons = document.querySelectorAll('button');
+      for (const btn of buttons) {
+        const text = (btn.textContent || '').trim();
+        if (text !== 'Select One') continue;
+        const rect = btn.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        const style = window.getComputedStyle(btn);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        btn.scrollIntoView({ block: 'center', behavior: 'instant' });
+        return true;
+      }
+
+      // 3. Unchecked required checkboxes
+      const checkboxes = document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]:not(:checked)');
+      for (const cb of checkboxes) {
+        const rect = cb.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) continue;
+        const parent = cb.closest('div, label, fieldset');
+        const parentText = (parent?.textContent || '').toLowerCase();
+        if (parentText.includes('acknowledge') || parentText.includes('terms') ||
+            parentText.includes('agree') || parentText.includes('privacy') ||
+            parentText.includes('required') || parentText.includes('*')) {
+          cb.scrollIntoView({ block: 'center', behavior: 'instant' });
+          return true;
+        }
+      }
+
+      return false;
+    });
+
+    if (centered) {
+      await adapter.page.waitForTimeout(300);
+    }
+    return centered;
+  }
+
+  // =========================================================================
+  // Navigation
+  // =========================================================================
+
+  /**
+   * Click "Save and Continue" / "Next" via DOM.
+   * Safety: if only "Submit" is available, check for review page first.
+   */
+  async clickNextButton(adapter: BrowserAutomationAdapter): Promise<'clicked' | 'review_detected' | 'not_found'> {
+    const result = await adapter.page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"], a'));
+
+      // Priority 1: Safe buttons that never submit
+      const safePriorities = ['save and continue', 'next', 'continue'];
+      for (const target of safePriorities) {
+        const btn = buttons.find(b => (b.textContent?.trim().toLowerCase() || '') === target);
+        if (btn) {
+          (btn as HTMLElement).click();
+          return 'clicked';
+        }
+      }
+      // Partial match for safe buttons
+      const fallback = buttons.find(b => {
+        const text = b.textContent?.trim().toLowerCase() || '';
+        return text.includes('save and continue') || text.includes('next');
+      });
+      if (fallback) {
+        (fallback as HTMLElement).click();
+        return 'clicked';
+      }
+
+      // Priority 2: "Submit" — only if NOT on the review page
+      const submitBtn = buttons.find(b => {
+        const text = b.textContent?.trim().toLowerCase() || '';
+        return text === 'submit' || text === 'submit application';
+      });
+      if (submitBtn) {
+        const headings = Array.from(document.querySelectorAll('h1, h2, h3'));
+        const isReviewHeading = headings.some(h => (h.textContent || '').toLowerCase().includes('review'));
+        const hasEditableInputs = document.querySelectorAll(
+          'input[type="text"]:not([readonly]), textarea:not([readonly]), input[type="email"], input[type="tel"]'
+        ).length > 0;
+        const hasSelectOne = buttons.some(b => (b.textContent?.trim() || '') === 'Select One');
+        const hasUncheckedRequired = document.querySelectorAll('input[type="checkbox"]:not(:checked)').length > 0;
+
+        if (isReviewHeading || (!hasEditableInputs && !hasSelectOne && !hasUncheckedRequired)) {
+          return 'review_detected';
+        }
+
+        (submitBtn as HTMLElement).click();
+        return 'clicked';
+      }
+
+      return 'not_found';
+    });
+
+    if (result === 'not_found') {
+      // Last resort: LLM with strict instruction
+      console.warn('[Workday] DOM click failed, falling back to LLM act()');
+      await adapter.act(
+        'Click the "Save and Continue" button. Click ONLY that button and then STOP. Do absolutely nothing else. Do NOT click "Submit" or "Submit Application".',
+      );
+      return 'clicked';
+    }
+
+    return result as 'clicked' | 'review_detected' | 'not_found';
+  }
+
+  async detectValidationErrors(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    return adapter.page.evaluate(() => {
+      const errorBanner = document.querySelector(
+        '[data-automation-id="errorMessage"], [role="alert"], .css-1fdonr0, [class*="WJLK"]'
+      );
+      if (errorBanner && errorBanner.textContent?.toLowerCase().includes('error')) return true;
+      const allText = document.body.innerText;
+      return allText.includes('Errors Found') || allText.includes('Error -');
+    });
+  }
+
+  // =========================================================================
+  // Optional Platform-Specific Overrides
+  // =========================================================================
+
+  /**
+   * Workday's "My Experience" page requires a custom handler because
+   * fields are hidden behind "Add" buttons and resume must be uploaded via DOM.
+   */
+  async handleExperiencePage(
+    adapter: BrowserAutomationAdapter,
+    profile: Record<string, any>,
+    _dataPrompt: string,
+  ): Promise<void> {
+    const userProfile = profile as WorkdayUserProfile;
+
+    console.log('[Workday] On My Experience page — uploading resume via DOM, then LLM fills sections...');
+
+    // Scroll to top first
+    await adapter.page.evaluate(() => window.scrollTo(0, 0));
+    await adapter.page.waitForTimeout(500);
+
+    // ==================== DOM-ONLY: Upload Resume ====================
+    if (userProfile.resume_path) {
+      console.log('[Workday] [MyExperience] Uploading resume via DOM...');
+      const resumePath = path.isAbsolute(userProfile.resume_path)
+        ? userProfile.resume_path
+        : path.resolve(process.cwd(), userProfile.resume_path);
+
+      if (!fs.existsSync(resumePath)) {
+        console.warn(`[Workday] [MyExperience] Resume not found at ${resumePath} — skipping upload.`);
+      } else {
+        try {
+          const fileInput = adapter.page.locator('input[type="file"]').first();
+          await fileInput.setInputFiles(resumePath);
+          console.log('[Workday] [MyExperience] Resume file set via DOM file input.');
+          await adapter.page.waitForTimeout(5000);
+
+          const uploadOk = await adapter.page.evaluate(() => {
+            return document.body.innerText.toLowerCase().includes('successfully uploaded')
+              || document.body.innerText.toLowerCase().includes('successfully');
+          });
+          if (uploadOk) {
+            console.log('[Workday] [MyExperience] Resume upload confirmed.');
+          } else {
+            console.warn('[Workday] [MyExperience] Resume upload status unclear — continuing.');
+          }
+        } catch (err) {
+          console.warn(`[Workday] [MyExperience] Resume upload failed: ${err}`);
+        }
+      }
+    }
+
+    // ==================== LLM fills everything else ====================
+    const exp = userProfile.experience?.[0];
+    const edu = userProfile.education?.[0];
+
+    let dataBlock = `CRITICAL — DO NOT TOUCH THESE SECTIONS:
+- "Websites" section: Do NOT click its "Add" button. Do NOT interact with it at all. Leave it completely empty. Clicking "Add" on Websites creates a required URL field that causes errors.
+- "Certifications" section: Do NOT click its "Add" button. Leave it empty.
+- Do NOT add more than one work experience entry.
+- Do NOT add more than one education entry.
+
+MY EXPERIENCE PAGE DATA:
+`;
+
+    if (exp) {
+      const fromDate = exp.start_date ? (() => {
+        const parts = exp.start_date.split('-');
+        return parts.length >= 2 ? `${parts[1]}/${parts[0]}` : exp.start_date;
+      })() : '';
+      dataBlock += `
+WORK EXPERIENCE (click "Add" under Work Experience section first):
+  Job Title: ${exp.title}
+  Company: ${exp.company}
+  Location: ${exp.location || ''}
+  I currently work here: ${exp.currently_work_here ? 'YES — check the checkbox' : 'No'}
+  From date: ${fromDate} — IMPORTANT: The date field has TWO parts side by side: MM on the LEFT and YYYY on the RIGHT. You MUST click on the LEFT part (the MM box) first, NOT the right part (YYYY). Then type "${fromDate.replace('/', '')}" as continuous digits — Workday will auto-advance from the MM box to the YYYY box as you type.
+  Role Description: ${exp.description}
+`;
+    }
+
+    if (edu) {
+      dataBlock += `
+EDUCATION (click "Add" under Education section first):
+  School or University: ${edu.school}
+  Degree: ${edu.degree} (this is a DROPDOWN — click it, then type "${edu.degree}" to filter and select)
+  Field of Study: ${edu.field_of_study} (this is a TYPEAHEAD — type "${edu.field_of_study}", wait for suggestions to load, then press Enter to select the first match)
+`;
+    }
+
+    if (userProfile.skills && userProfile.skills.length > 0) {
+      dataBlock += `
+SKILLS (find the skills input field, usually has placeholder "Type to Add Skills"):
+  For EACH skill below: click the skills input, type the skill name, WAIT for the autocomplete dropdown to appear, then press Enter to select the first match. After selecting, click on empty whitespace to dismiss the dropdown before typing the next skill.
+  Skills to add: ${userProfile.skills.map(s => `"${s}"`).join(', ')}
+`;
+    }
+
+    if (userProfile.linkedin_url) {
+      dataBlock += `
+LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
+  LinkedIn: ${userProfile.linkedin_url}
+  NOTE: The LinkedIn field is in the "Social Network URLs" section, which is DIFFERENT from the "Websites" section. Only fill the LinkedIn field.
+`;
+    }
+
+    const fillPrompt = buildExperiencePrompt(dataBlock);
+
+    // Custom scroll+LLM loop: ALWAYS invoke LLM each round because fields
+    // are behind "Add" buttons that hasEmptyVisibleFields() can't detect.
+    const MAX_SCROLL_ROUNDS = 8;
+    const MAX_LLM_CALLS = 6;
+    let llmCallCount = 0;
+
+    await adapter.page.evaluate(() => window.scrollTo(0, 0));
+    await adapter.page.waitForTimeout(500);
+
+    for (let round = 1; round <= MAX_SCROLL_ROUNDS; round++) {
+      if (llmCallCount < MAX_LLM_CALLS) {
+        await this.centerNextEmptyField(adapter);
+        console.log(`[Workday] [MyExperience] LLM fill round ${round} (call ${llmCallCount + 1}/${MAX_LLM_CALLS})...`);
+        await adapter.act(fillPrompt);
+        llmCallCount++;
+        await adapter.page.waitForTimeout(1000);
+      }
+
+      const scrollBefore = await adapter.page.evaluate(() => window.scrollY);
+      const scrollMax = await adapter.page.evaluate(
+        () => document.documentElement.scrollHeight - window.innerHeight,
+      );
+
+      if (scrollBefore >= scrollMax - 10) {
+        console.log('[Workday] [MyExperience] Reached bottom of page.');
+        break;
+      }
+
+      await adapter.page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.65)));
+      await adapter.page.waitForTimeout(800);
+
+      const scrollAfter = await adapter.page.evaluate(() => window.scrollY);
+      if (scrollAfter <= scrollBefore) {
+        console.log('[Workday] [MyExperience] Cannot scroll further.');
+        break;
+      }
+
+      console.log(`[Workday] [MyExperience] Scrolled to ${scrollAfter}px (round ${round})...`);
+    }
+
+    console.log(`[Workday] [MyExperience] Page complete. Total LLM calls: ${llmCallCount}`);
+    // NOTE: Navigation (clickNext) is handled by SmartApplyHandler after this returns
+  }
+
+  /**
+   * Workday login: Google SSO with account chooser, email entry, password entry.
+   */
+  async handleLogin(
+    adapter: BrowserAutomationAdapter,
+    profile: Record<string, any>,
+  ): Promise<void> {
+    const currentUrl = await adapter.getCurrentUrl();
+    const userProfile = profile as WorkdayUserProfile;
+    const email = userProfile.email;
+    const password = process.env.TEST_GMAIL_PASSWORD || '';
+
+    // Google sign-in page — handle each sub-page with DOM clicks
+    if (currentUrl.includes('accounts.google.com')) {
+      console.log(`[Workday] On Google sign-in page for ${email}...`);
+
+      const googlePageType = await adapter.page.evaluate(`
+        (() => {
+          const targetEmail = ${JSON.stringify(email)}.toLowerCase();
+          const bodyText = document.body.innerText.toLowerCase();
+
+          let hasVisiblePassword = false;
+          let hasVisibleEmail = false;
+          document.querySelectorAll('input[type="password"]').forEach(el => {
+            if (hasVisiblePassword) return;
+            if (el.getAttribute('aria-hidden') === 'true') return;
+            const s = window.getComputedStyle(el);
+            if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return;
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) hasVisiblePassword = true;
+          });
+          document.querySelectorAll('input[type="email"]').forEach(el => {
+            if (hasVisibleEmail) return;
+            if (el.getAttribute('aria-hidden') === 'true') return;
+            const s = window.getComputedStyle(el);
+            if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return;
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) hasVisibleEmail = true;
+          });
+
+          if (hasVisiblePassword) return { type: 'password_entry', found: true };
+          if (hasVisibleEmail) return { type: 'email_entry', found: true };
+
+          const accountLinks = document.querySelectorAll('[data-email], [data-identifier]');
+          for (const el of accountLinks) {
+            const addr = (el.getAttribute('data-email') || el.getAttribute('data-identifier') || '').toLowerCase();
+            if (addr === targetEmail) return { type: 'account_chooser', found: true };
+          }
+          if (bodyText.includes('choose an account') || bodyText.includes('select an account')) {
+            return { type: 'account_chooser', found: true };
+          }
+
+          return { type: 'unknown', found: false };
+        })()
+      `) as { type: string; found: boolean };
+
+      switch (googlePageType.type) {
+        case 'account_chooser': {
+          console.log('[Workday] Account chooser detected — clicking account via DOM...');
+          const clicked = await adapter.page.evaluate((targetEmail: string) => {
+            const byAttr = document.querySelector(`[data-email="${targetEmail}" i], [data-identifier="${targetEmail}" i]`);
+            if (byAttr) { (byAttr as HTMLElement).click(); return true; }
+
+            const allClickable = document.querySelectorAll('div[role="link"], li[role="option"], a, div[tabindex], li[data-email]');
+            for (const el of allClickable) {
+              if (el.textContent?.toLowerCase().includes(targetEmail.toLowerCase())) {
+                (el as HTMLElement).click();
+                return true;
+              }
+            }
+
+            const allEls = document.querySelectorAll('*');
+            for (const el of allEls) {
+              const text = el.textContent?.toLowerCase() || '';
+              if (text.includes(targetEmail.toLowerCase()) && el.children.length < 5) {
+                (el as HTMLElement).click();
+                return true;
+              }
+            }
+            return false;
+          }, email);
+
+          if (!clicked) {
+            console.warn('[Workday] Could not click account in chooser, falling back to LLM');
+            await adapter.act(`Click on the account "${email}" to sign in with it.`);
+          }
+
+          await adapter.page.waitForTimeout(2000);
+          return;
+        }
+
+        case 'email_entry': {
+          console.log('[Workday] Email entry page — typing email via DOM...');
+          const emailInput = adapter.page.locator('input[type="email"]:visible').first();
+          await emailInput.fill(email);
+          await adapter.page.waitForTimeout(300);
+          const nextClicked = await adapter.page.evaluate(() => {
+            const buttons = document.querySelectorAll('button, div[role="button"]');
+            for (const btn of buttons) {
+              if (btn.textContent?.trim().toLowerCase().includes('next')) {
+                (btn as HTMLElement).click();
+                return true;
+              }
+            }
+            return false;
+          });
+          if (!nextClicked) {
+            await adapter.act('Click the "Next" button.');
+          }
+          await adapter.page.waitForTimeout(2000);
+          return;
+        }
+
+        case 'password_entry': {
+          console.log('[Workday] Password entry page — typing password via DOM...');
+          const passwordInput = adapter.page.locator('input[type="password"]:visible').first();
+          await passwordInput.fill(password);
+          await adapter.page.waitForTimeout(300);
+          const nextClicked = await adapter.page.evaluate(() => {
+            const buttons = document.querySelectorAll('button, div[role="button"]');
+            for (const btn of buttons) {
+              if (btn.textContent?.trim().toLowerCase().includes('next')) {
+                (btn as HTMLElement).click();
+                return true;
+              }
+            }
+            return false;
+          });
+          if (!nextClicked) {
+            await adapter.act('Click the "Next" button.');
+          }
+          await adapter.page.waitForTimeout(2000);
+          return;
+        }
+
+        default: {
+          console.log('[Workday] Unknown Google page — using LLM fallback...');
+          await adapter.act(buildGoogleSignInFallbackPrompt(email, password));
+          await adapter.page.waitForTimeout(2000);
+          return;
+        }
+      }
+    }
+
+    // Workday login page — click "Sign in with Google"
+    console.log('[Workday] On login page, clicking Sign in with Google...');
+
+    let clicked = false;
+    const googleBtnSelectors = [
+      'button:has-text("Sign in with Google")',
+      'button:has-text("Continue with Google")',
+      'a:has-text("Sign in with Google")',
+      '[data-automation-id*="google" i]',
+    ];
+    for (const sel of googleBtnSelectors) {
+      try {
+        const btn = adapter.page.locator(sel).first();
+        if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
+          await btn.click();
+          clicked = true;
+          console.log('[Workday] Clicked "Sign in with Google" via Playwright locator.');
+          break;
+        }
+      } catch { /* try next selector */ }
+    }
+
+    if (!clicked) {
+      const result = await adapter.act(
+        'Look for a "Sign in with Google" button, a Google icon/logo button, or a "Continue with Google" option and click it. If there is no Google sign-in option, look for "Sign In" or "Log In" button instead.',
+      );
+      if (!result.success) {
+        console.warn(`[Workday] Google sign-in button not found, trying generic sign-in: ${result.message}`);
+        await adapter.act('Click the "Sign In", "Log In", or "Create Account" button.');
+      }
+    }
+
+    // Wait for page navigation
+    try {
+      await adapter.page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+      await adapter.page.waitForTimeout(3000);
+    } catch { /* non-fatal */ }
+  }
+
+  // =========================================================================
+  // Private Helpers
+  // =========================================================================
+
+  /**
+   * Find and click a dropdown option matching the target answer.
+   * 3-phase strategy: direct click → type-to-filter → arrow-scroll.
+   */
+  private async clickDropdownOption(
+    adapter: BrowserAutomationAdapter,
+    targetAnswer: string,
+  ): Promise<boolean> {
+    await adapter.page
+      .waitForSelector(
+        '[role="listbox"], [role="option"], [data-automation-id*="promptOption"]',
+        { timeout: 3000 },
+      )
+      .catch(() => {});
+
+    let searchText = targetAnswer;
+    if (targetAnswer.includes('→')) {
+      searchText = targetAnswer.split('→')[0].trim();
+    }
+
+    // Phase 1: Direct click on visible matching option
+    const directClick = await adapter.page.evaluate((target: string) => {
+      const targetLower = target.toLowerCase();
+      const options = document.querySelectorAll(
+        '[role="option"], [role="listbox"] li, ' +
+          '[data-automation-id*="promptOption"], [data-automation-id*="selectOption"]',
+      );
+
+      for (const opt of options) {
+        const text = opt.textContent?.trim().toLowerCase() || '';
+        if (text === targetLower || text.startsWith(targetLower) || text.includes(targetLower)) {
+          (opt as HTMLElement).click();
+          return true;
+        }
+      }
+      for (const opt of options) {
+        const text = opt.textContent?.trim().toLowerCase() || '';
+        if (text.length > 2 && targetLower.includes(text)) {
+          (opt as HTMLElement).click();
+          return true;
+        }
+      }
+      return false;
+    }, searchText);
+
+    if (directClick) return true;
+
+    // Phase 2: Type-to-filter
+    console.log(`[Workday] [Dropdown] Typing "${searchText}" to filter...`);
+    await adapter.page.keyboard.type(searchText, { delay: 50 });
+    await adapter.page.waitForTimeout(500);
+
+    const typedMatch = await adapter.page.evaluate((target: string) => {
+      const targetLower = target.toLowerCase();
+      const options = document.querySelectorAll(
+        '[role="option"], [role="listbox"] li, ' +
+          '[data-automation-id*="promptOption"], [data-automation-id*="selectOption"]',
+      );
+      for (const opt of options) {
+        const text = opt.textContent?.trim().toLowerCase() || '';
+        if (text === targetLower || text.startsWith(targetLower) || text.includes(targetLower)) {
+          (opt as HTMLElement).click();
+          return true;
+        }
+      }
+      for (const opt of options) {
+        const text = opt.textContent?.trim().toLowerCase() || '';
+        if (text.length > 2 && targetLower.includes(text)) {
+          (opt as HTMLElement).click();
+          return true;
+        }
+      }
+      return false;
+    }, searchText);
+
+    if (typedMatch) return true;
+
+    // Phase 3: Arrow-scroll through options
+    console.log(`[Workday] [Dropdown] Typing didn't filter, scrolling through options...`);
+    await adapter.page.keyboard.press('Home');
+    await adapter.page.waitForTimeout(100);
+
+    const MAX_SCROLL_ATTEMPTS = 30;
+    for (let attempt = 0; attempt < MAX_SCROLL_ATTEMPTS; attempt++) {
+      for (let k = 0; k < 3; k++) {
+        await adapter.page.keyboard.press('ArrowDown');
+        await adapter.page.waitForTimeout(80);
+      }
+
+      const scrollMatch = await adapter.page.evaluate((target: string) => {
+        const targetLower = target.toLowerCase();
+
+        const focused = document.querySelector('[role="option"][aria-selected="true"], [role="option"]:focus, [role="option"].selected');
+        if (focused) {
+          const text = focused.textContent?.trim().toLowerCase() || '';
+          if (text === targetLower || text.startsWith(targetLower) || text.includes(targetLower) || (text.length > 2 && targetLower.includes(text))) {
+            (focused as HTMLElement).click();
+            return 'clicked';
+          }
+        }
+
+        const options = document.querySelectorAll(
+          '[role="option"], [role="listbox"] li, ' +
+            '[data-automation-id*="promptOption"], [data-automation-id*="selectOption"]',
+        );
+        for (const opt of options) {
+          const text = opt.textContent?.trim().toLowerCase() || '';
+          if (text === targetLower || text.startsWith(targetLower) || text.includes(targetLower)) {
+            (opt as HTMLElement).click();
+            return 'clicked';
+          }
+        }
+
+        return 'not_found';
+      }, searchText);
+
+      if (scrollMatch === 'clicked') return true;
+    }
+
+    return false;
+  }
+}

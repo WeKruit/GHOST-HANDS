@@ -18,14 +18,16 @@ ABSOLUTE RULE #3 — ONE ATTEMPT PER FIELD: You may type into a given field AT M
 
 ABSOLUTE RULE #4 — NO TAB KEY: NEVER press the Tab key to move between fields. Instead, after filling a field, CLICK on empty whitespace to deselect, then CLICK directly on the next field you want to fill. Tab can jump to the wrong field.
 
-ABSOLUTE RULE #5 — NEVER NAVIGATE: Do NOT click "Save and Continue", "Next", "Submit", "Back", or any button that navigates to another page. When you are done filling visible fields, simply STOP taking actions. I handle all navigation myself.`;
+ABSOLUTE RULE #5 — NEVER NAVIGATE: Do NOT click "Save and Continue", "Next", "Submit", "Back", or any button that navigates to another page. When you are done filling visible fields, simply STOP taking actions. I handle all navigation myself.
+
+ABSOLUTE RULE #6 — TRUST FILLED FIELDS: If a text field shows ANY text at all, it is already filled — DO NOT touch it. Text in narrow input boxes is often visually truncated (e.g. an email field may display "alexanderwguwastak" when the full value "alexanderwguwastaken@gmail.com" is stored). This is normal browser behavior. Never click on, clear, or retype a field that already contains text.`;
 
 // ---------------------------------------------------------------------------
 // Common interaction patterns (reused across page-specific prompts)
 // ---------------------------------------------------------------------------
 
 /** Standard instructions for filling empty fields top-to-bottom. */
-export const FIELD_FILL_RULES = `1. If the field already has ANY value (even if formatted differently), SKIP IT entirely.
+export const FIELD_FILL_RULES = `1. If the field already has ANY value (even if formatted differently or visually truncated), SKIP IT entirely. Text in narrow fields often appears cut off (e.g. "alexanderwguwastak" when the full email is stored) — this is normal, the value is complete. Do NOT retype it.
 2. Phone numbers like "(408) 555-1234" are CORRECTLY formatted by Workday — do NOT re-enter them.
 3. If the field is truly empty (blank/no text): CLICK on it, type/select the correct value, then CLICK on whitespace to deselect.`;
 

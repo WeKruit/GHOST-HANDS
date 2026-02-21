@@ -56,12 +56,10 @@ const SELECTOR_PATTERNS: Omit<DOMMatch, 'details'>[] = [
   { type: 'captcha', selector: 'audio[src*="captcha"]', confidence: 0.85 },
 
   // -- Login --
-  { type: 'login', selector: 'form[action*="login"]', confidence: 0.8 },
-  { type: 'login', selector: 'form[action*="signin"]', confidence: 0.8 },
-  { type: 'login', selector: 'form[action*="sign-in"]', confidence: 0.8 },
-  { type: 'login', selector: 'input[type="password"]', confidence: 0.6 },
-  { type: 'login', selector: '#login-form', confidence: 0.85 },
-  { type: 'login', selector: '[data-testid="login-form"]', confidence: 0.85 },
+  // NOTE: Login detection removed from BlockerDetector. Login pages are expected
+  // navigation in the application flow — task handlers (SmartApplyHandler,
+  // WorkdayApplyHandler) handle login/auth pages directly. Only truly unsolvable
+  // blockers (CAPTCHAs, bot checks, rate limits) belong here.
 
   // -- Bot check --
   { type: 'bot_check', selector: '#challenge-running', confidence: 0.95 },
@@ -93,9 +91,7 @@ const TEXT_PATTERNS: { type: BlockerType; pattern: RegExp; confidence: number }[
   { type: '2fa', pattern: /email verification/i, confidence: 0.7 },
 
   // -- Login text --
-  { type: 'login', pattern: /sign in to continue/i, confidence: 0.85 },
-  { type: 'login', pattern: /session (has )?expired/i, confidence: 0.8 },
-  { type: 'login', pattern: /please (log|sign) ?in/i, confidence: 0.75 },
+  // Removed: login text patterns handled by task handlers, not the blocker detector.
 
   // -- Bot check text --
   { type: 'bot_check', pattern: /checking your browser/i, confidence: 0.85 },
@@ -134,10 +130,7 @@ const OBSERVE_CLASSIFICATION: { pattern: RegExp; type: BlockerType; confidence: 
   { pattern: /funcaptcha/i, type: 'captcha', confidence: 0.85 },
   { pattern: /not a robot/i, type: 'captcha', confidence: 0.85 },
 
-  // Login
-  { pattern: /sign.?in|log.?in/i, type: 'login', confidence: 0.75 },
-  { pattern: /password/i, type: 'login', confidence: 0.7 },
-  { pattern: /session expired/i, type: 'login', confidence: 0.8 },
+  // Login — removed: handled by task handlers directly.
 
   // 2FA
   { pattern: /two.?factor|2fa|mfa/i, type: '2fa', confidence: 0.85 },

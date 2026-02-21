@@ -107,6 +107,7 @@ function detectPlatform(url: string): string {
   if (url.includes('linkedin.com')) return 'linkedin';
   if (url.includes('lever.co')) return 'lever';
   if (url.includes('myworkdayjobs.com') || url.includes('workday.com')) return 'workday';
+  if (url.includes('amazon.jobs') || url.includes('www.amazon.jobs')) return 'amazon';
   if (url.includes('icims.com')) return 'icims';
   if (url.includes('taleo.net')) return 'taleo';
   if (url.includes('smartrecruiters.com')) return 'smartrecruiters';

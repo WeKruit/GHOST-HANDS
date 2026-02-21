@@ -81,6 +81,7 @@ export const TASK_BUDGET: Record<QualityPreset, number> = {
 /** Per-job-type budget overrides (in USD) — bypasses quality preset when present */
 export const JOB_TYPE_BUDGET_OVERRIDES: Record<string, number> = {
   workday_apply: 2.00,
+  smart_apply: 2.00,
 };
 
 /** Per-user monthly budget (in USD) by subscription tier */
@@ -102,6 +103,7 @@ export const JOB_TYPE_ACTION_LIMITS: Record<string, number> = {
   fill_form: 40,
   custom: 50,
   workday_apply: 200,
+  smart_apply: 200,
 };
 
 // ---------------------------------------------------------------------------
