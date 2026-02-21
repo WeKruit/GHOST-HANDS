@@ -3,6 +3,7 @@ import { Client as PgClient } from 'pg';
 import { JobPoller } from './JobPoller.js';
 import { JobExecutor } from './JobExecutor.js';
 import { registerBuiltinHandlers } from './taskHandlers/index.js';
+import { getLogger } from '../monitoring/logger.js';
 
 /**
  * GhostHands Worker Entry Point
@@ -45,15 +46,19 @@ function requireEnv(name: string): string {
 }
 
 async function main(): Promise<void> {
-  console.log(`[Worker] Starting with ID: ${WORKER_ID}`);
+  const logger = getLogger({ workerId: WORKER_ID });
+  logger.info('Worker starting', { workerId: WORKER_ID });
 
   // Register all built-in task handlers
   registerBuiltinHandlers();
-  console.log(`[Worker] Task handlers registered`);
+  logger.info('Task handlers registered');
 
   // Validate required environment variables
   const supabaseUrl = requireEnv('SUPABASE_URL');
-  const supabaseServiceKey = process.env.SUPABASE_SECRET_KEY || requireEnv('SUPABASE_SERVICE_KEY');
+  const supabaseServiceKey = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
+  if (!supabaseServiceKey) {
+    throw new Error('Missing required environment variable: SUPABASE_SECRET_KEY');
+  }
   // Prefer transaction-mode pooler (port 6543) to avoid session pool limits.
   // LISTEN/NOTIFY won't work through transaction pooler, but fallback polling handles it.
   const dbUrl = process.env.DATABASE_URL || process.env.SUPABASE_DIRECT_URL || requireEnv('DATABASE_DIRECT_URL');
@@ -68,9 +73,9 @@ async function main(): Promise<void> {
     connectionString: dbUrl,
   });
 
-  console.log(`[Worker] Connecting to Postgres...`);
+  logger.info('Connecting to Postgres');
   await pgDirect.connect();
-  console.log(`[Worker] Postgres connection established`);
+  logger.info('Postgres connection established');
 
   // CONVENTION: Single-task-per-worker. Each worker processes one job at a time.
   // This simplifies concurrency, avoids browser session conflicts, and makes
@@ -97,26 +102,26 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) {
       // Second signal -- force shutdown
-      console.log(`[Worker] Received second ${signal}, forcing shutdown...`);
-      console.log(`[Worker] Force-releasing claimed jobs...`);
+      logger.warn('Received second signal, forcing shutdown', { signal });
+      logger.info('Force-releasing claimed jobs');
       try {
         await poller.releaseClaimedJobs();
       } catch (err) {
-        console.error(`[Worker] Force release failed:`, err);
+        logger.error('Force release failed', { error: err instanceof Error ? err.message : String(err) });
       }
       try {
         await pgDirect.end();
       } catch {
         // Connection may already be closed
       }
-      console.log(`[Worker] ${WORKER_ID} force-killed`);
+      logger.info('Worker force-killed', { workerId: WORKER_ID });
       process.exit(1);
     }
 
     shuttingDown = true;
-    console.log(`[Worker] Received ${signal}, starting graceful shutdown...`);
-    console.log(`[Worker] Press Ctrl-C again to force-kill immediately`);
-    console.log(`[Worker] Draining ${poller.activeJobCount} active job(s)...`);
+    logger.info('Received signal, starting graceful shutdown', { signal });
+    logger.info('Press Ctrl-C again to force-kill immediately');
+    logger.info('Draining active jobs', { activeJobCount: poller.activeJobCount });
 
     await poller.stop();
     await deregisterWorker();
@@ -127,7 +132,7 @@ async function main(): Promise<void> {
       // Connection may already be closed
     }
 
-    console.log(`[Worker] ${WORKER_ID} shut down gracefully`);
+    logger.info('Worker shut down gracefully', { workerId: WORKER_ID });
     process.exit(0);
   };
 
@@ -136,11 +141,11 @@ async function main(): Promise<void> {
 
   // Handle uncaught errors to prevent silent crashes
   process.on('unhandledRejection', (reason) => {
-    console.error(`[Worker] Unhandled rejection:`, reason);
+    logger.error('Unhandled rejection', { reason: reason instanceof Error ? reason.message : String(reason) });
   });
 
   process.on('uncaughtException', (error) => {
-    console.error(`[Worker] Uncaught exception:`, error);
+    logger.error('Uncaught exception', { error: error.message });
     // Give time for logs to flush, then exit
     setTimeout(() => process.exit(1), 1000);
   });
@@ -176,17 +181,20 @@ async function main(): Promise<void> {
       if (!verify.rows[0]) {
         throw new Error(`Worker registration verification failed for ${WORKER_ID}`);
       }
-      console.log(`[Worker] Registered in gh_worker_registry (status: ${verify.rows[0].status})`);
+      logger.info('Registered in gh_worker_registry', { status: verify.rows[0].status });
       break; // Success
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (attempt < MAX_REGISTRATION_RETRIES) {
         const backoffMs = Math.pow(2, attempt) * 1000; // 2s, 4s
-        console.error(`[Worker] Registration attempt ${attempt}/${MAX_REGISTRATION_RETRIES} failed: ${errMsg} — retrying in ${backoffMs}ms`);
+        logger.error('Registration attempt failed, retrying', {
+          attempt, maxAttempts: MAX_REGISTRATION_RETRIES, error: errMsg, backoffMs,
+        });
         await new Promise((r) => setTimeout(r, backoffMs));
       } else {
-        console.error(`[Worker] Registration failed after ${MAX_REGISTRATION_RETRIES} attempts: ${errMsg}`);
-        console.error(`[Worker] Cannot start without registry entry — exiting`);
+        logger.error('Registration failed after all attempts, exiting', {
+          maxAttempts: MAX_REGISTRATION_RETRIES, error: errMsg,
+        });
         process.exit(1);
       }
     }
@@ -204,7 +212,7 @@ async function main(): Promise<void> {
         WHERE worker_id = $1
       `, [WORKER_ID, poller.currentJobId, shuttingDown ? 'draining' : 'active']);
     } catch (err) {
-      console.warn(`[Worker] Heartbeat update failed:`, err instanceof Error ? err.message : err);
+      logger.warn('Heartbeat update failed', { error: err instanceof Error ? err.message : String(err) });
     }
   }, HEARTBEAT_INTERVAL_MS);
 
@@ -217,9 +225,9 @@ async function main(): Promise<void> {
         SET status = 'offline', current_job_id = NULL, last_heartbeat = NOW()
         WHERE worker_id = $1
       `, [WORKER_ID]);
-      console.log(`[Worker] Marked offline in gh_worker_registry`);
+      logger.info('Marked offline in gh_worker_registry');
     } catch (err) {
-      console.warn(`[Worker] Failed to deregister:`, err instanceof Error ? err.message : err);
+      logger.warn('Failed to deregister', { error: err instanceof Error ? err.message : String(err) });
     }
   };
 
@@ -269,7 +277,7 @@ async function main(): Promise<void> {
 
         if (url.pathname === '/worker/drain' && req.method === 'POST') {
           if (!shuttingDown) {
-            console.log(`[Worker] Drain requested via HTTP — stopping job pickup`);
+            logger.info('Drain requested via HTTP, stopping job pickup');
             shuttingDown = true;
             // Update registry status to draining
             pgDirect.query(
@@ -278,7 +286,7 @@ async function main(): Promise<void> {
             ).catch(() => {});
             // Stop accepting new jobs but let active ones finish
             poller.stop().then(() => {
-              console.log(`[Worker] Drain complete — all jobs finished`);
+              logger.info('Drain complete, all jobs finished');
             });
           }
           return Response.json({
@@ -291,14 +299,14 @@ async function main(): Promise<void> {
         return Response.json({ error: 'not_found' }, { status: 404 });
       },
     });
-    console.log(`[Worker] Status server on port ${workerPort}`);
+    logger.info('Status server started', { port: workerPort });
   }
 
-  console.log(`[Worker] ${WORKER_ID} running (maxConcurrent=${maxConcurrent})`);
-  console.log(`[Worker] Listening for jobs on gh_job_created channel`);
+  logger.info('Worker running', { workerId: WORKER_ID, maxConcurrent });
+  logger.info('Listening for jobs on gh_job_created channel');
 }
 
 main().catch((err) => {
-  console.error(`[Worker] Fatal error:`, err);
+  getLogger().error('Worker fatal error', { error: err instanceof Error ? err.message : String(err) });
   process.exit(1);
 });

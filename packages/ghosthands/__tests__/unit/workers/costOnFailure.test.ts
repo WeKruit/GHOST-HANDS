@@ -408,37 +408,18 @@ describe('Cost recording on all exit paths', () => {
 // CostControlService.recordJobCost — zero cost recording
 // ---------------------------------------------------------------------------
 
-describe('CostControlService recordJobCost with zero cost', () => {
-  test('recordJobCost accepts zero-cost snapshot without error', async () => {
-    // Build a mock Supabase client that tracks calls
+describe('CostControlService recordJobCost with atomic RPC', () => {
+  test('recordJobCost accepts zero-cost snapshot and calls RPC with correct params', async () => {
+    // Build a mock Supabase client that tracks RPC and insert calls
     const insertCalls: any[] = [];
-    const updateCalls: any[] = [];
+    const rpcCalls: any[] = [];
 
     const mockSupabase = {
+      rpc: (fnName: string, params: any) => {
+        rpcCalls.push({ fnName, params });
+        return Promise.resolve({ error: null });
+      },
       from: (table: string) => {
-        if (table === 'gh_user_usage') {
-          return {
-            select: () => ({
-              eq: () => ({
-                eq: () => ({
-                  single: () => Promise.resolve({
-                    data: {
-                      id: 'usage-1',
-                      total_cost_usd: 0.5,
-                      total_input_tokens: 10000,
-                      total_output_tokens: 5000,
-                      job_count: 3,
-                    },
-                  }),
-                }),
-              }),
-            }),
-            update: (data: any) => {
-              updateCalls.push({ table, data });
-              return { eq: () => Promise.resolve({ error: null }) };
-            },
-          };
-        }
         if (table === 'gh_job_events') {
           return {
             insert: (data: any) => {
@@ -481,11 +462,14 @@ describe('CostControlService recordJobCost with zero cost', () => {
     // Should not throw
     await service.recordJobCost('user-1', 'job-1', zeroCostSnapshot);
 
-    // Should have updated gh_user_usage (incrementing job_count even for zero cost)
-    expect(updateCalls.length).toBe(1);
-    expect(updateCalls[0].table).toBe('gh_user_usage');
-    expect(updateCalls[0].data.total_cost_usd).toBe(0.5); // 0.5 + 0 = 0.5
-    expect(updateCalls[0].data.job_count).toBe(4); // 3 + 1 = 4
+    // Should have called the atomic RPC function
+    expect(rpcCalls.length).toBe(1);
+    expect(rpcCalls[0].fnName).toBe('gh_increment_user_usage');
+    expect(rpcCalls[0].params.p_user_id).toBe('user-1');
+    expect(rpcCalls[0].params.p_cost_usd).toBe(0);
+    expect(rpcCalls[0].params.p_input_tokens).toBe(0);
+    expect(rpcCalls[0].params.p_output_tokens).toBe(0);
+    expect(rpcCalls[0].params.p_job_count).toBe(1);
 
     // Should have inserted a cost event
     expect(insertCalls.length).toBe(1);
@@ -494,34 +478,15 @@ describe('CostControlService recordJobCost with zero cost', () => {
     expect(insertCalls[0].data.metadata.total_cost).toBe(0);
   });
 
-  test('recordJobCost accepts partial cost snapshot', async () => {
-    const updateCalls: any[] = [];
+  test('recordJobCost passes correct delta values to atomic RPC', async () => {
+    const rpcCalls: any[] = [];
 
     const mockSupabase = {
+      rpc: (fnName: string, params: any) => {
+        rpcCalls.push({ fnName, params });
+        return Promise.resolve({ error: null });
+      },
       from: (table: string) => {
-        if (table === 'gh_user_usage') {
-          return {
-            select: () => ({
-              eq: () => ({
-                eq: () => ({
-                  single: () => Promise.resolve({
-                    data: {
-                      id: 'usage-2',
-                      total_cost_usd: 1.0,
-                      total_input_tokens: 50000,
-                      total_output_tokens: 20000,
-                      job_count: 10,
-                    },
-                  }),
-                }),
-              }),
-            }),
-            update: (data: any) => {
-              updateCalls.push(data);
-              return { eq: () => Promise.resolve({ error: null }) };
-            },
-          };
-        }
         if (table === 'gh_job_events') {
           return {
             insert: () => Promise.resolve({ error: null }),
@@ -559,10 +524,56 @@ describe('CostControlService recordJobCost with zero cost', () => {
 
     await service.recordJobCost('user-2', 'job-2', partialCost);
 
-    expect(updateCalls.length).toBe(1);
-    expect(updateCalls[0].total_cost_usd).toBeCloseTo(1.008, 4);
-    expect(updateCalls[0].total_input_tokens).toBe(55000);
-    expect(updateCalls[0].total_output_tokens).toBe(21500);
-    expect(updateCalls[0].job_count).toBe(11);
+    // RPC should receive the *delta* values (not pre-computed totals)
+    // This is the key difference: the old code would send total_cost_usd = 1.008
+    // (existing 1.0 + 0.008), but the new atomic RPC sends just the delta (0.008)
+    // and lets Postgres do the addition server-side.
+    expect(rpcCalls.length).toBe(1);
+    expect(rpcCalls[0].fnName).toBe('gh_increment_user_usage');
+    expect(rpcCalls[0].params.p_cost_usd).toBeCloseTo(0.008, 4);
+    expect(rpcCalls[0].params.p_input_tokens).toBe(5000);
+    expect(rpcCalls[0].params.p_output_tokens).toBe(1500);
+    expect(rpcCalls[0].params.p_job_count).toBe(1);
+  });
+
+  test('recordJobCost throws when RPC returns an error', async () => {
+    const mockSupabase = {
+      rpc: () => Promise.resolve({
+        error: { message: 'connection refused' },
+      }),
+      from: (table: string) => {
+        if (table === 'profiles') {
+          return {
+            select: () => ({
+              eq: () => ({
+                single: () => Promise.resolve({ data: { subscription_tier: 'free' } }),
+              }),
+            }),
+          };
+        }
+        return {
+          select: () => ({ eq: () => ({ eq: () => ({ single: () => Promise.resolve({ data: null }) }) }) }),
+        };
+      },
+    } as any;
+
+    const service = new CostControlService(mockSupabase);
+
+    const costSnapshot = {
+      inputTokens: 100,
+      outputTokens: 50,
+      inputCost: 0.001,
+      outputCost: 0.001,
+      totalCost: 0.002,
+      actionCount: 1,
+      cookbookSteps: 0,
+      magnitudeSteps: 1,
+      imageCost: 0,
+      reasoningCost: 0.002,
+    };
+
+    await expect(
+      service.recordJobCost('user-3', 'job-3', costSnapshot),
+    ).rejects.toThrow('Failed to record job cost: connection refused');
   });
 });

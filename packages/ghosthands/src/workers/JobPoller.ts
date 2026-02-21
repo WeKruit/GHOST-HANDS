@@ -1,6 +1,7 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { Client as PgClient, Notification } from "pg";
 import { JobExecutor } from "./JobExecutor.js";
+import { getLogger } from '../monitoring/logger.js';
 
 const POLL_INTERVAL_MS = 5_000;
 const DRAIN_TIMEOUT_MS = 30_000;
@@ -80,9 +81,9 @@ export class JobPoller {
         // Always release claimed jobs on shutdown, regardless of whether they completed
         // This ensures clean handoff to other workers even if process is force-killed
         if (this.activeJobs > 0) {
-            console.warn(
-                `[JobPoller] Shutdown with ${this.activeJobs} active jobs still running`
-            );
+            getLogger().warn('Shutdown with active jobs still running', {
+                activeJobs: this.activeJobs,
+            });
         }
         await this.releaseClaimedJobs();
     }
@@ -112,16 +113,15 @@ export class JobPoller {
             );
 
             if (result.rows && result.rows.length > 0) {
-                console.log(
-                    `[JobPoller] Released ${
-                        result.rows.length
-                    } job(s) back to queue: ${result.rows
-                        .map((j: { id: string }) => j.id)
-                        .join(", ")}`
-                );
+                getLogger().info('Released jobs back to queue', {
+                    count: result.rows.length,
+                    jobIds: result.rows.map((j: { id: string }) => j.id),
+                });
             }
         } catch (err) {
-            console.error("[JobPoller] Failed to release claimed jobs:", err);
+            getLogger().error('Failed to release claimed jobs', {
+                error: err instanceof Error ? err.message : String(err),
+            });
         }
     }
 
@@ -162,25 +162,27 @@ export class JobPoller {
 
             this.activeJobs++;
             this._currentJobId = job.id;
-            console.log(
-                `[JobPoller] Picked up job ${job.id} (type=${job.job_type}, active=${this.activeJobs}/${this.maxConcurrent})`
-            );
+            getLogger().info('Picked up job', {
+                jobId: job.id, jobType: job.job_type,
+                activeJobs: this.activeJobs, maxConcurrent: this.maxConcurrent,
+            });
 
             // Execute in background -- do NOT await
             this.executor
                 .execute(job)
                 .catch((err) => {
-                    console.error(
-                        `[JobPoller] Job ${job.id} executor error:`,
-                        err
-                    );
+                    getLogger().error('Job executor error', {
+                        jobId: job.id,
+                        error: err instanceof Error ? err.message : String(err),
+                    });
                 })
                 .finally(() => {
                     this.activeJobs--;
                     this._currentJobId = null;
-                    console.log(
-                        `[JobPoller] Job ${job.id} finished (active=${this.activeJobs}/${this.maxConcurrent})`
-                    );
+                    getLogger().info('Job finished', {
+                        jobId: job.id,
+                        activeJobs: this.activeJobs, maxConcurrent: this.maxConcurrent,
+                    });
                     // Try to pick up the next job
                     if (this.running && this.activeJobs < this.maxConcurrent) {
                         this.tryPickup();
@@ -224,16 +226,15 @@ export class JobPoller {
             );
 
             if (result.rows && result.rows.length > 0) {
-                console.log(
-                    `[JobPoller] Recovered ${
-                        result.rows.length
-                    } stuck job(s): ${result.rows
-                        .map((j: { id: string }) => j.id)
-                        .join(", ")}`
-                );
+                getLogger().info('Recovered stuck jobs', {
+                    count: result.rows.length,
+                    jobIds: result.rows.map((j: { id: string }) => j.id),
+                });
             }
         } catch (err) {
-            console.error("[JobPoller] Stuck job recovery failed:", err);
+            getLogger().error('Stuck job recovery failed', {
+                error: err instanceof Error ? err.message : String(err),
+            });
         }
     }
 }

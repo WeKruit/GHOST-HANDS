@@ -103,9 +103,9 @@ async function main() {
 
   // Initialize session manager
   const supabaseUrl = process.env.SUPABASE_URL;
-  const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
+  const supabaseKey = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
   if (!supabaseUrl || !supabaseKey) {
-    console.error('Need SUPABASE_URL and SUPABASE_SERVICE_KEY');
+    console.error('Need SUPABASE_URL and SUPABASE_SECRET_KEY');
     process.exit(1);
   }
 

@@ -1,4 +1,5 @@
 import { SupabaseClient } from '@supabase/supabase-js';
+import { getLogger } from '../monitoring/logger.js';
 
 // ---------------------------------------------------------------------------
 // Progress lifecycle steps for a job application flow
@@ -261,7 +262,7 @@ export class ProgressTracker {
       });
     } catch (err) {
       // Progress logging should never crash the job
-      console.warn(`[ProgressTracker] Event write failed for job ${this.jobId}:`, err);
+      getLogger().warn('Event write failed', { jobId: this.jobId, error: err instanceof Error ? err.message : String(err) });
     }
 
     // Also update progress_pct + status_message on the job row itself
@@ -277,7 +278,7 @@ export class ProgressTracker {
         })
         .eq('id', this.jobId);
     } catch (err) {
-      console.warn(`[ProgressTracker] Job row update failed for job ${this.jobId}:`, err);
+      getLogger().warn('Job row update failed', { jobId: this.jobId, error: err instanceof Error ? err.message : String(err) });
     }
   }
 
