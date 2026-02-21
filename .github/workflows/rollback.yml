@@ -1,0 +1,141 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "ECR image tag to roll back to (e.g. staging-abc123 or abc123)"
+        required: true
+        type: string
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+
+concurrency:
+  group: rollback-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Rollback to ${{ github.event.inputs.image_tag }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Validate image tag exists in ECR
+        env:
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+        run: |
+          echo "Checking if image tag '${IMAGE_TAG}' exists in ECR..."
+
+          MANIFEST=$(aws ecr batch-get-image \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --query 'images[0].imageManifest' \
+            --output text 2>/dev/null || true)
+
+          if [ -z "$MANIFEST" ] || [ "$MANIFEST" = "None" ]; then
+            echo "::error::Image tag '${IMAGE_TAG}' not found in ECR repository '${ECR_REPOSITORY}'."
+            exit 1
+          fi
+
+          echo "Image tag '${IMAGE_TAG}' verified in ECR."
+
+      - name: Update Kasm workspace image
+        if: env.KASM_API_URL != ''
+        env:
+          KASM_API_URL: ${{ secrets.KASM_API_URL }}
+          KASM_API_KEY: ${{ secrets.KASM_API_KEY }}
+          KASM_API_SECRET: ${{ secrets.KASM_API_SECRET }}
+          KASM_IMAGE_ID: ${{ secrets.KASM_IMAGE_ID }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+        run: |
+          echo "Rolling back Kasm workspace image to ${IMAGE_TAG}"
+
+          HTTP_STATUS=$(curl -s -o /tmp/kasm_response.txt -w "%{http_code}" \
+            -X POST "${KASM_API_URL}/api/public/update_image" \
+            -H "Content-Type: application/json" \
+            --max-time 30 \
+            -d "{
+              \"api_key\": \"${KASM_API_KEY}\",
+              \"api_key_secret\": \"${KASM_API_SECRET}\",
+              \"target_image\": {
+                \"image_id\": \"${KASM_IMAGE_ID}\",
+                \"docker_registry\": \"${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}\"
+              }
+            }")
+
+          echo "Kasm responded with HTTP ${HTTP_STATUS}"
+          cat /tmp/kasm_response.txt
+
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "Kasm workspace image rolled back to ${IMAGE_TAG}."
+          else
+            echo "::error::Kasm API returned HTTP ${HTTP_STATUS}. Rollback may have failed."
+            exit 1
+          fi
+
+      - name: Notify VALET of rollback
+        env:
+          VALET_DEPLOY_WEBHOOK_URL: ${{ secrets.VALET_DEPLOY_WEBHOOK_URL }}
+          VALET_DEPLOY_WEBHOOK_SECRET: ${{ secrets.VALET_DEPLOY_WEBHOOK_SECRET }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+        run: |
+          if [ -z "$VALET_DEPLOY_WEBHOOK_URL" ]; then
+            echo "::warning::VALET_DEPLOY_WEBHOOK_URL not configured. Skipping notification."
+            exit 0
+          fi
+
+          PAYLOAD=$(jq -cn \
+            --arg event "ghosthands.rollback" \
+            --arg image "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" \
+            --arg image_tag "${IMAGE_TAG}" \
+            --arg environment "${ENVIRONMENT}" \
+            --arg repository "${{ github.repository }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg triggered_by "${{ github.actor }}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{event: $event, image: $image, image_tag: $image_tag, environment: $environment, repository: $repository, run_id: $run_id, run_url: $run_url, triggered_by: $triggered_by, timestamp: $timestamp}')
+
+          SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$VALET_DEPLOY_WEBHOOK_SECRET" | awk '{print $2}')
+
+          echo "Notifying VALET of rollback: ${ENVIRONMENT} -> ${IMAGE_TAG}"
+
+          HTTP_STATUS=$(curl -s -o /tmp/webhook_response.txt -w "%{http_code}" \
+            -X POST "$VALET_DEPLOY_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-GH-Webhook-Signature: sha256=${SIGNATURE}" \
+            -H "X-GH-Event: rollback" \
+            -H "X-GH-Environment: ${ENVIRONMENT}" \
+            --max-time 30 \
+            -d "$PAYLOAD")
+
+          echo "VALET responded with HTTP ${HTTP_STATUS}"
+          cat /tmp/webhook_response.txt
+
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "Rollback notification sent."
+          else
+            echo "::warning::VALET webhook returned HTTP ${HTTP_STATUS}."
+          fi
