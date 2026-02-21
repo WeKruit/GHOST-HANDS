@@ -3,7 +3,7 @@ import { ApplyHandler } from './applyHandler.js';
 import { ScrapeHandler } from './scrapeHandler.js';
 import { FillFormHandler } from './fillFormHandler.js';
 import { CustomHandler } from './customHandler.js';
-import { WorkdayApplyHandler } from './workdayApplyHandler.js';
+import { WorkdayApplyHandler } from './workday/index.js';
 
 export function registerBuiltinHandlers(): void {
   taskHandlerRegistry.register(new ApplyHandler());

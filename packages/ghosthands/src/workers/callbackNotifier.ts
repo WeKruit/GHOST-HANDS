@@ -6,6 +6,8 @@
  * Callback failures are logged but never fail the job.
  */
 
+import { getLogger } from '../monitoring/logger.js';
+
 export interface InteractionInfo {
   type: string;
   screenshot_url?: string;
@@ -209,6 +211,7 @@ export class CallbackNotifier {
   }
 
   private async sendWithRetry(url: string, payload: CallbackPayload): Promise<boolean> {
+    const logger = getLogger();
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
         const controller = new AbortController();
@@ -227,18 +230,19 @@ export class CallbackNotifier {
         clearTimeout(timeoutId);
 
         if (response.ok) {
-          console.log(`[CallbackNotifier] Successfully notified ${url} for job ${payload.job_id}`);
+          logger.info('Callback notification succeeded', { url, jobId: payload.job_id });
           return true;
         }
 
-        console.warn(
-          `[CallbackNotifier] Callback returned ${response.status} for job ${payload.job_id} (attempt ${attempt + 1}/${MAX_RETRIES + 1})`
-        );
+        logger.warn('Callback returned non-OK status', {
+          url, jobId: payload.job_id, status: response.status,
+          attempt: attempt + 1, maxAttempts: MAX_RETRIES + 1,
+        });
       } catch (err) {
-        console.warn(
-          `[CallbackNotifier] Callback failed for job ${payload.job_id} (attempt ${attempt + 1}/${MAX_RETRIES + 1}):`,
-          err instanceof Error ? err.message : err
-        );
+        logger.warn('Callback request failed', {
+          jobId: payload.job_id, attempt: attempt + 1, maxAttempts: MAX_RETRIES + 1,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
 
       // Wait before retry (except on last attempt)
@@ -247,7 +251,7 @@ export class CallbackNotifier {
       }
     }
 
-    console.error(`[CallbackNotifier] All retry attempts exhausted for job ${payload.job_id} -> ${url}`);
+    logger.error('All callback retry attempts exhausted', { jobId: payload.job_id, url });
     return false;
   }
 }

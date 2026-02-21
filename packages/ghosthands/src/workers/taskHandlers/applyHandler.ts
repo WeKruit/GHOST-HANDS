@@ -2,19 +2,31 @@ import { z } from 'zod';
 import type { TaskHandler, TaskContext, TaskResult, ValidationResult } from './types.js';
 import { ProgressStep } from '../progressTracker.js';
 
+/**
+ * Zod schema for ApplyHandler input validation.
+ * user_data is optional, but when present must contain first_name, last_name, and email.
+ */
+const ApplyInputSchema = z.object({
+  user_data: z.object({
+    first_name: z.string({ required_error: 'is required' }).min(1, 'is required'),
+    last_name: z.string({ required_error: 'is required' }).min(1, 'is required'),
+    email: z.string({ required_error: 'is required' }).email('must be a valid email'),
+  }).passthrough().optional(),
+}).passthrough();
+
 export class ApplyHandler implements TaskHandler {
   readonly type = 'apply';
   readonly description = 'Apply to a job posting by filling out the application form';
 
   validate(inputData: Record<string, any>): ValidationResult {
-    const errors: string[] = [];
-    const userData = inputData.user_data;
-    if (userData) {
-      if (!userData.first_name) errors.push('user_data.first_name is required');
-      if (!userData.last_name) errors.push('user_data.last_name is required');
-      if (!userData.email) errors.push('user_data.email is required');
+    const result = ApplyInputSchema.safeParse(inputData);
+    if (result.success) {
+      return { valid: true };
     }
-    return { valid: errors.length === 0, errors: errors.length > 0 ? errors : undefined };
+    const errors = result.error.issues.map((issue) =>
+      issue.path.length > 0 ? `${issue.path.join('.')} ${issue.message}` : issue.message
+    );
+    return { valid: false, errors };
   }
 
   async execute(ctx: TaskContext): Promise<TaskResult> {

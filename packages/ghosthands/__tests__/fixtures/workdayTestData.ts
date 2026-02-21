@@ -7,7 +7,7 @@
  * production builds.
  */
 
-import type { WorkdayUserProfile } from '../../src/workers/taskHandlers/workdayTypes.js';
+import type { WorkdayUserProfile } from '../../src/workers/taskHandlers/workday/workdayTypes.js';
 
 /**
  * Fabricated test user profile for development and testing.
