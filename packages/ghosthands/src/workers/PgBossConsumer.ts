@@ -1,7 +1,10 @@
 import { PgBoss, type Job } from 'pg-boss';
 import { Client as PgClient } from 'pg';
 import { JobExecutor } from './JobExecutor.js';
+import { getLogger } from '../monitoring/logger.js';
 import type { AutomationJob } from './taskHandlers/types.js';
+
+const logger = getLogger({ service: 'PgBossConsumer' });
 
 /** Payload shape enqueued by VALET's TaskQueueService */
 interface GhJobPayload {
@@ -18,6 +21,9 @@ interface GhJobPayload {
 /** The general queue name — must match VALET's QUEUE_APPLY_JOB constant */
 const QUEUE_APPLY_JOB = 'gh_apply_job';
 
+/** Max time a job can remain active before pg-boss marks it expired (30 min) */
+const JOB_EXPIRE_SECONDS = 1800;
+
 export interface PgBossConsumerOptions {
   boss: PgBoss;
   pgDirect: PgClient;
@@ -30,7 +36,8 @@ export interface PgBossConsumerOptions {
  *
  * Instead of LISTEN/NOTIFY + FOR UPDATE SKIP LOCKED polling, this consumer
  * uses pg-boss's work() method to claim and process jobs. pg-boss handles
- * retries, backoff, expiration, and dead-letter queues.
+ * expiration and dead-letter queues. Retry logic is owned by JobExecutor
+ * (retryLimit: 0 disables pg-boss retries to avoid dual-retry conflicts).
  *
  * The consumer subscribes to:
  * 1. `gh_apply_job` — general queue (any worker can pick up)
@@ -44,6 +51,12 @@ export class PgBossConsumer {
   private running = false;
   private activeJobs = 0;
   private _currentJobId: string | null = null;
+  /** Track the current pg-boss job ID for cleanup in releaseClaimedJobs */
+  private _currentPgBossJobId: string | null = null;
+  /** Track the current pg-boss queue name for fail() in releaseClaimedJobs */
+  private _currentQueueName: string | null = null;
+  /** Concurrency lock — ensures only one job runs at a time */
+  private processing = false;
 
   constructor(opts: PgBossConsumerOptions) {
     this.boss = opts.boss;
@@ -55,13 +68,18 @@ export class PgBossConsumer {
   async start(): Promise<void> {
     this.running = true;
 
+    const queueOptions = {
+      retryLimit: 0,           // JobExecutor owns retry logic — no pg-boss retries
+      expireInSeconds: JOB_EXPIRE_SECONDS,
+    };
+
     // Create queues if they don't exist
-    await this.boss.createQueue(QUEUE_APPLY_JOB).catch(() => {
+    await this.boss.createQueue(QUEUE_APPLY_JOB, queueOptions).catch(() => {
       // Queue may already exist — that's fine
     });
 
     const targetedQueue = `${QUEUE_APPLY_JOB}:${this.workerId}`;
-    await this.boss.createQueue(targetedQueue).catch(() => {
+    await this.boss.createQueue(targetedQueue, queueOptions).catch(() => {
       // Queue may already exist — that's fine
     });
 
@@ -83,13 +101,17 @@ export class PgBossConsumer {
       },
     );
 
-    console.log(`[PgBossConsumer] Subscribed to queues: ${QUEUE_APPLY_JOB}, ${targetedQueue}`);
+    logger.info('Subscribed to queues', {
+      generalQueue: QUEUE_APPLY_JOB,
+      targetedQueue,
+      workerId: this.workerId,
+    });
   }
 
   async stop(): Promise<void> {
     this.running = false;
     // pg-boss stop is handled by the caller (main.ts) since PgBoss is shared
-    console.log(`[PgBossConsumer] Stopped (active jobs: ${this.activeJobs})`);
+    logger.info('Stopped', { activeJobs: this.activeJobs, workerId: this.workerId });
   }
 
   private async handleJobs(jobs: Job<GhJobPayload>[]): Promise<void> {
@@ -101,13 +123,32 @@ export class PgBossConsumer {
   private async handleJob(job: Job<GhJobPayload>): Promise<void> {
     const payload = job.data;
     const ghJobId = payload.ghJobId;
+    const queueName = job.name;
 
-    console.log(
-      `[PgBossConsumer] Received job ${job.id} (ghJobId=${ghJobId}, type=${payload.jobType})`,
-    );
+    // Concurrency guard: if already processing a job, re-enqueue and return
+    if (this.processing) {
+      logger.warn('Worker busy, re-enqueueing job', {
+        pgBossJobId: job.id,
+        ghJobId,
+        queueName,
+        workerId: this.workerId,
+      });
+      await this.boss.send(queueName, payload);
+      return;
+    }
 
+    this.processing = true;
     this.activeJobs++;
     this._currentJobId = ghJobId;
+    this._currentPgBossJobId = job.id;
+    this._currentQueueName = queueName;
+
+    logger.info('Received job', {
+      pgBossJobId: job.id,
+      ghJobId,
+      jobType: payload.jobType,
+      workerId: this.workerId,
+    });
 
     try {
       // Look up the full gh_automation_jobs record (created by VALET in WEK-98)
@@ -117,7 +158,7 @@ export class PgBossConsumer {
       );
 
       if (!result.rows || result.rows.length === 0) {
-        console.error(`[PgBossConsumer] gh_automation_jobs record not found for ${ghJobId}`);
+        logger.error('gh_automation_jobs record not found', { ghJobId });
         throw new Error(`Job record not found: ${ghJobId}`);
       }
 
@@ -148,20 +189,28 @@ export class PgBossConsumer {
         execution_mode: dbJob.execution_mode || undefined,
       };
 
-      // Execute the job (same path as JobPoller)
+      // Execute the job (same path as JobPoller).
+      // JobExecutor handles its own retry logic (sets status='pending', re-queues via DB update).
+      // Do NOT re-throw — retryLimit: 0 means pg-boss would move the job to dead letter.
       await this.executor.execute(automationJob);
 
-      console.log(`[PgBossConsumer] Job ${ghJobId} completed successfully`);
+      logger.info('Job completed successfully', { ghJobId, workerId: this.workerId });
     } catch (err) {
-      console.error(`[PgBossConsumer] Job ${ghJobId} failed:`, err);
-      // pg-boss will handle retries based on the queue config
-      throw err;
+      // JobExecutor.execute() already handles retryable errors internally by setting
+      // status='pending' + retry_count++ in the DB. If we get here, it's either:
+      // 1. A job record lookup failure (not found) — genuinely non-retryable
+      // 2. An error that JobExecutor already classified and handled
+      // Don't re-throw: with retryLimit: 0, pg-boss would move it to the dead-letter queue,
+      // conflicting with JobExecutor's own retry logic.
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.error('Job failed', { ghJobId, error: errorMsg, workerId: this.workerId });
     } finally {
       this.activeJobs--;
       this._currentJobId = null;
-      console.log(
-        `[PgBossConsumer] Job ${ghJobId} finished (active=${this.activeJobs})`,
-      );
+      this._currentPgBossJobId = null;
+      this._currentQueueName = null;
+      this.processing = false;
+      logger.debug('Job finished', { ghJobId, activeJobs: this.activeJobs, workerId: this.workerId });
     }
   }
 
@@ -180,9 +229,27 @@ export class PgBossConsumer {
   /**
    * Release jobs claimed by this worker back to the queue.
    * Mirror of JobPoller.releaseClaimedJobs() for shutdown compatibility.
+   *
+   * Also fails the current pg-boss job so pg-boss doesn't think it's still active.
    */
   async releaseClaimedJobs(): Promise<void> {
     try {
+      // Fail the current pg-boss job so it doesn't remain "active" in pg-boss
+      if (this._currentPgBossJobId && this._currentQueueName) {
+        try {
+          await this.boss.fail(this._currentQueueName, this._currentPgBossJobId, { reason: 'worker_shutdown' });
+          logger.info('Failed current pg-boss job for release', {
+            pgBossJobId: this._currentPgBossJobId,
+            workerId: this.workerId,
+          });
+        } catch (pgBossErr) {
+          logger.warn('Could not fail pg-boss job during release', {
+            pgBossJobId: this._currentPgBossJobId,
+            error: pgBossErr instanceof Error ? pgBossErr.message : String(pgBossErr),
+          });
+        }
+      }
+
       const result = await this.pgDirect.query(
         `UPDATE gh_automation_jobs
          SET status = 'pending', worker_id = NULL,
@@ -193,12 +260,17 @@ export class PgBossConsumer {
       );
 
       if (result.rows && result.rows.length > 0) {
-        console.log(
-          `[PgBossConsumer] Released ${result.rows.length} job(s): ${result.rows.map((j: { id: string }) => j.id).join(', ')}`,
-        );
+        logger.info('Released jobs', {
+          count: result.rows.length,
+          jobIds: result.rows.map((j: { id: string }) => j.id),
+          workerId: this.workerId,
+        });
       }
     } catch (err) {
-      console.error('[PgBossConsumer] Failed to release claimed jobs:', err);
+      logger.error('Failed to release claimed jobs', {
+        error: err instanceof Error ? err.message : String(err),
+        workerId: this.workerId,
+      });
     }
   }
 }
