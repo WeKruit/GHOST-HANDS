@@ -232,7 +232,7 @@ jobs:
   deploy-production:
     name: Deploy Production
     runs-on: ubuntu-latest
-    needs: [deploy-staging]
+    needs: [docker, deploy-staging]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     environment: production
     steps:
