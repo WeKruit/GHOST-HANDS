@@ -1,48 +1,37 @@
 /**
  * Workday LLM Prompts
  *
- * Centralized prompt strings for the WorkdayApplyHandler.
+ * Centralized prompt strings for the WorkdayApplyHandler and WorkdayPlatformConfig.
  * The base rules are shared across all page handlers; each page type
  * adds its own context-specific instructions on top.
  */
 
 // ---------------------------------------------------------------------------
-// Base rules (shared across all form-filling prompts)
+// Base rules (shared across all Workday form-filling prompts)
 // ---------------------------------------------------------------------------
 
-export const WORKDAY_BASE_RULES = `ABSOLUTE RULE #1 — ZERO SCROLLING: You must NEVER scroll the page — not even 1 pixel. No mouse wheel, no scroll actions, no Page Down. I handle all scrolling myself.
-
-ABSOLUTE RULE #2 — FULLY VISIBLE ONLY: If ANY part of a field, dropdown button, question text, or input box is cut off at the top or bottom edge of the screen, it is NOT fully visible — DO NOT interact with it at all. Only touch fields where the ENTIRE element is within the viewport. When in doubt, skip it. IMPORTANT: if you already typed a value into a field but CANNOT see the text you typed (because the field is near the edge of the screen), DO NOT type again — the value is there, you just can't see it. Move on.
-
-ABSOLUTE RULE #3 — ONE ATTEMPT PER FIELD: You may type into a given field AT MOST ONCE. After you type a value and click elsewhere, that field is DONE. Do NOT go back and re-type. Even if the field appears empty after you typed, trust that your input was registered and move to the next field. Typing into the same field multiple times causes duplicate text (e.g. "WuWuWu" instead of "Wu").
-
-ABSOLUTE RULE #4 — NO TAB KEY: NEVER press the Tab key to move between fields. Instead, after filling a field, CLICK on empty whitespace to deselect, then CLICK directly on the next field you want to fill. Tab can jump to the wrong field.
-
-ABSOLUTE RULE #5 — NEVER NAVIGATE: Do NOT click "Save and Continue", "Next", "Submit", "Back", or any button that navigates to another page. When you are done filling visible fields, simply STOP taking actions. I handle all navigation myself.
-
-ABSOLUTE RULE #6 — TRUST FILLED FIELDS: If a text field shows ANY text at all, it is already filled — DO NOT touch it. Text in narrow input boxes is often visually truncated (e.g. an email field may display "alexanderwguwastak" when the full value "alexanderwguwastaken@gmail.com" is stored). This is normal browser behavior. Never click on, clear, or retype a field that already contains text.`;
+export const WORKDAY_BASE_RULES = `RULES:
+1. NO SCROLLING — I handle all scrolling. Never scroll the page.
+2. VISIBLE ONLY — Only interact with fields fully visible in the viewport. If any part is cut off at the screen edge, skip it. If you typed into a field but cannot see the text (field near screen edge), trust the value is there — move on.
+3. ONE ATTEMPT PER FIELD — Fill each field once, then move to the next. If it looks empty after you typed, trust your input was registered. Retyping causes duplicates (e.g. "WuWuWu" instead of "Wu").
+4. NO TAB KEY — After filling a field, click on empty whitespace to deselect, then click directly on the next field. Tab can jump to the wrong field in Workday.
+5. NO NAVIGATION — Do not click "Save and Continue", "Next", "Submit", "Back", or any page-navigation button. I handle navigation.
+6. TRUST FILLED FIELDS — If a field shows any text, it is already filled. Narrow fields truncate long values visually (e.g. "alexanderwgu..." for a full email). Never click on, clear, or retype a field that shows text. Phone numbers like "(408) 555-1234" are correctly formatted by Workday — do not re-enter them.
+7. SIGNAL COMPLETION — When all visible fields are filled (or none need filling), report the task as done.`;
 
 // ---------------------------------------------------------------------------
-// Common interaction patterns (reused across page-specific prompts)
+// Workday interaction patterns
 // ---------------------------------------------------------------------------
 
-/** Standard instructions for filling empty fields top-to-bottom. */
-export const FIELD_FILL_RULES = `1. If the field already has ANY value (even if formatted differently or visually truncated), SKIP IT entirely. Text in narrow fields often appears cut off (e.g. "alexanderwguwastak" when the full email is stored) — this is normal, the value is complete. Do NOT retype it.
-2. Phone numbers like "(408) 555-1234" are CORRECTLY formatted by Workday — do NOT re-enter them.
-3. If the field is truly empty (blank/no text): CLICK on it, type/select the correct value, then CLICK on whitespace to deselect.`;
+/** Workday-specific dropdown instructions. */
+export const DROPDOWN_RULES = `DROPDOWNS: Click the dropdown, then TYPE your answer to filter (e.g. "No", "Yes", "Male", "Website"), then click the matching option. The popup menu ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps other questions. If no match appears, click whitespace to close, reopen, and try a shorter keyword. Never use arrow keys or mouse-scroll inside dropdowns.`;
 
-/** How to interact with dropdown fields. */
-export const DROPDOWN_RULES = `DROPDOWNS: After clicking a dropdown, ALWAYS TYPE your desired answer first (e.g. type "No", "Yes", "Male", "Website") to filter the list, then click the matching option. The popup menu that appears after you click a dropdown ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions on the page. If typing doesn't produce a match, click whitespace to close, re-click the dropdown, and try typing a shorter keyword. NEVER use arrow keys. NEVER mouse-scroll inside dropdowns.`;
+/** Workday segmented date fields. */
+export const DATE_FIELD_RULES = (todayDate: string, todayFormatted: string, graduationDate: string) =>
+  `DATE FIELDS (MM/DD/YYYY): Click the MM (month) part FIRST, then type the full date as continuous digits with no slashes (e.g. "${todayDate}" for ${todayFormatted}). For "today's date" or "signature date", type "${todayDate}". For "expected graduation date", type "${graduationDate}".`;
 
-/** How to interact with date fields. */
-export const DATE_FIELD_RULES = (todayDate: string, todayFormatted: string) =>
-  `DATE FIELDS (MM/DD/YYYY): Click on the MM (month) part FIRST, then type the full date as continuous digits with NO slashes (e.g. "${todayDate}" for ${todayFormatted}). For "today's date" or "signature date", type "${todayDate}". For "expected graduation date" use 05012027.`;
-
-/** How to interact with checkboxes. */
-export const CHECKBOX_RULES = `CHECKBOXES: If you see a required checkbox (e.g. "I acknowledge..." or Terms & Conditions), click on it to check it.`;
-
-/** "Stop if done" footer. */
-export const STOP_IF_DONE = `If ALL visible fields already have values, STOP IMMEDIATELY — do nothing.`;
+/** Checkbox instructions. */
+export const CHECKBOX_RULES = `CHECKBOXES: Click required checkboxes (e.g. "I acknowledge...", Terms & Conditions) to check them.`;
 
 // ---------------------------------------------------------------------------
 // Page-specific prompt builders
@@ -54,16 +43,20 @@ export const STOP_IF_DONE = `If ALL visible fields already have values, STOP IMM
 export function buildPersonalInfoPrompt(dataBlock: string): string {
   const todayDate = getTodayDateDigits();
   const todayFormatted = getTodayFormatted();
+  const graduationDate = getGraduationDateDigits();
 
   return `${WORKDAY_BASE_RULES}
 
-Fill any EMPTY form fields that are FULLY visible on screen, from TOP to BOTTOM:
-${FIELD_FILL_RULES}
-4. ${DROPDOWN_RULES}
-5. ${DATE_FIELD_RULES(todayDate, todayFormatted)}
-6. ${CHECKBOX_RULES}
+HOW TO FILL FIELDS:
+- Skip any field that already shows text or a selected value — even if truncated.
+- Empty text fields: click the field, type the value, click whitespace to deselect.
+- ${DROPDOWN_RULES}
+- ${DATE_FIELD_RULES(todayDate, todayFormatted, graduationDate)}
+- Radio buttons: click the correct option matching the data mapping.
+- ${CHECKBOX_RULES}
+- OPTIONAL FIELDS: Not every empty field needs filling. If a field has no matching value in the data mapping (e.g., Address Line 2, Middle Name, Suffix), leave it empty and move on.
 
-${STOP_IF_DONE}
+TASK: Fill any empty form fields visible on screen, top to bottom. When done, report the task as complete.
 
 ${dataBlock}`;
 }
@@ -74,16 +67,20 @@ ${dataBlock}`;
 export function buildFormPagePrompt(pageDescription: string, dataPrompt: string): string {
   const todayDate = getTodayDateDigits();
   const todayFormatted = getTodayFormatted();
+  const graduationDate = getGraduationDateDigits();
 
   return `${WORKDAY_BASE_RULES}
 
-You are on a "${pageDescription}" form page. Fill any EMPTY questions/fields that are FULLY visible on screen, from top to bottom:
-${FIELD_FILL_RULES}
-4. ${DROPDOWN_RULES}
-5. ${DATE_FIELD_RULES(todayDate, todayFormatted)}
-6. ${CHECKBOX_RULES}
+HOW TO FILL FIELDS:
+- Skip any field that already shows text or a selected value — even if truncated.
+- Empty text fields: click the field, type the value, click whitespace to deselect.
+- ${DROPDOWN_RULES}
+- ${DATE_FIELD_RULES(todayDate, todayFormatted, graduationDate)}
+- Radio buttons: click the correct option matching the data mapping.
+- ${CHECKBOX_RULES}
+- OPTIONAL FIELDS: Not every empty field needs filling. If a field has no matching value in the data mapping, leave it empty and move on.
 
-If ALL visible fields already have values, STOP IMMEDIATELY — do nothing.
+TASK: You are on a "${pageDescription}" form page. Fill any empty questions/fields visible on screen, top to bottom. When done, report the task as complete.
 
 ${dataPrompt}`;
 }
@@ -94,57 +91,62 @@ ${dataPrompt}`;
 export function buildExperiencePrompt(dataBlock: string): string {
   return `${WORKDAY_BASE_RULES}
 
-This is the "My Experience" page. Fill any EMPTY fields/sections that are FULLY visible on screen.
+This is the "My Experience" page. Fill any empty fields/sections visible on screen.
 
-IMPORTANT INTERACTION PATTERNS:
-1. "Add" BUTTONS: ONLY click "Add" under "Work Experience" and "Education" sections. Do NOT click "Add" under "Websites" or "Certifications" — those must stay empty. If the form fields are already expanded (you can see Job Title, Company, etc.), do NOT click Add again.
-2. ${DROPDOWN_RULES}
-3. TYPEAHEAD FIELDS (e.g. Field of Study, Skills): Type the value, WAIT 2-3 seconds for the autocomplete suggestions to load, then press Enter to select the first match.
-4. DATE FIELDS (MM/YYYY): The date has TWO boxes side by side — MM on the LEFT, YYYY on the RIGHT. Click on the LEFT box (MM) first. Then type the digits continuously (e.g. "012026"). Workday auto-advances from MM to YYYY. NEVER click on the right/YYYY box directly.
-5. ${CHECKBOX_RULES}
-6. After filling each field, CLICK on empty whitespace to deselect before moving to the next field.
+HOW TO FILL FIELDS:
+- "Add" buttons: ONLY click "Add" under "Work Experience" and "Education". Do NOT click "Add" under "Websites" or "Certifications" — leave those empty. If fields are already expanded (Job Title, Company visible), do NOT click Add again.
+- ${DROPDOWN_RULES}
+- Typeahead fields (e.g. Field of Study, Skills): type the value, wait 2-3 seconds for autocomplete, then press Enter to select the first match.
+- Date fields (MM/YYYY): two boxes side by side — MM on left, YYYY on right. Click the LEFT box (MM) first, then type digits continuously (e.g. "012026"). Workday auto-advances to YYYY. Never click the right/YYYY box directly.
+- Radio buttons: click the correct option matching the data.
+- ${CHECKBOX_RULES}
+- After filling each field, click whitespace to deselect before the next field.
 
-If ALL visible fields already have values, STOP IMMEDIATELY — do nothing.
+When done, report the task as complete.
 
 ${dataBlock}`;
 }
 
 /**
  * Build the prompt for the Voluntary Self-Identification page (gender, race, veteran, disability).
+ * Now data-driven — answers come from the dataBlock.
  */
-export function buildVoluntaryDisclosurePrompt(): string {
+export function buildVoluntaryDisclosurePrompt(dataBlock: string): string {
   return `${WORKDAY_BASE_RULES}
 
-This is a voluntary self-identification page. Fill any UNANSWERED questions that are FULLY visible on screen:
-1. If a dropdown already has an answer selected, SKIP IT.
-2. If empty: CLICK the dropdown, then TYPE the desired answer to filter:
-   - Gender → type "Male"
-   - Race/Ethnicity → type "Asian"
-   - Veteran Status → type "not a protected"
-   - Disability → type "do not wish"
-   The popup menu that appears ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions.
-3. If typing doesn't produce a match, click whitespace to close, re-click the dropdown, and try a shorter keyword. NEVER use arrow keys. NEVER mouse-scroll inside dropdowns.
-4. ${CHECKBOX_RULES}
+This is a voluntary self-identification page. Fill any unanswered questions visible on screen.
 
-If ALL visible questions already have answers, STOP IMMEDIATELY.`;
+HOW TO FILL:
+- If a dropdown already has an answer selected, skip it.
+- If empty: click the dropdown, then TYPE the desired answer from the data mapping below to filter the list, then click the matching option.
+- The popup menu ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps other questions.
+- If typing doesn't produce a match, click whitespace to close, reopen, and try a shorter keyword. Never use arrow keys or mouse-scroll inside dropdowns.
+- ${CHECKBOX_RULES}
+
+When all visible questions have answers, report the task as complete.
+
+${dataBlock}`;
 }
 
 /**
  * Build the prompt for the Self-Identify page (typically disability status).
+ * Now data-driven — answers come from the dataBlock.
  */
-export function buildSelfIdentifyPrompt(): string {
+export function buildSelfIdentifyPrompt(dataBlock: string): string {
   return `${WORKDAY_BASE_RULES}
 
-This is a self-identification page (often about disability status). Fill any UNANSWERED questions that are FULLY visible on screen:
-1. If a field/dropdown already has an answer selected, SKIP IT.
-2. If empty: CLICK the dropdown, then TYPE the desired answer to filter:
-   - Disability Status → type "do not wish"
-   - Any other question → type "Decline"
-   The popup menu that appears ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions.
-3. If typing doesn't produce a match, click whitespace to close, re-click the dropdown, and try a shorter keyword. NEVER use arrow keys. NEVER mouse-scroll inside dropdowns.
-4. ${CHECKBOX_RULES}
+This is a self-identification page (often about disability status). Fill any unanswered questions visible on screen.
 
-If ALL visible questions already have answers, STOP IMMEDIATELY.`;
+HOW TO FILL:
+- If a dropdown already has an answer selected, skip it.
+- If empty: click the dropdown, then TYPE the desired answer from the data mapping below to filter the list, then click the matching option.
+- The popup menu ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps other questions.
+- If typing doesn't produce a match, click whitespace to close, reopen, and try a shorter keyword. Never use arrow keys or mouse-scroll inside dropdowns.
+- ${CHECKBOX_RULES}
+
+When all visible questions have answers, report the task as complete.
+
+${dataBlock}`;
 }
 
 /**
@@ -153,26 +155,31 @@ If ALL visible questions already have answers, STOP IMMEDIATELY.`;
 export function buildGenericPagePrompt(dataPrompt: string): string {
   return `${WORKDAY_BASE_RULES}
 
-Look at this page. Fill any EMPTY form fields that are FULLY visible, from top to bottom:
-1. If a field already has ANY value, SKIP IT — do not re-enter or "fix" it.
-2. If truly empty: CLICK the field, type/select the correct value, CLICK whitespace to deselect.
-3. ${DROPDOWN_RULES}
-4. ${CHECKBOX_RULES}
+HOW TO FILL FIELDS:
+- Skip any field that already shows text or a selected value.
+- Empty fields: click the field, type/select the correct value, click whitespace to deselect.
+- ${DROPDOWN_RULES}
+- Radio buttons: click the correct option matching the data mapping.
+- ${CHECKBOX_RULES}
+- OPTIONAL FIELDS: Not every empty field needs filling. If a field has no matching value in the data mapping, leave it empty and move on.
 
-If ALL fields already have values or no form fields exist, STOP IMMEDIATELY.
+TASK: Fill any empty form fields visible on screen, top to bottom. When done, report the task as complete.
 
 ${dataPrompt}`;
 }
 
 /**
  * Build the prompt for the Google sign-in LLM fallback.
+ * NOTE: Password is NOT included — password entry is handled via DOM only.
  */
-export function buildGoogleSignInFallbackPrompt(email: string, password: string): string {
-  return `This is a Google sign-in page. Do exactly ONE of these actions, then STOP:
-1. If you see an existing account for "${email}", click on it.
-2. If you see an "Email or phone" field, type "${email}" and click "Next".
-3. If you see a "Password" field, type "${password}" and click "Next".
-Do NOT interact with CAPTCHAs, reCAPTCHAs, or image challenges. If you see one, STOP immediately.`;
+export function buildGoogleSignInFallbackPrompt(email: string): string {
+  return `This is a Google sign-in page. Move through the sign-in flow for "${email}":
+- If you see a "Continue", "Confirm", or "Allow" button, click it to proceed.
+- If you see the account "${email}" listed, click on it to select it.
+- If you see an "Email or phone" field, type "${email}" and click "Next".
+- If you see a "Password" field, do NOT type anything — just report the task as done.
+- If you see a CAPTCHA or image challenge, report the task as done.
+Click only ONE button, then report the task as done.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -195,4 +202,12 @@ function getTodayFormatted(): string {
   const dd = String(now.getDate()).padStart(2, '0');
   const yyyy = String(now.getFullYear());
   return `${mm}/${dd}/${yyyy}`;
+}
+
+/** Get expected graduation date as continuous digits (MMDDYYYY). Dynamic — always May of next year. */
+function getGraduationDateDigits(): string {
+  const now = new Date();
+  // If we're past May, use May of next year; otherwise May of this year
+  const gradYear = now.getMonth() >= 5 ? now.getFullYear() + 1 : now.getFullYear();
+  return `0501${gradYear}`;
 }

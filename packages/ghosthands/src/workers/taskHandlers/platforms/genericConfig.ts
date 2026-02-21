@@ -6,23 +6,22 @@ import type { PlatformConfig, PageState, PageType } from './types.js';
 // Base rules (generic — works for most ATS platforms)
 // ---------------------------------------------------------------------------
 
-const GENERIC_BASE_RULES = `ABSOLUTE RULE #1 — ZERO SCROLLING: You must NEVER scroll the page — not even 1 pixel. No mouse wheel, no scroll actions, no Page Down. I handle all scrolling myself.
+const GENERIC_BASE_RULES = `RULES:
+1. SCROLLING — You may scroll down if you need to reach form fields that are below the current viewport. Scroll in small increments (about half the screen). Do NOT scroll back up to revisit fields you already filled.
+2. ONE ATTEMPT PER FIELD — Fill each field once, then move to the next. If it looks empty after you typed, trust your input was registered. Retyping causes duplicates (e.g. "WuWuWu" instead of "Wu").
+3. NO PAGE NAVIGATION — Do not click "Next", "Continue", "Submit", "Save and Continue", or any button that moves to the next page/step. I handle page navigation. However, you MAY click buttons within the form like "Add Another", "Add Work Experience", "Add Education", "Upload", or similar buttons that add sections or expand fields on the current page.
+4. TRUST FILLED FIELDS — If a field shows any text, it is already filled. Narrow fields truncate long values visually (e.g. "alexanderwgu..." for a full email address). Never click on, clear, or retype a field that already shows text.
+5. SIGNAL COMPLETION — When all visible fields are filled (or none need filling), report the task as done. Do not keep searching for more work.`;
 
-ABSOLUTE RULE #2 — FULLY VISIBLE ONLY: If ANY part of a field, dropdown, or input is cut off at the top or bottom edge of the screen, DO NOT interact with it. Only touch fields where the ENTIRE element is within the viewport.
-
-ABSOLUTE RULE #3 — ONE ATTEMPT PER FIELD: You may type into a given field AT MOST ONCE. After you type a value and click elsewhere, that field is DONE. Do NOT go back and re-type. Even if it appears empty, trust that your input was registered and move on.
-
-ABSOLUTE RULE #4 — NEVER NAVIGATE: Do NOT click "Next", "Continue", "Submit", "Save and Continue", or any button that navigates to another page. When you are done filling visible fields, simply STOP taking actions. I handle all navigation myself.
-
-ABSOLUTE RULE #5 — TRUST FILLED FIELDS: If a text field shows ANY text at all, it is already filled — DO NOT touch it. Text in narrow input boxes is often visually truncated (e.g. an email field may display "alexanderwguwastak" when the full value "alexanderwguwastaken@gmail.com" is stored). This is normal browser behavior. Never click on, clear, or retype a field that already contains text.`;
-
-const FIELD_FILL_RULES = `1. If the field already has ANY value (even if formatted differently), SKIP IT entirely. IMPORTANT: Text in narrow input fields is often TRUNCATED visually — the field may show "alexanderwguwastak" when the full value "alexanderwguwastaken@gmail.com" is actually there. If a field shows ANY text at all, it is FILLED — do NOT click on it, do NOT retype it, do NOT "fix" it. Move on.
-2. If the field is truly empty (blank/no text): CLICK on it, type/select the correct value, then CLICK on whitespace to deselect.
-3. After filling each field, CLICK on empty whitespace to deselect before moving to the next field.`;
-
-const DROPDOWN_RULES = `DROPDOWNS: After clicking a dropdown, type your desired answer to filter the list, then click the matching option. If typing doesn't produce a match, click whitespace to close, re-click the dropdown, and try a shorter keyword.`;
-
-const CHECKBOX_RULES = `CHECKBOXES: If you see a required checkbox (e.g. "I acknowledge..." or Terms & Conditions), click it to check it.`;
+const FIELD_INTERACTION_RULES = `HOW TO FILL FIELDS:
+- Text fields: Click the field, type the value from the data mapping, then click empty space to deselect.
+- Dropdowns: Click to open, type your answer to filter the list (e.g. "Yes", "No", "Male"), then click the matching option. IMPORTANT: If your exact answer is not in the dropdown options, pick the CLOSEST available option (e.g. if "Company Website" is not listed, pick "Other" or "Website" or whatever is closest). Never scroll through a dropdown more than twice — if you haven't found an exact match after two scrolls, pick the best available option or "Other".
+- Radio buttons: Click the correct option that matches the data mapping. If the answer is "Yes", click the "Yes" radio button.
+- Required checkboxes (terms, agreements, "I acknowledge..."): Click to check them.
+- Skip any field that already shows text, a selected value, or a checked state — even if the text looks truncated.
+- OPTIONAL FIELDS: Not every empty field needs to be filled. If a field has no matching value in the data mapping (e.g., Address Line 2 with no apartment number, Middle Name, Suffix), leave it empty and move on. Only fill fields that have a clear match in the data mapping.
+- If a question is not covered by the data mapping and you are unsure of the answer, skip it rather than guessing.
+- NEVER get stuck on one field. If you have tried twice and cannot get the right value into a field, pick the closest available option or skip it and move on.`;
 
 // ---------------------------------------------------------------------------
 // Page state schema (generic page types only)
@@ -48,6 +47,21 @@ const GenericPageStateSchema = z.object({
 
 function normalizeLabel(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+}
+
+/**
+ * Derive a standard education level from a degree string.
+ * Maps free-text degree names to dropdown-friendly labels.
+ */
+function deriveEducationLevel(degree: string): string {
+  const d = degree.toLowerCase();
+  if (d.includes('phd') || d.includes('doctorate') || d.includes('doctor of')) return "Doctorate";
+  if (d.includes('master') || d === 'mba' || d === 'ms' || d === 'ma' || d === 'msc') return "Master's Degree";
+  if (d.includes('bachelor') || d === 'bs' || d === 'ba' || d === 'bsc') return "Bachelor's Degree";
+  if (d.includes('associate')) return "Associate's Degree";
+  if (d.includes('high school') || d.includes('ged') || d.includes('diploma')) return "High School or Equivalent";
+  if (d.includes('certificate') || d.includes('certification')) return "Professional Certificate";
+  return degree; // Pass through as-is if no match
 }
 
 function findBestAnswer(label: string, qaMap: Record<string, string>): string | null {
@@ -144,13 +158,14 @@ CLASSIFICATION RULES (check in this order):
 3. If the page asks for name, email, phone, address (personal details) → "personal_info"
 4. If the page asks for resume/CV upload, work experience, education history → "experience" or "resume_upload"
 5. If the page has screening questions (radio buttons, dropdowns, text answers about eligibility, availability, etc.) → "questions"
-6. If the page shows a summary of the entire application with a prominent "Submit" or "Submit Application" button and NO editable fields → "review"
+6. REVIEW PAGE — classify as "review" ONLY if ALL of these are true: (a) the page shows a READ-ONLY summary of your entire application (all your previously entered data displayed as non-editable text), (b) there is a prominent "Submit" or "Submit Application" button, and (c) there are truly NO fillable form fields on the page. A page that has a Submit button but ALSO has form fields, input boxes, dropdowns, or sections still to fill is NOT a review page — classify it based on what needs to be filled.
 7. If the page shows an error message → "error"
 8. If the page shows a confirmation, thank-you message, or "application received" → "confirmation"
 9. If the page asks to create an account or register → "account_creation"
 10. Otherwise → "unknown"
 
-IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify as "login" (NOT "account_creation").`;
+IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify as "login" (NOT "account_creation").
+IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT mean you are on the review page. Only classify as "review" if the page is purely a read-only summary with no fields to fill.`;
   }
 
   async classifyByDOMFallback(adapter: BrowserAutomationAdapter): Promise<PageType> {
@@ -160,14 +175,18 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
       const headingText = headings.map(h => (h.textContent || '').toLowerCase()).join(' ');
       const allText = headingText + ' ' + bodyText.substring(0, 3000);
 
-      // Check for review page (no editable fields + submit button)
-      const hasEditableInputs = document.querySelectorAll(
-        'input[type="text"]:not([readonly]), textarea:not([readonly]), input[type="email"], input[type="tel"]'
-      ).length > 0;
+      // Check for review page — must check ENTIRE page DOM (not just viewport)
+      // to avoid false positives on single-page forms where fields are below the fold
+      const allEditableInputs = document.querySelectorAll(
+        'input[type="text"]:not([readonly]):not([disabled]), textarea:not([readonly]):not([disabled]), input[type="email"]:not([readonly]):not([disabled]), input[type="tel"]:not([readonly]):not([disabled]), select:not([disabled])'
+      );
+      const hasAnyEditableInputs = allEditableInputs.length > 0;
       const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
       const buttonTexts = buttons.map(b => (b.textContent || '').trim().toLowerCase());
       const hasSubmitButton = buttonTexts.some(t => t === 'submit' || t === 'submit application');
-      if (hasSubmitButton && !hasEditableInputs) return 'review' as PageType;
+      const hasNextButton = buttonTexts.some(t => t === 'next' || t === 'continue' || t.includes('save and continue'));
+      // Only classify as review if: submit button exists, NO editable inputs anywhere on page, and no "next" button
+      if (hasSubmitButton && !hasAnyEditableInputs && !hasNextButton) return 'review' as PageType;
 
       if (allText.includes('thank you') || allText.includes('application received') || allText.includes('successfully submitted')) return 'confirmation' as PageType;
       if (allText.includes('sign in') || allText.includes('log in')) return 'login' as PageType;
@@ -181,50 +200,98 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
   // --- Form Filling ---
 
   buildDataPrompt(profile: Record<string, any>, qaOverrides: Record<string, string>): string {
-    const parts: string[] = ['FIELD-TO-VALUE MAPPING — read each field label and fill with the matching value:'];
-    parts.push('');
+    const lines: string[] = ['DATA MAPPING:'];
 
-    // Flatten profile into field mappings
-    if (profile.first_name) parts.push(`If label says "First Name" or "Given Name" → type: ${profile.first_name}`);
-    if (profile.last_name) parts.push(`If label says "Last Name" or "Family Name" or "Surname" → type: ${profile.last_name}`);
-    if (profile.email) parts.push(`If label says "Email" or "Email Address" → type: ${profile.email}`);
-    if (profile.phone) parts.push(`If label says "Phone" or "Phone Number" or "Mobile" → type: ${profile.phone}`);
+    // Personal info
+    if (profile.first_name) lines.push(`- First Name / Given Name: ${profile.first_name}`);
+    if (profile.last_name) lines.push(`- Last Name / Family Name / Surname: ${profile.last_name}`);
+    if (profile.email) lines.push(`- Email / Email Address: ${profile.email}`);
+    if (profile.phone) lines.push(`- Phone / Phone Number / Mobile: ${profile.phone}`);
 
     // Address
-    if (profile.address?.street || profile.street) parts.push(`If label says "Street" or "Address" or "Address Line 1" → type: ${profile.address?.street || profile.street}`);
-    if (profile.address?.city || profile.city) parts.push(`If label says "City" → type: ${profile.address?.city || profile.city}`);
-    if (profile.address?.state || profile.state) parts.push(`If label says "State" or "Province" → type: ${profile.address?.state || profile.state}`);
-    if (profile.address?.zip || profile.zip) parts.push(`If label says "Zip" or "Postal Code" or "Zip Code" → type: ${profile.address?.zip || profile.zip}`);
-    if (profile.address?.country || profile.country) parts.push(`If label says "Country" → type: ${profile.address?.country || profile.country}`);
+    const addr = profile.address || {};
+    if (addr.street || profile.street) lines.push(`- Street / Address / Address Line 1: ${addr.street || profile.street}`);
+    const addrLine2 = addr.line2 || addr.address_line_2 || profile.address_line_2 || '';
+    if (addrLine2) lines.push(`- Address Line 2 / Apt / Suite: ${addrLine2}`);
+    if (addr.city || profile.city) lines.push(`- City: ${addr.city || profile.city}`);
+    if (addr.state || profile.state) lines.push(`- State / Province: ${addr.state || profile.state}`);
+    if (addr.zip || profile.zip) lines.push(`- Zip / Postal Code / ZIP Code: ${addr.zip || profile.zip}`);
+    if (addr.country || profile.country) lines.push(`- Country: ${addr.country || profile.country}`);
 
     // Professional
-    if (profile.linkedin_url) parts.push(`If label says "LinkedIn" or "LinkedIn URL" → type: ${profile.linkedin_url}`);
-    if (profile.portfolio_url || profile.website_url) parts.push(`If label says "Website" or "Portfolio" → type: ${profile.portfolio_url || profile.website_url}`);
-    if (profile.current_company) parts.push(`If label says "Current Company" or "Current Employer" → type: ${profile.current_company}`);
-    if (profile.current_title) parts.push(`If label says "Current Title" or "Job Title" → type: ${profile.current_title}`);
+    if (profile.linkedin_url) lines.push(`- LinkedIn / LinkedIn URL: ${profile.linkedin_url}`);
+    if (profile.portfolio_url || profile.website_url) lines.push(`- Website / Portfolio: ${profile.portfolio_url || profile.website_url}`);
+    if (profile.current_company) lines.push(`- Current Company / Employer: ${profile.current_company}`);
+    if (profile.current_title) lines.push(`- Current Title / Job Title: ${profile.current_title}`);
 
     // Work authorization
-    if (profile.work_authorization) parts.push(`If question about work authorization → answer: ${profile.work_authorization}`);
-    if (profile.salary_expectation) parts.push(`If question about salary expectations → answer: ${profile.salary_expectation}`);
-    if (profile.years_of_experience != null) parts.push(`If question about years of experience → answer: ${profile.years_of_experience}`);
+    if (profile.work_authorization) lines.push(`- Work authorization: ${profile.work_authorization}`);
+    if (profile.salary_expectation) lines.push(`- Salary expectations: ${profile.salary_expectation}`);
+    if (profile.years_of_experience != null) lines.push(`- Years of experience: ${profile.years_of_experience}`);
 
-    // Q&A overrides
-    if (qaOverrides && Object.keys(qaOverrides).length > 0) {
-      parts.push('');
-      parts.push('--- SCREENING QUESTIONS ---');
-      for (const [question, answer] of Object.entries(qaOverrides)) {
-        parts.push(`If question asks "${question}" → answer: ${answer}`);
+    // Education
+    const educationArr = profile.education || profile.work_history_education || [];
+    if (Array.isArray(educationArr) && educationArr.length > 0) {
+      const edu = educationArr[0]; // Primary education entry
+      const degree = edu.degree || edu.level || '';
+      const school = edu.school || edu.institution || '';
+      const field = edu.field_of_study || edu.field || edu.major || '';
+      const gradYear = edu.graduation_year || edu.end_date || '';
+
+      // Derive education level from degree string
+      const educationLevel = deriveEducationLevel(degree);
+      if (educationLevel) lines.push(`- Education Level / Highest Degree: ${educationLevel}`);
+      if (degree) lines.push(`- Degree: ${degree}`);
+      if (school) lines.push(`- School / University / Institution: ${school}`);
+      if (field) lines.push(`- Field of Study / Major: ${field}`);
+      if (gradYear) lines.push(`- Graduation Year: ${gradYear}`);
+    }
+
+    // Work experience
+    const experienceArr = profile.experience || profile.work_history || [];
+    if (Array.isArray(experienceArr) && experienceArr.length > 0) {
+      lines.push('');
+      lines.push('WORK EXPERIENCE:');
+      for (const exp of experienceArr) {
+        const company = exp.company || '';
+        const title = exp.title || '';
+        const location = exp.location || '';
+        const startDate = exp.start_date || '';
+        const endDate = exp.currently_work_here ? 'Present' : (exp.end_date || '');
+        const desc = exp.description || '';
+        lines.push(`- ${title} at ${company}${location ? ` (${location})` : ''}, ${startDate}–${endDate}`);
+        if (desc) lines.push(`  Description: ${desc}`);
       }
     }
 
-    // General rules
-    parts.push('');
-    parts.push('--- GENERAL RULES ---');
-    parts.push('For any question not covered above, use reasonable professional defaults.');
-    parts.push('For "How did you hear about us?" → answer: Company Website');
-    parts.push('NEVER click Submit, Next, or any navigation button.');
+    // Skills
+    const skills = profile.skills || [];
+    if (Array.isArray(skills) && skills.length > 0) {
+      lines.push(`- Skills: ${skills.join(', ')}`);
+    }
 
-    return parts.join('\n');
+    // Voluntary self-identification
+    if (profile.gender) lines.push(`- Gender: ${profile.gender}`);
+    if (profile.race_ethnicity) lines.push(`- Race / Ethnicity: ${profile.race_ethnicity}`);
+    if (profile.veteran_status) lines.push(`- Veteran Status: ${profile.veteran_status}`);
+    if (profile.disability_status) lines.push(`- Disability Status: ${profile.disability_status}`);
+
+    // Q&A overrides
+    if (qaOverrides && Object.keys(qaOverrides).length > 0) {
+      lines.push('');
+      lines.push('SCREENING QUESTIONS:');
+      for (const [question, answer] of Object.entries(qaOverrides)) {
+        lines.push(`- "${question}" → ${answer}`);
+      }
+    }
+
+    // Defaults
+    lines.push('');
+    lines.push('DEFAULTS:');
+    lines.push('- "How did you hear about us?" → Other');
+    lines.push('- For unknown questions not listed above, skip the field rather than guessing.');
+
+    return lines.join('\n');
   }
 
   buildQAMap(profile: Record<string, any>, qaOverrides: Record<string, string>): Record<string, string> {
@@ -242,11 +309,35 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
     if (profile.address?.zip || profile.zip) map['Zip Code'] = profile.address?.zip || profile.zip;
     if (profile.address?.country || profile.country) map['Country'] = profile.address?.country || profile.country;
 
+    // Education
+    const eduArr = profile.education || [];
+    if (Array.isArray(eduArr) && eduArr.length > 0) {
+      const edu = eduArr[0];
+      const degree = edu.degree || edu.level || '';
+      if (degree) {
+        const level = deriveEducationLevel(degree);
+        map['Education Level'] = level;
+        map['Highest Degree'] = level;
+        map['Degree'] = degree;
+      }
+      const school = edu.school || edu.institution || '';
+      if (school) {
+        map['School'] = school;
+        map['University'] = school;
+        map['Institution'] = school;
+      }
+      const field = edu.field_of_study || edu.field || edu.major || '';
+      if (field) {
+        map['Field of Study'] = field;
+        map['Major'] = field;
+      }
+    }
+
     // Common screening questions with generic defaults
     map['Are you legally authorized to work in the United States?'] = profile.work_authorization || 'Yes';
     map['Will you now or in the future require sponsorship?'] = profile.visa_sponsorship || 'No';
     map['Are you at least 18 years of age?'] = 'Yes';
-    map['How did you hear about this position?'] = 'Company Website';
+    map['How did you hear about this position?'] = 'Other';
     map['Are you willing to relocate?'] = 'Yes';
 
     // User overrides take priority
@@ -255,17 +346,12 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
     return map;
   }
 
-  buildPagePrompt(pageType: PageType, dataBlock: string): string {
-    const pageLabel = pageType === 'unknown' ? 'form' : pageType.replace(/_/g, ' ');
-
+  buildPagePrompt(_pageType: PageType, dataBlock: string): string {
     return `${GENERIC_BASE_RULES}
 
-You are on a "${pageLabel}" page. Fill any EMPTY form fields that are FULLY visible on screen, from TOP to BOTTOM:
-${FIELD_FILL_RULES}
-4. ${DROPDOWN_RULES}
-5. ${CHECKBOX_RULES}
+${FIELD_INTERACTION_RULES}
 
-If ALL visible fields already have values, STOP IMMEDIATELY — do nothing.
+TASK: Fill any empty form fields visible on screen, working top to bottom. Use the data mapping below to find the right answer for each field. If all fields are already filled or there are no fields that match the data mapping, report the task as done immediately.
 
 ${dataBlock}`;
   }
@@ -428,6 +514,22 @@ ${dataBlock}`;
         if (cb.required || cb.getAttribute('aria-required') === 'true') return true;
       }
 
+      // Check radio button groups where none is selected
+      const radioGroups = new Map<string, boolean>();
+      const radios = document.querySelectorAll<HTMLInputElement>('input[type="radio"]:not([disabled])');
+      for (const radio of radios) {
+        const name = radio.name;
+        if (!name) continue;
+        const rect = radio.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+        if (!radioGroups.has(name)) radioGroups.set(name, false);
+        if (radio.checked) radioGroups.set(name, true);
+      }
+      for (const [, hasSelection] of radioGroups) {
+        if (!hasSelection) return true; // Found a visible radio group with no selection
+      }
+
       return false;
     });
   }
@@ -466,7 +568,12 @@ ${dataBlock}`;
   // --- Navigation ---
 
   async clickNextButton(adapter: BrowserAutomationAdapter): Promise<'clicked' | 'review_detected' | 'not_found'> {
+    // NOTE: Do NOT define named functions (const fn = ...) inside page.evaluate —
+    // esbuild's --keep-names injects __name() wrappers that don't exist in the browser context.
     return adapter.page.evaluate(() => {
+      const NEXT_TEXTS = ['next', 'continue', 'proceed', 'review application', 'review my application', 'go to next step', 'next step'];
+      const NEXT_INCLUDES = ['save and continue', 'save & continue'];
+
       const buttons = Array.from(document.querySelectorAll<HTMLButtonElement | HTMLAnchorElement>(
         'button, [role="button"], input[type="submit"], a.btn'
       ));
@@ -479,16 +586,14 @@ ${dataBlock}`;
       // Check if this is the review page (Submit button present, no Next button)
       const hasSubmit = buttonTexts.some(b => b.text === 'submit' || b.text === 'submit application');
       const hasNext = buttonTexts.some(b =>
-        b.text === 'next' || b.text === 'continue' || b.text.includes('save and continue')
-        || b.text.includes('save & continue')
+        NEXT_TEXTS.indexOf(b.text) !== -1 || NEXT_INCLUDES.some(s => b.text.indexOf(s) !== -1)
       );
 
       if (hasSubmit && !hasNext) return 'review_detected' as const;
 
-      // Try to find and click Next/Continue
+      // Try to find and click Next/Continue (priority order: exact matches first)
       const nextButton = buttonTexts.find(b =>
-        b.text === 'next' || b.text === 'continue' || b.text.includes('save and continue')
-        || b.text.includes('save & continue')
+        NEXT_TEXTS.indexOf(b.text) !== -1 || NEXT_INCLUDES.some(s => b.text.indexOf(s) !== -1)
       );
 
       if (nextButton) {
