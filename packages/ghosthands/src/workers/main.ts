@@ -7,6 +7,7 @@ import { PgBossConsumer } from './PgBossConsumer.js';
 import { JobExecutor } from './JobExecutor.js';
 import { registerBuiltinHandlers } from './taskHandlers/index.js';
 import { getLogger } from '../monitoring/logger.js';
+import { fetchEc2InstanceId, completeLifecycleAction } from './asg-lifecycle.js';
 
 const logger = getLogger({ service: 'Worker' });
 
@@ -146,6 +147,10 @@ async function main(): Promise<void> {
   let draining = false;
   let shuttingDown = false;
 
+  // Declare early so shutdown closure can reference it safely (avoids TDZ if
+  // SIGTERM arrives while fetchEc2InstanceId() is still in-flight).
+  let ec2InstanceId: string = 'unknown';
+
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) {
       // Second signal -- force shutdown
@@ -176,6 +181,10 @@ async function main(): Promise<void> {
       try { await boss.stop({ graceful: true, timeout: 10_000 }); } catch { /* ignore */ }
     }
     await deregisterWorker();
+
+    // Complete ASG lifecycle action if configured (signals ASG that
+    // this instance is ready to be terminated)
+    await completeLifecycleAction(ec2InstanceId);
 
     // Close Redis connection
     if (redis) {
@@ -211,14 +220,18 @@ async function main(): Promise<void> {
     setTimeout(() => process.exit(1), 1000);
   });
 
+  // ── EC2 Instance Metadata ────────────────────────────────────────
+  // Auto-detect EC2 instance ID from the metadata service (IMDSv2).
+  // Falls back to EC2_INSTANCE_ID env var or 'unknown' for local dev.
+  ec2InstanceId = await fetchEc2InstanceId();
+  const ec2Ip = process.env.EC2_IP || 'unknown';
+
   // ── Worker Registry ────────────────────────────────────────────
   // UPSERT into gh_worker_registry so the fleet monitoring endpoint
   // and VALET deregistration know about this worker.
   // Registration MUST succeed before polling starts — if it fails after
   // retries, exit so Docker restarts the container.
   const targetWorkerId = process.env.GH_WORKER_ID || null;
-  const ec2InstanceId = process.env.EC2_INSTANCE_ID || 'unknown';
-  const ec2Ip = process.env.EC2_IP || 'unknown';
 
   const MAX_REGISTRATION_RETRIES = 3;
   for (let attempt = 1; attempt <= MAX_REGISTRATION_RETRIES; attempt++) {
@@ -353,11 +366,14 @@ async function main(): Promise<void> {
         if (url.pathname === '/worker/status') {
           return Response.json({
             worker_id: WORKER_ID,
+            ec2_instance_id: ec2InstanceId,
+            ec2_ip: ec2Ip,
             active_jobs: getActiveJobCount(),
             max_concurrent: maxConcurrent,
             is_running: getIsRunning(),
             is_draining: draining || shuttingDown,
             dispatch_mode: dispatchMode,
+            asg_name: process.env.AWS_ASG_NAME || null,
             uptime_ms: Date.now() - startTime,
             timestamp: new Date().toISOString(),
           });
