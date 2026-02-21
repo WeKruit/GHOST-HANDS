@@ -89,7 +89,7 @@ function topoSort(elements: ParsedElements): string[] {
     const dep = elements[key]?.depends_on;
     if (dep) {
       // depends_on can be comma-separated
-      for (const d of dep.split(',').map((s) => s.trim())) {
+      for (const d of dep.split(',').map((s: string) => s.trim())) {
         if (elements[d]) visit(d);
       }
     }

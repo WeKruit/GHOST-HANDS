@@ -66,6 +66,10 @@ export const JOB_EVENT_TYPES = {
   // Budget
   BUDGET_PREFLIGHT_FAILED: 'budget_preflight_failed',
 
+  // Resume
+  RESUME_DOWNLOADED: 'resume_downloaded',
+  RESUME_DOWNLOAD_FAILED: 'resume_download_failed',
+
   // Trace
   TRACE_RECORDING_STARTED: 'trace_recording_started',
   TRACE_RECORDING_COMPLETED: 'trace_recording_completed',

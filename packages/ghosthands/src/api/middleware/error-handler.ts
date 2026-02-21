@@ -1,11 +1,12 @@
 import { Context } from 'hono';
+import { getLogger } from '../../monitoring/logger.js';
 
 /**
  * Global error handler for the Hono app. Catches unhandled errors and
  * returns a consistent JSON error response.
  */
 export function errorHandler(err: Error, c: Context) {
-  console.error('[GhostHands API Error]', err.message, err.stack);
+  getLogger().error('API error', { message: err.message, stack: err.stack });
 
   // Hono HTTPException
   if ('status' in err && typeof (err as any).status === 'number') {

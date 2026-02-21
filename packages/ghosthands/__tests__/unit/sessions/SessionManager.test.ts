@@ -97,7 +97,7 @@ describe('SessionManager', () => {
     });
 
     test('throws on invalid URL', () => {
-      expect(() => SessionManager.extractDomain('not-a-url')).toThrow();
+      expect(() => SessionManager.extractDomain('://missing-scheme')).toThrow();
     });
   });
 
