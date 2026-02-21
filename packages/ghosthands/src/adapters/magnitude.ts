@@ -135,11 +135,17 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
 
   async act(instruction: string, context?: ActionContext): Promise<ActionResult> {
     const start = Date.now();
+    const ACT_TIMEOUT_MS = context?.timeoutMs ?? 60_000; // default 60s per act() call
     try {
-      await this.requireAgent().act(instruction, {
-        prompt: context?.prompt,
-        data: context?.data,
-      });
+      await Promise.race([
+        this.requireAgent().act(instruction, {
+          prompt: context?.prompt,
+          data: context?.data,
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`act() timed out after ${ACT_TIMEOUT_MS}ms`)), ACT_TIMEOUT_MS),
+        ),
+      ]);
       return {
         success: true,
         message: `Completed: ${instruction}`,

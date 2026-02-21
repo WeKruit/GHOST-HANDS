@@ -18,6 +18,7 @@
         "worker:named": "bun src/workers/main.ts --worker-id=my-name",
         "apply:simple": "bun src/scripts/apply-simple.ts",
         "apply:workday": "bun src/scripts/apply-workday.ts",
+        "apply:amazon": "bun src/scripts/apply-amazon.ts",
         "release-stuck-jobs": "bun src/scripts/release-stuck-jobs.ts",
         "test-shutdown": "bun src/scripts/test-shutdown-cleanup.ts",
         "delete-jobs": "bun src/scripts/delete-all-jobs.ts",

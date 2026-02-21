@@ -4,6 +4,7 @@ import { ScrapeHandler } from './scrapeHandler.js';
 import { FillFormHandler } from './fillFormHandler.js';
 import { CustomHandler } from './customHandler.js';
 import { WorkdayApplyHandler } from './workdayApplyHandler.js';
+import { SmartApplyHandler } from './smartApplyHandler.js';
 
 export function registerBuiltinHandlers(): void {
   taskHandlerRegistry.register(new ApplyHandler());
@@ -11,6 +12,7 @@ export function registerBuiltinHandlers(): void {
   taskHandlerRegistry.register(new FillFormHandler());
   taskHandlerRegistry.register(new CustomHandler());
   taskHandlerRegistry.register(new WorkdayApplyHandler());
+  taskHandlerRegistry.register(new SmartApplyHandler());
 }
 
 export { taskHandlerRegistry } from './registry.js';

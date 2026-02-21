@@ -13,6 +13,7 @@ export type Platform =
   | 'greenhouse'
   | 'lever'
   | 'workday'
+  | 'amazon'
   | 'icims'
   | 'taleo'
   | 'smartrecruiters'
@@ -42,6 +43,7 @@ export const RATE_LIMITS = {
   platforms: {
     linkedin: { hourly: 5, daily: 20 },
     workday: { hourly: 20, daily: 100 },
+    amazon: { hourly: 20, daily: 100 },
     greenhouse: { hourly: 30, daily: 150 },
     lever: { hourly: 30, daily: 150 },
     icims: { hourly: 30, daily: 150 },

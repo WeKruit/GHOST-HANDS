@@ -53,6 +53,12 @@ const PLATFORM_ALLOWLISTS: Record<string, string[]> = {
     'smartrecruiters.com',
     'jobs.smartrecruiters.com',
   ],
+  amazon: [
+    'amazon.jobs',
+    'www.amazon.jobs',
+    'amazon.com',
+    'www.amazon.com',
+  ],
 };
 
 // Common CDN/resource domains that should always be allowed for page rendering

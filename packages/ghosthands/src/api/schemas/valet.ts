@@ -57,7 +57,7 @@ export const ValetApplySchema = z.object({
   target_url: z.string().url().max(2048),
   platform: z.enum([
     'greenhouse', 'workday', 'linkedin', 'lever',
-    'icims', 'taleo', 'smartrecruiters', 'other',
+    'icims', 'taleo', 'smartrecruiters', 'amazon', 'other',
   ]).optional(),
   resume: ResumeRefSchema.optional(),
   profile: ProfileSchema,
