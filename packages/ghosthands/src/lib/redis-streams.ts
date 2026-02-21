@@ -38,10 +38,12 @@ export interface StreamEventFields {
  * Returns the message ID assigned by Redis.
  */
 export async function xaddEvent(
-  redis: Redis,
+  redis: Redis | null | undefined,
   jobId: string,
   event: StreamEventFields,
 ): Promise<string | null> {
+  if (!redis) return null;
+
   const key = streamKey(jobId);
 
   // Flatten event to string key-value pairs for XADD
@@ -60,10 +62,12 @@ export async function xaddEvent(
  * Trim a stream to approximately `maxLen` entries.
  */
 export async function xtrimStream(
-  redis: Redis,
+  redis: Redis | null | undefined,
   jobId: string,
   maxLen = 1000,
 ): Promise<number> {
+  if (!redis) return 0;
+
   const key = streamKey(jobId);
   return redis.xtrim(key, 'MAXLEN', '~', maxLen);
 }
@@ -72,9 +76,11 @@ export async function xtrimStream(
  * Delete a stream entirely.
  */
 export async function deleteStream(
-  redis: Redis,
+  redis: Redis | null | undefined,
   jobId: string,
 ): Promise<number> {
+  if (!redis) return 0;
+
   const key = streamKey(jobId);
   return redis.del(key);
 }
@@ -86,10 +92,12 @@ export async function deleteStream(
  * @param ttlSeconds - Time to live in seconds (default: 86400 = 24 hours)
  */
 export async function setStreamTTL(
-  redis: Redis,
+  redis: Redis | null | undefined,
   jobId: string,
   ttlSeconds = 86400,
 ): Promise<void> {
+  if (!redis) return;
+
   const key = streamKey(jobId);
   await redis.expire(key, ttlSeconds);
 }

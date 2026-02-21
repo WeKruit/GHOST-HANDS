@@ -209,3 +209,58 @@ describe('deleteStream', () => {
     expect(result).toBe(1);
   });
 });
+
+// ── Null / undefined Redis client handling ──────────────────────────────
+
+describe('null / undefined Redis client', () => {
+  const sampleEvent: StreamEventFields = {
+    step: 'filling',
+    progress_pct: 45,
+    description: 'Filling form fields',
+    action_index: 3,
+    total_actions_estimate: 8,
+    current_action: 'Typing first name',
+    started_at: '2026-02-20T10:00:00Z',
+    elapsed_ms: 1200,
+    eta_ms: 1500,
+    timestamp: '2026-02-20T10:00:01Z',
+  };
+
+  test('xaddEvent returns null when Redis client is null', async () => {
+    const result = await xaddEvent(null as any, 'job-1', sampleEvent);
+    expect(result).toBeNull();
+  });
+
+  test('xaddEvent returns null when Redis client is undefined', async () => {
+    const result = await xaddEvent(undefined as any, 'job-1', sampleEvent);
+    expect(result).toBeNull();
+  });
+
+  test('setStreamTTL resolves without throwing when Redis client is null', async () => {
+    await expect(setStreamTTL(null as any, 'job-1')).resolves.toBeUndefined();
+  });
+
+  test('setStreamTTL resolves without throwing when Redis client is undefined', async () => {
+    await expect(setStreamTTL(undefined as any, 'job-1')).resolves.toBeUndefined();
+  });
+
+  test('xtrimStream returns 0 when Redis client is null', async () => {
+    const result = await xtrimStream(null as any, 'job-1');
+    expect(result).toBe(0);
+  });
+
+  test('xtrimStream returns 0 when Redis client is undefined', async () => {
+    const result = await xtrimStream(undefined as any, 'job-1');
+    expect(result).toBe(0);
+  });
+
+  test('deleteStream returns 0 when Redis client is null', async () => {
+    const result = await deleteStream(null as any, 'job-1');
+    expect(result).toBe(0);
+  });
+
+  test('deleteStream returns 0 when Redis client is undefined', async () => {
+    const result = await deleteStream(undefined as any, 'job-1');
+    expect(result).toBe(0);
+  });
+});
