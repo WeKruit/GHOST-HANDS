@@ -1,0 +1,11 @@
+{
+  "name": "@wekruit/scripts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./lib/index.ts",
+  "exports": {
+    "./docker-client": "./lib/docker-client.ts",
+    "./ecr-auth": "./lib/ecr-auth.ts"
+  }
+}

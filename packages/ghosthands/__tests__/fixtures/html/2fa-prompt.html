@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html>
+<head><title>Two-Factor Authentication</title></head>
+<body>
+  <h1>Two-factor authentication</h1>
+  <p>Enter the code sent to your phone number ending in •••1234.</p>
+  <form action="/verify-2fa">
+    <input type="text" name="code" placeholder="Verification code" maxlength="6" />
+    <button type="submit">Verify</button>
+  </form>
+  <p>Open your authenticator app and enter the 6-digit code.</p>
+</body>
+</html>

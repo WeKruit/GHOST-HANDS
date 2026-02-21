@@ -1,6 +1,31 @@
 import { describe, expect, test, beforeEach, afterEach, mock } from 'bun:test';
 import { CallbackNotifier } from '../../../src/workers/callbackNotifier.js';
 import { MockAdapter } from '../../../src/adapters/mock.js';
+import {
+  HITL_ELIGIBLE_ERRORS,
+  classifyError,
+} from '../../../src/workers/JobExecutor.js';
+
+// ── Shared test helper ───────────────────────────────────────────────────
+
+function createMockSupabase() {
+  const updates: Record<string, any>[] = [];
+  const chainable: Record<string, any> = {};
+  chainable.select = () => chainable;
+  chainable.eq = () => chainable;
+  chainable.single = () => Promise.resolve({ data: null, error: null });
+  chainable.update = (data: Record<string, any>) => {
+    updates.push(data);
+    return chainable;
+  };
+  chainable.insert = () => Promise.resolve({ data: null, error: null });
+
+  return {
+    from: () => chainable,
+    _chain: chainable,
+    _updates: updates,
+  };
+}
 
 // ── CallbackNotifier tests ────────────────────────────────────────────────
 
@@ -185,25 +210,6 @@ describe('MockAdapter pause/resume', () => {
 // ── HITL flow simulation (requestHumanIntervention logic) ─────────────────
 
 describe('HITL flow simulation', () => {
-  function createMockSupabase() {
-    const updates: Record<string, any>[] = [];
-    const chainable: Record<string, any> = {};
-    chainable.select = () => chainable;
-    chainable.eq = () => chainable;
-    chainable.single = () => Promise.resolve({ data: null, error: null });
-    chainable.update = (data: Record<string, any>) => {
-      updates.push(data);
-      return chainable;
-    };
-    chainable.insert = () => Promise.resolve({ data: null, error: null });
-
-    return {
-      from: () => chainable,
-      _chain: chainable,
-      _updates: updates,
-    };
-  }
-
   test('full pause -> resume flow updates job status correctly', async () => {
     const supabase = createMockSupabase();
     const adapter = new MockAdapter();
@@ -459,28 +465,100 @@ describe('pg LISTEN/NOTIFY mock', () => {
   });
 });
 
+// ── WEK-67: 2FA triggers HITL pause ──────────────────────────────────────
+
+describe('2FA triggers HITL pause (WEK-67)', () => {
+  // Verify that the error classification and HITL eligibility gate work for 2FA
+  // ERROR_CLASSIFICATIONS, HITL_ELIGIBLE_ERRORS, and classifyError are imported
+  // from JobExecutor.ts so tests exercise the actual production constants.
+
+  function mapErrorToBlockerType(errorCode: string): string {
+    return errorCode === 'captcha_blocked' ? 'captcha' : errorCode === '2fa_required' ? '2fa' : 'login';
+  }
+
+  test('classifies "two-factor authentication required" as 2fa_required', () => {
+    expect(classifyError('Two-factor authentication required')).toBe('2fa_required');
+  });
+
+  test('classifies "verification code needed" as 2fa_required', () => {
+    expect(classifyError('Please enter your verification code')).toBe('2fa_required');
+  });
+
+  test('classifies "authenticator app" as 2fa_required', () => {
+    expect(classifyError('Open your authenticator app and enter the code')).toBe('2fa_required');
+  });
+
+  test('classifies "2FA challenge" as 2fa_required', () => {
+    expect(classifyError('2FA challenge presented on page')).toBe('2fa_required');
+  });
+
+  test('2fa_required is HITL-eligible', () => {
+    expect(HITL_ELIGIBLE_ERRORS.has('2fa_required')).toBe(true);
+  });
+
+  test('2fa_required maps to blocker type "2fa"', () => {
+    expect(mapErrorToBlockerType('2fa_required')).toBe('2fa');
+  });
+
+  test('captcha_blocked still maps to "captcha"', () => {
+    expect(mapErrorToBlockerType('captcha_blocked')).toBe('captcha');
+  });
+
+  test('login_required still maps to "login"', () => {
+    expect(mapErrorToBlockerType('login_required')).toBe('login');
+  });
+
+  test('2FA error triggers HITL pause flow (not retry/fail)', async () => {
+    const supabase = createMockSupabase();
+    const adapter = new MockAdapter();
+    await adapter.start({ url: 'https://boards.greenhouse.io', llm: { provider: 'mock', options: { model: 'mock' } } });
+
+    // Simulate: error classified as 2fa_required → enters HITL flow
+    const errorMessage = 'Two-factor authentication required';
+    const errorCode = classifyError(errorMessage);
+    expect(errorCode).toBe('2fa_required');
+    expect(HITL_ELIGIBLE_ERRORS.has(errorCode)).toBe(true);
+
+    // Pause adapter (as requestHumanIntervention would)
+    await adapter.pause();
+    expect(adapter.isPaused()).toBe(true);
+
+    // Update job to paused with 2fa interaction type
+    await supabase.from('gh_automation_jobs').update({
+      status: 'paused',
+      interaction_type: '2fa',
+      interaction_data: {
+        type: '2fa',
+        confidence: 0.9,
+        details: errorMessage,
+        page_url: 'https://boards.greenhouse.io/login/2fa',
+      },
+      paused_at: new Date().toISOString(),
+      status_message: 'Waiting for human: 2fa',
+    }).eq('id', 'job-2fa-test');
+
+    expect(supabase._updates[0].status).toBe('paused');
+    expect(supabase._updates[0].interaction_type).toBe('2fa');
+
+    // Human provides 2FA code → resume
+    await adapter.resume();
+    expect(adapter.isPaused()).toBe(false);
+
+    await supabase.from('gh_automation_jobs').update({
+      status: 'running',
+      paused_at: null,
+      status_message: 'Resumed after human intervention',
+    }).eq('id', 'job-2fa-test');
+
+    const lastUpdate = supabase._updates[supabase._updates.length - 1];
+    expect(lastUpdate.status).toBe('running');
+    expect(lastUpdate.paused_at).toBeNull();
+  });
+});
+
 // ── Job status transitions ────────────────────────────────────────────────
 
 describe('job status transitions', () => {
-  function createMockSupabase() {
-    const updates: Record<string, any>[] = [];
-    const chainable: Record<string, any> = {};
-    chainable.select = () => chainable;
-    chainable.eq = () => chainable;
-    chainable.single = () => Promise.resolve({ data: null, error: null });
-    chainable.update = (data: Record<string, any>) => {
-      updates.push(data);
-      return chainable;
-    };
-    chainable.insert = () => Promise.resolve({ data: null, error: null });
-
-    return {
-      from: () => chainable,
-      _chain: chainable,
-      _updates: updates,
-    };
-  }
-
   test('running -> paused -> running transition', async () => {
     const supabase = createMockSupabase();
 

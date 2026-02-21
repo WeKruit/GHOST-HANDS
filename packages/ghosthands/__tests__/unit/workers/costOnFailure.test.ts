@@ -117,8 +117,8 @@ describe('CostTracker getSnapshot() failure edge cases', () => {
     tracker.recordTokenUsage({
       inputTokens: 1000,
       outputTokens: 500,
-      inputCost: 0.005,
-      outputCost: 0.003,
+      inputCost: 0.020,
+      outputCost: 0.015,
     });
 
     // This will exceed the speed budget
@@ -126,8 +126,8 @@ describe('CostTracker getSnapshot() failure edge cases', () => {
       tracker.recordTokenUsage({
         inputTokens: 10000,
         outputTokens: 5000,
-        inputCost: 0.010,
-        outputCost: 0.008,
+        inputCost: 0.015,
+        outputCost: 0.010,
       });
     } catch {
       // Expected
@@ -135,7 +135,7 @@ describe('CostTracker getSnapshot() failure edge cases', () => {
 
     // Snapshot should reflect the full accumulated cost (including the over-budget usage)
     const snap = tracker.getSnapshot();
-    expect(snap.totalCost).toBeCloseTo(0.026, 4);
+    expect(snap.totalCost).toBeCloseTo(0.06, 4);
     expect(snap.inputTokens).toBe(11000);
     expect(snap.outputTokens).toBe(5500);
   });
@@ -335,7 +335,7 @@ describe('Cost recording on all exit paths', () => {
     });
     tracker.recordAction();
 
-    // Second call exceeds budget
+    // Second call exceeds budget ($0.030 + $0.025 = $0.055 > $0.05)
     let budgetSnapshot: any = null;
     try {
       tracker.recordTokenUsage({

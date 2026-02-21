@@ -31,8 +31,11 @@ export class FillFormHandler implements TaskHandler {
   async execute(ctx: TaskContext): Promise<TaskResult> {
     const { job, adapter } = ctx;
 
+    // Resume upload is handled automatically by JobExecutor's filechooser listener.
     const actResult = await adapter.act(job.task_description, {
-      prompt: ctx.dataPrompt,
+      prompt: ctx.resumeFilePath
+        ? `${ctx.dataPrompt}\n\nA resume file is available for upload. When you encounter a file upload field, click it to trigger the file dialog — the file will be attached automatically.`
+        : ctx.dataPrompt,
       data: job.input_data.user_data || job.input_data.form_data,
     });
 
