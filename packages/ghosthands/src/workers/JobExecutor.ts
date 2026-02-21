@@ -175,7 +175,6 @@ export class JobExecutor {
         : await costService.preflightBudgetCheck(
             job.user_id,
             qualityPreset,
-            job.job_type,
           );
       if (isDev) {
         console.log(`[JobExecutor] Skipping budget preflight (NODE_ENV=development)`);

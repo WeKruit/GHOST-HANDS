@@ -1,6 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
 import { Client as PgClient } from 'pg';
+import { PgBoss } from 'pg-boss';
 import { JobPoller } from './JobPoller.js';
+import { PgBossConsumer } from './PgBossConsumer.js';
 import { JobExecutor } from './JobExecutor.js';
 import { registerBuiltinHandlers } from './taskHandlers/index.js';
 
@@ -9,13 +11,16 @@ import { registerBuiltinHandlers } from './taskHandlers/index.js';
  *
  * Long-running Node.js process that:
  * 1. Connects to Supabase (pooled for queries, direct for LISTEN/NOTIFY)
- * 2. Listens for gh_job_created notifications
- * 3. Polls for pending jobs using FOR UPDATE SKIP LOCKED
- * 4. Executes jobs via BrowserAgent.act()
- * 5. Updates job status and results in the database
- * 6. Sends heartbeats every 30s during execution
- * 7. Exposes a status HTTP server on GH_WORKER_PORT (default 3101)
+ * 2. Picks up jobs via pg-boss queue (queue mode) or LISTEN/NOTIFY polling (legacy mode)
+ * 3. Executes jobs via BrowserAgent.act()
+ * 4. Updates job status and results in the database
+ * 5. Sends heartbeats every 30s during execution
+ * 6. Exposes a status HTTP server on GH_WORKER_PORT (default 3101)
  *    so VALET/deploy.sh can check if it's safe to restart
+ *
+ * Job dispatch mode (JOB_DISPATCH_MODE env var):
+ *   queue  → pg-boss consumer (new, requires VALET to enqueue via TaskQueueService)
+ *   legacy → JobPoller with LISTEN/NOTIFY + polling (default)
  */
 
 function parseWorkerId(): string {
@@ -45,7 +50,8 @@ function requireEnv(name: string): string {
 }
 
 async function main(): Promise<void> {
-  console.log(`[Worker] Starting with ID: ${WORKER_ID}`);
+  const dispatchMode = process.env.JOB_DISPATCH_MODE === 'queue' ? 'queue' : 'legacy';
+  console.log(`[Worker] Starting with ID: ${WORKER_ID} (dispatch=${dispatchMode})`);
 
   // Register all built-in task handlers
   registerBuiltinHandlers();
@@ -82,13 +88,26 @@ async function main(): Promise<void> {
     workerId: WORKER_ID,
   });
 
-  const poller = new JobPoller({
-    supabase,
-    pgDirect,
-    workerId: WORKER_ID,
-    executor,
-    maxConcurrent,
-  });
+  // ── Dispatch mode: pg-boss queue vs legacy LISTEN/NOTIFY poller ──
+  let boss: PgBoss | undefined;
+  let poller: JobPoller | undefined;
+  let consumer: PgBossConsumer | undefined;
+
+  // Unified interface so shutdown, heartbeat, and HTTP server work with both modes.
+  const getActiveJobCount = (): number =>
+    consumer ? consumer.activeJobCount : poller ? poller.activeJobCount : 0;
+  const getIsRunning = (): boolean =>
+    consumer ? consumer.isRunning : poller ? poller.isRunning : false;
+  const getCurrentJobId = (): string | null =>
+    consumer ? consumer.currentJobId : poller ? poller.currentJobId : null;
+  const releaseJobs = async (): Promise<void> => {
+    if (consumer) await consumer.releaseClaimedJobs();
+    else if (poller) await poller.releaseClaimedJobs();
+  };
+  const stopJobProcessor = async (): Promise<void> => {
+    if (consumer) await consumer.stop();
+    else if (poller) await poller.stop();
+  };
 
   // Two-phase shutdown handler:
   // - First signal: graceful shutdown (drain active jobs, release claimed jobs)
@@ -100,9 +119,12 @@ async function main(): Promise<void> {
       console.log(`[Worker] Received second ${signal}, forcing shutdown...`);
       console.log(`[Worker] Force-releasing claimed jobs...`);
       try {
-        await poller.releaseClaimedJobs();
+        await releaseJobs();
       } catch (err) {
         console.error(`[Worker] Force release failed:`, err);
+      }
+      if (boss) {
+        try { await boss.stop({ graceful: false }); } catch { /* ignore */ }
       }
       try {
         await pgDirect.end();
@@ -116,9 +138,12 @@ async function main(): Promise<void> {
     shuttingDown = true;
     console.log(`[Worker] Received ${signal}, starting graceful shutdown...`);
     console.log(`[Worker] Press Ctrl-C again to force-kill immediately`);
-    console.log(`[Worker] Draining ${poller.activeJobCount} active job(s)...`);
+    console.log(`[Worker] Draining ${getActiveJobCount()} active job(s)...`);
 
-    await poller.stop();
+    await stopJobProcessor();
+    if (boss) {
+      try { await boss.stop({ graceful: true, timeout: 10_000 }); } catch { /* ignore */ }
+    }
     await deregisterWorker();
 
     try {
@@ -202,7 +227,7 @@ async function main(): Promise<void> {
             current_job_id = $2::UUID,
             status = $3
         WHERE worker_id = $1
-      `, [WORKER_ID, poller.currentJobId, shuttingDown ? 'draining' : 'active']);
+      `, [WORKER_ID, getCurrentJobId(), shuttingDown ? 'draining' : 'active']);
     } catch (err) {
       console.warn(`[Worker] Heartbeat update failed:`, err instanceof Error ? err.message : err);
     }
@@ -223,8 +248,41 @@ async function main(): Promise<void> {
     }
   };
 
-  // Start polling
-  await poller.start();
+  // ── Start job processor ──────────────────────────────────────────
+  if (dispatchMode === 'queue') {
+    // pg-boss needs session-mode Postgres (direct URL, not pgbouncer)
+    const directUrl = process.env.DATABASE_DIRECT_URL || process.env.SUPABASE_DIRECT_URL || dbUrl;
+    boss = new PgBoss({
+      connectionString: directUrl,
+      schema: 'pgboss',
+    });
+
+    boss.on('error', (err: Error) => {
+      console.error(`[Worker] pg-boss error:`, err.message);
+    });
+
+    console.log(`[Worker] Starting pg-boss...`);
+    await boss.start();
+    console.log(`[Worker] pg-boss started`);
+
+    consumer = new PgBossConsumer({
+      boss,
+      pgDirect,
+      workerId: WORKER_ID,
+      executor,
+    });
+    await consumer.start();
+  } else {
+    // Legacy LISTEN/NOTIFY + polling mode
+    poller = new JobPoller({
+      supabase,
+      pgDirect,
+      workerId: WORKER_ID,
+      executor,
+      maxConcurrent,
+    });
+    await poller.start();
+  }
 
   // ── Worker Status HTTP Server ──────────────────────────────────────
   // Lightweight HTTP endpoint so VALET / deploy.sh can check worker state
@@ -246,21 +304,22 @@ async function main(): Promise<void> {
         if (url.pathname === '/worker/status') {
           return Response.json({
             worker_id: WORKER_ID,
-            active_jobs: poller.activeJobCount,
+            active_jobs: getActiveJobCount(),
             max_concurrent: maxConcurrent,
-            is_running: poller.isRunning,
+            is_running: getIsRunning(),
             is_draining: shuttingDown,
+            dispatch_mode: dispatchMode,
             uptime_ms: Date.now() - startTime,
             timestamp: new Date().toISOString(),
           });
         }
 
         if (url.pathname === '/worker/health') {
-          const idle = poller.activeJobCount === 0 && !shuttingDown;
+          const idle = getActiveJobCount() === 0 && !shuttingDown;
           return Response.json(
             {
               status: idle ? 'idle' : shuttingDown ? 'draining' : 'busy',
-              active_jobs: poller.activeJobCount,
+              active_jobs: getActiveJobCount(),
               deploy_safe: idle,
             },
             { status: idle ? 200 : 503 },
@@ -277,13 +336,13 @@ async function main(): Promise<void> {
               [WORKER_ID]
             ).catch(() => {});
             // Stop accepting new jobs but let active ones finish
-            poller.stop().then(() => {
+            stopJobProcessor().then(() => {
               console.log(`[Worker] Drain complete — all jobs finished`);
             });
           }
           return Response.json({
             status: 'draining',
-            active_jobs: poller.activeJobCount,
+            active_jobs: getActiveJobCount(),
             worker_id: WORKER_ID,
           });
         }
@@ -294,8 +353,12 @@ async function main(): Promise<void> {
     console.log(`[Worker] Status server on port ${workerPort}`);
   }
 
-  console.log(`[Worker] ${WORKER_ID} running (maxConcurrent=${maxConcurrent})`);
-  console.log(`[Worker] Listening for jobs on gh_job_created channel`);
+  console.log(`[Worker] ${WORKER_ID} running (maxConcurrent=${maxConcurrent}, dispatch=${dispatchMode})`);
+  if (dispatchMode === 'queue') {
+    console.log(`[Worker] Consuming jobs from pg-boss queues`);
+  } else {
+    console.log(`[Worker] Listening for jobs on gh_job_created channel`);
+  }
 }
 
 main().catch((err) => {
