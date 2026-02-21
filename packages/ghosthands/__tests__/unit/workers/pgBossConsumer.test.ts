@@ -206,6 +206,7 @@ describe('PgBossConsumer', () => {
       expect(executedJob.target_url).toBe('https://boards.greenhouse.io/company/jobs/123');
       expect(executedJob.user_id).toBe('user-123');
       expect(executedJob.input_data).toEqual({ resume_ref: 'resume-abc' });
+      expect(executedJob.metadata).toEqual({ source: 'valet' });
       expect(executedJob.valet_task_id).toBe('vtask-001');
     });
 
@@ -273,6 +274,53 @@ describe('PgBossConsumer', () => {
       expect(mockExecutor.execute).toHaveBeenCalledTimes(1);
 
       // Resolve first job to clean up
+      resolveFirstJob!();
+      await firstJobHandle;
+    });
+
+    test('re-enqueues targeted queue job back to the targeted queue', async () => {
+      const dbRow = sampleDbRow();
+      let resolveFirstJob: () => void;
+      const firstJobPromise = new Promise<void>((resolve) => {
+        resolveFirstJob = resolve;
+      });
+
+      mockExecutor.execute.mockImplementationOnce(() => firstJobPromise);
+      mockPg.query
+        .mockResolvedValueOnce({ rows: [dbRow] })
+        .mockResolvedValueOnce({ rows: [] });
+
+      const consumer = createConsumer();
+      await consumer.start();
+
+      // Start processing first job on the general queue
+      const workCallback = mockBoss.work.mock.calls[0][2];
+      const firstJobHandle = workCallback([samplePgBossJob()]);
+
+      // Second job arrives on the TARGETED queue while first is still processing
+      const targetedQueueName = `gh_apply_job/${WORKER_ID}`;
+      const targetedJob = samplePgBossJob({
+        id: 'pgboss-job-003',
+        name: targetedQueueName,
+        data: {
+          ghJobId: 'gh-job-003',
+          valetTaskId: 'vtask-003',
+          userId: 'user-789',
+          targetUrl: 'https://example.com/job3',
+          jobType: 'apply',
+        },
+      });
+
+      // Use the targeted queue callback (second work() subscription)
+      const targetedCallback = mockBoss.work.mock.calls[1][2];
+      await targetedCallback([targetedJob]);
+
+      // Should re-enqueue to the TARGETED queue (not the general queue)
+      expect(mockBoss.send).toHaveBeenCalledWith(
+        targetedQueueName,
+        targetedJob.data,
+      );
+
       resolveFirstJob!();
       await firstJobHandle;
     });
@@ -426,6 +474,15 @@ describe('PgBossConsumer', () => {
       await consumer.stop();
       expect(consumer.isRunning).toBe(false);
     });
+
+    test('does not call boss.stop() (pg-boss lifecycle is owned by main.ts)', async () => {
+      const consumer = createConsumer();
+      await consumer.start();
+      await consumer.stop();
+
+      // PgBoss instance is shared — stop is handled by the caller (main.ts)
+      expect(mockBoss.stop).not.toHaveBeenCalled();
+    });
   });
 
   // ── Test 7: AutomationJob mapping edge cases ────────────────────────
@@ -462,15 +519,45 @@ describe('PgBossConsumer', () => {
       const consumer = createConsumer();
       await consumer.start();
 
+      // Include taskDescription in payload to test the middle fallback branch
+      const jobWithDescription = samplePgBossJob({
+        data: {
+          ghJobId: 'gh-job-001',
+          valetTaskId: 'vtask-001',
+          userId: 'user-123',
+          targetUrl: 'https://boards.greenhouse.io/company/jobs/123',
+          jobType: 'apply',
+          taskDescription: 'Apply via payload fallback',
+          callbackUrl: 'https://valet-api-stg.fly.dev/api/v1/webhooks/ghosthands',
+        },
+      });
+
       const workCallback = mockBoss.work.mock.calls[0][2];
-      await workCallback([samplePgBossJob()]);
+      await workCallback([jobWithDescription]);
 
       const executedJob = mockExecutor.execute.mock.calls[0][0];
       // Should fall back to payload values
       expect(executedJob.job_type).toBe('apply');
       expect(executedJob.target_url).toBe('https://boards.greenhouse.io/company/jobs/123');
+      expect(executedJob.task_description).toBe('Apply via payload fallback');
       expect(executedJob.callback_url).toBe('https://valet-api-stg.fly.dev/api/v1/webhooks/ghosthands');
       expect(executedJob.valet_task_id).toBe('vtask-001');
+    });
+
+    test('parses string metadata as JSON', async () => {
+      const dbRow = sampleDbRow({ metadata: '{"source":"valet","quality_preset":"speed"}' });
+      mockPg.query
+        .mockResolvedValueOnce({ rows: [dbRow] })
+        .mockResolvedValueOnce({ rows: [] });
+
+      const consumer = createConsumer();
+      await consumer.start();
+
+      const workCallback = mockBoss.work.mock.calls[0][2];
+      await workCallback([samplePgBossJob()]);
+
+      const executedJob = mockExecutor.execute.mock.calls[0][0];
+      expect(executedJob.metadata).toEqual({ source: 'valet', quality_preset: 'speed' });
     });
 
     test('parses string tags as JSON array', async () => {
