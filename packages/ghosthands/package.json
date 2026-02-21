@@ -33,6 +33,7 @@
         "@supabase/supabase-js": "^2.95.3",
         "eventemitter3": "^5.0.1",
         "hono": "^4.0.0",
+        "ioredis": "^5.4.0",
         "magnitude-core": "^0.3.1",
         "magnitude-extract": "^0.0.2",
         "pg": "^8.13.0",

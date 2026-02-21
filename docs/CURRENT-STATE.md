@@ -61,6 +61,7 @@ packages/ghosthands/src/
   detection/      BlockerDetector (captcha/login wall detection)
   engine/         ExecutionEngine, CookbookExecutor, ManualStore, TraceRecorder
   events/         Job event type constants (JOB_EVENT_TYPES)
+  lib/            Shared utilities (Redis Streams helpers)
   monitoring/     Structured JSON logger, Prometheus metrics, health checks, alerts
   scripts/        Operational scripts (run-migration, verify-setup, job management)
   security/       Rate limiting, domain lockdown, input sanitization
@@ -897,4 +898,5 @@ Run in order:
 | `DATABASE_DIRECT_URL` | -- | Alias for direct Postgres URL |
 | `EC2_INSTANCE_ID` | -- | EC2 metadata for worker registry |
 | `EC2_IP` | -- | EC2 IP for worker registry |
+| `REDIS_URL` | -- | Redis connection URL (optional, enables real-time streaming via Redis Streams for SSE) |
 | `CORS_ORIGIN` | `*` | Allowed CORS origins |
