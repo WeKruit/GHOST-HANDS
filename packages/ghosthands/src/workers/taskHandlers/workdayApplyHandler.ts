@@ -517,7 +517,7 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
         default: {
           // Unknown Google page — use LLM as fallback but with strict instruction
           console.log('[WorkdayApply] Unknown Google page — using LLM fallback...');
-          await adapter.act(buildGoogleSignInFallbackPrompt(email, password));
+          await adapter.act(buildGoogleSignInFallbackPrompt(email));
           await adapter.page.waitForTimeout(2000);
           return;
         }
@@ -867,7 +867,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
   ): Promise<void> {
     console.log('[WorkdayApply] Filling voluntary self-identification page...');
 
-    const fillPrompt = buildVoluntaryDisclosurePrompt();
+    const fillPrompt = buildVoluntaryDisclosurePrompt(dataPrompt);
 
     await this.fillWithSmartScroll(adapter, fillPrompt, 'voluntary disclosure');
   }
@@ -878,7 +878,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
   ): Promise<void> {
     console.log('[WorkdayApply] Filling self-identification page...');
 
-    const fillPrompt = buildSelfIdentifyPrompt();
+    const fillPrompt = buildSelfIdentifyPrompt(dataPrompt);
 
     await this.fillWithSmartScroll(adapter, fillPrompt, 'self-identify');
   }

@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import type { TaskHandler, TaskContext, TaskResult, ValidationResult } from './types.js';
 import type { BrowserAutomationAdapter } from '../../adapters/types.js';
 import type { PlatformConfig, PageState, PageType } from './platforms/types.js';
@@ -46,6 +47,9 @@ export class SmartApplyHandler implements TaskHandler {
     const qaMap = config.buildQAMap(userProfile, qaOverrides);
 
     let pagesProcessed = 0;
+    let lastPageUrl = '';
+    let samePageCount = 0;
+    const MAX_SAME_PAGE = 3; // bail if stuck on same page this many times
 
     try {
       // Main detect-and-act loop
@@ -59,7 +63,31 @@ export class SmartApplyHandler implements TaskHandler {
 
         // Detect current page type
         const pageState = await this.detectPage(adapter, config);
+        const currentPageUrl = await adapter.getCurrentUrl();
         console.log(`[SmartApply] Page ${pagesProcessed}: ${pageState.page_type} (title: ${pageState.page_title || 'N/A'})`);
+
+        // Stuck detection: if we keep seeing the same URL, we're looping
+        if (currentPageUrl === lastPageUrl) {
+          samePageCount++;
+          if (samePageCount >= MAX_SAME_PAGE) {
+            console.warn(`[SmartApply] Stuck on same page for ${samePageCount} iterations — stopping to avoid infinite loop.`);
+            await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
+            return {
+              success: true,
+              keepBrowserOpen: true,
+              awaitingUserReview: true,
+              data: {
+                platform: config.platformId,
+                pages_processed: pagesProcessed,
+                final_page: 'stuck',
+                message: `Application appears stuck on the same page. Browser open for manual takeover.`,
+              },
+            };
+          }
+        } else {
+          samePageCount = 0;
+          lastPageUrl = currentPageUrl;
+        }
 
         // Handle based on page type
         switch (pageState.page_type) {
@@ -86,19 +114,6 @@ export class SmartApplyHandler implements TaskHandler {
 
           case 'account_creation':
             await this.handleAccountCreation(adapter, dataPrompt);
-            break;
-
-          case 'experience':
-          case 'resume_upload':
-            await progress.setStep(ProgressStep.UPLOADING_RESUME);
-            if (config.needsCustomExperienceHandler && config.handleExperiencePage) {
-              await config.handleExperiencePage(adapter, userProfile, dataPrompt);
-            } else {
-              const fillPrompt = config.buildPagePrompt('experience', dataPrompt);
-              await this.fillWithSmartScroll(adapter, config, fillPrompt, qaMap, 'experience');
-            }
-            // Navigate after filling
-            await this.clickNextWithErrorRecovery(adapter, config, config.buildPagePrompt('experience', dataPrompt), qaMap, 'experience');
             break;
 
           case 'review':
@@ -143,19 +158,26 @@ export class SmartApplyHandler implements TaskHandler {
             };
 
           default: {
-            // For all form page types (personal_info, questions, voluntary_disclosure, etc.)
-            const stepMap: Record<string, string> = {
-              personal_info: ProgressStep.FILLING_FORM,
-              questions: ProgressStep.ANSWERING_QUESTIONS,
-              voluntary_disclosure: ProgressStep.ANSWERING_QUESTIONS,
-              self_identify: ProgressStep.ANSWERING_QUESTIONS,
-            };
-            const step = stepMap[pageState.page_type] || ProgressStep.FILLING_FORM;
-            await progress.setStep(step as any);
+            // ALL form pages — personal_info, experience, resume_upload, questions, etc.
+            // We don't special-case by page type for generic sites. The LLM sees the
+            // actual page and fills whatever is on screen. Platform configs with
+            // custom experience handlers (e.g. Workday) override via handleCustomPageType.
+            if (
+              (pageState.page_type === 'experience' || pageState.page_type === 'resume_upload') &&
+              config.needsCustomExperienceHandler && config.handleExperiencePage
+            ) {
+              await progress.setStep(ProgressStep.UPLOADING_RESUME);
+              await config.handleExperiencePage(adapter, userProfile, dataPrompt);
+            } else {
+              const step = (pageState.page_type === 'experience' || pageState.page_type === 'resume_upload')
+                ? ProgressStep.UPLOADING_RESUME
+                : ProgressStep.FILLING_FORM;
+              await progress.setStep(step as any);
 
-            const fillPrompt = config.buildPagePrompt(pageState.page_type, dataPrompt);
-            await this.fillWithSmartScroll(adapter, config, fillPrompt, qaMap, pageState.page_type);
-            await this.clickNextWithErrorRecovery(adapter, config, fillPrompt, qaMap, pageState.page_type);
+              const fillPrompt = config.buildPagePrompt(pageState.page_type, dataPrompt);
+              await this.fillWithSmartScroll(adapter, config, fillPrompt, qaMap, pageState.page_type);
+            }
+            await this.clickNextWithErrorRecovery(adapter, config, config.buildPagePrompt(pageState.page_type, dataPrompt), qaMap, pageState.page_type);
             break;
           }
         }
@@ -228,7 +250,21 @@ export class SmartApplyHandler implements TaskHandler {
       if (currentUrl.includes('job') || currentUrl.includes('position') || currentUrl.includes('career')) urlHints.push('This appears to be a job-related page.');
 
       const classificationPrompt = config.buildClassificationPrompt(urlHints);
-      return await adapter.extract(classificationPrompt, config.pageStateSchema);
+      const llmResult = await adapter.extract(classificationPrompt, config.pageStateSchema);
+
+      // SAFETY: If LLM says "review", do a second LLM check to confirm.
+      // Many single-page forms (e.g. Amazon) show a Submit button on every
+      // page, which fools the first classification. The verification prompt
+      // explicitly asks the LLM to look for signs this is NOT the final review.
+      if (llmResult.page_type === 'review') {
+        const isReallyReview = await this.verifyReviewPage(adapter);
+        if (!isReallyReview) {
+          console.log('[SmartApply] Review verification failed — overriding to "questions"');
+          return { ...llmResult, page_type: 'questions' as PageType };
+        }
+      }
+
+      return llmResult;
     } catch (error) {
       console.warn(`[SmartApply] LLM page detection failed: ${error}`);
 
@@ -251,9 +287,9 @@ export class SmartApplyHandler implements TaskHandler {
     const urlBefore = await adapter.getCurrentUrl();
     const result = await adapter.act(
       'Click the "Apply" or "Apply Now" button to start the job application. ' +
-      'IMPORTANT: Your ONLY task is to click the apply button — nothing else. ' +
-      'After clicking, STOP immediately. Do NOT try to fill any forms or log in. ' +
-      'Do NOT report failure if the page navigates away — that is expected behavior.',
+      'Your ONLY task is to click the apply button — nothing else. ' +
+      'After clicking, report the task as done immediately. ' +
+      'The page will navigate away — that is expected.',
     );
 
     // The LLM agent may report "failure" if the page navigated to a login/auth
@@ -308,12 +344,23 @@ export class SmartApplyHandler implements TaskHandler {
           if (hasVisiblePassword) return { type: 'password_entry' };
           if (hasVisibleEmail) return { type: 'email_entry' };
 
+          const bodyText = document.body.innerText.toLowerCase();
+
+          // Check for confirmation page (account pre-selected, "Continue" button visible)
+          const buttons = document.querySelectorAll('button, div[role="button"]');
+          const hasContinue = Array.from(buttons).some(b => {
+            const t = (b.textContent || '').trim().toLowerCase();
+            return t === 'continue' || t === 'confirm' || t === 'allow';
+          });
+          if (hasContinue && (bodyText.includes(targetEmail) || bodyText.includes('confirm') || bodyText.includes('signing in'))) {
+            return { type: 'confirmation' };
+          }
+
           const accountLinks = document.querySelectorAll('[data-email], [data-identifier]');
           for (const el of accountLinks) {
             const addr = (el.getAttribute('data-email') || el.getAttribute('data-identifier') || '').toLowerCase();
             if (addr === targetEmail) return { type: 'account_chooser' };
           }
-          const bodyText = document.body.innerText.toLowerCase();
           if (bodyText.includes('choose an account') || bodyText.includes('select an account')) {
             return { type: 'account_chooser' };
           }
@@ -321,6 +368,26 @@ export class SmartApplyHandler implements TaskHandler {
           return { type: 'unknown' };
         })()
       `) as { type: string };
+
+      if (googlePageType.type === 'confirmation') {
+        console.log('[SmartApply] Google confirmation page — clicking Continue...');
+        const clicked = await adapter.page.evaluate(() => {
+          const buttons = document.querySelectorAll('button, div[role="button"]');
+          for (const btn of buttons) {
+            const t = (btn.textContent || '').trim().toLowerCase();
+            if (t === 'continue' || t === 'confirm' || t === 'allow') {
+              (btn as HTMLElement).click();
+              return true;
+            }
+          }
+          return false;
+        });
+        if (!clicked) {
+          await adapter.act('Click the "Continue" or "Confirm" button to proceed with the Google sign-in.');
+        }
+        await adapter.page.waitForTimeout(2000);
+        return;
+      }
 
       if (googlePageType.type === 'account_chooser') {
         const clicked = await adapter.page.evaluate((targetEmail: string) => {
@@ -358,13 +425,15 @@ export class SmartApplyHandler implements TaskHandler {
         return;
       }
 
-      // Unknown Google page — LLM fallback
+      // Unknown Google page — LLM fallback (password handled via DOM only)
       await adapter.act(
-        `This is a Google sign-in page. Do exactly ONE of these actions, then STOP:
-1. If you see an existing account for "${email}", click on it.
-2. If you see an "Email or phone" field, type "${email}" and click "Next".
-3. If you see a "Password" field, type "${password}" and click "Next".
-Do NOT interact with CAPTCHAs or image challenges. If you see one, STOP immediately.`,
+        `This is a Google sign-in page. Move through the sign-in flow for "${email}":
+- If you see a "Continue", "Confirm", or "Allow" button, click it to proceed.
+- If you see the account "${email}" listed, click on it to select it.
+- If you see an "Email or phone" field, type "${email}" and click "Next".
+- If you see a "Password" field, do NOT type anything — just report the task as done.
+- If you see a CAPTCHA or image challenge, report the task as done.
+Click only ONE button, then report the task as done.`,
       );
       await adapter.page.waitForTimeout(2000);
       return;
@@ -373,7 +442,7 @@ Do NOT interact with CAPTCHAs or image challenges. If you see one, STOP immediat
     // Generic login: look for SSO or sign-in buttons
     console.log('[SmartApply] On login page, looking for sign-in options...');
     const loginResult = await adapter.act(
-      'Look for a "Sign in with Google" button, a Google icon/logo button, or a "Continue with Google" option and click it. If there is no Google sign-in option, look for "Sign In" or "Log In" button instead. Click ONLY ONE button, then STOP.',
+      'Look for a "Sign in with Google" button, a Google icon/logo button, or a "Continue with Google" option and click it. If there is no Google sign-in option, look for "Sign In" or "Log In" button instead. Click ONLY ONE button, then report the task as done.',
     );
     if (!loginResult.success) {
       console.warn(`[SmartApply] Login act() failed or timed out: ${loginResult.message}. Will retry on next loop iteration.`);
@@ -412,7 +481,7 @@ Do NOT interact with CAPTCHAs or image challenges. If you see one, STOP immediat
     console.log(`[SmartApply] Found verification code: ${code}`);
 
     const enterResult = await adapter.act(
-      `Enter the verification code "${code}" into the verification code input field and click the "Next", "Verify", "Continue", or "Submit" button.`,
+      `Enter the verification code "${code}" into the verification code input field, then click the "Next", "Verify", "Continue", or "Submit" button. Report the task as done after clicking.`,
     );
 
     if (!enterResult.success) {
@@ -445,7 +514,16 @@ Do NOT interact with CAPTCHAs or image challenges. If you see one, STOP immediat
     console.log('[SmartApply] Account creation page detected, filling in details...');
 
     const result = await adapter.act(
-      `Fill out the account creation form with the provided user information, then click "Create Account", "Register", "Continue", or "Next". ${dataPrompt}`,
+      `Fill out the account creation form, then click "Create Account", "Register", "Continue", or "Next".
+
+HOW TO FILL:
+- Use the email from the data mapping as both the username/email and for any confirmation fields.
+- If a password field exists, use a strong password: "GhApp2026!x" (capital letter, number, symbol, 12+ chars).
+- If a "confirm password" field exists, type the same password again.
+- Fill name, email, and other fields from the data mapping below.
+- Report the task as done after clicking the registration button.
+
+${dataPrompt}`,
     );
 
     if (!result.success) {
@@ -471,8 +549,9 @@ Do NOT interact with CAPTCHAs or image challenges. If you see one, STOP immediat
     pageLabel: string,
   ): Promise<void> {
     const MAX_SCROLL_ROUNDS = 10;
-    const MAX_LLM_CALLS = 4;
+    const MAX_LLM_CALLS = 8;
     let llmCallCount = 0;
+    let totalProgrammaticFills = 0;
 
     // Safety: check if this is actually the review page (misclassified)
     const isActuallyReview = await this.checkIfReviewPage(adapter);
@@ -494,6 +573,7 @@ Do NOT interact with CAPTCHAs or image challenges. If you see one, STOP immediat
       const programmaticFilled = await config.fillDropdownsProgrammatically(adapter, qaMap);
       if (programmaticFilled > 0) {
         console.log(`[SmartApply] [${pageLabel}] Programmatically filled ${programmaticFilled} dropdown(s)`);
+        totalProgrammaticFills += programmaticFilled;
       }
     }
     await config.fillDateFieldsProgrammatically(adapter, qaMap);
@@ -502,8 +582,17 @@ Do NOT interact with CAPTCHAs or image challenges. If you see one, STOP immediat
     const needsLLM = await config.hasEmptyVisibleFields(adapter);
     if (needsLLM && llmCallCount < MAX_LLM_CALLS) {
       await config.centerNextEmptyField(adapter);
+      const filledSummary = await this.getFilledFieldsSummary(adapter);
+      const promptWithState = filledSummary ? `${filledSummary}\n${fillPrompt}` : fillPrompt;
       console.log(`[SmartApply] [${pageLabel}] LLM filling remaining fields (round 1, call ${llmCallCount + 1}/${MAX_LLM_CALLS})...`);
-      await adapter.act(fillPrompt);
+      await this.protectFilledFields(adapter);
+      try {
+        await adapter.act(promptWithState);
+      } catch (actError) {
+        console.warn(`[SmartApply] [${pageLabel}] LLM act() failed: ${actError instanceof Error ? actError.message : actError}`);
+      } finally {
+        try { await this.unprotectFields(adapter); } catch { /* page may have navigated */ }
+      }
       llmCallCount++;
     } else if (llmCallCount >= MAX_LLM_CALLS) {
       console.log(`[SmartApply] [${pageLabel}] LLM call limit reached (${MAX_LLM_CALLS}) — skipping.`);
@@ -540,6 +629,7 @@ Do NOT interact with CAPTCHAs or image challenges. If you see one, STOP immediat
         const programmaticFilled = await config.fillDropdownsProgrammatically(adapter, qaMap);
         if (programmaticFilled > 0) {
           console.log(`[SmartApply] [${pageLabel}] Programmatically filled ${programmaticFilled} dropdown(s)`);
+          totalProgrammaticFills += programmaticFilled;
         }
       }
       await config.fillDateFieldsProgrammatically(adapter, qaMap);
@@ -552,12 +642,33 @@ Do NOT interact with CAPTCHAs or image challenges. If you see one, STOP immediat
       const stillNeedsLLM = await config.hasEmptyVisibleFields(adapter);
       if (stillNeedsLLM) {
         await config.centerNextEmptyField(adapter);
+        const filledSummary = await this.getFilledFieldsSummary(adapter);
+        const promptWithState = filledSummary ? `${filledSummary}\n${fillPrompt}` : fillPrompt;
         console.log(`[SmartApply] [${pageLabel}] LLM filling remaining fields (round ${round}, call ${llmCallCount + 1}/${MAX_LLM_CALLS})...`);
-        await adapter.act(fillPrompt);
+        await this.protectFilledFields(adapter);
+        try { await adapter.act(promptWithState); } finally { await this.unprotectFields(adapter); }
         llmCallCount++;
       } else {
         console.log(`[SmartApply] [${pageLabel}] All visible fields filled — skipping LLM.`);
       }
+    }
+
+    // GUARANTEE: Always call the LLM at least once per page.
+    // DOM checks only detect standard HTML form elements (<input>, <select>, radio buttons).
+    // Many sites use custom UI components (card selectors, toggle switches, styled buttons
+    // representing choices) that only the LLM can see and interact with visually.
+    // If we never called the LLM and had no programmatic fills, the page likely has
+    // non-standard interactive elements that need LLM attention.
+    if (llmCallCount === 0 && totalProgrammaticFills === 0) {
+      console.log(`[SmartApply] [${pageLabel}] No fields detected by DOM — calling LLM once to handle any custom UI elements...`);
+      await adapter.page.evaluate(() => window.scrollTo(0, 0));
+      await adapter.page.waitForTimeout(500);
+      try {
+        await adapter.act(fillPrompt);
+      } catch (actError) {
+        console.warn(`[SmartApply] [${pageLabel}] LLM act() failed: ${actError instanceof Error ? actError.message : actError}`);
+      }
+      llmCallCount++;
     }
 
     console.log(`[SmartApply] [${pageLabel}] Page complete. Total LLM calls: ${llmCallCount}`);
@@ -584,6 +695,7 @@ Do NOT interact with CAPTCHAs or image challenges. If you see one, STOP immediat
       await adapter.page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
       await adapter.page.waitForTimeout(800);
 
+      const urlBefore = await adapter.getCurrentUrl();
       console.log(`[SmartApply] [${pageLabel}] Clicking Next (attempt ${attempt})...`);
       const clickResult = await config.clickNextButton(adapter);
 
@@ -592,14 +704,45 @@ Do NOT interact with CAPTCHAs or image challenges. If you see one, STOP immediat
         return;
       }
 
+      // If DOM couldn't find a Next button, use LLM as fallback
+      if (clickResult === 'not_found') {
+        console.log(`[SmartApply] [${pageLabel}] No Next button found via DOM — trying LLM fallback...`);
+        await adapter.act(
+          'Click the button that advances to the next step of the application. ' +
+          'Look for buttons labeled "Next", "Continue", "Proceed", "Save and Continue", "Review", or similar. ' +
+          'Do NOT click "Submit" or "Submit Application". Report done after clicking.',
+        );
+      }
+
       // Wait for page response
       await adapter.page.waitForTimeout(2000);
+
+      // Verify the page actually changed
+      const urlAfter = await adapter.getCurrentUrl();
+      const pageChanged = urlAfter !== urlBefore;
 
       // Check for validation errors
       const hasErrors = await config.detectValidationErrors(adapter);
 
-      if (!hasErrors) {
+      if (!hasErrors && pageChanged) {
         console.log(`[SmartApply] [${pageLabel}] Navigation succeeded.`);
+        await this.waitForPageLoad(adapter);
+        return;
+      }
+
+      if (!hasErrors && !pageChanged) {
+        // No errors but page didn't change — might be a SPA that updates in-place
+        // Wait a bit longer and check again
+        await adapter.page.waitForTimeout(2000);
+        const urlAfterWait = await adapter.getCurrentUrl();
+        if (urlAfterWait !== urlBefore) {
+          console.log(`[SmartApply] [${pageLabel}] Navigation succeeded (delayed).`);
+          await this.waitForPageLoad(adapter);
+          return;
+        }
+        // Page truly didn't change — treat as success for SPAs where URL stays the same
+        // The stuck detection in the main loop will catch actual loops
+        console.log(`[SmartApply] [${pageLabel}] Page URL unchanged — may be SPA navigation. Continuing.`);
         await this.waitForPageLoad(adapter);
         return;
       }
@@ -610,12 +753,13 @@ Do NOT interact with CAPTCHAs or image challenges. If you see one, STOP immediat
       await adapter.page.evaluate(() => window.scrollTo(0, 0));
       await adapter.page.waitForTimeout(500);
 
-      // Use LLM to handle errors
+      // Use LLM to handle errors — shorter prompt that focuses on the task
       await adapter.act(
-        `There are validation errors on this page. Look for any error messages or fields highlighted in red. If you see clickable error links at the top of the page, click on each one — they will jump you directly to the missing field. Then fill in the correct value. For each missing/invalid field:
-1. CLICK on the error link to jump to it, OR click directly on the field.
-2. Fill in the correct value or select the correct option.
-3. CLICK on empty whitespace to deselect.
+        `Validation errors are showing on this page. Fix them:
+1. If there are clickable error links at the top, click each one to jump to the missing field.
+2. Fill the missing/invalid field with the correct value from the data mapping.
+3. Click whitespace to deselect, then fix the next error.
+Report the task as done when all visible errors are addressed.
 
 ${fillPrompt}`,
       );
@@ -642,7 +786,7 @@ ${fillPrompt}`,
         const hasEmpty = await config.hasEmptyVisibleFields(adapter);
         if (hasEmpty) {
           await adapter.act(
-            `If there are any EMPTY required fields visible on screen (marked with * or highlighted in red), CLICK on each one and fill it with the correct value. If ALL visible fields are already filled, do NOTHING — just stop immediately.
+            `Fill any empty required fields visible on screen (marked with * or highlighted in red). If all fields are filled, report the task as done.
 
 ${fillPrompt}`,
           );
@@ -750,21 +894,181 @@ ${fillPrompt}`,
   }
 
   /**
-   * Quick check if the current page is actually the review page (misclassified).
+   * Quick DOM-only check if the current page looks like a review page.
+   * Used as a lightweight safety net inside fillWithSmartScroll — NOT the
+   * primary review detection (that's verifyReviewPage with LLM confirmation).
+   * Only returns true if heading says "review" AND Submit present AND no editable fields.
    */
   private async checkIfReviewPage(adapter: BrowserAutomationAdapter): Promise<boolean> {
     return adapter.page.evaluate(() => {
       const headings = Array.from(document.querySelectorAll('h1, h2, h3'));
       const isReviewHeading = headings.some(h => (h.textContent || '').toLowerCase().includes('review'));
+      if (!isReviewHeading) return false;
       const buttons = Array.from(document.querySelectorAll('button'));
       const hasSubmit = buttons.some(b => (b.textContent?.trim().toLowerCase() || '') === 'submit');
-      const hasSaveAndContinue = buttons.some(b => (b.textContent?.trim().toLowerCase() || '').includes('save and continue'));
-      const hasSelectOne = buttons.some(b => (b.textContent?.trim() || '') === 'Select One');
-      const hasEditableInputs = document.querySelectorAll(
-        'input[type="text"]:not([readonly]), textarea:not([readonly]), input[type="email"], input[type="tel"]'
-      ).length > 0;
-      return isReviewHeading && hasSubmit && !hasSaveAndContinue && !hasSelectOne && !hasEditableInputs;
+      if (!hasSubmit) return false;
+      // Check entire page for any editable form elements
+      const editableCount = document.querySelectorAll(
+        'input[type="text"]:not([readonly]):not([disabled]), ' +
+        'input[type="email"]:not([readonly]):not([disabled]), ' +
+        'input[type="tel"]:not([readonly]):not([disabled]), ' +
+        'textarea:not([readonly]):not([disabled]), ' +
+        'select:not([disabled]), ' +
+        'input[type="radio"]:not([disabled]), ' +
+        'input[type="checkbox"]:not([disabled])'
+      ).length;
+      // If there are interactive form elements, probably not a true review page
+      return editableCount === 0;
     });
+  }
+
+  /**
+   * Use a second LLM call to verify the page is truly the final review/summary.
+   * DOM checks miss radio buttons, toggles, custom widgets, and other non-standard
+   * form elements, so we ask the LLM to visually inspect the page for signs that
+   * there is still more application to complete.
+   */
+  private async verifyReviewPage(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    const ReviewVerificationSchema = z.object({
+      is_final_review: z.boolean(),
+      reason: z.string(),
+    });
+
+    try {
+      console.log('[SmartApply] Verifying review page classification with LLM...');
+      const result = await adapter.extract(
+        `Look at this page carefully. I need to determine if this is the FINAL review/summary page of a job application, or if there are still more steps to complete.
+
+A TRUE final review page:
+- Shows a read-only summary of ALL your previously entered application data
+- Has a "Submit" or "Submit Application" button as the final action
+- Has NO more sections, steps, or pages left to fill out
+- The application progress indicator (if any) shows you are at the last step
+
+This is NOT the final review page if ANY of these are true:
+- There are still more steps/sections visible in a sidebar, progress bar, or navigation that haven't been completed yet
+- The page is asking you to make a choice (e.g. enable notifications, select preferences, agree to terms)
+- There are form fields, radio buttons, toggles, checkboxes, or dropdowns that need interaction
+- A progress indicator shows you are NOT at the final step
+- The page has content to interact with beyond just reviewing submitted data
+
+Set is_final_review to true ONLY if this is genuinely the last page before submission with nothing left to do except click Submit.`,
+        ReviewVerificationSchema,
+      );
+
+      console.log(`[SmartApply] Review verification: is_final_review=${result.is_final_review}, reason="${result.reason}"`);
+      return result.is_final_review;
+    } catch (error) {
+      console.warn(`[SmartApply] Review verification LLM call failed: ${error}`);
+      // If the verification fails, err on the side of NOT treating it as review
+      // so we don't prematurely stop the application
+      return false;
+    }
+  }
+
+  /**
+   * Make filled text fields readonly so the LLM agent physically cannot corrupt them.
+   * This is the strongest defense against the LLM re-typing into already-filled fields.
+   * Fields are tagged with data-gh-protected so we can restore them after the act() call.
+   */
+  private async protectFilledFields(adapter: BrowserAutomationAdapter): Promise<void> {
+    const count = await adapter.page.evaluate(() => {
+      let protected_count = 0;
+      const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+        'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="number"], input:not([type]), textarea'
+      );
+      for (const input of inputs) {
+        if (!input.value || input.value.trim() === '') continue;
+        if (input.readOnly) continue;
+        if (input.type === 'hidden') continue;
+        // Don't protect fields with very short values — likely just a prefix
+        // (e.g. "+1" country code, "Mr" title) not a complete answer
+        if (input.value.trim().length < 4) continue;
+        const rect = input.getBoundingClientRect();
+        if (rect.width < 20 || rect.height < 10) continue;
+        // Don't protect inputs inside dropdowns (they need to be typeable for filtering)
+        if (input.closest('[role="listbox"], [role="combobox"]')) continue;
+        const style = window.getComputedStyle(input);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+        input.setAttribute('data-gh-protected', 'true');
+        input.readOnly = true;
+        protected_count++;
+      }
+      return protected_count;
+    });
+    if (count > 0) {
+      console.log(`[SmartApply] Protected ${count} filled field(s) as readonly`);
+    }
+  }
+
+  /**
+   * Remove readonly protection from fields we previously locked.
+   */
+  private async unprotectFields(adapter: BrowserAutomationAdapter): Promise<void> {
+    await adapter.page.evaluate(() => {
+      const protectedEls = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('[data-gh-protected="true"]');
+      for (const el of protectedEls) {
+        el.readOnly = false;
+        el.removeAttribute('data-gh-protected');
+      }
+    });
+  }
+
+  /**
+   * Scan the DOM for fields that already have values and return a summary string.
+   * This is prepended to the LLM prompt so it knows which fields are DONE.
+   */
+  private async getFilledFieldsSummary(adapter: BrowserAutomationAdapter): Promise<string> {
+    const filledFields = await adapter.page.evaluate(() => {
+      const results: string[] = [];
+      const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+        'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="number"], input:not([type]), textarea'
+      );
+      for (const input of inputs) {
+        if (!input.value || input.value.trim() === '') continue;
+        if (input.type === 'hidden') continue;
+        const rect = input.getBoundingClientRect();
+        if (rect.width < 20 || rect.height < 10) continue;
+        // Skip inputs inside dropdowns
+        if (input.closest('[role="listbox"], [role="combobox"]')) continue;
+
+        const style = window.getComputedStyle(input);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+        // Find the label
+        let label = '';
+        const labelEl = (input as HTMLInputElement).labels?.[0];
+        if (labelEl) label = labelEl.textContent?.trim() || '';
+        if (!label) label = input.getAttribute('aria-label') || '';
+        if (!label) label = input.placeholder || '';
+        if (!label) label = input.name || input.id || '';
+        // Clean up
+        label = label.replace(/\s*\*\s*/g, '').replace(/Required/gi, '').trim();
+        if (!label) label = input.type || 'text';
+
+        // Truncate long values for display
+        const val = input.value.length > 30 ? input.value.substring(0, 27) + '...' : input.value;
+        results.push(`  - "${label}": "${val}"`);
+      }
+
+      // Also check selects that have a value
+      const selects = document.querySelectorAll<HTMLSelectElement>('select');
+      for (const sel of selects) {
+        if (sel.selectedIndex <= 0) continue;
+        const rect = sel.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        let label = sel.labels?.[0]?.textContent?.trim() || sel.getAttribute('aria-label') || sel.name || 'dropdown';
+        label = label.replace(/\s*\*\s*/g, '').replace(/Required/gi, '').trim();
+        results.push(`  - "${label}": "${sel.options[sel.selectedIndex]?.text || sel.value}"`);
+      }
+
+      return results;
+    });
+
+    if (filledFields.length === 0) return '';
+
+    return `ALREADY FILLED (${filledFields.length} fields) — DO NOT click on, clear, retype, or interact with ANY of these fields. They are correct even if values look truncated or short. Moving to a filled field and retyping WILL corrupt the data.\n${filledFields.join('\n')}\nOnly interact with EMPTY fields that have a matching value in the data mapping.\n`;
   }
 
   /**

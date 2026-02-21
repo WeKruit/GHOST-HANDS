@@ -15,6 +15,9 @@ import {
   buildGoogleSignInFallbackPrompt,
 } from '../workdayPrompts.js';
 
+// Re-export for backward compatibility
+export { WORKDAY_BASE_RULES };
+
 // ---------------------------------------------------------------------------
 // Workday page state schema (extends base with voluntary_disclosure, self_identify)
 // ---------------------------------------------------------------------------
@@ -259,16 +262,20 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
       }
     }
 
+    // Voluntary self-identification
     parts.push('');
-    parts.push('--- GENERAL RULES ---');
+    parts.push('--- SELF-IDENTIFICATION ---');
+    parts.push(`Gender → ${p.gender || 'I do not wish to answer'}`);
+    parts.push(`Race/Ethnicity → ${p.race_ethnicity || 'I do not wish to answer'}`);
+    parts.push(`Veteran Status → ${p.veteran_status || 'I am not a protected veteran'}`);
+    parts.push(`Disability Status → ${p.disability_status || 'I do not wish to answer'}`);
+
+    parts.push('');
+    parts.push('--- GENERAL ---');
     parts.push(`Work Authorization → ${p.work_authorization}`);
     parts.push(`Visa Sponsorship → ${p.visa_sponsorship}`);
-    parts.push('For self-identification: Gender → select "Male". Race/Ethnicity → select "Asian (Not Hispanic or Latino)". Veteran Status → select "I am not a protected veteran". Disability → select "I do not wish to answer".');
-    parts.push('For any question not listed above, select the most reasonable/common answer.');
-    parts.push('DROPDOWN TECHNIQUE: After clicking a dropdown, ALWAYS TYPE your desired answer first (e.g. "No", "Yes", "Male", "Website") to filter the list. If a matching option appears, click it. If typing does not produce a match, click whitespace to close the dropdown, then re-click it and try typing a shorter keyword. The popup menu that appears after clicking a dropdown ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions. NEVER use arrow keys inside dropdowns. NEVER mouse scroll inside dropdowns.');
+    parts.push('For unknown questions not listed above, skip the field rather than guessing.');
     parts.push('NESTED DROPDOWNS: Some dropdowns have sub-menus. After selecting a category (e.g. "Website"), a second list appears with specific options (e.g. "workday.com"). Select the sub-option. Do NOT click any back arrow or "← Category" button — that navigates backwards.');
-    parts.push('DATE FIELDS: Workday date fields have separate MM/DD/YYYY parts. ALWAYS click on the MM (month) part FIRST, then type the full date as continuous digits WITHOUT slashes or dashes (e.g. for 02/18/2026, click on MM and type "02182026"). Workday auto-advances from month to day to year. For "today\'s date" or "signature date", type "02182026" (which is 02/18/2026). For "expected graduation date", use 05012027.');
-    parts.push('NEVER click "Submit Application" or "Submit".');
 
     return parts.join('\n');
   }
@@ -315,9 +322,9 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
       case 'questions':
         return buildFormPagePrompt('application questions', dataBlock);
       case 'voluntary_disclosure':
-        return buildVoluntaryDisclosurePrompt();
+        return buildVoluntaryDisclosurePrompt(dataBlock);
       case 'self_identify':
-        return buildSelfIdentifyPrompt();
+        return buildSelfIdentifyPrompt(dataBlock);
       default:
         return buildGenericPagePrompt(dataBlock);
     }
@@ -667,17 +674,22 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
     const yyyy = String(now.getFullYear());
     const todayDigits = `${mm}${dd}${yyyy}`;
 
+    // Dynamic graduation date: May of next year if past May, otherwise May of this year
+    const gradYear = now.getMonth() >= 5 ? now.getFullYear() + 1 : now.getFullYear();
+    const graduationDigits = `0501${gradYear}`;
+
     let filled = 0;
     for (const field of dateFields) {
       const labelLower = field.label.toLowerCase();
       let dateValue = todayDigits;
 
       if (labelLower.includes('graduation') || labelLower.includes('expected')) {
-        dateValue = '05012027';
+        dateValue = graduationDigits;
       } else if (labelLower.includes('start')) {
-        dateValue = '08012023';
+        // Default start date: use today's date (will be overridden by profile data via LLM)
+        dateValue = todayDigits;
       } else if (labelLower.includes('end')) {
-        dateValue = '05012027';
+        dateValue = graduationDigits;
       }
 
       console.log(`[Workday] [Date] Filling "${field.label || 'date field'}" → ${dateValue.substring(0, 2)}/${dateValue.substring(2, 4)}/${dateValue.substring(4)}`);
@@ -1184,6 +1196,16 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
           if (hasVisiblePassword) return { type: 'password_entry', found: true };
           if (hasVisibleEmail) return { type: 'email_entry', found: true };
 
+          // Check for confirmation page (account pre-selected, "Continue" button visible)
+          var buttons = document.querySelectorAll('button, div[role="button"]');
+          var hasContinue = Array.from(buttons).some(function(b) {
+            var t = (b.textContent || '').trim().toLowerCase();
+            return t === 'continue' || t === 'confirm' || t === 'allow';
+          });
+          if (hasContinue && (bodyText.includes(targetEmail) || bodyText.includes('confirm') || bodyText.includes('signing in'))) {
+            return { type: 'confirmation', found: true };
+          }
+
           const accountLinks = document.querySelectorAll('[data-email], [data-identifier]');
           for (const el of accountLinks) {
             const addr = (el.getAttribute('data-email') || el.getAttribute('data-identifier') || '').toLowerCase();
@@ -1198,6 +1220,26 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
       `) as { type: string; found: boolean };
 
       switch (googlePageType.type) {
+        case 'confirmation': {
+          console.log('[Workday] Google confirmation page — clicking Continue...');
+          const continueClicked = await adapter.page.evaluate(() => {
+            const buttons = document.querySelectorAll('button, div[role="button"]');
+            for (const btn of buttons) {
+              const t = (btn.textContent || '').trim().toLowerCase();
+              if (t === 'continue' || t === 'confirm' || t === 'allow') {
+                (btn as HTMLElement).click();
+                return true;
+              }
+            }
+            return false;
+          });
+          if (!continueClicked) {
+            await adapter.act('Click the "Continue" or "Confirm" button to proceed with the Google sign-in.');
+          }
+          await adapter.page.waitForTimeout(2000);
+          return;
+        }
+
         case 'account_chooser': {
           console.log('[Workday] Account chooser detected — clicking account via DOM...');
           const clicked = await adapter.page.evaluate((targetEmail: string) => {
@@ -1278,7 +1320,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
 
         default: {
           console.log('[Workday] Unknown Google page — using LLM fallback...');
-          await adapter.act(buildGoogleSignInFallbackPrompt(email, password));
+          await adapter.act(buildGoogleSignInFallbackPrompt(email));
           await adapter.page.waitForTimeout(2000);
           return;
         }
