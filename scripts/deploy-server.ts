@@ -33,7 +33,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
-import { execSync } from 'node:child_process';
+import { execSync, exec } from 'node:child_process';
 
 import {
   pullImage,
@@ -584,10 +584,19 @@ if (typeof Bun !== 'undefined') {
 
         console.log('[deploy-server] Disk cleanup requested');
         try {
-          const output = execSync(
-            'bash /opt/ghosthands/scripts/disk-cleanup.sh 2>&1',
-            { encoding: 'utf-8', timeout: 120_000 },
-          );
+          const output = await new Promise<string>((resolve, reject) => {
+            exec(
+              'bash /opt/ghosthands/scripts/disk-cleanup.sh 2>&1',
+              { encoding: 'utf-8', timeout: 120_000 },
+              (error, stdout, stderr) => {
+                if (error) {
+                  reject(new Error(stdout || stderr || error.message));
+                } else {
+                  resolve(stdout);
+                }
+              },
+            );
+          });
           console.log('[deploy-server] Disk cleanup completed');
           return Response.json({ success: true, message: 'Cleanup completed', output });
         } catch (err) {
