@@ -12,6 +12,7 @@
  *   GET  /workers     — Returns worker registry status (no auth)
  *   POST /deploy      — Rolling deploy via Docker Engine API (requires X-Deploy-Secret)
  *   POST /drain       — Triggers graceful worker drain (requires X-Deploy-Secret)
+ *   POST /cleanup     — Runs disk cleanup (Docker prune + tmp + logs) (requires X-Deploy-Secret)
  *   POST /rollback    — Stub for future rollback support (requires X-Deploy-Secret)
  *
  * Auth:
@@ -569,6 +570,33 @@ if (typeof Bun !== 'undefined') {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           return Response.json({ success: false, message: `Drain failed: ${msg}` }, { status: 500 });
+        }
+      }
+
+      // ── POST /cleanup — Authenticated disk cleanup trigger ──────
+      if (url.pathname === '/cleanup' && req.method === 'POST') {
+        if (!verifySecret(req)) {
+          return Response.json(
+            { success: false, message: 'Unauthorized' },
+            { status: 401 },
+          );
+        }
+
+        console.log('[deploy-server] Disk cleanup requested');
+        try {
+          const output = execSync(
+            'bash /opt/ghosthands/scripts/disk-cleanup.sh 2>&1',
+            { encoding: 'utf-8', timeout: 120_000 },
+          );
+          console.log('[deploy-server] Disk cleanup completed');
+          return Response.json({ success: true, message: 'Cleanup completed', output });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[deploy-server] Disk cleanup failed: ${msg}`);
+          return Response.json(
+            { success: false, message: `Cleanup failed: ${msg}` },
+            { status: 500 },
+          );
         }
       }
 

@@ -8,63 +8,54 @@
 # Usage:
 #   sudo bash scripts/disk-cleanup.sh          # manual run
 #   # or via cron (installed by setup-cleanup-cron.sh)
-#
-# Exit codes:
-#   0 — cleanup completed (warnings are non-fatal)
-#   1 — critical error (could not determine disk state)
 # ──────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 
 LOG_PREFIX="[disk-cleanup]"
-TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-log() { echo "${LOG_PREFIX} ${TIMESTAMP} $*"; }
-warn() { echo "${LOG_PREFIX} ${TIMESTAMP} WARNING: $*" >&2; }
+log()  { echo "${LOG_PREFIX} $(date -u +'%Y-%m-%dT%H:%M:%SZ') $*"; }
+warn() { echo "${LOG_PREFIX} $(date -u +'%Y-%m-%dT%H:%M:%SZ') WARNING: $*" >&2; }
 
 log "=== Disk cleanup started ==="
 
 # ── 1. Disk usage before cleanup ──────────────────────────────────────
 
-DISK_BEFORE=$(df -h / | awk 'NR==2 {print $5}')
+if ! DISK_BEFORE=$(df -h / | awk 'NR==2 {print $5}') || [ -z "${DISK_BEFORE}" ]; then
+  log "ERROR: Could not determine disk state"
+  exit 1
+fi
 DISK_AVAIL_BEFORE=$(df -h / | awk 'NR==2 {print $4}')
 log "Disk usage before: ${DISK_BEFORE} used, ${DISK_AVAIL_BEFORE} available"
 
-# ── 2. Docker: prune dangling images ─────────────────────────────────
+# ── 2. Docker cleanup ────────────────────────────────────────────────
 
-log "Pruning dangling Docker images..."
+HAS_DOCKER=false
 if command -v docker &>/dev/null; then
+  HAS_DOCKER=true
+fi
+
+if [ "${HAS_DOCKER}" = true ]; then
+  log "Pruning dangling Docker images..."
   DANGLING=$(docker image prune -f 2>&1) || warn "docker image prune failed: ${DANGLING}"
   log "Dangling prune result: ${DANGLING}"
+
+  log "Pruning unused Docker images older than 72h..."
+  OLD_IMAGES=$(docker image prune -a --filter "until=72h" -f 2>&1) || warn "docker image prune -a failed: ${OLD_IMAGES}"
+  log "Old image prune result: ${OLD_IMAGES}"
+
+  log "Pruning Docker build cache..."
+  BUILD_CACHE=$(docker builder prune -f --filter "until=72h" 2>&1) || warn "docker builder prune failed: ${BUILD_CACHE}"
+  log "Build cache prune result: ${BUILD_CACHE}"
+
+  log "Pruning unused Docker volumes..."
+  VOLUMES=$(docker volume prune -f 2>&1) || warn "docker volume prune failed: ${VOLUMES}"
+  log "Volume prune result: ${VOLUMES}"
 else
   warn "docker not found, skipping Docker cleanup"
 fi
 
-# ── 3. Docker: prune old unused images (>72h) ────────────────────────
-
-log "Pruning unused Docker images older than 72h..."
-if command -v docker &>/dev/null; then
-  OLD_IMAGES=$(docker image prune -a --filter "until=72h" -f 2>&1) || warn "docker image prune -a failed: ${OLD_IMAGES}"
-  log "Old image prune result: ${OLD_IMAGES}"
-fi
-
-# ── 4. Docker: prune build cache ─────────────────────────────────────
-
-log "Pruning Docker build cache..."
-if command -v docker &>/dev/null; then
-  BUILD_CACHE=$(docker builder prune -f --filter "until=72h" 2>&1) || warn "docker builder prune failed: ${BUILD_CACHE}"
-  log "Build cache prune result: ${BUILD_CACHE}"
-fi
-
-# ── 5. Docker: prune unused volumes ──────────────────────────────────
-
-log "Pruning unused Docker volumes..."
-if command -v docker &>/dev/null; then
-  VOLUMES=$(docker volume prune -f 2>&1) || warn "docker volume prune failed: ${VOLUMES}"
-  log "Volume prune result: ${VOLUMES}"
-fi
-
-# ── 6. /tmp cleanup (files older than 24h) ────────────────────────────
+# ── 3. /tmp cleanup (files older than 24h) ────────────────────────────
 
 log "Cleaning /tmp files older than 24 hours..."
 TMP_COUNT=$(find /tmp -type f -mtime +1 2>/dev/null | wc -l || echo 0)
@@ -75,7 +66,7 @@ else
   log "No old /tmp files to clean"
 fi
 
-# ── 7. Log rotation for GhostHands logs ──────────────────────────────
+# ── 4. Log rotation for GhostHands logs ──────────────────────────────
 
 GH_LOG_DIR="/opt/ghosthands/logs"
 if [ -d "${GH_LOG_DIR}" ]; then
@@ -92,14 +83,14 @@ else
   log "No GH log directory at ${GH_LOG_DIR}, skipping log rotation"
 fi
 
-# ── 8. Clean journal logs older than 3 days ───────────────────────────
+# ── 5. Clean journal logs older than 3 days ───────────────────────────
 
 if command -v journalctl &>/dev/null; then
   log "Vacuuming journald logs older than 3 days..."
   journalctl --vacuum-time=3d 2>&1 || warn "journalctl vacuum failed"
 fi
 
-# ── 9. Disk usage after cleanup ───────────────────────────────────────
+# ── 6. Disk usage after cleanup ───────────────────────────────────────
 
 DISK_AFTER=$(df -h / | awk 'NR==2 {print $5}')
 DISK_AVAIL_AFTER=$(df -h / | awk 'NR==2 {print $4}')
