@@ -332,7 +332,7 @@ describe('Container Configs Module', () => {
       test('runs deploy-server.ts script', () => {
         expect(getDeployService().config.Cmd).toEqual([
           'bun',
-          '/opt/ghosthands/scripts/deploy-server.ts',
+          'scripts/deploy-server.ts',
         ]);
       });
     });
