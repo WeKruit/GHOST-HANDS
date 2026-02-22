@@ -22,6 +22,7 @@ import { TraceRecorder } from '../engine/TraceRecorder.js';
 import { StagehandObserver } from '../engine/StagehandObserver.js';
 import type { MagnitudeAdapter } from '../adapters/magnitude.js';
 import { ThoughtThrottle, JOB_EVENT_TYPES } from '../events/JobEventTypes.js';
+import { AdsPowerClient } from '../connectors/AdsPowerClient.js';
 
 // Re-export AutomationJob from the canonical location for backward compat
 export type { AutomationJob } from './taskHandlers/types.js';
@@ -148,6 +149,8 @@ export class JobExecutor {
     let adapter: BrowserAutomationAdapter | null = null;
     let observer: StagehandObserver | undefined;
     let blockerCheckInterval: ReturnType<typeof setInterval> | null = null;
+    let adsPowerClient: AdsPowerClient | null = null;
+    let adsPowerProfileId: string | null = null;
 
     // Initialize cost tracker with budget limits
     const qualityPreset = resolveQualityPreset(job.input_data, job.metadata);
@@ -175,7 +178,6 @@ export class JobExecutor {
         : await costService.preflightBudgetCheck(
             job.user_id,
             qualityPreset,
-            job.job_type,
           );
       if (isDev) {
         console.log(`[JobExecutor] Skipping budget preflight (NODE_ENV=development)`);
@@ -314,6 +316,28 @@ export class JobExecutor {
       }
 
       // 7. Create and start adapter
+      // 7a. Connect to AdsPower anti-detect browser if configured
+      let adsPowerContext: import('playwright').BrowserContext | undefined;
+
+      if (process.env.ADSPOWER_API_BASE) {
+        adsPowerClient = new AdsPowerClient({
+          baseUrl: process.env.ADSPOWER_API_BASE,
+          apiKey: process.env.ADSPOWER_API_KEY,
+        });
+        adsPowerProfileId = process.env.ADSPOWER_PROFILE_ID ?? null;
+        if (!adsPowerProfileId) {
+          throw new Error('ADSPOWER_PROFILE_ID is required when ADSPOWER_API_BASE is set');
+        }
+        // connectContext: starts browser, polls until active, connects via Patchright CDP
+        const { context, cdpUrl } = await adsPowerClient.connectContext(adsPowerProfileId);
+        adsPowerContext = context;
+        console.log(`[JobExecutor] AdsPower connected via CDP: ${cdpUrl}`);
+        await this.logJobEvent(job.id, 'adspower_browser_started', {
+          profile_id: adsPowerProfileId,
+          cdp_url: cdpUrl,
+        });
+      }
+
       const adapterType = (process.env.GH_BROWSER_ENGINE || 'magnitude') as AdapterType;
       adapter = createAdapter(adapterType);
       await adapter.start({
@@ -321,6 +345,7 @@ export class JobExecutor {
         llm: llmSetup.llm,
         ...(llmSetup.imageLlm && { imageLlm: llmSetup.imageLlm }),
         ...(storedSession ? { storageState: storedSession } : {}),
+        ...(adsPowerContext ? { browserContext: adsPowerContext } : {}),
       });
 
       // 7a. Attach StagehandObserver for enriched blocker detection (optional)
@@ -1028,6 +1053,13 @@ export class JobExecutor {
           await adapter.stop();
         } catch {
           // Adapter may already be stopped
+        }
+      }
+      if (adsPowerClient && adsPowerProfileId) {
+        try {
+          await adsPowerClient.stopBrowser(adsPowerProfileId);
+        } catch {
+          // AdsPower browser may already be stopped
         }
       }
     }
