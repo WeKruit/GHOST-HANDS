@@ -222,7 +222,7 @@ describe('removeContainer', () => {
 
     expect(fetchCalls).toHaveLength(1);
     expect(fetchCalls[0].url).toContain('/containers/my-container?force=true&v=true');
-    expect(fetchCalls[0].options.method).toBe('POST');
+    expect(fetchCalls[0].options.method).toBe('DELETE');
   });
 
   test('ignores 404 (container not found)', async () => {
