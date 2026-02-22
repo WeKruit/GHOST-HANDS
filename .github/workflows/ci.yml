@@ -226,6 +226,48 @@ jobs:
             echo "::warning::Kasm API returned HTTP ${HTTP_STATUS}."
           fi
 
+  # ─── Deploy to ASG instances (SSH) ────────────────────────────
+  # After Docker push + staging notification, SSH to each running
+  # ASG instance and pull/restart the new image.
+
+  deploy-asg:
+    name: Deploy to ASG Fleet
+    runs-on: ubuntu-latest
+    needs: [docker, deploy-staging]
+    if: github.event_name == 'push'
+    environment: ${{ needs.docker.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Write SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SANDBOX_SSH_KEY }}" > ~/.ssh/valet-worker.pem
+          chmod 600 ~/.ssh/valet-worker.pem
+
+      - name: Deploy to ASG instances
+        env:
+          AWS_ASG_NAME: ghosthands-worker-asg
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          SSH_KEY_PATH: ~/.ssh/valet-worker.pem
+          SSH_USER: ubuntu
+        run: |
+          chmod +x scripts/deploy-to-asg.sh
+          bash scripts/deploy-to-asg.sh "${{ needs.docker.outputs.image_tag }}"
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/valet-worker.pem
+
   # ─── Deploy: Production ───────────────────────────────────────
   # Only triggers on main branch pushes, after staging succeeds
 
