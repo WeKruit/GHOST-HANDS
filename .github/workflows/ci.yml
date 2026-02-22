@@ -258,7 +258,6 @@ jobs:
           AWS_REGION: ${{ secrets.AWS_REGION }}
           ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
           ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          SSH_KEY_PATH: ~/.ssh/valet-worker.pem
           SSH_USER: ubuntu
         run: |
           chmod +x scripts/deploy-to-asg.sh
