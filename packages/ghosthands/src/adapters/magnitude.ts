@@ -83,14 +83,27 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
       llmConfig = buildLlmConfig(options.llm);
     }
 
+    // Determine browser launch options.
+    // GH_BROWSER_HEADLESS env var controls headed/headless mode:
+    //   "false" → headed (renders on DISPLAY, visible via VNC)
+    //   "true" or unset → headless (default, no display needed)
+    // Explicit browserOptions from the caller take precedence.
+    let browserConfig: any;
+    if (options.cdpUrl) {
+      browserConfig = { cdp: options.cdpUrl };
+    } else if (options.browserOptions) {
+      browserConfig = options.browserOptions;
+    } else {
+      const headless = process.env.GH_BROWSER_HEADLESS !== 'false';
+      browserConfig = { headless };
+    }
+
     this.agent = await startBrowserAgent({
       url: options.url,
       llm: llmConfig,
       connectors: options.connectors,
       prompt: options.systemPrompt,
-      browser: options.cdpUrl
-        ? { cdp: options.cdpUrl }
-        : options.browserOptions as any,
+      browser: browserConfig,
     });
 
     // Wire Magnitude events to adapter events
