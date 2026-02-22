@@ -9,12 +9,14 @@ import { ProgressStep } from '../progressTracker.js';
 
 const PAGE_TRANSITION_WAIT_MS = 3_000;
 const MAX_FORM_PAGES = 15;
+const MIN_LLM_GAP_MS = 5_000; // Minimum gap between LLM calls to stay under rate limits
 
 // --- Handler ---
 
 export class SmartApplyHandler implements TaskHandler {
   readonly type = 'smart_apply';
   readonly description = 'Fill out a job application on any ATS platform (multi-step), stopping before submission';
+  private lastLlmCallTime = 0;
 
   validate(inputData: Record<string, any>): ValidationResult {
     const errors: string[] = [];
@@ -47,7 +49,7 @@ export class SmartApplyHandler implements TaskHandler {
     const qaMap = config.buildQAMap(userProfile, qaOverrides);
 
     let pagesProcessed = 0;
-    let lastPageUrl = '';
+    let lastPageSignature = '';
     let samePageCount = 0;
     const MAX_SAME_PAGE = 3; // bail if stuck on same page this many times
 
@@ -66,11 +68,15 @@ export class SmartApplyHandler implements TaskHandler {
         const currentPageUrl = await adapter.getCurrentUrl();
         console.log(`[SmartApply] Page ${pagesProcessed}: ${pageState.page_type} (title: ${pageState.page_title || 'N/A'})`);
 
-        // Stuck detection: if we keep seeing the same URL, we're looping
-        if (currentPageUrl === lastPageUrl) {
+        // Stuck detection: compare URL + visible content fingerprint.
+        // On SPAs (like Amazon.jobs), the URL stays constant across sections,
+        // so we also check headings, field count, and active sidebar item.
+        const contentFingerprint = await this.getPageFingerprint(adapter);
+        const pageSignature = `${currentPageUrl}|${contentFingerprint}`;
+        if (pageSignature === lastPageSignature) {
           samePageCount++;
           if (samePageCount >= MAX_SAME_PAGE) {
-            console.warn(`[SmartApply] Stuck on same page for ${samePageCount} iterations — stopping to avoid infinite loop.`);
+            console.warn(`[SmartApply] Stuck on same page for ${samePageCount} iterations (signature: ${contentFingerprint}) — stopping.`);
             await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
             return {
               success: true,
@@ -86,7 +92,7 @@ export class SmartApplyHandler implements TaskHandler {
           }
         } else {
           samePageCount = 0;
-          lastPageUrl = currentPageUrl;
+          lastPageSignature = pageSignature;
         }
 
         // Handle based on page type
@@ -245,18 +251,45 @@ export class SmartApplyHandler implements TaskHandler {
 
     // Tier 3: LLM classification
     try {
+      // Check page health before sending screenshot to LLM — broken pages
+      // showing raw JS waste massive tokens (5-10k+ per screenshot)
+      const healthy = await this.isPageHealthy(adapter);
+      if (!healthy) {
+        console.warn('[SmartApply] Page appears broken (raw JS/code visible) — skipping LLM classification.');
+        const fallbackType = await config.classifyByDOMFallback(adapter);
+        return { page_type: fallbackType, page_title: 'broken_page' };
+      }
+
       const urlHints: string[] = [];
       if (currentUrl.includes('signin') || currentUrl.includes('login')) urlHints.push('This appears to be a login page.');
       if (currentUrl.includes('job') || currentUrl.includes('position') || currentUrl.includes('career')) urlHints.push('This appears to be a job-related page.');
 
       const classificationPrompt = config.buildClassificationPrompt(urlHints);
+      await this.throttleLlm(adapter);
       const llmResult = await adapter.extract(classificationPrompt, config.pageStateSchema);
 
-      // SAFETY: If LLM says "review", do a second LLM check to confirm.
+      // SAFETY: If LLM says "review", verify before stopping the application.
       // Many single-page forms (e.g. Amazon) show a Submit button on every
-      // page, which fools the first classification. The verification prompt
-      // explicitly asks the LLM to look for signs this is NOT the final review.
+      // page, which fools the classification.
       if (llmResult.page_type === 'review') {
+        // Quick DOM check first — if page has editable fields, it's definitely
+        // NOT the review page. Saves ~1,875 tokens vs the LLM verification call.
+        const hasEditableFields = await adapter.page.evaluate(() => {
+          return document.querySelectorAll(
+            'input[type="text"]:not([readonly]):not([disabled]), ' +
+            'input[type="email"]:not([readonly]):not([disabled]), ' +
+            'input[type="tel"]:not([readonly]):not([disabled]), ' +
+            'textarea:not([readonly]):not([disabled]), ' +
+            'select:not([disabled])'
+          ).length > 0;
+        });
+
+        if (hasEditableFields) {
+          console.log('[SmartApply] Page has editable fields — overriding "review" to "questions" (skipped LLM verify)');
+          return { ...llmResult, page_type: 'questions' as PageType };
+        }
+
+        // DOM inconclusive — use expensive LLM verification as last resort
         const isReallyReview = await this.verifyReviewPage(adapter);
         if (!isReallyReview) {
           console.log('[SmartApply] Review verification failed — overriding to "questions"');
@@ -285,6 +318,7 @@ export class SmartApplyHandler implements TaskHandler {
     console.log('[SmartApply] On job listing page, clicking Apply...');
 
     const urlBefore = await adapter.getCurrentUrl();
+    await this.throttleLlm(adapter);
     const result = await adapter.act(
       'Click the "Apply" or "Apply Now" button to start the job application. ' +
       'Your ONLY task is to click the apply button — nothing else. ' +
@@ -549,7 +583,7 @@ ${dataPrompt}`,
     pageLabel: string,
   ): Promise<void> {
     const MAX_SCROLL_ROUNDS = 10;
-    const MAX_LLM_CALLS = 8;
+    const MAX_LLM_CALLS = 4;
     let llmCallCount = 0;
     let totalProgrammaticFills = 0;
 
@@ -564,9 +598,6 @@ ${dataPrompt}`,
     await adapter.page.evaluate(() => window.scrollTo(0, 0));
     await adapter.page.waitForTimeout(500);
 
-    // Dismiss error banners (if platform supports it)
-    await this.dismissErrorBanners(adapter);
-
     // Round 1: DOM-first fill, then LLM for remaining fields
     console.log(`[SmartApply] [${pageLabel}] Round 1: DOM fill pass...`);
     if (Object.keys(qaMap).length > 0) {
@@ -576,8 +607,10 @@ ${dataPrompt}`,
         totalProgrammaticFills += programmaticFilled;
       }
     }
-    await config.fillDateFieldsProgrammatically(adapter, qaMap);
-    await config.checkRequiredCheckboxes(adapter);
+    const dateFillsR1 = await config.fillDateFieldsProgrammatically(adapter, qaMap);
+    totalProgrammaticFills += dateFillsR1;
+    const cbFillsR1 = await config.checkRequiredCheckboxes(adapter);
+    totalProgrammaticFills += cbFillsR1;
 
     const needsLLM = await config.hasEmptyVisibleFields(adapter);
     if (needsLLM && llmCallCount < MAX_LLM_CALLS) {
@@ -585,13 +618,10 @@ ${dataPrompt}`,
       const filledSummary = await this.getFilledFieldsSummary(adapter);
       const promptWithState = filledSummary ? `${filledSummary}\n${fillPrompt}` : fillPrompt;
       console.log(`[SmartApply] [${pageLabel}] LLM filling remaining fields (round 1, call ${llmCallCount + 1}/${MAX_LLM_CALLS})...`);
-      await this.protectFilledFields(adapter);
       try {
-        await adapter.act(promptWithState);
+        await this.safeAct(adapter, promptWithState, pageLabel);
       } catch (actError) {
         console.warn(`[SmartApply] [${pageLabel}] LLM act() failed: ${actError instanceof Error ? actError.message : actError}`);
-      } finally {
-        try { await this.unprotectFields(adapter); } catch { /* page may have navigated */ }
       }
       llmCallCount++;
     } else if (llmCallCount >= MAX_LLM_CALLS) {
@@ -600,21 +630,40 @@ ${dataPrompt}`,
       console.log(`[SmartApply] [${pageLabel}] All visible fields filled — skipping LLM.`);
     }
 
+    // EARLY EXIT: If round 1 found no standard form fields at all (no empty fields,
+    // no programmatic fills, no LLM call needed), this page likely has no fillable
+    // content (e.g. SMS Notifications, preferences, terms). Call LLM once for any
+    // custom UI elements, then return — don't scroll past nav buttons into broken territory.
+    if (llmCallCount === 0 && totalProgrammaticFills === 0) {
+      console.log(`[SmartApply] [${pageLabel}] No standard form fields detected — calling LLM once for custom UI...`);
+      await adapter.page.evaluate(() => window.scrollTo(0, 0));
+      await adapter.page.waitForTimeout(500);
+      try {
+        await this.safeAct(adapter, fillPrompt, pageLabel);
+      } catch (actError) {
+        console.warn(`[SmartApply] [${pageLabel}] LLM act() failed: ${actError instanceof Error ? actError.message : actError}`);
+      }
+      llmCallCount++;
+      console.log(`[SmartApply] [${pageLabel}] Page complete (no-scroll path). Total LLM calls: ${llmCallCount}`);
+      return;
+    }
+
     // Scroll-and-fill loop
+    let consecutiveEmptyRounds = 0;
     for (let round = 2; round <= MAX_SCROLL_ROUNDS; round++) {
       const scrollBefore = await adapter.page.evaluate(() => window.scrollY);
-      const scrollMax = await adapter.page.evaluate(
-        () => document.documentElement.scrollHeight - window.innerHeight,
-      );
+      const scrollMax = await this.getContentScrollMax(adapter);
 
       if (scrollBefore >= scrollMax - 10) {
-        console.log(`[SmartApply] [${pageLabel}] Reached bottom of page.`);
+        console.log(`[SmartApply] [${pageLabel}] Reached content boundary.`);
         break;
       }
 
-      // Scroll down 65% of viewport
-      await adapter.page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.65)));
-      await adapter.page.waitForTimeout(800);
+      // Scroll down 65% of viewport — smooth scroll so SPA frameworks can render
+      await adapter.page.evaluate(() =>
+        window.scrollBy({ top: Math.round(window.innerHeight * 0.65), behavior: 'smooth' }),
+      );
+      await adapter.page.waitForTimeout(1200);
 
       const scrollAfter = await adapter.page.evaluate(() => window.scrollY);
       if (scrollAfter <= scrollBefore) {
@@ -625,50 +674,48 @@ ${dataPrompt}`,
       console.log(`[SmartApply] [${pageLabel}] Scrolled to ${scrollAfter}px (round ${round})...`);
 
       // DOM-first fills
+      let roundHadWork = false;
       if (Object.keys(qaMap).length > 0) {
         const programmaticFilled = await config.fillDropdownsProgrammatically(adapter, qaMap);
         if (programmaticFilled > 0) {
           console.log(`[SmartApply] [${pageLabel}] Programmatically filled ${programmaticFilled} dropdown(s)`);
           totalProgrammaticFills += programmaticFilled;
+          roundHadWork = true;
         }
       }
-      await config.fillDateFieldsProgrammatically(adapter, qaMap);
-      await config.checkRequiredCheckboxes(adapter);
+      const dateFills = await config.fillDateFieldsProgrammatically(adapter, qaMap);
+      if (dateFills > 0) roundHadWork = true;
+      const cbFills = await config.checkRequiredCheckboxes(adapter);
+      if (cbFills > 0) roundHadWork = true;
 
       if (llmCallCount >= MAX_LLM_CALLS) {
         console.log(`[SmartApply] [${pageLabel}] LLM call limit reached (${MAX_LLM_CALLS}) — skipping for round ${round}.`);
-        continue;
-      }
-      const stillNeedsLLM = await config.hasEmptyVisibleFields(adapter);
-      if (stillNeedsLLM) {
-        await config.centerNextEmptyField(adapter);
-        const filledSummary = await this.getFilledFieldsSummary(adapter);
-        const promptWithState = filledSummary ? `${filledSummary}\n${fillPrompt}` : fillPrompt;
-        console.log(`[SmartApply] [${pageLabel}] LLM filling remaining fields (round ${round}, call ${llmCallCount + 1}/${MAX_LLM_CALLS})...`);
-        await this.protectFilledFields(adapter);
-        try { await adapter.act(promptWithState); } finally { await this.unprotectFields(adapter); }
-        llmCallCount++;
       } else {
-        console.log(`[SmartApply] [${pageLabel}] All visible fields filled — skipping LLM.`);
+        const stillNeedsLLM = await config.hasEmptyVisibleFields(adapter);
+        if (stillNeedsLLM) {
+          await config.centerNextEmptyField(adapter);
+          const filledSummary = await this.getFilledFieldsSummary(adapter);
+          const promptWithState = filledSummary ? `${filledSummary}\n${fillPrompt}` : fillPrompt;
+          console.log(`[SmartApply] [${pageLabel}] LLM filling remaining fields (round ${round}, call ${llmCallCount + 1}/${MAX_LLM_CALLS})...`);
+          await this.safeAct(adapter, promptWithState, pageLabel);
+          llmCallCount++;
+          roundHadWork = true;
+        } else {
+          console.log(`[SmartApply] [${pageLabel}] All visible fields filled — skipping LLM.`);
+        }
       }
-    }
 
-    // GUARANTEE: Always call the LLM at least once per page.
-    // DOM checks only detect standard HTML form elements (<input>, <select>, radio buttons).
-    // Many sites use custom UI components (card selectors, toggle switches, styled buttons
-    // representing choices) that only the LLM can see and interact with visually.
-    // If we never called the LLM and had no programmatic fills, the page likely has
-    // non-standard interactive elements that need LLM attention.
-    if (llmCallCount === 0 && totalProgrammaticFills === 0) {
-      console.log(`[SmartApply] [${pageLabel}] No fields detected by DOM — calling LLM once to handle any custom UI elements...`);
-      await adapter.page.evaluate(() => window.scrollTo(0, 0));
-      await adapter.page.waitForTimeout(500);
-      try {
-        await adapter.act(fillPrompt);
-      } catch (actError) {
-        console.warn(`[SmartApply] [${pageLabel}] LLM act() failed: ${actError instanceof Error ? actError.message : actError}`);
+      // Stop scrolling if multiple consecutive rounds found nothing to fill.
+      // Prevents scrolling past navigation buttons into broken page territory.
+      if (!roundHadWork) {
+        consecutiveEmptyRounds++;
+        if (consecutiveEmptyRounds >= 2) {
+          console.log(`[SmartApply] [${pageLabel}] ${consecutiveEmptyRounds} consecutive empty scroll rounds — stopping.`);
+          break;
+        }
+      } else {
+        consecutiveEmptyRounds = 0;
       }
-      llmCallCount++;
     }
 
     console.log(`[SmartApply] [${pageLabel}] Page complete. Total LLM calls: ${llmCallCount}`);
@@ -691,9 +738,12 @@ ${dataPrompt}`,
     const MAX_RETRIES = 3;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-      // Scroll to bottom where the navigation button lives
-      await adapter.page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
-      await adapter.page.waitForTimeout(800);
+      // Scroll to bottom of content area (not raw scrollHeight) where the nav button lives
+      const navScrollTarget = await this.getContentScrollMax(adapter);
+      await adapter.page.evaluate((target: number) =>
+        window.scrollTo({ top: target, behavior: 'smooth' }),
+      navScrollTarget);
+      await adapter.page.waitForTimeout(1000);
 
       const urlBefore = await adapter.getCurrentUrl();
       console.log(`[SmartApply] [${pageLabel}] Clicking Next (attempt ${attempt})...`);
@@ -707,10 +757,11 @@ ${dataPrompt}`,
       // If DOM couldn't find a Next button, use LLM as fallback
       if (clickResult === 'not_found') {
         console.log(`[SmartApply] [${pageLabel}] No Next button found via DOM — trying LLM fallback...`);
-        await adapter.act(
+        await this.safeAct(adapter,
           'Click the button that advances to the next step of the application. ' +
-          'Look for buttons labeled "Next", "Continue", "Proceed", "Save and Continue", "Review", or similar. ' +
-          'Do NOT click "Submit" or "Submit Application". Report done after clicking.',
+          'Look for buttons labeled "Next", "Continue", "Proceed", "Save and Continue", "Skip and Continue", "Skip & Continue", "Review", or similar. ' +
+          'Do NOT click "Submit" or "Submit Application". Do NOT click sidebar navigation links. Report done after clicking.',
+          pageLabel,
         );
       }
 
@@ -754,7 +805,7 @@ ${dataPrompt}`,
       await adapter.page.waitForTimeout(500);
 
       // Use LLM to handle errors — shorter prompt that focuses on the task
-      await adapter.act(
+      await this.safeAct(adapter,
         `Validation errors are showing on this page. Fix them:
 1. If there are clickable error links at the top, click each one to jump to the missing field.
 2. Fill the missing/invalid field with the correct value from the data mapping.
@@ -762,18 +813,19 @@ ${dataPrompt}`,
 Report the task as done when all visible errors are addressed.
 
 ${fillPrompt}`,
+        pageLabel,
       );
 
       // Programmatic scroll pass to catch anything the LLM missed
       for (let scrollPass = 0; scrollPass < 5; scrollPass++) {
         const before = await adapter.page.evaluate(() => window.scrollY);
-        const max = await adapter.page.evaluate(
-          () => document.documentElement.scrollHeight - window.innerHeight,
-        );
+        const max = await this.getContentScrollMax(adapter);
         if (before >= max - 10) break;
 
-        await adapter.page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.65)));
-        await adapter.page.waitForTimeout(800);
+        await adapter.page.evaluate(() =>
+          window.scrollBy({ top: Math.round(window.innerHeight * 0.65), behavior: 'smooth' }),
+        );
+        await adapter.page.waitForTimeout(1200);
 
         const after = await adapter.page.evaluate(() => window.scrollY);
         if (after <= before) break;
@@ -785,10 +837,11 @@ ${fillPrompt}`,
 
         const hasEmpty = await config.hasEmptyVisibleFields(adapter);
         if (hasEmpty) {
-          await adapter.act(
+          await this.safeAct(adapter,
             `Fill any empty required fields visible on screen (marked with * or highlighted in red). If all fields are filled, report the task as done.
 
 ${fillPrompt}`,
+            pageLabel,
           );
         }
       }
@@ -936,6 +989,7 @@ ${fillPrompt}`,
 
     try {
       console.log('[SmartApply] Verifying review page classification with LLM...');
+      await this.throttleLlm(adapter);
       const result = await adapter.extract(
         `Look at this page carefully. I need to determine if this is the FINAL review/summary page of a job application, or if there are still more steps to complete.
 
@@ -964,55 +1018,6 @@ Set is_final_review to true ONLY if this is genuinely the last page before submi
       // so we don't prematurely stop the application
       return false;
     }
-  }
-
-  /**
-   * Make filled text fields readonly so the LLM agent physically cannot corrupt them.
-   * This is the strongest defense against the LLM re-typing into already-filled fields.
-   * Fields are tagged with data-gh-protected so we can restore them after the act() call.
-   */
-  private async protectFilledFields(adapter: BrowserAutomationAdapter): Promise<void> {
-    const count = await adapter.page.evaluate(() => {
-      let protected_count = 0;
-      const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
-        'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="number"], input:not([type]), textarea'
-      );
-      for (const input of inputs) {
-        if (!input.value || input.value.trim() === '') continue;
-        if (input.readOnly) continue;
-        if (input.type === 'hidden') continue;
-        // Don't protect fields with very short values — likely just a prefix
-        // (e.g. "+1" country code, "Mr" title) not a complete answer
-        if (input.value.trim().length < 4) continue;
-        const rect = input.getBoundingClientRect();
-        if (rect.width < 20 || rect.height < 10) continue;
-        // Don't protect inputs inside dropdowns (they need to be typeable for filtering)
-        if (input.closest('[role="listbox"], [role="combobox"]')) continue;
-        const style = window.getComputedStyle(input);
-        if (style.display === 'none' || style.visibility === 'hidden') continue;
-
-        input.setAttribute('data-gh-protected', 'true');
-        input.readOnly = true;
-        protected_count++;
-      }
-      return protected_count;
-    });
-    if (count > 0) {
-      console.log(`[SmartApply] Protected ${count} filled field(s) as readonly`);
-    }
-  }
-
-  /**
-   * Remove readonly protection from fields we previously locked.
-   */
-  private async unprotectFields(adapter: BrowserAutomationAdapter): Promise<void> {
-    await adapter.page.evaluate(() => {
-      const protectedEls = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('[data-gh-protected="true"]');
-      for (const el of protectedEls) {
-        el.readOnly = false;
-        el.removeAttribute('data-gh-protected');
-      }
-    });
   }
 
   /**
@@ -1072,20 +1077,196 @@ Set is_final_review to true ONLY if this is genuinely the last page before submi
   }
 
   /**
-   * Dismiss error banners so the LLM doesn't get distracted by them.
+   * Call adapter.act() with throttling, broken-page guard, and 429 retry.
+   * - Enforces minimum gap between LLM calls to stay under rate limits
+   * - Checks page health before sending screenshots (broken pages waste tokens)
+   * - Retries once on 429 with a 30s backoff (the rate limit window is per-minute)
    */
-  private async dismissErrorBanners(adapter: BrowserAutomationAdapter): Promise<void> {
-    await adapter.page.evaluate(() => {
-      // Hide common error banner patterns
-      const errorBanners = document.querySelectorAll(
-        '[data-automation-id="errorMessage"], [role="alert"]'
-      );
-      errorBanners.forEach(el => (el as HTMLElement).style.display = 'none');
-      // Click "Errors Found" collapse buttons
-      const errorSections = Array.from(document.querySelectorAll('button, [role="button"]'))
-        .filter(el => el.textContent?.includes('Errors Found'));
-      errorSections.forEach(el => (el as HTMLElement).click());
-    });
-    await adapter.page.waitForTimeout(300);
+  private async safeAct(
+    adapter: BrowserAutomationAdapter,
+    prompt: string,
+    label: string,
+  ): Promise<void> {
+    // Check page health — don't waste tokens on broken pages showing raw JS
+    const healthy = await this.isPageHealthy(adapter);
+    if (!healthy) {
+      console.warn(`[SmartApply] [${label}] Page appears broken (raw JS/code visible) — skipping LLM call to save tokens.`);
+      return;
+    }
+
+    // Enforce minimum gap between LLM calls
+    await this.throttleLlm(adapter);
+
+    try {
+      await adapter.act(prompt);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes('429') || msg.includes('rate_limit') || msg.includes('Too Many Requests')) {
+        console.warn(`[SmartApply] [${label}] Rate limited (429) — waiting 30s before retry...`);
+        await adapter.page.waitForTimeout(30_000);
+        this.lastLlmCallTime = Date.now();
+        await adapter.act(prompt);
+        return;
+      }
+      throw error;
+    }
   }
+
+  /**
+   * Generate a fingerprint of the visible page content for SPA stuck detection.
+   * On SPAs where the URL never changes, this detects actual page transitions
+   * by comparing headings, form field count, and active sidebar items.
+   */
+  private async getPageFingerprint(adapter: BrowserAutomationAdapter): Promise<string> {
+    return adapter.page.evaluate(() => {
+      // First visible heading
+      const h = document.querySelector('h1, h2, h3');
+      const heading = (h?.textContent || '').trim().substring(0, 60);
+
+      // Count visible form fields as a content signature
+      const fields = document.querySelectorAll('input:not([type="hidden"]), select, textarea');
+      let visibleFieldCount = 0;
+      for (const f of fields) {
+        const rect = f.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) visibleFieldCount++;
+      }
+
+      // Active sidebar/step indicator (common in multi-step forms)
+      const activeSelectors = [
+        '[aria-current="step"]', '[aria-current="true"]',
+        '.active-step', '.current-step',
+        'li.active', 'a.active',
+        '[class*="activeSection"]', '[class*="currentSection"]',
+      ];
+      let activeText = '';
+      for (const sel of activeSelectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+          activeText = (el.textContent || '').trim().substring(0, 40);
+          break;
+        }
+      }
+
+      return `${heading}|fields:${visibleFieldCount}|active:${activeText}`;
+    });
+  }
+
+  /**
+   * Calculate the maximum safe scroll position based on actual visible content,
+   * NOT raw document.scrollHeight. On SPAs (React/Next.js) like Amazon.jobs,
+   * scrollHeight includes <script> tags and framework boilerplate past the
+   * rendered content. Scrolling into that territory shows raw JavaScript.
+   * This finds the bottom edge of the last meaningful UI element and uses
+   * that as the content boundary — matching what manual scrolling would reach.
+   */
+  private async getContentScrollMax(adapter: BrowserAutomationAdapter): Promise<number> {
+    return adapter.page.evaluate(() => {
+      const elements = document.querySelectorAll(
+        'button, [role="button"], input, select, textarea, a[href], label, h1, h2, h3, h4, p, li, td, th, img, [role="listbox"], [role="combobox"]'
+      );
+      let maxBottom = 0;
+      for (const el of elements) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        const bottom = rect.bottom + window.scrollY;
+        if (bottom > maxBottom) maxBottom = bottom;
+      }
+      // Use content boundary + buffer, capped at actual scroll height
+      const contentLimit = maxBottom > 0
+        ? Math.min(maxBottom + 150, document.documentElement.scrollHeight)
+        : document.documentElement.scrollHeight;
+      return Math.max(0, contentLimit - window.innerHeight);
+    });
+  }
+
+  /**
+   * Check if the visible page content is healthy (actual UI) vs broken (raw JS/source code).
+   * On SPAs, rendering glitches can expose raw JavaScript, minified bundles, or JSON in the
+   * viewport. Sending a screenshot of dense code to the LLM is extremely expensive (a single
+   * screenshot of minified JS can burn 5-10k+ vision tokens). This checks the visible text
+   * for code-like patterns and returns false if the page looks broken.
+   */
+  private async isPageHealthy(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    return adapter.page.evaluate(() => {
+      // Sample visible text in the viewport
+      const viewportHeight = window.innerHeight;
+      const elements = document.elementsFromPoint(window.innerWidth / 2, viewportHeight / 2);
+
+      // Get all text visible in the viewport by checking elements in the viewport region
+      let visibleText = '';
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let node: Text | null;
+      let textNodes = 0;
+      while ((node = walker.nextNode() as Text | null)) {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const rect = range.getBoundingClientRect();
+        // Only check text in the current viewport
+        if (rect.bottom < 0 || rect.top > viewportHeight) continue;
+        if (rect.width === 0 || rect.height === 0) continue;
+        visibleText += node.textContent + ' ';
+        textNodes++;
+        if (visibleText.length > 5000) break; // Sample enough text
+      }
+
+      if (visibleText.length < 200) return true; // Not enough text to judge — assume healthy
+
+      // Count code-like patterns
+      const codePatterns = [
+        /\bfunction\s*\(/g, /\bconst\s+\w+/g, /\bvar\s+\w+/g, /\blet\s+\w+/g,
+        /\bimport\s+/g, /\bexport\s+/g, /\brequire\s*\(/g, /\bmodule\.exports/g,
+        /=>\s*\{/g, /\}\s*\)/g, /\bclass\s+\w+/g, /\bnew\s+\w+/g,
+        /\btry\s*\{/g, /\bcatch\s*\(/g, /\bthrow\s+/g,
+        /\bif\s*\(/g, /\belse\s*\{/g, /\breturn\s+/g,
+        /\bwindow\./g, /\bdocument\./g, /\bconsole\./g,
+        /[{};]\s*[{};]/g, // dense punctuation typical of minified JS
+      ];
+
+      let codeHits = 0;
+      for (const pattern of codePatterns) {
+        const matches = visibleText.match(pattern);
+        if (matches) codeHits += matches.length;
+      }
+
+      // Count UI-like elements in viewport (buttons, inputs, labels, headings)
+      const uiElements = document.querySelectorAll(
+        'button, [role="button"], input:not([type="hidden"]), select, textarea, label, h1, h2, h3, h4, img'
+      );
+      let visibleUiCount = 0;
+      for (const el of uiElements) {
+        const rect = el.getBoundingClientRect();
+        if (rect.bottom < 0 || rect.top > viewportHeight) continue;
+        if (rect.width > 0 && rect.height > 0) visibleUiCount++;
+      }
+
+      // Heuristic: if code patterns significantly outnumber UI elements, page is broken
+      // A healthy form page typically has >5 UI elements and <5 code patterns
+      // A broken page showing JS typically has 20+ code patterns and <3 UI elements
+      if (codeHits >= 15 && visibleUiCount < 3) return false;
+      if (codeHits >= 10 && codeHits > visibleUiCount * 3) return false;
+
+      return true;
+    });
+  }
+
+  /**
+   * Enforce a minimum gap between LLM calls to stay under rate limits.
+   * The Magnitude SDK makes multiple internal LLM calls per act()/extract(),
+   * so we need breathing room between our calls.
+   */
+  private async throttleLlm(adapter: BrowserAutomationAdapter): Promise<void> {
+    const now = Date.now();
+    const elapsed = now - this.lastLlmCallTime;
+    if (this.lastLlmCallTime > 0 && elapsed < MIN_LLM_GAP_MS) {
+      const wait = MIN_LLM_GAP_MS - elapsed;
+      console.log(`[SmartApply] Rate limit throttle: waiting ${wait}ms before next LLM call...`);
+      await adapter.page.waitForTimeout(wait);
+    }
+    this.lastLlmCallTime = Date.now();
+  }
+
+  // Note: dismissErrorBanners was removed. Hiding [role="alert"] elements via
+  // style.display='none' breaks React's DOM reconciliation on SPAs. Error banners
+  // are left visible — the LLM prompt already instructs it to fix errors, not get
+  // distracted by them.
 }
