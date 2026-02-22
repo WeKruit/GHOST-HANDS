@@ -44,7 +44,7 @@ ENV COMMIT_SHA=${COMMIT_SHA}
 ENV BUILD_TIME=${BUILD_TIME}
 ENV IMAGE_TAG=${IMAGE_TAG}
 
-# Install system dependencies for Patchright/Chromium
+# Install system dependencies for Patchright/Chromium + VNC stack
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
@@ -68,6 +68,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libwayland-client0 \
     fonts-noto-color-emoji \
     fonts-liberation \
+    xvfb \
+    x11vnc \
+    novnc \
+    websockify \
+    procps \
     && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -93,8 +98,9 @@ COPY --from=build /app/packages/ghosthands/dist ./packages/ghosthands/dist
 COPY --from=build /app/packages/ghosthands/src ./packages/ghosthands/src
 COPY --from=build /app/packages/ghosthands/package.json ./packages/ghosthands/
 
-# Copy scripts (deploy-server, docker-client, ecr-auth, container-configs)
+# Copy scripts (deploy-server, docker-client, ecr-auth, container-configs, VNC)
 COPY --from=build /app/scripts ./scripts
+RUN chmod +x scripts/start-vnc.sh scripts/docker-entrypoint.sh
 # Note: bun hoists all dependencies to root node_modules/, so
 # packages/ghosthands/node_modules/ typically doesn't exist.
 
@@ -107,5 +113,8 @@ USER ghosthands
 RUN bunx patchright install chromium
 
 # Default: start API server
-EXPOSE 3100
+# Expose API (3100) + noVNC web viewer (6080)
+EXPOSE 3100 6080
+
+ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
 CMD ["bun", "packages/ghosthands/src/api/server.ts"]
