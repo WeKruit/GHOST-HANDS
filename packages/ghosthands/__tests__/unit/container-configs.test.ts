@@ -148,7 +148,7 @@ describe('Container Configs Module', () => {
     test('all containers use the same ECR image built from the image tag', () => {
       const services = getServiceConfigs('staging-abc123', 'staging');
       const expectedImage =
-        '471112621974.dkr.ecr.us-east-1.amazonaws.com/wekruit/ghosthands:staging-abc123';
+        '168495702277.dkr.ecr.us-east-1.amazonaws.com/ghosthands:staging-abc123';
 
       for (const svc of services) {
         expect(svc.config.Image).toBe(expectedImage);
@@ -232,8 +232,7 @@ describe('Container Configs Module', () => {
       test('runs bun with correct command', () => {
         expect(getApiService().config.Cmd).toEqual([
           'bun',
-          'run',
-          'packages/ghosthands/dist/api/server.js',
+          'packages/ghosthands/src/api/server.ts',
         ]);
       });
     });
@@ -249,7 +248,7 @@ describe('Container Configs Module', () => {
       });
 
       test('has drain endpoint on port 3101', () => {
-        expect(getWorkerService().drainEndpoint).toBe('http://localhost:3101/drain');
+        expect(getWorkerService().drainEndpoint).toBe('http://localhost:3101/worker/drain');
       });
 
       test('has GH_WORKER_PORT=3101 in env', () => {
@@ -277,7 +276,7 @@ describe('Container Configs Module', () => {
       });
 
       test('has health endpoint on port 3101', () => {
-        expect(getWorkerService().healthEndpoint).toBe('http://localhost:3101/health');
+        expect(getWorkerService().healthEndpoint).toBe('http://localhost:3101/worker/health');
       });
 
       test('has 60-second drain timeout', () => {
@@ -333,7 +332,6 @@ describe('Container Configs Module', () => {
       test('runs deploy-server.ts script', () => {
         expect(getDeployService().config.Cmd).toEqual([
           'bun',
-          'run',
           '/opt/ghosthands/scripts/deploy-server.ts',
         ]);
       });
@@ -376,7 +374,7 @@ describe('Container Configs Module', () => {
       test('builds correct ECR image reference from tag', () => {
         const services = getServiceConfigs('prod-v1.2.3', 'production');
         const expectedImage =
-          '471112621974.dkr.ecr.us-east-1.amazonaws.com/wekruit/ghosthands:prod-v1.2.3';
+          '168495702277.dkr.ecr.us-east-1.amazonaws.com/ghosthands:prod-v1.2.3';
 
         expect(services[0].config.Image).toBe(expectedImage);
       });

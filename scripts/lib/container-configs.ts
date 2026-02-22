@@ -15,8 +15,9 @@
 import * as fs from 'fs';
 import type { ContainerCreateConfig } from './docker-client';
 
-/** ECR registry base URL */
-const ECR_REGISTRY = '471112621974.dkr.ecr.us-east-1.amazonaws.com/wekruit/ghosthands';
+/** ECR registry base URL — reads from env, falls back to account default */
+const ECR_REGISTRY = process.env.ECR_REGISTRY ?? '168495702277.dkr.ecr.us-east-1.amazonaws.com';
+const ECR_REPOSITORY = process.env.ECR_REPOSITORY ?? 'ghosthands';
 
 /** Path to .env file on the EC2 host */
 const ENV_FILE_PATH = '/opt/ghosthands/.env';
@@ -70,7 +71,7 @@ export function loadEnvFile(path: string): string[] {
  * @returns Full ECR image URI
  */
 function buildEcrImage(imageTag: string): string {
-  return `${ECR_REGISTRY}:${imageTag}`;
+  return `${ECR_REGISTRY}/${ECR_REPOSITORY}:${imageTag}`;
 }
 
 /**
@@ -81,7 +82,7 @@ function buildApiService(ecrImage: string, envVars: string[]): ServiceDefinition
     name: 'ghosthands-api',
     config: {
       Image: ecrImage,
-      Cmd: ['bun', 'run', 'packages/ghosthands/dist/api/server.js'],
+      Cmd: ['bun', 'packages/ghosthands/src/api/server.ts'],
       Env: [...envVars, 'GH_API_PORT=3100'],
       HostConfig: {
         NetworkMode: 'host',
@@ -112,7 +113,7 @@ function buildWorkerService(ecrImage: string, envVars: string[]): ServiceDefinit
     name: 'ghosthands-worker',
     config: {
       Image: ecrImage,
-      Cmd: ['bun', 'run', 'packages/ghosthands/dist/workers/start.js'],
+      Cmd: ['bun', 'packages/ghosthands/src/workers/main.ts'],
       Env: [...envVars, 'GH_WORKER_PORT=3101', 'MAX_CONCURRENT_JOBS=1'],
       HostConfig: {
         NetworkMode: 'host',
@@ -125,9 +126,9 @@ function buildWorkerService(ecrImage: string, envVars: string[]): ServiceDefinit
         'gh.managed': 'true',
       },
     },
-    healthEndpoint: 'http://localhost:3101/health',
+    healthEndpoint: 'http://localhost:3101/worker/health',
     healthTimeout: 30_000,
-    drainEndpoint: 'http://localhost:3101/drain',
+    drainEndpoint: 'http://localhost:3101/worker/drain',
     drainTimeout: 60_000,
     skipOnSelfUpdate: false,
     startOrder: 2,
@@ -143,13 +144,14 @@ function buildDeployServerService(ecrImage: string, envVars: string[]): ServiceD
     name: 'ghosthands-deploy-server',
     config: {
       Image: ecrImage,
-      Cmd: ['bun', 'run', '/opt/ghosthands/scripts/deploy-server.ts'],
-      Env: [...envVars, 'GH_DEPLOY_PORT=8000'],
+      Cmd: ['bun', '/opt/ghosthands/scripts/deploy-server.ts'],
+      Env: [...envVars, 'GH_DEPLOY_PORT=8000', 'DOCKER_CONFIG_PATH=/home/ghosthands/.docker/config.json'],
       HostConfig: {
         NetworkMode: 'host',
         Binds: [
           '/opt/ghosthands:/opt/ghosthands:ro',
           '/var/run/docker.sock:/var/run/docker.sock',
+          '/home/ubuntu/.docker/config.json:/home/ghosthands/.docker/config.json:ro',
         ],
         RestartPolicy: {
           Name: 'unless-stopped',
