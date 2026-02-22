@@ -20,20 +20,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="/opt/ghosthands/scripts"
 LOG_FILE="/var/log/gh-disk-cleanup.log"
 CRON_MARKER="# gh-disk-cleanup"
+SOURCE_SCRIPT="${SCRIPT_DIR}/disk-cleanup.sh"
 
 echo "[setup] Installing GhostHands disk cleanup cron..."
 
-# ── 1. Create install directory ───────────────────────────────────────
+# ── 1. Verify source script exists ────────────────────────────────────
+
+if [ ! -f "${SOURCE_SCRIPT}" ]; then
+  echo "[setup] ERROR: ${SOURCE_SCRIPT} not found" >&2
+  echo "[setup] Make sure disk-cleanup.sh is in the same directory as this script" >&2
+  exit 1
+fi
+
+# ── 2. Create install directory ───────────────────────────────────────
 
 mkdir -p "${INSTALL_DIR}"
 
-# ── 2. Copy cleanup script ───────────────────────────────────────────
+# ── 3. Copy cleanup script ───────────────────────────────────────────
 
-cp "${SCRIPT_DIR}/disk-cleanup.sh" "${INSTALL_DIR}/disk-cleanup.sh"
+cp "${SOURCE_SCRIPT}" "${INSTALL_DIR}/disk-cleanup.sh"
 chmod +x "${INSTALL_DIR}/disk-cleanup.sh"
 echo "[setup] Installed ${INSTALL_DIR}/disk-cleanup.sh"
 
-# ── 3. Install cron job (idempotent) ──────────────────────────────────
+# ── 4. Install cron job (idempotent) ──────────────────────────────────
 
 CRON_LINE="0 3 * * * ${INSTALL_DIR}/disk-cleanup.sh >> ${LOG_FILE} 2>&1 ${CRON_MARKER}"
 
@@ -42,7 +51,7 @@ CRON_LINE="0 3 * * * ${INSTALL_DIR}/disk-cleanup.sh >> ${LOG_FILE} 2>&1 ${CRON_M
 echo "[setup] Cron job installed: daily at 3 AM UTC"
 echo "[setup] Cron entry: ${CRON_LINE}"
 
-# ── 4. Set up logrotate ──────────────────────────────────────────────
+# ── 5. Set up logrotate ──────────────────────────────────────────────
 
 cat > /etc/logrotate.d/gh-disk-cleanup <<EOF
 ${LOG_FILE} {
@@ -57,12 +66,12 @@ ${LOG_FILE} {
 EOF
 echo "[setup] Logrotate config installed at /etc/logrotate.d/gh-disk-cleanup"
 
-# ── 5. Create initial log file ────────────────────────────────────────
+# ── 6. Create initial log file ────────────────────────────────────────
 
 touch "${LOG_FILE}"
 chmod 644 "${LOG_FILE}"
 
-# ── 6. Verify ─────────────────────────────────────────────────────────
+# ── 7. Verify ─────────────────────────────────────────────────────────
 
 echo ""
 echo "[setup] Installation complete!"

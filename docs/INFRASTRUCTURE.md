@@ -315,6 +315,27 @@ sudo /opt/ghosthands/scripts/disk-cleanup.sh
 df -h /
 ```
 
+### Trigger Cleanup via API (All Instances)
+
+The deploy-server exposes `POST /cleanup` (requires `X-Deploy-Secret`). Use this to trigger cleanup on any instance without SSH — works across the whole fleet:
+
+```bash
+# Single instance
+curl -X POST http://<instance-ip>:8000/cleanup \
+  -H "X-Deploy-Secret: $GH_DEPLOY_SECRET"
+
+# All ASG instances (discover IPs, hit each)
+aws ec2 describe-instances \
+  --filters "Name=tag:aws:autoscaling:groupName,Values=ghosthands-worker-asg" \
+            "Name=instance-state-name,Values=running" \
+  --query 'Reservations[].Instances[].PublicIpAddress' --output text \
+| tr '\t' '\n' | while read -r ip; do
+    echo "Cleaning $ip..."
+    curl -sf -X POST "http://${ip}:8000/cleanup" \
+      -H "X-Deploy-Secret: $GH_DEPLOY_SECRET" || echo "FAILED: $ip"
+  done
+```
+
 ### For Golden AMI
 
 When baking a new Golden AMI, run `setup-cleanup-cron.sh` before creating the image so all new ASG instances get the cron automatically.
