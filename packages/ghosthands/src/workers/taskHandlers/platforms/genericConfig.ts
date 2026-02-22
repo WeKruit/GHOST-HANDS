@@ -6,14 +6,17 @@ import type { PlatformConfig, PageState, PageType } from './types.js';
 // Base rules (generic — works for most ATS platforms)
 // ---------------------------------------------------------------------------
 
-const GENERIC_BASE_RULES = `RULES:
-1. FILL empty fields visible on screen using the data below. Work top to bottom.
-2. SKIP fields that already show text or a selection.
-3. You MAY click dropdowns, radio buttons, checkboxes, "Add Another", "Upload", and other form controls needed to fill fields.
-4. DO NOT click navigation buttons: Next, Continue, Submit, Save, Submit Application, or similar. I handle page navigation.
-5. DO NOT scroll — no mouse wheel, no scroll actions, no dragging scrollbars. I handle all scrolling.
-6. DO NOT navigate to a URL, reload the page, or use the address bar.
-7. When all visible empty fields are filled (or have no matching data), report done.`;
+const GENERIC_BASE_RULES = `YOUR ROLE: You are a form-filling assistant. Your ONLY job is to type data into the empty fields currently visible on screen. Nothing else. A separate system handles scrolling, page navigation, and detecting new fields. You NEVER need to worry about what is off-screen or on the next page.
+
+RULES:
+1. FILL empty fields CURRENTLY VISIBLE on screen using the data below. Work top to bottom.
+2. SKIP fields that already have text or a selection.
+3. SKIP fields that have no matching data (e.g. Middle Name, Address Line 2) — do NOT try to find them or navigate to them.
+4. You MAY click dropdowns, radio buttons, checkboxes, "Add Another", "Upload", and other form controls to fill fields.
+5. DO NOT click Next, Continue, Submit, Save, or any navigation button. Another system handles that.
+6. DO NOT scroll, press Tab to navigate, or try to discover more fields. Another system handles that.
+7. DO NOT navigate to a URL, reload the page, or use the address bar.
+8. When every visible empty field is filled (or has no matching data), IMMEDIATELY report done. Do not look for more fields.`;
 
 const FIELD_INTERACTION_RULES = `HOW TO FILL:
 - Text fields: Click, type the value, click away to deselect.
