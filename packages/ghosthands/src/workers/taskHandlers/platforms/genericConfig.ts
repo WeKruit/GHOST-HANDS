@@ -7,11 +7,12 @@ import type { PlatformConfig, PageState, PageType } from './types.js';
 // ---------------------------------------------------------------------------
 
 const GENERIC_BASE_RULES = `RULES:
-1. SCROLLING — You may scroll down if you need to reach form fields that are below the current viewport. Scroll in small increments (about half the screen). Do NOT scroll back up to revisit fields you already filled.
+1. NO SCROLLING — Do NOT scroll the page. I handle all scrolling for you. The viewport has already been positioned to show the fields you need to fill. Only interact with what is currently visible on screen.
 2. ONE ATTEMPT PER FIELD — Fill each field once, then move to the next. If it looks empty after you typed, trust your input was registered. Retyping causes duplicates (e.g. "WuWuWu" instead of "Wu").
-3. NO PAGE NAVIGATION — Do not click "Next", "Continue", "Submit", "Save and Continue", or any button that moves to the next page/step. I handle page navigation. However, you MAY click buttons within the form like "Add Another", "Add Work Experience", "Add Education", "Upload", or similar buttons that add sections or expand fields on the current page.
+3. NO PAGE NAVIGATION — Do not click "Next", "Continue", "Submit", "Save and Continue", or any button that moves to the next page/step. Do NOT click sidebar navigation links, section headers, or progress bar steps to jump to different sections — I handle all navigation between sections. ABSOLUTELY DO NOT navigate to a URL, reload the page, use the browser address bar, or use browser back/forward. Never use the browser:nav action. You MAY click buttons within the form like "Add Another", "Add Work Experience", "Add Education", "Upload", or similar buttons that add sections or expand fields on the current page.
 4. TRUST FILLED FIELDS — If a field shows any text, it is already filled. Narrow fields truncate long values visually (e.g. "alexanderwgu..." for a full email address). Never click on, clear, or retype a field that already shows text.
-5. SIGNAL COMPLETION — When all visible fields are filled (or none need filling), report the task as done. Do not keep searching for more work.`;
+5. SIGNAL COMPLETION — When all visible fields are filled (or none need filling), report the task as done immediately. Do not scroll looking for more fields — I will scroll for you and call you again if there are more fields below.
+6. BROKEN PAGE — If the page shows raw JavaScript, source code, a blank screen, or looks completely broken, report the task as done immediately. Do NOT try to fix it, navigate away, or reload. I will handle the situation.`;
 
 const FIELD_INTERACTION_RULES = `HOW TO FILL FIELDS:
 - Text fields: Click the field, type the value from the data mapping, then click empty space to deselect.
@@ -143,6 +144,14 @@ export class GenericPlatformConfig implements PlatformConfig {
 
     if (signals.hasSignInWithGoogle || (signals.hasSignIn && !signals.hasApplyButton && !signals.hasFormInputs)) {
       return { page_type: 'login', page_title: 'Sign-In', has_sign_in_with_google: signals.hasSignInWithGoogle };
+    }
+
+    // If page has form inputs and none of the special types matched above,
+    // classify as a form page. This avoids the ~2,050 token LLM classification
+    // call for obvious form pages. All form types (personal_info, questions,
+    // experience) go through the same fillWithSmartScroll path on generic sites.
+    if (signals.hasFormInputs) {
+      return { page_type: 'questions', page_title: 'Form Page' };
     }
 
     return null;
@@ -408,7 +417,20 @@ ${dataBlock}`;
             if (!select) return;
             const option = Array.from(select.options).find(o => o.text.trim() === value);
             if (option) {
-              select.value = option.value;
+              // Use the NATIVE value setter to bypass React's override on the value property.
+              // React intercepts `select.value = x` via a custom setter. If we use it directly,
+              // React's internal state is NOT updated and the value reverts on the next re-render.
+              // The native setter writes directly to the DOM, then the dispatched events propagate
+              // through React's event delegation so React picks up the change.
+              const nativeSetter = Object.getOwnPropertyDescriptor(
+                HTMLSelectElement.prototype, 'value'
+              )?.set;
+              if (nativeSetter) {
+                nativeSetter.call(select, option.value);
+              } else {
+                select.value = option.value;
+              }
+              select.dispatchEvent(new Event('input', { bubbles: true }));
               select.dispatchEvent(new Event('change', { bubbles: true }));
             }
           },
@@ -438,7 +460,17 @@ ${dataBlock}`;
         // Check if this looks like a "today's date" or "signature date" field
         const label = (input.getAttribute('aria-label') || input.name || '').toLowerCase();
         if (label.includes('today') || label.includes('signature') || label.includes('current')) {
-          input.value = new Date().toISOString().split('T')[0];
+          // Use the NATIVE value setter so React picks up the change
+          const nativeSetter = Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype, 'value'
+          )?.set;
+          const newValue = new Date().toISOString().split('T')[0];
+          if (nativeSetter) {
+            nativeSetter.call(input, newValue);
+          } else {
+            input.value = newValue;
+          }
+          input.dispatchEvent(new Event('input', { bubbles: true }));
           input.dispatchEvent(new Event('change', { bubbles: true }));
           filled++;
         }
@@ -572,7 +604,7 @@ ${dataBlock}`;
     // esbuild's --keep-names injects __name() wrappers that don't exist in the browser context.
     return adapter.page.evaluate(() => {
       const NEXT_TEXTS = ['next', 'continue', 'proceed', 'review application', 'review my application', 'go to next step', 'next step'];
-      const NEXT_INCLUDES = ['save and continue', 'save & continue'];
+      const NEXT_INCLUDES = ['save and continue', 'save & continue', 'skip and continue', 'skip & continue'];
 
       const buttons = Array.from(document.querySelectorAll<HTMLButtonElement | HTMLAnchorElement>(
         'button, [role="button"], input[type="submit"], a.btn'
@@ -607,20 +639,46 @@ ${dataBlock}`;
 
   async detectValidationErrors(adapter: BrowserAutomationAdapter): Promise<boolean> {
     return adapter.page.evaluate(() => {
-      const bodyText = document.body.innerText.toLowerCase();
-      // Look for common error patterns
-      const errorPatterns = [
-        'required field', 'this field is required', 'please fill', 'please enter',
-        'please select', 'error', 'invalid', 'must be completed',
+      // Strategy: Only detect REAL validation errors by checking for visible elements
+      // whose text content contains actual error language. Avoid false positives from
+      // React error boundaries, hidden error containers, or generic class names.
+
+      const ERROR_TEXT_PATTERNS = [
+        'required', 'this field is required', 'please fill', 'please enter',
+        'please select', 'invalid', 'must be completed', 'cannot be blank',
+        'is not valid', 'must provide', 'missing required',
       ];
-      // Check for visible error elements
+
+      // Check specific error role elements and common error CSS classes
+      // NOTE: Intentionally NOT using [class*="error"] — it matches React internals,
+      // error boundary wrappers, and other false positives on SPAs like Amazon.jobs.
       const errorEls = document.querySelectorAll(
-        '[role="alert"], .error, .field-error, .validation-error, .form-error, [class*="error"]'
+        '[role="alert"], .field-error, .validation-error, .form-error, .input-error, .error-message'
       );
       for (const el of errorEls) {
         const rect = (el as HTMLElement).getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0 && el.textContent?.trim()) return true;
+        if (rect.width === 0 || rect.height === 0) continue;
+        const text = (el.textContent || '').trim().toLowerCase();
+        if (!text || text.length > 500) continue; // Skip empty or suspiciously large elements
+        // Must contain actual error language
+        if (ERROR_TEXT_PATTERNS.some(p => text.includes(p))) return true;
       }
+
+      // Also check for red-bordered inputs (common validation indicator)
+      const inputs = document.querySelectorAll('input, select, textarea');
+      for (const input of inputs) {
+        const rect = (input as HTMLElement).getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+        const style = window.getComputedStyle(input as HTMLElement);
+        // Check for red border (common error indicator)
+        const borderColor = style.borderColor;
+        if (borderColor && (borderColor.includes('rgb(255, 0') || borderColor.includes('rgb(220, 53') || borderColor.includes('rgb(239, 68'))) {
+          // Only count if the input also has aria-invalid
+          if ((input as HTMLElement).getAttribute('aria-invalid') === 'true') return true;
+        }
+      }
+
       return false;
     });
   }
