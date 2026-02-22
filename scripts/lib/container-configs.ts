@@ -144,14 +144,13 @@ function buildDeployServerService(ecrImage: string, envVars: string[]): ServiceD
     name: 'ghosthands-deploy-server',
     config: {
       Image: ecrImage,
-      Cmd: ['bun', '/opt/ghosthands/scripts/deploy-server.ts'],
-      Env: [...envVars, 'GH_DEPLOY_PORT=8000', 'DOCKER_CONFIG_PATH=/home/ghosthands/.docker/config.json'],
+      Cmd: ['bun', 'scripts/deploy-server.ts'],
+      Env: [...envVars, 'GH_DEPLOY_PORT=8000'],
       HostConfig: {
         NetworkMode: 'host',
         Binds: [
           '/opt/ghosthands:/opt/ghosthands:ro',
           '/var/run/docker.sock:/var/run/docker.sock',
-          '/home/ubuntu/.docker/config.json:/home/ghosthands/.docker/config.json:ro',
         ],
         RestartPolicy: {
           Name: 'unless-stopped',
