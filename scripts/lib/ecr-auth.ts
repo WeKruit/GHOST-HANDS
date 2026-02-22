@@ -1,14 +1,17 @@
 /**
  * ECR Authentication Module
  *
- * Provides programmatic authentication to Amazon ECR using the AWS SDK.
- * Replaces `aws ecr get-login-password` CLI calls with native SDK calls.
- * Uses IAM instance profile credentials (no hardcoded secrets).
+ * Reads Docker registry auth from the host's Docker config.json file
+ * (mounted into the container). This avoids the @aws-sdk/client-ecr
+ * dependency which is not available in the runtime Docker image.
+ *
+ * The host must run `aws ecr get-login-password | docker login` periodically
+ * (cron every 6h) to keep the token fresh. ECR tokens are valid for 12 hours.
  *
  * @module scripts/lib/ecr-auth
  */
 
-import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
+import { readFileSync } from 'node:fs';
 
 /**
  * ECR authorization token for Docker registry authentication.
@@ -19,28 +22,22 @@ import { ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
 export interface EcrAuthToken {
   /** Base64-encoded Docker auth config for X-Registry-Auth header */
   token: string;
-  /** Token expiration timestamp (from ECR API) */
+  /** Token expiration timestamp (estimated — config.json has no expiry field) */
   expiresAt: Date;
-  /** Registry URL without protocol (e.g., "471112621974.dkr.ecr.us-east-1.amazonaws.com") */
+  /** Registry URL without protocol (e.g., "168495702277.dkr.ecr.us-east-1.amazonaws.com") */
   registryUrl: string;
 }
 
 /**
- * Default AWS region for ECR
+ * Default ECR registry URL (read from ECR_REGISTRY env or auto-detected from config.json)
  */
-const DEFAULT_REGION = 'us-east-1';
+const DEFAULT_REGISTRY = process.env.ECR_REGISTRY ?? '';
 
 /**
- * Default ECR registry URL
- * Account: 471112621974, Region: us-east-1
+ * Path to Docker config.json inside the container (mounted from host).
+ * Override with DOCKER_CONFIG_PATH env var.
  */
-const DEFAULT_REGISTRY = '471112621974.dkr.ecr.us-east-1.amazonaws.com';
-
-/**
- * Token buffer before expiry (30 minutes)
- * Tokens from ECR are valid for 12 hours; we refresh when less than this buffer remains.
- */
-const EXPIRY_BUFFER_MS = 30 * 60 * 1000;
+const DOCKER_CONFIG_PATH = process.env.DOCKER_CONFIG_PATH ?? '/root/.docker/config.json';
 
 /**
  * In-memory cached token
@@ -48,63 +45,77 @@ const EXPIRY_BUFFER_MS = 30 * 60 * 1000;
 let cachedToken: EcrAuthToken | null = null;
 
 /**
- * Retrieves an ECR authorization token for Docker registry authentication.
- *
- * Uses IAM instance profile credentials (discovered from IMDS) - no explicit
- * credentials needed. Tokens are cached in-memory with a 30-minute pre-expiry buffer.
- *
- * @param region - AWS region override (defaults to AWS_REGION env var or us-east-1)
- * @returns ECR authorization token
- * @throws Error if ECR API call fails or returns invalid data
- *
- * @example
- * ```ts
- * import { getEcrAuth } from './scripts/lib/ecr-auth';
- * import { pullImage } from './scripts/lib/docker-client';
- *
- * const auth = await getEcrAuth();
- * await pullImage('471112621974.dkr.ecr.us-east-1.amazonaws.com/wekruit/ghosthands', 'v1.2.3', auth.token);
- * ```
+ * Cache TTL — re-read config.json every 30 minutes to pick up refreshed tokens.
  */
-export async function getEcrAuth(region?: string): Promise<EcrAuthToken> {
-  // Return cached token if still valid (30-min buffer before 12-hour expiry)
-  if (cachedToken && cachedToken.expiresAt.getTime() - Date.now() > EXPIRY_BUFFER_MS) {
+const CACHE_TTL_MS = 30 * 60 * 1000;
+
+interface DockerConfig {
+  auths?: Record<string, { auth?: string }>;
+}
+
+/**
+ * Retrieves an ECR authorization token by reading Docker's config.json.
+ *
+ * The host must have a valid ECR login (via `aws ecr get-login-password | docker login`).
+ * A cron job refreshes this every 6 hours.
+ *
+ * @returns ECR authorization token
+ * @throws Error if config.json is missing, unreadable, or has no ECR auth entry
+ */
+export async function getEcrAuth(): Promise<EcrAuthToken> {
+  // Return cached token if still fresh
+  if (cachedToken && cachedToken.expiresAt.getTime() - Date.now() > 0) {
     return cachedToken;
   }
 
-  const resolvedRegion = region ?? process.env.AWS_REGION ?? DEFAULT_REGION;
-  const client = new ECRClient({ region: resolvedRegion });
-  const cmd = new GetAuthorizationTokenCommand({});
-
   try {
-    const response = await client.send(cmd);
+    const configRaw = readFileSync(DOCKER_CONFIG_PATH, 'utf-8');
+    const config: DockerConfig = JSON.parse(configRaw);
 
-    const authData = response.authorizationData?.[0];
-    if (!authData?.authorizationToken || !authData.proxyEndpoint) {
-      throw new Error('Failed to get ECR authorization token: invalid response from ECR API');
+    if (!config.auths) {
+      throw new Error(`No 'auths' section in ${DOCKER_CONFIG_PATH}`);
     }
 
-    // ECR returns base64("AWS:<password>") — Docker API needs base64 JSON config
-    // Format: base64 JSON with username, password, serveraddress
-    const decoded = Buffer.from(authData.authorizationToken, 'base64').toString('utf-8');
-    const [username, password] = decoded.split(':');
+    // Find the ECR registry entry (matches *.dkr.ecr.*.amazonaws.com)
+    let registryUrl = '';
+    let authB64 = '';
 
-    if (!password) {
-      throw new Error('Failed to parse ECR authorization token: invalid format');
+    for (const [registry, entry] of Object.entries(config.auths)) {
+      if (registry.includes('.dkr.ecr.') && registry.includes('.amazonaws.com') && entry.auth) {
+        registryUrl = registry;
+        authB64 = entry.auth;
+        break;
+      }
     }
+
+    if (!registryUrl || !authB64) {
+      throw new Error(`No ECR auth entry found in ${DOCKER_CONFIG_PATH}`);
+    }
+
+    // config.json stores base64("AWS:<token>") — Docker Engine API needs
+    // base64(JSON({ username, password, serveraddress }))
+    const decoded = Buffer.from(authB64, 'base64').toString('utf-8');
+    const colonIdx = decoded.indexOf(':');
+    if (colonIdx === -1) {
+      throw new Error('Invalid Docker auth format: expected "username:password"');
+    }
+
+    const username = decoded.substring(0, colonIdx);
+    const password = decoded.substring(colonIdx + 1);
 
     const dockerAuth = Buffer.from(
       JSON.stringify({
         username,
         password,
-        serveraddress: authData.proxyEndpoint,
+        serveraddress: `https://${registryUrl}`,
       }),
     ).toString('base64');
 
     cachedToken = {
       token: dockerAuth,
-      expiresAt: authData.expiresAt ?? new Date(Date.now() + 12 * 60 * 60 * 1000),
-      registryUrl: authData.proxyEndpoint.replace('https://', ''),
+      // Re-read from config.json after CACHE_TTL_MS (actual ECR token lasts 12h)
+      expiresAt: new Date(Date.now() + CACHE_TTL_MS),
+      registryUrl,
     };
 
     return cachedToken;
@@ -118,17 +129,7 @@ export async function getEcrAuth(region?: string): Promise<EcrAuthToken> {
 
 /**
  * Clears the in-memory ECR token cache.
- *
- * Primarily used for testing - forces the next call to `getEcrAuth()`
- * to fetch a fresh token from ECR.
- *
- * @example
- * ```ts
- * import { clearEcrAuthCache, getEcrAuth } from './scripts/lib/ecr-auth';
- *
- * clearEcrAuthCache();
- * const freshAuth = await getEcrAuth(); // Fetches new token
- * ```
+ * Forces the next call to `getEcrAuth()` to re-read config.json.
  */
 export function clearEcrAuthCache(): void {
   cachedToken = null;
@@ -137,18 +138,18 @@ export function clearEcrAuthCache(): void {
 /**
  * Gets the full ECR image reference for the GhostHands image.
  *
- * @param tag - Image tag (e.g., 'v1.2.3', 'latest')
- * @returns Full image reference (e.g., '471112621974.dkr.ecr.us-east-1.amazonaws.com/wekruit/ghosthands:v1.2.3')
- *
- * @example
- * ```ts
- * import { getEcrImageRef } from './scripts/lib/ecr-auth';
- *
- * const imageRef = getEcrImageRef('v1.2.3');
- * // => '471112621974.dkr.ecr.us-east-1.amazonaws.com/wekruit/ghosthands:v1.2.3'
- * ```
+ * @param tag - Image tag (e.g., 'staging-abc1234', 'latest')
+ * @returns Full image reference (e.g., '168495702277.dkr.ecr.us-east-1.amazonaws.com/ghosthands:staging-abc1234')
  */
 export function getEcrImageRef(tag: string): string {
-  const registry = process.env.ECR_REGISTRY ?? DEFAULT_REGISTRY;
-  return `${registry}/wekruit/ghosthands:${tag}`;
+  const repository = process.env.ECR_REPOSITORY ?? 'ghosthands';
+  const registry = DEFAULT_REGISTRY;
+  if (!registry) {
+    // If ECR_REGISTRY not set, try to discover from cached auth
+    if (cachedToken?.registryUrl) {
+      return `${cachedToken.registryUrl}/${repository}:${tag}`;
+    }
+    throw new Error('ECR_REGISTRY env var not set and no cached auth available. Call getEcrAuth() first.');
+  }
+  return `${registry}/${repository}:${tag}`;
 }

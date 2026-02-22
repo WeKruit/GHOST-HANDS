@@ -40,9 +40,10 @@ import {
   removeContainer,
   createContainer,
   startContainer,
+  listContainers,
   pruneImages,
 } from './lib/docker-client';
-import { getEcrAuth } from './lib/ecr-auth';
+import { getEcrAuth, getEcrImageRef } from './lib/ecr-auth';
 import { getServiceConfigs, type ServiceDefinition } from './lib/container-configs';
 
 const DEPLOY_PORT = parseInt(process.env.GH_DEPLOY_PORT || '8000', 10);
@@ -182,9 +183,10 @@ async function executeDeploy(imageTag: string): Promise<DeployResult | DeployFai
 
     // 2. Pull new image
     if (currentDeploy) currentDeploy.step = 'pull-image';
-    const fullImage = `${ecrAuth.registryUrl}/wekruit/ghosthands`;
-    console.log(`[deploy] Pulling image: ${fullImage}:${imageTag}`);
-    await pullImage(fullImage, imageTag, ecrAuth.token);
+    const fullImageRef = getEcrImageRef(imageTag);
+    const [imageName, tag] = fullImageRef.split(':') as [string, string];
+    console.log(`[deploy] Pulling image: ${fullImageRef}`);
+    await pullImage(imageName, tag, ecrAuth.token);
     console.log(`[deploy] Image pulled successfully`);
 
     // 3. Get service configs
@@ -192,8 +194,11 @@ async function executeDeploy(imageTag: string): Promise<DeployResult | DeployFai
     const services = getServiceConfigs(imageTag, currentEnvironment);
     console.log(`[deploy] Loaded ${services.length} service configs (env: ${currentEnvironment})`);
 
-    // 4. Stop phase (respect stopOrder — lower numbers stop first)
+    // 4. Stop phase — find ALL matching containers (docker-compose or deploy-server created)
+    //    Docker-compose names: ghosthands-api-1, ghosthands-worker-1
+    //    Deploy-server names: ghosthands-api, ghosthands-worker
     if (currentDeploy) currentDeploy.step = 'stop-services';
+    const allContainers = await listContainers(true);
     const stopOrder = [...services].sort((a, b) => a.stopOrder - b.stopOrder);
     for (const service of stopOrder) {
       if (service.skipOnSelfUpdate) {
@@ -201,25 +206,47 @@ async function executeDeploy(imageTag: string): Promise<DeployResult | DeployFai
         continue;
       }
 
-      console.log(`[deploy] Stopping ${service.name} (stopOrder: ${service.stopOrder})`);
+      // Find all containers whose name starts with the service name
+      // Docker names have a leading "/" in the API response
+      const matching = allContainers.filter((c) => {
+        const names: string[] = (c as Record<string, unknown>).Names as string[] ?? [];
+        return names.some((n: string) => {
+          const clean = n.replace(/^\//, '');
+          return clean === service.name || clean.startsWith(service.name + '-');
+        });
+      });
 
-      // Drain if endpoint exists
-      if (service.drainEndpoint) {
-        await drainService(service.drainEndpoint, service.drainTimeout);
+      if (matching.length === 0) {
+        console.log(`[deploy] No existing container found for ${service.name}`);
+        continue;
       }
 
-      try {
-        await stopContainer(service.name, 30);
-        await removeContainer(service.name);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[deploy] Failed to stop/remove ${service.name}: ${msg}`);
-        return {
-          success: false,
-          error: `Failed to stop service: ${msg}`,
-          failedStep: 'stop-services',
-          failedService: service.name,
-        };
+      for (const container of matching) {
+        const cName = ((container as Record<string, unknown>).Names as string[])?.[0]?.replace(/^\//, '') ?? 'unknown';
+        const cId = (container as Record<string, unknown>).Id as string;
+        console.log(`[deploy] Stopping ${cName} (${cId.slice(0, 12)})`);
+
+        // Drain if endpoint exists and container is running
+        const state = (container as Record<string, unknown>).State as string;
+        if (service.drainEndpoint && state === 'running') {
+          await drainService(service.drainEndpoint, service.drainTimeout);
+        }
+
+        try {
+          if (state === 'running') {
+            await stopContainer(cId, 30);
+          }
+          await removeContainer(cId);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[deploy] Failed to stop/remove ${cName}: ${msg}`);
+          return {
+            success: false,
+            error: `Failed to stop service: ${msg}`,
+            failedStep: 'stop-services',
+            failedService: service.name,
+          };
+        }
       }
     }
 

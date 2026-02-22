@@ -2,266 +2,221 @@
  * WEK-83: ECR Authentication Module Tests
  *
  * Unit tests for the ECR auth module (scripts/lib/ecr-auth.ts).
- * All tests mock the AWS SDK to avoid real ECR API calls.
+ * Uses real temp files instead of vi.mock('fs') because Bun runs all test files
+ * in the same process and vi.mock leaks across files (same pattern as container-configs.test.ts).
+ *
+ * The module reads DOCKER_CONFIG_PATH at import time, so we must set the env var
+ * BEFORE the module is first loaded. We use dynamic import() inside beforeAll to
+ * ensure correct ordering (Bun hoists static import above other statements).
  */
 
-import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, test, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 
-// Mock the AWS SDK before importing the module under test
-const mockSend = vi.fn();
+// Module functions — populated via dynamic import in beforeAll
+let getEcrAuth: typeof import('../../../../scripts/lib/ecr-auth').getEcrAuth;
+let clearEcrAuthCache: typeof import('../../../../scripts/lib/ecr-auth').clearEcrAuthCache;
+let getEcrImageRef: typeof import('../../../../scripts/lib/ecr-auth').getEcrImageRef;
 
-vi.mock('@aws-sdk/client-ecr', () => ({
-  ECRClient: vi.fn().mockImplementation(() => ({
-    send: mockSend,
-  })),
-  GetAuthorizationTokenCommand: vi.fn().mockImplementation((input) => ({
-    _input: input,
-  })),
-}));
-
-// Import after mocks are set up
-import { getEcrAuth, clearEcrAuthCache, getEcrImageRef } from '../../../../scripts/lib/ecr-auth';
+let tmpDir: string;
+let configPath: string;
 
 /**
- * Builds a mock ECR GetAuthorizationToken response.
- *
- * @param overrides - Properties to override in the response
- * @returns Mock ECR response matching AWS SDK shape
+ * Writes a mock Docker config.json to the temp file.
  */
-function buildMockEcrResponse(overrides: {
-  authorizationToken?: string | null;
-  proxyEndpoint?: string | null;
-  expiresAt?: Date | null;
-} = {}) {
-  // Default: base64("AWS:mock-password")
-  const defaultToken = Buffer.from('AWS:mock-password').toString('base64');
+function writeDockerConfig(overrides: {
+  registry?: string;
+  auth?: string | null;
+  extraAuths?: Record<string, { auth?: string }>;
+} = {}): void {
+  const registry = overrides.registry ?? '168495702277.dkr.ecr.us-east-1.amazonaws.com';
+  const auth = overrides.auth === null
+    ? undefined
+    : (overrides.auth ?? Buffer.from('AWS:mock-ecr-token').toString('base64'));
 
-  return {
-    authorizationData: [
-      {
-        authorizationToken: overrides.authorizationToken === null
-          ? undefined
-          : (overrides.authorizationToken ?? defaultToken),
-        proxyEndpoint: overrides.proxyEndpoint === null
-          ? undefined
-          : (overrides.proxyEndpoint ?? 'https://471112621974.dkr.ecr.us-east-1.amazonaws.com'),
-        expiresAt: overrides.expiresAt === null
-          ? undefined
-          : (overrides.expiresAt ?? new Date(Date.now() + 12 * 60 * 60 * 1000)),
-      },
-    ],
+  const auths: Record<string, { auth?: string }> = {
+    ...(overrides.extraAuths ?? {}),
   };
+
+  if (auth !== undefined) {
+    auths[registry] = { auth };
+  } else {
+    auths[registry] = {};
+  }
+
+  fs.writeFileSync(configPath, JSON.stringify({ auths }), 'utf-8');
 }
 
 describe('ECR Auth Module', () => {
+  const savedEnv: Record<string, string | undefined> = {};
+
+  beforeAll(async () => {
+    // Create temp dir and config path BEFORE importing the module
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gh-ecr-test-'));
+    configPath = path.join(tmpDir, 'config.json');
+
+    // Set env var so the module picks up our temp path
+    savedEnv.DOCKER_CONFIG_PATH = process.env.DOCKER_CONFIG_PATH;
+    savedEnv.ECR_REGISTRY = process.env.ECR_REGISTRY;
+    savedEnv.ECR_REPOSITORY = process.env.ECR_REPOSITORY;
+    process.env.DOCKER_CONFIG_PATH = configPath;
+    delete process.env.ECR_REGISTRY;
+    delete process.env.ECR_REPOSITORY;
+
+    // Dynamic import AFTER env is set — this ensures the module reads our temp path
+    const mod = await import('../../../../scripts/lib/ecr-auth');
+    getEcrAuth = mod.getEcrAuth;
+    clearEcrAuthCache = mod.clearEcrAuthCache;
+    getEcrImageRef = mod.getEcrImageRef;
+  });
+
   beforeEach(() => {
-    vi.clearAllMocks();
     clearEcrAuthCache();
+    delete process.env.ECR_REGISTRY;
+    delete process.env.ECR_REPOSITORY;
+    // Remove config file if it exists
+    try { fs.unlinkSync(configPath); } catch { /* ok */ }
   });
 
   afterEach(() => {
     clearEcrAuthCache();
   });
 
+  afterAll(() => {
+    // Restore env vars
+    for (const [key, val] of Object.entries(savedEnv)) {
+      if (val !== undefined) {
+        process.env[key] = val;
+      } else {
+        delete process.env[key];
+      }
+    }
+    // Clean up temp dir
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch { /* ok */ }
+  });
+
   describe('getEcrAuth', () => {
     test('returns correctly formatted Docker auth token (base64 JSON with username/password/serveraddress)', async () => {
-      mockSend.mockResolvedValueOnce(buildMockEcrResponse());
+      writeDockerConfig();
 
       const result = await getEcrAuth();
 
-      // The token should be base64-encoded JSON
       const decoded = JSON.parse(Buffer.from(result.token, 'base64').toString('utf-8'));
       expect(decoded).toHaveProperty('username', 'AWS');
-      expect(decoded).toHaveProperty('password', 'mock-password');
-      expect(decoded).toHaveProperty('serveraddress', 'https://471112621974.dkr.ecr.us-east-1.amazonaws.com');
+      expect(decoded).toHaveProperty('password', 'mock-ecr-token');
+      expect(decoded).toHaveProperty('serveraddress', 'https://168495702277.dkr.ecr.us-east-1.amazonaws.com');
     });
 
     test('returns registryUrl without https:// prefix', async () => {
-      mockSend.mockResolvedValueOnce(buildMockEcrResponse());
+      writeDockerConfig();
 
       const result = await getEcrAuth();
 
-      expect(result.registryUrl).toBe('471112621974.dkr.ecr.us-east-1.amazonaws.com');
+      expect(result.registryUrl).toBe('168495702277.dkr.ecr.us-east-1.amazonaws.com');
       expect(result.registryUrl).not.toContain('https://');
     });
 
-    test('returns expiresAt from ECR response', async () => {
-      const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000);
-      mockSend.mockResolvedValueOnce(buildMockEcrResponse({ expiresAt }));
-
-      const result = await getEcrAuth();
-
-      expect(result.expiresAt).toEqual(expiresAt);
-    });
-
-    test('defaults expiresAt to 12 hours from now when ECR response omits it', async () => {
+    test('returns expiresAt approximately 30 minutes from now (cache TTL)', async () => {
+      writeDockerConfig();
       const before = Date.now();
-      mockSend.mockResolvedValueOnce(buildMockEcrResponse({ expiresAt: null }));
 
       const result = await getEcrAuth();
       const after = Date.now();
 
-      // Should be approximately 12 hours from now (within 2 seconds tolerance)
-      const twelveHoursMs = 12 * 60 * 60 * 1000;
-      expect(result.expiresAt.getTime()).toBeGreaterThanOrEqual(before + twelveHoursMs - 2000);
-      expect(result.expiresAt.getTime()).toBeLessThanOrEqual(after + twelveHoursMs + 2000);
+      const thirtyMinMs = 30 * 60 * 1000;
+      expect(result.expiresAt.getTime()).toBeGreaterThanOrEqual(before + thirtyMinMs - 2000);
+      expect(result.expiresAt.getTime()).toBeLessThanOrEqual(after + thirtyMinMs + 2000);
     });
 
-    test('token caching: second call returns cached token without hitting ECR API', async () => {
-      // Token expires 12 hours from now (well within the 30-min buffer)
-      const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000);
-      mockSend.mockResolvedValueOnce(buildMockEcrResponse({ expiresAt }));
+    test('token caching: second call returns cached token without re-reading file', async () => {
+      writeDockerConfig();
 
       const first = await getEcrAuth();
+
+      // Overwrite the file with different content — if caching works, second call returns same token
+      writeDockerConfig({ auth: Buffer.from('AWS:different-token').toString('base64') });
+
       const second = await getEcrAuth();
 
-      // ECR API should only be called once
-      expect(mockSend).toHaveBeenCalledTimes(1);
-      // Both calls should return the same token
       expect(second.token).toBe(first.token);
       expect(second.expiresAt).toEqual(first.expiresAt);
     });
 
-    test('token refresh: expired token triggers new ECR API call', async () => {
-      // First token expires in 10 minutes (below the 30-min buffer)
-      const nearExpiry = new Date(Date.now() + 10 * 60 * 1000);
-      mockSend.mockResolvedValueOnce(buildMockEcrResponse({ expiresAt: nearExpiry }));
+    test('cache refresh: after clearing cache, re-reads file', async () => {
+      writeDockerConfig();
 
       const first = await getEcrAuth();
 
-      // Second call should detect the token is about to expire and fetch a new one
-      const freshExpiry = new Date(Date.now() + 12 * 60 * 60 * 1000);
-      const freshToken = Buffer.from('AWS:fresh-password').toString('base64');
-      mockSend.mockResolvedValueOnce(buildMockEcrResponse({
-        authorizationToken: freshToken,
-        expiresAt: freshExpiry,
-      }));
+      clearEcrAuthCache();
+
+      writeDockerConfig({ auth: Buffer.from('AWS:new-token').toString('base64') });
 
       const second = await getEcrAuth();
 
-      // ECR API should be called twice
-      expect(mockSend).toHaveBeenCalledTimes(2);
-      // The tokens should be different
       expect(second.token).not.toBe(first.token);
     });
 
-    test('token refresh: exactly at 30-minute buffer triggers refresh', async () => {
-      // Token expires in exactly 30 minutes (the buffer boundary) - should trigger refresh
-      const exactBuffer = new Date(Date.now() + 30 * 60 * 1000);
-      mockSend.mockResolvedValueOnce(buildMockEcrResponse({ expiresAt: exactBuffer }));
-
-      await getEcrAuth();
-
-      // Second call: the remaining time (30 min) is NOT greater than the buffer (30 min),
-      // so it should fetch a new token
-      mockSend.mockResolvedValueOnce(buildMockEcrResponse({
-        expiresAt: new Date(Date.now() + 12 * 60 * 60 * 1000),
-      }));
-
-      await getEcrAuth();
-
-      expect(mockSend).toHaveBeenCalledTimes(2);
-    });
-
-    test('error handling: ECR API returns no auth data throws descriptive error', async () => {
-      mockSend.mockResolvedValueOnce({
-        authorizationData: [],
-      });
+    test('error handling: config.json has no auths section throws descriptive error', async () => {
+      fs.writeFileSync(configPath, JSON.stringify({}), 'utf-8');
 
       await expect(getEcrAuth()).rejects.toThrow(/ECR authentication failed/);
     });
 
-    test('error handling: ECR API returns null authorizationToken throws descriptive error', async () => {
-      mockSend.mockResolvedValueOnce(buildMockEcrResponse({
-        authorizationToken: null,
-      }));
+    test('error handling: no ECR registry entry in config.json throws descriptive error', async () => {
+      fs.writeFileSync(configPath, JSON.stringify({
+        auths: {
+          'docker.io': { auth: Buffer.from('user:pass').toString('base64') },
+        },
+      }), 'utf-8');
 
-      await expect(getEcrAuth()).rejects.toThrow('ECR authentication failed');
+      await expect(getEcrAuth()).rejects.toThrow(/ECR authentication failed/);
     });
 
-    test('error handling: ECR API returns null proxyEndpoint throws descriptive error', async () => {
-      mockSend.mockResolvedValueOnce(buildMockEcrResponse({
-        proxyEndpoint: null,
-      }));
+    test('error handling: ECR entry with no auth field throws descriptive error', async () => {
+      writeDockerConfig({ auth: null });
 
-      await expect(getEcrAuth()).rejects.toThrow('ECR authentication failed');
+      await expect(getEcrAuth()).rejects.toThrow(/ECR authentication failed/);
     });
 
-    test('error handling: ECR API returns token with invalid format (no colon separator)', async () => {
-      const badToken = Buffer.from('no-colon-separator').toString('base64');
-      mockSend.mockResolvedValueOnce(buildMockEcrResponse({
-        authorizationToken: badToken,
-      }));
+    test('error handling: config.json with invalid auth format (no colon separator)', async () => {
+      const badAuth = Buffer.from('no-colon-separator').toString('base64');
+      writeDockerConfig({ auth: badAuth });
 
-      await expect(getEcrAuth()).rejects.toThrow(/ECR authentication failed.*invalid format/);
+      await expect(getEcrAuth()).rejects.toThrow(/ECR authentication failed/);
     });
 
-    test('error handling: ECR SDK throws error is wrapped with descriptive message', async () => {
-      mockSend.mockRejectedValueOnce(new Error('Network timeout'));
+    test('error handling: missing config file throws descriptive error', async () => {
+      // config file doesn't exist (we removed it in beforeEach)
 
-      await expect(getEcrAuth()).rejects.toThrow('ECR authentication failed: Network timeout');
+      await expect(getEcrAuth()).rejects.toThrow(/ECR authentication failed/);
     });
 
-    test('error handling: non-Error thrown by SDK is wrapped', async () => {
-      mockSend.mockRejectedValueOnce('string error');
+    test('finds ECR registry entry among multiple auths', async () => {
+      writeDockerConfig({
+        extraAuths: {
+          'docker.io': { auth: Buffer.from('docker:token').toString('base64') },
+          'ghcr.io': { auth: Buffer.from('gh:token').toString('base64') },
+        },
+      });
 
-      await expect(getEcrAuth()).rejects.toThrow('ECR authentication failed: unknown error');
-    });
-
-    test('uses AWS_REGION env var when no region argument provided', async () => {
-      const { ECRClient } = await import('@aws-sdk/client-ecr');
-      const originalRegion = process.env.AWS_REGION;
-      process.env.AWS_REGION = 'eu-west-1';
-
-      mockSend.mockResolvedValueOnce(buildMockEcrResponse());
-
-      await getEcrAuth();
-
-      expect(ECRClient).toHaveBeenCalledWith({ region: 'eu-west-1' });
-
-      // Restore
-      if (originalRegion !== undefined) {
-        process.env.AWS_REGION = originalRegion;
-      } else {
-        delete process.env.AWS_REGION;
-      }
-    });
-
-    test('region argument overrides AWS_REGION env var', async () => {
-      const { ECRClient } = await import('@aws-sdk/client-ecr');
-      const originalRegion = process.env.AWS_REGION;
-      process.env.AWS_REGION = 'eu-west-1';
-
-      mockSend.mockResolvedValueOnce(buildMockEcrResponse());
-
-      await getEcrAuth('ap-southeast-1');
-
-      expect(ECRClient).toHaveBeenCalledWith({ region: 'ap-southeast-1' });
-
-      // Restore
-      if (originalRegion !== undefined) {
-        process.env.AWS_REGION = originalRegion;
-      } else {
-        delete process.env.AWS_REGION;
-      }
+      const result = await getEcrAuth();
+      expect(result.registryUrl).toContain('.dkr.ecr.');
     });
   });
 
   describe('clearEcrAuthCache', () => {
-    test('resets cache so next getEcrAuth hits ECR API again', async () => {
-      const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000);
-      mockSend.mockResolvedValue(buildMockEcrResponse({ expiresAt }));
+    test('resets cache so next getEcrAuth re-reads file', async () => {
+      writeDockerConfig();
 
-      // First call populates cache
-      await getEcrAuth();
-      expect(mockSend).toHaveBeenCalledTimes(1);
+      const first = await getEcrAuth();
 
-      // Clear cache
       clearEcrAuthCache();
+      writeDockerConfig({ auth: Buffer.from('AWS:refreshed-token').toString('base64') });
 
-      // Second call should hit the API again
-      await getEcrAuth();
-      expect(mockSend).toHaveBeenCalledTimes(2);
+      const second = await getEcrAuth();
+      expect(second.token).not.toBe(first.token);
     });
 
     test('can be called when cache is already empty without error', () => {
@@ -270,40 +225,28 @@ describe('ECR Auth Module', () => {
   });
 
   describe('getEcrImageRef', () => {
-    test('returns full ECR image reference with tag', () => {
-      const ref = getEcrImageRef('v1.2.3');
-      expect(ref).toContain('/wekruit/ghosthands:v1.2.3');
-    });
-
-    test('uses default registry when ECR_REGISTRY env var is not set', () => {
-      const originalRegistry = process.env.ECR_REGISTRY;
+    test('uses cached registry URL from getEcrAuth', async () => {
       delete process.env.ECR_REGISTRY;
+      writeDockerConfig();
+
+      await getEcrAuth();
 
       const ref = getEcrImageRef('latest');
-      expect(ref).toBe('471112621974.dkr.ecr.us-east-1.amazonaws.com/wekruit/ghosthands:latest');
-
-      // Restore
-      if (originalRegistry !== undefined) {
-        process.env.ECR_REGISTRY = originalRegistry;
-      }
+      expect(ref).toBe('168495702277.dkr.ecr.us-east-1.amazonaws.com/ghosthands:latest');
     });
 
-    test('uses ECR_REGISTRY env var when set', () => {
-      const originalRegistry = process.env.ECR_REGISTRY;
-      process.env.ECR_REGISTRY = 'custom.ecr.registry.com';
+    test('throws when ECR_REGISTRY not set and no cached auth', () => {
+      delete process.env.ECR_REGISTRY;
+      clearEcrAuthCache();
 
-      const ref = getEcrImageRef('staging-abc123');
-      expect(ref).toBe('custom.ecr.registry.com/wekruit/ghosthands:staging-abc123');
-
-      // Restore
-      if (originalRegistry !== undefined) {
-        process.env.ECR_REGISTRY = originalRegistry;
-      } else {
-        delete process.env.ECR_REGISTRY;
-      }
+      expect(() => getEcrImageRef('latest')).toThrow(/ECR_REGISTRY/);
     });
 
-    test('handles special characters in tag', () => {
+    test('handles special characters in tag', async () => {
+      delete process.env.ECR_REGISTRY;
+      writeDockerConfig();
+      await getEcrAuth();
+
       const ref = getEcrImageRef('staging-abc123-special.tag');
       expect(ref).toContain(':staging-abc123-special.tag');
     });
