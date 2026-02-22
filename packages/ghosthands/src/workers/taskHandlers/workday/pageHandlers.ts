@@ -19,14 +19,191 @@ import {
   buildPersonalInfoPrompt,
   buildFormPagePrompt,
   buildExperiencePrompt,
+  buildExperienceEntryPrompt,
   buildVoluntaryDisclosurePrompt,
   buildSelfIdentifyPrompt,
   buildGenericPagePrompt,
+  type SelfIdFields,
 } from './workdayPrompts.js';
 import { handleGoogleSignIn } from './googleSignIn.js';
 import { fillWithSmartScroll } from './smartScroll.js';
 import { centerNextEmptyField } from './domFillers.js';
 import { waitForPageLoad, clickNextWithErrorRecovery } from './navigation.js';
+
+// --- DOM Helpers ---
+
+/**
+ * Find and click the "Add" button for a specific section (e.g. "Work Experience", "Education").
+ *
+ * Two-phase approach:
+ *   1. DOM scan: find the button, tag it with data-gh-add-target, scroll it into view.
+ *   2. Playwright click: use real mouse events (Workday's React handlers ignore JS .click()).
+ *
+ * Matches button text: "Add", "Add Another", "Add Work Experience", etc.
+ */
+async function clickSectionAddButton(
+  adapter: BrowserAutomationAdapter,
+  sectionLabel: string,
+): Promise<boolean> {
+  const logger = getLogger();
+  const labelLower = sectionLabel.toLowerCase();
+
+  // Phase 1: DOM scan — heading-first approach.
+  // Find the section heading, then find the nearest Add button after it in DOM order.
+  // This prevents matching a Work Experience Add button when looking for Education.
+  const found = await adapter.page.evaluate(`
+    (() => {
+      var label = "${labelLower}";
+      // Remove any stale tag from a prior call
+      var old = document.querySelector('[data-gh-add-target]');
+      if (old) old.removeAttribute('data-gh-add-target');
+
+      // Step 1: Find all headings and buttons in DOM order using TreeWalker
+      var walker = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_ELEMENT,
+        { acceptNode: function(n) {
+          var tag = n.tagName;
+          if (tag === 'BUTTON' || tag === 'H2' || tag === 'H3' || tag === 'H4' || tag === 'H5') {
+            return NodeFilter.FILTER_ACCEPT;
+          }
+          return NodeFilter.FILTER_SKIP;
+        }}
+      );
+
+      var elements = [];
+      var el;
+      while (el = walker.nextNode()) { elements.push(el); }
+
+      // Step 2: Find the LAST heading that matches our section label
+      var lastHeadingIndex = -1;
+      for (var i = 0; i < elements.length; i++) {
+        var tag = elements[i].tagName;
+        if (tag !== 'BUTTON') {
+          var text = (elements[i].textContent || '').toLowerCase();
+          if (text.includes(label)) { lastHeadingIndex = i; }
+        }
+      }
+      if (lastHeadingIndex === -1) return false;
+
+      // Step 3: Starting after the heading, find the first Add button.
+      // Stop if we hit a heading for a DIFFERENT section (means we've left our section).
+      var knownSections = ['work experience', 'education', 'skills', 'websites', 'certifications'];
+      for (var j = lastHeadingIndex + 1; j < elements.length; j++) {
+        var el = elements[j];
+        if (el.tagName !== 'BUTTON') {
+          // It's a heading — check if it belongs to a different section
+          var headText = (el.textContent || '').toLowerCase();
+          var isDifferentSection = false;
+          for (var s = 0; s < knownSections.length; s++) {
+            if (knownSections[s] !== label && headText.includes(knownSections[s])) {
+              isDifferentSection = true;
+              break;
+            }
+          }
+          if (isDifferentSection) break; // Left our section
+          continue;
+        }
+        // It's a button
+        var btnText = (el.textContent || '').trim().toLowerCase();
+        if (!btnText.startsWith('add')) continue;
+        var rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+
+        el.setAttribute('data-gh-add-target', 'true');
+        el.scrollIntoView({ block: 'center', behavior: 'instant' });
+        return true;
+      }
+      return false;
+    })()
+  `) as boolean;
+
+  if (!found) return false;
+
+  // Phase 2: Playwright click — real mouse events that trigger Workday's React handlers
+  try {
+    const btn = adapter.page.locator('[data-gh-add-target="true"]');
+    await btn.click({ timeout: 3000 });
+    logger.info('Clicked Add button via Playwright', { section: sectionLabel });
+  } catch {
+    // Fallback to DOM click if Playwright can't reach it
+    await adapter.page.evaluate(() => {
+      const el = document.querySelector('[data-gh-add-target="true"]') as HTMLElement;
+      if (el) el.click();
+    });
+    logger.info('Clicked Add button via DOM fallback', { section: sectionLabel });
+  }
+
+  // Clean up tag
+  await adapter.page.evaluate(() => {
+    const el = document.querySelector('[data-gh-add-target]');
+    if (el) el.removeAttribute('data-gh-add-target');
+  });
+
+  return true;
+}
+
+/**
+ * After clicking "Add" for a section, scroll to the newly created empty entry fields.
+ * Finds the LAST empty text input within/near the section (the newest entry) and
+ * scrolls it into view. Falls back to scrolling the section heading into view.
+ */
+async function scrollToNewEntryFields(
+  adapter: BrowserAutomationAdapter,
+  sectionLabel: string,
+): Promise<void> {
+  const labelLower = sectionLabel.toLowerCase();
+
+  await adapter.page.evaluate(`
+    (() => {
+      var label = "${labelLower}";
+
+      // Find the section container by looking for headings that mention the label
+      var headings = document.querySelectorAll('h2, h3, h4, h5, legend, [data-automation-id]');
+      var sectionEl = null;
+      for (var i = 0; i < headings.length; i++) {
+        var text = (headings[i].textContent || '').toLowerCase();
+        if (text.includes(label)) {
+          // Walk up a few levels to find the section container
+          sectionEl = headings[i].parentElement;
+          for (var u = 0; u < 5 && sectionEl; u++) {
+            // A good container has multiple inputs inside it
+            var inputs = sectionEl.querySelectorAll('input[type="text"], input:not([type]), textarea');
+            if (inputs.length >= 2) break;
+            sectionEl = sectionEl.parentElement;
+          }
+          break;
+        }
+      }
+
+      // Find the FIRST empty text input in the section (the newly created entry's first field)
+      var searchArea = sectionEl || document.body;
+      var inputs = searchArea.querySelectorAll('input[type="text"], input:not([type]), textarea');
+      var firstEmpty = null;
+      for (var j = 0; j < inputs.length; j++) {
+        var inp = inputs[j];
+        if (inp.disabled || inp.readOnly || inp.type === 'hidden') continue;
+        var rect = inp.getBoundingClientRect();
+        if (rect.width < 20 || rect.height < 10) continue;
+        var ph = (inp.placeholder || '').toUpperCase();
+        if (ph === 'MM' || ph === 'DD' || ph === 'YYYY') continue;
+        if (inp.closest('[role="listbox"]')) continue;
+        if (!inp.value || inp.value.trim() === '') {
+          firstEmpty = inp;
+          break;
+        }
+      }
+
+      if (firstEmpty) {
+        firstEmpty.scrollIntoView({ block: 'center', behavior: 'instant' });
+      } else if (sectionEl) {
+        sectionEl.scrollIntoView({ block: 'center', behavior: 'instant' });
+      }
+    })()
+  `);
+
+  await adapter.page.waitForTimeout(500);
+}
 
 // --- Job Listing ---
 
@@ -340,123 +517,193 @@ export async function handleExperiencePage(
   }
 
   // ==================== LLM fills everything else ====================
-  // Build a data prompt with all experience/education/skills/linkedin info
-  const exp = userProfile.experience?.[0];
-  const edu = userProfile.education?.[0];
+  // Configurable max entries (defaults: 3 experiences, 2 educations)
+  const maxExperiences = (userProfile as any).max_experiences ?? 10;
+  const maxEducations = (userProfile as any).max_educations ?? 5;
 
-  let dataBlock = `CRITICAL — DO NOT TOUCH THESE SECTIONS:
-- "Websites" section: Do NOT click its "Add" button. Do NOT interact with it at all. Leave it completely empty. Clicking "Add" on Websites creates a required URL field that causes errors.
-- "Certifications" section: Do NOT click its "Add" button. Leave it empty.
-- Do NOT add more than one work experience entry.
-- Do NOT add more than one education entry.
+  const experiences = (userProfile.experience || []).slice(0, maxExperiences);
+  const educations = (userProfile.education || []).slice(0, maxEducations);
 
-MY EXPERIENCE PAGE DATA:
-`;
+  logger.info('Experience page entries', {
+    totalExperiences: userProfile.experience?.length || 0,
+    fillingExperiences: experiences.length,
+    totalEducations: userProfile.education?.length || 0,
+    fillingEducations: educations.length,
+  });
 
-  if (exp) {
-    const fromDate = exp.start_date ? (() => {
-      const parts = exp.start_date.split('-');
-      return parts.length >= 2 ? `${parts[1]}/${parts[0]}` : exp.start_date;
-    })() : '';
-    dataBlock += `
-WORK EXPERIENCE (click "Add" under Work Experience section first):
+  let llmCallCount = 0;
+
+  // Scroll to top before filling
+  await adapter.page.evaluate(() => window.scrollTo(0, 0));
+  await adapter.page.waitForTimeout(500);
+
+  // ==================== SEQUENTIAL WORK EXPERIENCE ENTRIES ====================
+  for (let i = 0; i < experiences.length; i++) {
+    const exp = experiences[i];
+    logger.info('Filling work experience entry', { entry: i + 1, total: experiences.length, title: exp.title });
+
+    // a. Click "Add" under Work Experience via DOM
+    const addClicked = await clickSectionAddButton(adapter, 'Work Experience');
+    if (!addClicked) {
+      logger.warn('Could not find Add button for Work Experience', { entry: i + 1 });
+    }
+    await adapter.page.waitForTimeout(1000);
+
+    // b. Scroll to the new entry's first empty field
+    await scrollToNewEntryFields(adapter, 'Work Experience');
+
+    // c. Build focused prompt for just this entry
+    // Date defaults: yesterday for "from", today for "to"
+    const yesterday = new Date(Date.now() - 86400000);
+    const today = new Date();
+    const fmtDate = (d: Date) => `${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
+    const parseDate = (raw: string | undefined, fallback: Date) => {
+      if (!raw) return fmtDate(fallback);
+      const parts = raw.split('-');
+      return parts.length >= 2 ? `${parts[1]}/${parts[0]}` : raw;
+    };
+
+    const fromDate = parseDate(exp.start_date, yesterday);
+    const toDate = parseDate(exp.end_date, today);
+
+    const toDateLine = exp.currently_work_here
+      ? ''
+      : `\n  To date: ${toDate} — click on the "MM" text, then type "${toDate.replace('/', '')}" as continuous digits.`;
+
+    const entryData = `You are filling WORK EXPERIENCE entry ${i + 1} of ${experiences.length}.
+
+CRITICAL: Find the heading "Work Experience ${i + 1}" on the page. IGNORE everything ABOVE that heading — those fields belong to previous entries and you must NOT interact with them. Only fill fields that appear BELOW the "Work Experience ${i + 1}" heading.
+
+Fill ALL of these fields (scroll down if needed to find them):
   Job Title: ${exp.title}
   Company: ${exp.company}
   Location: ${exp.location || ''}
-  I currently work here: ${exp.currently_work_here ? 'YES — check the checkbox' : 'No'}
-  From date: ${fromDate} — Look for the text "MM" on screen and click DIRECTLY on the letters "MM". Do NOT click the calendar icon or the "YYYY" box. After clicking "MM", type "${fromDate.replace('/', '')}" as continuous digits — Workday auto-advances to YYYY. If you see "1900" or an error, click the "YYYY" box, press Delete 6 times to clear it, then retype "${fromDate.replace('/', '')}".
+  I currently work here: ${exp.currently_work_here ? 'YES — check the checkbox' : 'No — leave unchecked'}
+  From date: ${fromDate} — click on the "MM" text, then type "${fromDate.replace('/', '')}" as continuous digits.${toDateLine}
   Role Description: ${exp.description}
-`;
+
+REMEMBER: NEVER scroll up. All fields for this entry are BELOW the "Work Experience ${i + 1}" heading — keep scrolling DOWN to find them. The Role Description field is below the date fields.
+
+RECOVERY: If at any point you see a heading for a PREVIOUS entry (e.g. "Work Experience ${i}" or earlier), you have scrolled too far up or are looking at the wrong area. Immediately scroll DOWN (at least 50 pixels per scroll) until you see the "Work Experience ${i + 1}" heading, then continue filling fields below it.
+
+Do NOT click any "Add" buttons. Do NOT touch any other sections. Do NOT interact with fields under any other "Work Experience" heading.`;
+
+    const entryPrompt = buildExperienceEntryPrompt(entryData);
+
+    // d. Single LLM call — the LLM can scroll within the entry
+    logger.debug('Work experience LLM call', { entry: i + 1, llmCall: llmCallCount + 1 });
+    await adapter.act(entryPrompt);
+    llmCallCount++;
+    await adapter.page.waitForTimeout(1000);
+
+    logger.info('Work experience entry done', { entry: i + 1, title: exp.title });
   }
 
-  if (edu) {
-    dataBlock += `
-EDUCATION (click "Add" under Education section first):
+  // ==================== SEQUENTIAL EDUCATION ENTRIES ====================
+  for (let i = 0; i < educations.length; i++) {
+    const edu = educations[i];
+    logger.info('Filling education entry', { entry: i + 1, total: educations.length, school: edu.school });
+
+    // a. Click "Add" under Education via DOM
+    const addClicked = await clickSectionAddButton(adapter, 'Education');
+    if (!addClicked) {
+      logger.warn('Could not find Add button for Education', { entry: i + 1 });
+    }
+    await adapter.page.waitForTimeout(1000);
+
+    // b. Scroll to the new entry's first empty field
+    await scrollToNewEntryFields(adapter, 'Education');
+
+    // c. Build focused prompt for just this entry
+    const entryData = `You are filling EDUCATION entry ${i + 1} of ${educations.length}.
+
+CRITICAL: Find the heading "Education ${i + 1}" on the page. IGNORE everything ABOVE that heading — those fields belong to previous entries and you must NOT interact with them. Only fill fields that appear BELOW the "Education ${i + 1}" heading.
+
+Fill ALL of these fields (scroll down if needed to find them):
   School or University: ${edu.school}
   Degree: ${edu.degree} (this is a DROPDOWN — click it, then type "${edu.degree}" to filter and select)
-  Field of Study: ${edu.field_of_study} (this is a TYPEAHEAD — follow these steps exactly:
-    1. Click the Field of Study input.
+  Field of Study: ${edu.field_of_study} (this is a TYPEAHEAD — the value MUST be selected from the dropdown, typing alone will NOT work. Follow these steps exactly:
+    1. Click the Field of Study input box to select it.
     2. Type "${edu.field_of_study}" into the input.
-    3. Press Enter to trigger the dropdown to update.
-    4. Wait a moment for the options to load.
-    5. Look through the visible options for "${edu.field_of_study}" and click it.
-    6. If the correct option is NOT visible in the dropdown, scroll through the dropdown list by clicking the scrollbar on the side of the dropdown to find and click the correct option.
+    3. Press ENTER to trigger the dropdown to filter/update.
+    4. WAIT 3 seconds — do nothing during this time. Let the dropdown load.
+    5. Look for "${edu.field_of_study}" in the dropdown list and CLICK on it. The field is NOT filled until you click the option.
+    6. If "${edu.field_of_study}" is NOT visible in the dropdown list: first, clear the input field (select all + delete), then scroll through the dropdown options. Each scroll must move at least 20 pixels. Keep scrolling until you find and click "${edu.field_of_study}".
+    7. After clicking the option, click on empty whitespace to dismiss the dropdown.
+    DO NOT skip step 3 (Enter) or step 5 (click). Typing alone does NOT fill the field.
   )
-`;
+
+Do NOT click any "Add" buttons. Do NOT touch any other sections. Do NOT interact with fields under any other "Education" heading.`;
+
+    const entryPrompt = buildExperienceEntryPrompt(entryData);
+
+    // d. Single LLM call — the LLM can scroll within the entry
+    logger.debug('Education LLM call', { entry: i + 1, llmCall: llmCallCount + 1 });
+    await adapter.act(entryPrompt);
+    llmCallCount++;
+    await adapter.page.waitForTimeout(1000);
+
+    logger.info('Education entry done', { entry: i + 1, school: edu.school });
   }
 
+  // ==================== SKILLS + LINKEDIN (final scroll+LLM loop) ====================
+  let skillsLinkedinBlock = `CRITICAL — DO NOT TOUCH THESE SECTIONS:
+- "Websites" section: Do NOT click its "Add" button. Leave it empty.
+- "Certifications" section: Do NOT click its "Add" button. Leave it empty.
+- Do NOT click "Add" under Work Experience or Education — those are already filled.
+
+Fill ONLY Skills and LinkedIn fields below. Skip any fields that already have values.
+`;
+
   if (userProfile.skills && userProfile.skills.length > 0) {
-    dataBlock += `
+    skillsLinkedinBlock += `
 SKILLS (find the skills input field, usually has placeholder "Type to Add Skills"):
-  For EACH skill below: click the skills input, type the skill name, press Enter to trigger the dropdown, WAIT for the autocomplete dropdown to appear, then CLICK the matching option from the dropdown. If the correct option is not visible, scroll the dropdown to find it. After selecting, click on empty whitespace to dismiss the dropdown before typing the next skill.
+  For EACH skill below: click the skills input, type the skill name, press ENTER to trigger the dropdown, then WAIT 3 seconds for the suggestions to load. IMPORTANT: You MUST click the matching option from the dropdown — just typing is NOT enough. If the correct option is NOT visible, clear the input (select all + delete) and scroll through the dropdown options (minimum 20 pixels per scroll) until you find it. After selecting, click on empty whitespace to dismiss the dropdown before typing the next skill.
   Skills to add: ${userProfile.skills.map(s => `"${s}"`).join(', ')}
 `;
   }
 
   if (userProfile.linkedin_url) {
-    dataBlock += `
+    skillsLinkedinBlock += `
 LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
   LinkedIn: ${userProfile.linkedin_url}
   NOTE: The LinkedIn field is in the "Social Network URLs" section, which is DIFFERENT from the "Websites" section. Only fill the LinkedIn field.
 `;
   }
 
-  const fillPrompt = buildExperiencePrompt(dataBlock);
+  if (userProfile.skills?.length || userProfile.linkedin_url) {
+    const skillsPrompt = buildExperiencePrompt(skillsLinkedinBlock);
+    const MAX_SKILLS_ROUNDS = 15;
 
-  // Custom scroll+LLM loop: ALWAYS invoke LLM each round because fields
-  // are behind "Add" buttons that hasEmptyVisibleFields() can't detect.
-  const MAX_SCROLL_ROUNDS = 8;
-  const MAX_LLM_CALLS = 6;
-  let llmCallCount = 0;
-
-  // Scroll to top before DOM fills
-  await adapter.page.evaluate(() => window.scrollTo(0, 0));
-  await adapter.page.waitForTimeout(500);
-
-  // Scroll back to top before the LLM loop begins.
-  // centerNextEmptyField and DOM interactions above may have shifted the scroll position.
-  await adapter.page.evaluate(() => window.scrollTo(0, 0));
-  await adapter.page.waitForTimeout(400);
-
-  for (let round = 1; round <= MAX_SCROLL_ROUNDS; round++) {
-    // Always invoke LLM — experience page has dynamic content behind Add buttons
-    if (llmCallCount < MAX_LLM_CALLS) {
-      // Center the next empty field so the LLM sees it mid-screen (not at an edge)
+    for (let round = 1; round <= MAX_SKILLS_ROUNDS; round++) {
       await centerNextEmptyField(adapter);
-      logger.debug('MyExperience LLM fill round', { round, llmCall: llmCallCount + 1, maxLlmCalls: MAX_LLM_CALLS });
-      await adapter.act(fillPrompt);
+      logger.debug('Skills/LinkedIn LLM round', { round, llmCall: llmCallCount + 1 });
+      await adapter.act(skillsPrompt);
       llmCallCount++;
       await adapter.page.waitForTimeout(1000);
+
+      // Check if we can scroll further
+      const scrollBefore = await adapter.page.evaluate(() => window.scrollY);
+      const scrollMax = await adapter.page.evaluate(
+        () => document.documentElement.scrollHeight - window.innerHeight,
+      );
+      if (scrollBefore >= scrollMax - 10) break;
+
+      await adapter.page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.65)));
+      await adapter.page.waitForTimeout(800);
+
+      const scrollAfter = await adapter.page.evaluate(() => window.scrollY);
+      if (scrollAfter <= scrollBefore) break;
     }
-
-    // Check if we can scroll further
-    const scrollBefore = await adapter.page.evaluate(() => window.scrollY);
-    const scrollMax = await adapter.page.evaluate(
-      () => document.documentElement.scrollHeight - window.innerHeight,
-    );
-
-    if (scrollBefore >= scrollMax - 10) {
-      logger.debug('MyExperience reached bottom of page');
-      break;
-    }
-
-    // Scroll down 65% of viewport
-    await adapter.page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.65)));
-    await adapter.page.waitForTimeout(800);
-
-    const scrollAfter = await adapter.page.evaluate(() => window.scrollY);
-    if (scrollAfter <= scrollBefore) {
-      logger.debug('MyExperience cannot scroll further');
-      break;
-    }
-
-    logger.debug('MyExperience scrolled', { scrollY: scrollAfter, round });
   }
 
-  logger.info('MyExperience page complete', { totalLlmCalls: llmCallCount });
+  logger.info('MyExperience page complete', { totalLlmCalls: llmCallCount, experiences: experiences.length, educations: educations.length });
+
+  // Build a generic fallback prompt for error recovery during navigation
+  const fallbackPrompt = buildExperiencePrompt('All entries have been filled. If you see any empty required fields, fill them.');
 
   // Navigate: click Save and Continue with error recovery
-  await clickNextWithErrorRecovery(adapter, fillPrompt, 'my experience', fullQAMap);
+  await clickNextWithErrorRecovery(adapter, fallbackPrompt, 'my experience', fullQAMap);
 }
 
 // --- Voluntary Disclosure ---
@@ -465,10 +712,11 @@ export async function handleVoluntaryDisclosure(
   adapter: BrowserAutomationAdapter,
   dataPrompt: string,
   fullQAMap: Record<string, string>,
+  selfId: SelfIdFields,
 ): Promise<'done' | 'review_detected'> {
   getLogger().info('Filling voluntary self-identification page');
 
-  const fillPrompt = buildVoluntaryDisclosurePrompt();
+  const fillPrompt = buildVoluntaryDisclosurePrompt(selfId);
 
   return fillWithSmartScroll(adapter, fillPrompt, 'voluntary disclosure', fullQAMap);
 }
@@ -479,10 +727,11 @@ export async function handleSelfIdentify(
   adapter: BrowserAutomationAdapter,
   dataPrompt: string,
   fullQAMap: Record<string, string>,
+  selfId: SelfIdFields,
 ): Promise<'done' | 'review_detected'> {
   getLogger().info('Filling self-identification page');
 
-  const fillPrompt = buildSelfIdentifyPrompt();
+  const fillPrompt = buildSelfIdentifyPrompt(selfId);
 
   return fillWithSmartScroll(adapter, fillPrompt, 'self-identify', fullQAMap);
 }

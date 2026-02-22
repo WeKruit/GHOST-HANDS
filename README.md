@@ -61,6 +61,48 @@ docker compose up
 - **Cost Control** -- Per-task budgets ($0.02-$0.30), per-user monthly limits, tiered rate limiting
 - **VALET Integration** -- Dedicated `/valet/` routes, callback notifications, shared Supabase DB
 
+## Common Commands (Windows)
+
+All commands run from `packages/ghosthands/`.
+
+```bash
+# Start a worker
+npx tsx --env-file=.env src/workers/main.ts --worker-id=workday-test
+
+# Submit a Workday application job (pulls user profile from VALET's parsed resumes)
+npx tsx --env-file=.env src/scripts/apply-workday.ts -- --user-id=<uuid> --worker-id=workday-test
+# Optional flags:
+#   --url=<workday-url>    — override the default Workday listing URL
+#   --worker-id=<id>       — target a specific worker (required if multiple workers running)
+
+# Kill all jobs
+npx tsx --env-file=.env src/scripts/kill-jobs.ts
+
+# Kill zombie workers
+npx tsx --env-file=.env src/scripts/kill-zombies.ts
+
+# Fix tier lock
+npx tsx --env-file=.env src/scripts/fix-tier.ts
+
+# Clear old session cookies from Supabase
+npx tsx --env-file=.env src/scripts/clear-old-sessions.ts
+
+# Run session persistence test (from packages/ghosthands/)
+npx vitest run __tests__/integration/sessions/sessionPersistence.test.ts
+```
+
+### Workday Profile Defaults
+
+When loading a user's parsed resume from VALET, some Workday-specific fields
+(gender, veteran status, disability, etc.) are not in the resume. These use
+defaults defined in:
+
+```
+packages/ghosthands/src/db/resumeProfileLoader.ts → WORKDAY_PROFILE_DEFAULTS
+```
+
+Edit that object to change the default answers for self-identification questions.
+
 ## Requirements
 
 - Bun 1.2+

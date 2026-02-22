@@ -23,6 +23,7 @@ import { StagehandObserver } from '../engine/StagehandObserver.js';
 import type { MagnitudeAdapter } from '../adapters/magnitude.js';
 import { ThoughtThrottle, JOB_EVENT_TYPES } from '../events/JobEventTypes.js';
 import { ResumeDownloader, type ResumeRef } from './resumeDownloader.js';
+import { ResumeProfileLoader } from '../db/resumeProfileLoader.js';
 import { getLogger } from '../monitoring/logger.js';
 
 const logger = getLogger({ service: 'job-executor' });
@@ -267,6 +268,9 @@ export class JobExecutor {
         });
       }
 
+      // 1b. Auto-populate user_data from VALET's resumes table if not provided
+      await this.enrichJobFromResumeProfile(job);
+
       // 2. Resolve task handler
       const handler = taskHandlerRegistry.getOrThrow(job.job_type);
 
@@ -332,7 +336,10 @@ export class JobExecutor {
           await this.logJobEvent(job.id, JOB_EVENT_TYPES.RESUME_DOWNLOAD_FAILED, {
             error: errMsg,
           });
-          throw new Error(`Resume download failed: ${errMsg}`);
+          logger.warn('Resume download failed, continuing without file', {
+            jobId: job.id,
+            error: errMsg,
+          });
         }
       }
 
@@ -1642,6 +1649,49 @@ export class JobExecutor {
     } catch (err) {
       // Event logging failures should not crash the job
       getLogger().warn('Event log failed', { eventType, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  // --- Resume profile enrichment ---
+
+  /**
+   * If the job has no user_data, attempt to load it from VALET's `resumes` table.
+   * Also sets up resume_ref from the resume's file_key if not already provided.
+   * This is backwards-compatible: if user_data is already present, this is a no-op.
+   */
+  private async enrichJobFromResumeProfile(job: AutomationJob): Promise<void> {
+    const hasUserData = job.input_data.user_data
+      && typeof job.input_data.user_data === 'object'
+      && Object.keys(job.input_data.user_data).length > 0;
+
+    if (hasUserData) return;
+
+    try {
+      const loader = new ResumeProfileLoader(this.supabase);
+      const result = await loader.loadForUser(job.user_id);
+
+      job.input_data.user_data = result.profile;
+
+      if (!job.resume_ref && result.fileKey) {
+        (job as any).resume_ref = { storage_path: result.fileKey };
+      }
+
+      await this.logJobEvent(job.id, 'resume_profile_loaded', {
+        resume_id: result.resumeId,
+        user_id: result.userId,
+        confidence: result.parsingConfidence,
+      });
+
+      getLogger().info('Auto-populated user_data from VALET resumes table', {
+        jobId: job.id,
+        resumeId: result.resumeId,
+      });
+    } catch (err) {
+      getLogger().warn('Failed to auto-populate user_data from resumes table', {
+        jobId: job.id,
+        userId: job.user_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 

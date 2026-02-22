@@ -59,24 +59,19 @@ export class ResumeDownloader {
   }
 
   private async downloadFromSupabase(storagePath: string, jobId: string): Promise<string> {
-    // Determine bucket and path
-    // Format: "bucket/path/to/file.pdf" or just "path/to/file.pdf" (default bucket: resumes)
-    const parts = storagePath.split('/');
-    let bucket = 'resumes';
-    let path = storagePath;
-
-    // If the first part looks like a bucket name (no dots, no slashes in first segment)
-    if (parts.length > 1 && !parts[0].includes('.')) {
-      bucket = parts[0];
-      path = parts.slice(1).join('/');
-    }
+    // VALET uploads via Supabase's S3-compatible API with bucket "resumes"
+    // and stores the S3 key (e.g. "resumes/userId/uuid-file.pdf") as file_key.
+    // The Supabase JS client needs the full S3 key as the path within the bucket.
+    const bucket = 'resumes';
+    const path = storagePath;
 
     const { data, error } = await this.supabase.storage
       .from(bucket)
       .download(path);
 
     if (error) {
-      throw new Error(`Failed to download resume from Supabase Storage: ${error.message}`);
+      const errorMsg = (error as any)?.message || JSON.stringify(error) || 'Unknown storage error';
+      throw new Error(`Failed to download resume from Supabase Storage (bucket=${bucket}, path=${path}): ${errorMsg}`);
     }
 
     if (!data) {
