@@ -7,22 +7,21 @@ import type { PlatformConfig, PageState, PageType } from './types.js';
 // ---------------------------------------------------------------------------
 
 const GENERIC_BASE_RULES = `RULES:
-1. NO SCROLLING — Do NOT scroll the page. I handle all scrolling for you. The viewport has already been positioned to show the fields you need to fill. Only interact with what is currently visible on screen.
-2. ONE ATTEMPT PER FIELD — Fill each field once, then move to the next. If it looks empty after you typed, trust your input was registered. Retyping causes duplicates (e.g. "WuWuWu" instead of "Wu").
-3. NO PAGE NAVIGATION — Do not click "Next", "Continue", "Submit", "Save and Continue", or any button that moves to the next page/step. Do NOT click sidebar navigation links, section headers, or progress bar steps to jump to different sections — I handle all navigation between sections. ABSOLUTELY DO NOT navigate to a URL, reload the page, use the browser address bar, or use browser back/forward. Never use the browser:nav action. You MAY click buttons within the form like "Add Another", "Add Work Experience", "Add Education", "Upload", or similar buttons that add sections or expand fields on the current page.
-4. TRUST FILLED FIELDS — If a field shows any text, it is already filled. Narrow fields truncate long values visually (e.g. "alexanderwgu..." for a full email address). Never click on, clear, or retype a field that already shows text.
-5. SIGNAL COMPLETION — When all visible fields are filled (or none need filling), report the task as done immediately. Do not scroll looking for more fields — I will scroll for you and call you again if there are more fields below.
-6. BROKEN PAGE — If the page shows raw JavaScript, source code, a blank screen, or looks completely broken, report the task as done immediately. Do NOT try to fix it, navigate away, or reload. I will handle the situation.`;
+1. FILL empty fields visible on screen using the data below. Work top to bottom.
+2. SKIP fields that already show text or a selection.
+3. You MAY click dropdowns, radio buttons, checkboxes, "Add Another", "Upload", and other form controls needed to fill fields.
+4. DO NOT click navigation buttons: Next, Continue, Submit, Save, Submit Application, or similar. I handle page navigation.
+5. DO NOT scroll — no mouse wheel, no scroll actions, no dragging scrollbars. I handle all scrolling.
+6. DO NOT navigate to a URL, reload the page, or use the address bar.
+7. When all visible empty fields are filled (or have no matching data), report done.`;
 
-const FIELD_INTERACTION_RULES = `HOW TO FILL FIELDS:
-- Text fields: Click the field, type the value from the data mapping, then click empty space to deselect.
-- Dropdowns: Click to open, type your answer to filter the list (e.g. "Yes", "No", "Male"), then click the matching option. IMPORTANT: If your exact answer is not in the dropdown options, pick the CLOSEST available option (e.g. if "Company Website" is not listed, pick "Other" or "Website" or whatever is closest). Never scroll through a dropdown more than twice — if you haven't found an exact match after two scrolls, pick the best available option or "Other".
-- Radio buttons: Click the correct option that matches the data mapping. If the answer is "Yes", click the "Yes" radio button.
-- Required checkboxes (terms, agreements, "I acknowledge..."): Click to check them.
-- Skip any field that already shows text, a selected value, or a checked state — even if the text looks truncated.
-- OPTIONAL FIELDS: Not every empty field needs to be filled. If a field has no matching value in the data mapping (e.g., Address Line 2 with no apartment number, Middle Name, Suffix), leave it empty and move on. Only fill fields that have a clear match in the data mapping.
-- If a question is not covered by the data mapping and you are unsure of the answer, skip it rather than guessing.
-- NEVER get stuck on one field. If you have tried twice and cannot get the right value into a field, pick the closest available option or skip it and move on.`;
+const FIELD_INTERACTION_RULES = `HOW TO FILL:
+- Text fields: Click, type the value, click away to deselect.
+- Dropdowns: Click to open, type to filter, click the match. If no exact match, pick the closest option.
+- Radio buttons: Click the matching option.
+- Required checkboxes (terms, agreements): Check them.
+- If a field has no match in the data mapping (e.g. Middle Name, Address Line 2), skip it.
+- If stuck on a field after two tries, skip it and move on.`;
 
 // ---------------------------------------------------------------------------
 // Page state schema (generic page types only)
@@ -126,30 +125,57 @@ export class GenericPlatformConfig implements PlatformConfig {
   async detectPageByDOM(adapter: BrowserAutomationAdapter): Promise<PageState | null> {
     const signals = await adapter.page.evaluate(() => {
       const bodyText = document.body.innerText.toLowerCase();
-      const html = document.body.innerHTML.toLowerCase();
-      return {
-        hasSignInWithGoogle: bodyText.includes('sign in with google') || bodyText.includes('continue with google'),
-        hasSignIn: bodyText.includes('sign in') || bodyText.includes('log in') || bodyText.includes('login'),
-        hasCreateAccount: bodyText.includes('create account') || bodyText.includes('sign up') || bodyText.includes('register'),
-        hasApplyButton: (bodyText.includes('apply') || bodyText.includes('apply now')) && !bodyText.includes('application questions'),
-        hasSubmitApplication: bodyText.includes('submit application') || bodyText.includes('submit your application'),
-        hasConfirmation: bodyText.includes('thank you') || bodyText.includes('application received') || bodyText.includes('successfully submitted'),
-        hasFormInputs: document.querySelectorAll('input[type="text"], input[type="email"], input[type="tel"], textarea, select').length > 3,
-      };
+
+      // Scan ALL clickable elements — buttons, links, role="button", submit inputs
+      const clickables = Array.from(document.querySelectorAll(
+        'button, [role="button"], input[type="submit"], a[href], a[role="link"]'
+      ));
+      const clickableTexts = clickables.map(el => {
+        const raw = (el.textContent || el.getAttribute('value') || el.getAttribute('aria-label') || '').trim();
+        // Collapse whitespace and take first 60 chars to avoid grabbing entire paragraphs from links
+        return raw.replace(/\s+/g, ' ').substring(0, 60).toLowerCase();
+      });
+
+      // Apply button
+      const hasApplyButton = clickableTexts.some(t =>
+        t === 'apply' || t === 'apply now' || t === 'apply for this job' ||
+        t === 'apply on company site' || t === 'apply to this job'
+      );
+
+      // Sign-in detection — check clickable elements AND form fields
+      const hasPasswordField = document.querySelectorAll('input[type="password"]').length > 0;
+      const hasEmailField = document.querySelectorAll('input[type="email"]').length > 0;
+      const hasSignInWithGoogle = bodyText.includes('sign in with google') || bodyText.includes('continue with google');
+      const hasSignInClickable = clickableTexts.some(t =>
+        t === 'sign in' || t === 'log in' || t === 'login' ||
+        t === 'sign in with google' || t === 'continue with google'
+      );
+
+      // A page is login-related if it has sign-in form fields OR a sign-in button/link
+      const isLoginPage = hasPasswordField || hasSignInWithGoogle ||
+        (hasEmailField && hasSignInClickable) || hasSignInClickable;
+
+      const hasFormInputs = document.querySelectorAll('input[type="text"], input[type="email"], input[type="tel"], textarea, select').length > 3;
+      const hasConfirmation = bodyText.includes('thank you') || bodyText.includes('application received') || bodyText.includes('successfully submitted');
+
+      return { hasApplyButton, isLoginPage, hasSignInClickable, hasSignInWithGoogle, hasFormInputs, hasConfirmation };
     });
 
     if (signals.hasConfirmation && !signals.hasFormInputs) {
       return { page_type: 'confirmation', page_title: 'Confirmation' };
     }
 
-    if (signals.hasSignInWithGoogle || (signals.hasSignIn && !signals.hasApplyButton && !signals.hasFormInputs)) {
+    // Job listing: has an Apply button and no form fields → user needs to click Apply
+    if (signals.hasApplyButton && !signals.hasFormInputs) {
+      return { page_type: 'job_listing', page_title: 'Job Listing', has_apply_button: true };
+    }
+
+    // Login: has sign-in button/link (even without form fields — the form may be on the next page)
+    if (signals.isLoginPage && !signals.hasApplyButton) {
       return { page_type: 'login', page_title: 'Sign-In', has_sign_in_with_google: signals.hasSignInWithGoogle };
     }
 
-    // If page has form inputs and none of the special types matched above,
-    // classify as a form page. This avoids the ~2,050 token LLM classification
-    // call for obvious form pages. All form types (personal_info, questions,
-    // experience) go through the same fillWithSmartScroll path on generic sites.
+    // Form page: has multiple input fields → skip the expensive LLM classification
     if (signals.hasFormInputs) {
       return { page_type: 'questions', page_title: 'Form Page' };
     }
@@ -184,24 +210,50 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
       const headingText = headings.map(h => (h.textContent || '').toLowerCase()).join(' ');
       const allText = headingText + ' ' + bodyText.substring(0, 3000);
 
-      // Check for review page — must check ENTIRE page DOM (not just viewport)
-      // to avoid false positives on single-page forms where fields are below the fold
       const allEditableInputs = document.querySelectorAll(
         'input[type="text"]:not([readonly]):not([disabled]), textarea:not([readonly]):not([disabled]), input[type="email"]:not([readonly]):not([disabled]), input[type="tel"]:not([readonly]):not([disabled]), select:not([disabled])'
       );
       const hasAnyEditableInputs = allEditableInputs.length > 0;
-      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
-      const buttonTexts = buttons.map(b => (b.textContent || '').trim().toLowerCase());
-      const hasSubmitButton = buttonTexts.some(t => t === 'submit' || t === 'submit application');
-      const hasNextButton = buttonTexts.some(t => t === 'next' || t === 'continue' || t.includes('save and continue'));
-      // Only classify as review if: submit button exists, NO editable inputs anywhere on page, and no "next" button
+
+      // Scan ALL clickable elements — buttons, links, role="button", submit inputs
+      const clickables = Array.from(document.querySelectorAll(
+        'button, [role="button"], input[type="submit"], a[href], a[role="link"]'
+      ));
+      const clickableTexts = clickables.map(el => {
+        const raw = (el.textContent || el.getAttribute('value') || el.getAttribute('aria-label') || '').trim();
+        return raw.replace(/\s+/g, ' ').substring(0, 60).toLowerCase();
+      });
+
+      const hasSubmitButton = clickableTexts.some(t => t === 'submit' || t === 'submit application');
+      const hasNextButton = clickableTexts.some(t => t === 'next' || t === 'continue' || t.includes('save and continue'));
+      const hasApplyButton = clickableTexts.some(t =>
+        t === 'apply' || t === 'apply now' || t === 'apply for this job' ||
+        t === 'apply on company site' || t === 'apply to this job'
+      );
+      const hasPasswordField = document.querySelectorAll('input[type="password"]').length > 0;
+      const hasSignInClickable = clickableTexts.some(t =>
+        t === 'sign in' || t === 'log in' || t === 'login' || t === 'sign in with google'
+      );
+
+      // Review: submit button, no editable inputs, no next button
       if (hasSubmitButton && !hasAnyEditableInputs && !hasNextButton) return 'review' as PageType;
 
       if (allText.includes('thank you') || allText.includes('application received') || allText.includes('successfully submitted')) return 'confirmation' as PageType;
-      if (allText.includes('sign in') || allText.includes('log in')) return 'login' as PageType;
-      if (allText.includes('application questions') || allText.includes('screening questions')) return 'questions' as PageType;
-      if (allText.includes('work experience') || allText.includes('resume') || allText.includes('upload cv')) return 'experience' as PageType;
-      if (allText.includes('personal info') || allText.includes('contact info') || allText.includes('your information')) return 'personal_info' as PageType;
+
+      // Job listing: has an Apply button
+      if (hasApplyButton) return 'job_listing' as PageType;
+
+      // Login: has a sign-in button/link or password field
+      if (hasPasswordField || hasSignInClickable) return 'login' as PageType;
+
+      // Form pages with editable inputs
+      if (hasAnyEditableInputs) {
+        if (allText.includes('application questions') || allText.includes('screening questions')) return 'questions' as PageType;
+        if (allText.includes('work experience') || allText.includes('resume') || allText.includes('upload cv')) return 'experience' as PageType;
+        if (allText.includes('personal info') || allText.includes('contact info') || allText.includes('your information')) return 'personal_info' as PageType;
+        return 'questions' as PageType; // Default form page
+      }
+
       return 'unknown' as PageType;
     });
   }
@@ -359,8 +411,6 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
     return `${GENERIC_BASE_RULES}
 
 ${FIELD_INTERACTION_RULES}
-
-TASK: Fill any empty form fields visible on screen, working top to bottom. Use the data mapping below to find the right answer for each field. If all fields are already filled or there are no fields that match the data mapping, report the task as done immediately.
 
 ${dataBlock}`;
   }
@@ -566,37 +616,6 @@ ${dataBlock}`;
     });
   }
 
-  async centerNextEmptyField(adapter: BrowserAutomationAdapter): Promise<boolean> {
-    return adapter.page.evaluate(() => {
-      const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
-        'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="number"], input:not([type]), textarea, select'
-      );
-      for (const input of inputs) {
-        const rect = input.getBoundingClientRect();
-        if (rect.width < 20 || rect.height < 10) continue;
-        if ((input as HTMLInputElement).disabled || (input as HTMLInputElement).readOnly) continue;
-        if ((input as HTMLInputElement).type === 'hidden') continue;
-        if (input.getAttribute('aria-hidden') === 'true') continue;
-
-        const style = window.getComputedStyle(input);
-        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
-
-        const isEmpty = input instanceof HTMLSelectElement
-          ? input.selectedIndex <= 0
-          : !input.value || input.value.trim() === '';
-
-        if (isEmpty) {
-          // Scroll so this field is centered in the viewport
-          const fieldCenter = rect.top + rect.height / 2 + window.scrollY;
-          const targetScroll = fieldCenter - window.innerHeight / 2;
-          window.scrollTo(0, Math.max(0, targetScroll));
-          return true;
-        }
-      }
-      return false;
-    });
-  }
-
   // --- Navigation ---
 
   async clickNextButton(adapter: BrowserAutomationAdapter): Promise<'clicked' | 'review_detected' | 'not_found'> {
@@ -604,32 +623,39 @@ ${dataBlock}`;
     // esbuild's --keep-names injects __name() wrappers that don't exist in the browser context.
     return adapter.page.evaluate(() => {
       const NEXT_TEXTS = ['next', 'continue', 'proceed', 'review application', 'review my application', 'go to next step', 'next step'];
-      const NEXT_INCLUDES = ['save and continue', 'save & continue', 'skip and continue', 'skip & continue'];
+      const NEXT_INCLUDES = ['save and continue', 'save & continue', 'skip and continue', 'skip & continue', 'submit profile', 'submit and continue', 'submit & continue'];
 
-      const buttons = Array.from(document.querySelectorAll<HTMLButtonElement | HTMLAnchorElement>(
+      const vh = window.innerHeight;
+      const allButtons = Array.from(document.querySelectorAll<HTMLButtonElement | HTMLAnchorElement>(
         'button, [role="button"], input[type="submit"], a.btn'
       ));
 
-      const buttonTexts = buttons.map(b => ({
-        el: b,
-        text: (b.textContent || b.getAttribute('value') || '').trim().toLowerCase(),
-      }));
+      const allButtonTexts = allButtons.map(b => {
+        const rect = b.getBoundingClientRect();
+        return {
+          el: b,
+          text: (b.textContent || b.getAttribute('value') || '').trim().toLowerCase(),
+          visible: rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < vh,
+        };
+      });
 
-      // Check if this is the review page (Submit button present, no Next button)
-      const hasSubmit = buttonTexts.some(b => b.text === 'submit' || b.text === 'submit application');
-      const hasNext = buttonTexts.some(b =>
+      // Review detection scans ALL buttons (page-wide) — a Submit button anywhere
+      // with no Next button anywhere means this is the review page.
+      const hasSubmit = allButtonTexts.some(b => b.text === 'submit' || b.text === 'submit application');
+      const hasNext = allButtonTexts.some(b =>
         NEXT_TEXTS.indexOf(b.text) !== -1 || NEXT_INCLUDES.some(s => b.text.indexOf(s) !== -1)
       );
 
       if (hasSubmit && !hasNext) return 'review_detected' as const;
 
-      // Try to find and click Next/Continue (priority order: exact matches first)
-      const nextButton = buttonTexts.find(b =>
-        NEXT_TEXTS.indexOf(b.text) !== -1 || NEXT_INCLUDES.some(s => b.text.indexOf(s) !== -1)
+      // Only click buttons that are visible in the current viewport.
+      // If the Next button is below the fold, the orchestrator will scroll to it.
+      const visibleNext = allButtonTexts.find(b =>
+        b.visible && (NEXT_TEXTS.indexOf(b.text) !== -1 || NEXT_INCLUDES.some(s => b.text.indexOf(s) !== -1))
       );
 
-      if (nextButton) {
-        (nextButton.el as HTMLElement).click();
+      if (visibleNext) {
+        (visibleNext.el as HTMLElement).click();
         return 'clicked' as const;
       }
 

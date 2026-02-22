@@ -143,12 +143,6 @@ export interface PlatformConfig {
    */
   hasEmptyVisibleFields(adapter: BrowserAutomationAdapter): Promise<boolean>;
 
-  /**
-   * Scroll the next empty field to the center of the viewport.
-   * Returns true if a field was found and scrolled to.
-   */
-  centerNextEmptyField(adapter: BrowserAutomationAdapter): Promise<boolean>;
-
   // --- Navigation ---
 
   /**
