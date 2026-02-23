@@ -153,7 +153,7 @@
     },
     "claude-sonnet": {
       "provider": "anthropic",
-      "model": "claude-sonnet-4-5-20250929",
+      "model": "claude-sonnet-4-6",
       "vision": true,
       "cost": { "input": 3.00, "output": 15.00, "unit": "$/M tokens" }
     },

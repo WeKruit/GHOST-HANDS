@@ -286,55 +286,64 @@ export class SmartApplyHandler implements TaskHandler {
   ): Promise<PageState> {
     const currentUrl = await adapter.getCurrentUrl();
 
-    // Tier 1: URL-based (fast, no LLM cost)
+    // Tier 1: URL-based (fast, no LLM cost) — only catches dead-obvious patterns
     const urlResult = config.detectPageByUrl(currentUrl);
     if (urlResult) return urlResult;
 
-    // Tier 2: DOM-based (fast, no LLM cost)
-    const domResult = await config.detectPageByDOM(adapter);
-    if (domResult) return domResult;
+    // Tier 2: Minimal DOM checks — ONLY for things the LLM can't see (or to save cost on obvious pages)
+    const obviousResult = await this.detectObviousPage(adapter, currentUrl);
+    if (obviousResult) return obviousResult;
 
-    // Tier 3: LLM classification
+    // Tier 3: LLM classification — the LLM sees the screenshot and decides
     try {
-      // Check page health before sending screenshot to LLM — broken pages
-      // showing raw JS waste massive tokens (5-10k+ per screenshot)
       const healthy = await this.isPageHealthy(adapter);
       if (!healthy) {
-        console.warn('[SmartApply] Page appears broken (raw JS/code visible) — skipping LLM classification.');
+        console.warn('[SmartApply] Page appears broken (raw JS/code visible) — using DOM fallback.');
         const fallbackType = await config.classifyByDOMFallback(adapter);
         return { page_type: fallbackType, page_title: 'broken_page' };
       }
 
+      // Build URL hints so the LLM has context about where we are
       const urlHints: string[] = [];
-      if (currentUrl.includes('signin') || currentUrl.includes('login')) urlHints.push('This appears to be a login page.');
-      if (currentUrl.includes('job') || currentUrl.includes('position') || currentUrl.includes('career')) urlHints.push('This appears to be a job-related page.');
+      if (currentUrl.includes('signin') || currentUrl.includes('login') || currentUrl.includes('accounts.google.com')) {
+        urlHints.push('The URL indicates this is a login/sign-in page.');
+      }
+      if (currentUrl.includes('review') || currentUrl.includes('summary')) {
+        urlHints.push('The URL indicates this may be a review/summary page.');
+      }
+      if (currentUrl.includes('job') || currentUrl.includes('position') || currentUrl.includes('career')) {
+        urlHints.push('The URL is job-related.');
+      }
+      if (currentUrl.includes('apply')) {
+        urlHints.push('The URL contains "apply" — this could be the application form or a job listing with an Apply button.');
+      }
 
       const classificationPrompt = config.buildClassificationPrompt(urlHints);
       await this.throttleLlm(adapter);
       const llmResult = await adapter.extract(classificationPrompt, config.pageStateSchema);
+      console.log(`[SmartApply] LLM classified page as: ${llmResult.page_type}`);
 
-      // SAFETY: If LLM says "review", verify before stopping the application.
-      // Many single-page forms (e.g. Amazon) show a Submit button on every
-      // page, which fools the classification.
+      // SAFETY: If LLM says "review", double-check — many single-page forms
+      // show a Submit button on every page, which fools the classification.
       if (llmResult.page_type === 'review') {
-        // Quick DOM check first — if page has editable fields, it's definitely
-        // NOT the review page. Saves ~1,875 tokens vs the LLM verification call.
         const hasEditableFields = await adapter.page.evaluate(() => {
           return document.querySelectorAll(
             'input[type="text"]:not([readonly]):not([disabled]), ' +
             'input[type="email"]:not([readonly]):not([disabled]), ' +
             'input[type="tel"]:not([readonly]):not([disabled]), ' +
             'textarea:not([readonly]):not([disabled]), ' +
-            'select:not([disabled])'
+            'select:not([disabled]), ' +
+            '[role="combobox"]:not([aria-disabled="true"]), ' +
+            '[role="radiogroup"], ' +
+            '[role="radio"]:not([aria-checked="true"])'
           ).length > 0;
         });
 
         if (hasEditableFields) {
-          console.log('[SmartApply] Page has editable fields — overriding "review" to "questions" (skipped LLM verify)');
+          console.log('[SmartApply] LLM said "review" but page has editable fields — overriding to "questions"');
           return { ...llmResult, page_type: 'questions' as PageType };
         }
 
-        // DOM inconclusive — use expensive LLM verification as last resort
         const isReallyReview = await this.verifyReviewPage(adapter);
         if (!isReallyReview) {
           console.log('[SmartApply] Review verification failed — overriding to "questions"');
@@ -353,6 +362,42 @@ export class SmartApplyHandler implements TaskHandler {
       }
       return { page_type: fallbackType, page_title: fallbackType === 'unknown' ? 'N/A' : fallbackType };
     }
+  }
+
+  /**
+   * Detect only dead-obvious pages that don't need LLM classification.
+   * Keeps costs down for pages like Google Sign-In, confirmation, etc.
+   */
+  private async detectObviousPage(
+    adapter: BrowserAutomationAdapter,
+    currentUrl: string,
+  ): Promise<PageState | null> {
+    // Google Sign-In — URL is unmistakable
+    if (currentUrl.includes('accounts.google.com')) {
+      return { page_type: 'google_signin', page_title: 'Google Sign-In', has_sign_in_with_google: true };
+    }
+
+    // Quick DOM check for login (password field) and confirmation (thank you text)
+    const obvious = await adapter.page.evaluate(() => {
+      const bodyText = document.body.innerText.toLowerCase();
+      const hasPasswordField = document.querySelectorAll('input[type="password"]').length > 0;
+      const hasConfirmation = bodyText.includes('thank you for applying')
+        || bodyText.includes('application received')
+        || bodyText.includes('successfully submitted')
+        || bodyText.includes('application has been submitted');
+      return { hasPasswordField, hasConfirmation };
+    });
+
+    if (obvious.hasConfirmation) {
+      return { page_type: 'confirmation', page_title: 'Confirmation' };
+    }
+
+    if (obvious.hasPasswordField) {
+      return { page_type: 'login', page_title: 'Sign-In' };
+    }
+
+    // Everything else → let the LLM decide
+    return null;
   }
 
   // =========================================================================
@@ -662,9 +707,31 @@ ${dataPrompt}`,
         if (uploaded) {
           resumeUploaded = true;
           domFills++;
+        } else if (await this.hasVisibleUploadArea(adapter)) {
+          // No <input type="file"> in DOM or setInputFiles failed.
+          // Use the LLM to click the upload button/dropzone — the filechooser
+          // listener (set up at the start of execute()) will auto-attach the resume.
+          console.log(`[SmartApply] [${pageLabel}] Upload area visible — clicking via LLM to trigger file dialog...`);
+          try {
+            await this.safeAct(adapter,
+              'Click the resume/CV upload button or drag-and-drop area to open the file picker. ' +
+              'Look for text like "Upload", "Attach", "Choose File", "Browse", "Add Resume", or a drag-and-drop zone. ' +
+              'Click it ONCE, then report done immediately. Do NOT fill any other fields.',
+              pageLabel);
+            llmCalls++;
+            // Wait for filechooser listener to fire and upload to process
+            await adapter.page.waitForTimeout(3000);
+            resumeUploaded = true;
+            domFills++;
+            console.log(`[SmartApply] [${pageLabel}] Resume upload triggered via LLM click.`);
+          } catch (err) {
+            console.warn(`[SmartApply] [${pageLabel}] LLM resume upload click failed: ${err}`);
+          }
         }
       }
       if (Object.keys(qaMap).length > 0) {
+        domFills += await config.fillTextFieldsProgrammatically(adapter, qaMap);
+        domFills += await config.fillRadioButtonsProgrammatically(adapter, qaMap);
         domFills += await config.fillDropdownsProgrammatically(adapter, qaMap);
         domFills += await config.fillCustomDropdownsProgrammatically(adapter, qaMap);
       }
@@ -680,6 +747,9 @@ ${dataPrompt}`,
         // Snapshot field state BEFORE the LLM acts so we can detect whether it actually changed anything
         const fieldsBefore = await this.getVisibleFieldValues(adapter);
 
+        // Snapshot checked checkboxes so we can restore any the LLM accidentally unchecks
+        const checkedBefore = await this.getCheckedCheckboxes(adapter);
+
         console.log(`[SmartApply] [${pageLabel}] LLM call ${llmCalls + 1}/${MAX_LLM_CALLS}...`);
         try {
           await this.safeAct(adapter, fillPrompt, pageLabel);
@@ -687,6 +757,14 @@ ${dataPrompt}`,
           console.warn(`[SmartApply] [${pageLabel}] LLM act() failed: ${actError instanceof Error ? actError.message : actError}`);
         }
         llmCalls++;
+
+        // Dismiss any open dropdowns/overlays the LLM left behind.
+        // An open dropdown blocks clicks on other elements and prevents
+        // the selection from being committed (no blur/change event).
+        await this.dismissOpenOverlays(adapter);
+
+        // Restore any checkboxes the LLM unchecked (it should NEVER uncheck)
+        await this.restoreUncheckedCheckboxes(adapter, checkedBefore);
 
         // Check if the LLM actually filled anything new
         const fieldsAfter = await this.getVisibleFieldValues(adapter);
@@ -707,6 +785,7 @@ ${dataPrompt}`,
 
       const urlBeforeClick = await adapter.getCurrentUrl();
       const fingerprintBeforeClick = await this.getPageFingerprint(adapter);
+      const scrollBeforeClick = await adapter.page.evaluate(() => window.scrollY);
 
       // Try to click Next via DOM
       const clickResult = await config.clickNextButton(adapter);
@@ -739,6 +818,16 @@ ${dataPrompt}`,
         if (urlAfterWait !== urlBeforeClick || fingerprintAfterWait !== fingerprintBeforeClick) {
           await this.waitForPageLoad(adapter);
           return 'navigated';
+        }
+
+        // Page didn't navigate. Check if the site auto-scrolled (e.g. to unfilled
+        // fields that failed validation). If it did, do NOT scroll further — go
+        // straight back to Phase 1 to fill the fields the site just revealed.
+        const scrollAfterClick = await adapter.page.evaluate(() => window.scrollY);
+        if (Math.abs(scrollAfterClick - scrollBeforeClick) > 50) {
+          console.log(`[SmartApply] [${pageLabel}] Clicked Next — page auto-scrolled to unfilled fields (${scrollBeforeClick}→${scrollAfterClick}px). Re-filling.`);
+          consecutiveNoProgress = 0;
+          continue; // Back to Phase 1 at the new scroll position
         }
 
         // Click happened but nothing changed — treat as not navigated and scroll
@@ -822,6 +911,42 @@ ${dataPrompt}`,
   }
 
   /**
+   * Check if there's a visible upload button, link, or dropzone on screen.
+   * Used to decide whether to invoke the LLM to click it when DOM upload fails.
+   */
+  private async hasVisibleUploadArea(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    return adapter.page.evaluate(() => {
+      const vh = window.innerHeight;
+      const uploadWords = [
+        'upload', 'attach', 'choose file', 'select file', 'browse',
+        'add file', 'add resume', 'add cv', 'add document', 'add cover letter',
+        'drag', 'drop file', 'drop your', 'drop here',
+      ];
+      const els = document.querySelectorAll(
+        'button, [role="button"], a[href], label[for], ' +
+        '[class*="upload"], [class*="dropzone"], [class*="drop-zone"], ' +
+        '[class*="file-upload"], [class*="attach"], [class*="resume-upload"]'
+      );
+      for (let i = 0; i < els.length; i++) {
+        const el = els[i];
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.bottom < 0 || rect.top > vh) continue;
+        const st = window.getComputedStyle(el);
+        if (st.display === 'none' || st.visibility === 'hidden') continue;
+        const text = (el.textContent || '').trim().toLowerCase().replace(/\s+/g, ' ');
+        if (text.length > 150) continue;
+        // Skip nav buttons
+        if (text === 'submit' || text === 'next' || text === 'continue' || text === 'save') continue;
+        for (const word of uploadWords) {
+          if (text.includes(word)) return true;
+        }
+      }
+      return false;
+    });
+  }
+
+  /**
    * Quick fingerprint of visible field values to detect whether the LLM changed anything.
    */
   private async getVisibleFieldValues(adapter: BrowserAutomationAdapter): Promise<string> {
@@ -837,6 +962,67 @@ ${dataPrompt}`,
       });
       return vals.join('|');
     });
+  }
+
+  /**
+   * Dismiss any open dropdowns, popups, or overlays the LLM may have left behind.
+   * An open dropdown blocks clicks on other elements and prevents the selected
+   * value from being committed (blur/change events don't fire until it closes).
+   */
+  private async dismissOpenOverlays(adapter: BrowserAutomationAdapter): Promise<void> {
+    try {
+      // Press Escape to close any open dropdown/popup/menu
+      await adapter.page.keyboard.press('Escape');
+      await adapter.page.waitForTimeout(200);
+
+      // Click a neutral area to trigger blur on any focused element.
+      // Use coordinates unlikely to hit a button (top-left corner of viewport).
+      await adapter.page.mouse.click(5, 5);
+      await adapter.page.waitForTimeout(300);
+    } catch {
+      // Non-fatal — overlay may not exist
+    }
+  }
+
+  /**
+   * Snapshot which checkboxes are currently checked (by index) so we can detect if
+   * the LLM accidentally unchecks any.
+   */
+  private async getCheckedCheckboxes(adapter: BrowserAutomationAdapter): Promise<number[]> {
+    return adapter.page.evaluate(() => {
+      const indices: number[] = [];
+      const cbs = document.querySelectorAll('input[type="checkbox"]');
+      for (let i = 0; i < cbs.length; i++) {
+        if ((cbs[i] as HTMLInputElement).checked) indices.push(i);
+      }
+      return indices;
+    });
+  }
+
+  /**
+   * Re-check any checkboxes that were checked before the LLM acted but got unchecked.
+   * The LLM should NEVER uncheck a checkbox.
+   */
+  private async restoreUncheckedCheckboxes(
+    adapter: BrowserAutomationAdapter,
+    previouslyChecked: number[],
+  ): Promise<void> {
+    if (previouslyChecked.length === 0) return;
+    const restored = await adapter.page.evaluate((indices) => {
+      let count = 0;
+      const cbs = document.querySelectorAll('input[type="checkbox"]');
+      for (let i = 0; i < indices.length; i++) {
+        const cb = cbs[indices[i]] as HTMLInputElement | undefined;
+        if (cb && !cb.checked) {
+          cb.click();
+          count++;
+        }
+      }
+      return count;
+    }, previouslyChecked);
+    if (restored > 0) {
+      console.log(`[SmartApply] Restored ${restored} checkbox(es) the LLM accidentally unchecked.`);
+    }
   }
 
   /**

@@ -359,7 +359,7 @@ export class JobExecutor {
         llm: llmSetup.llm,
         ...(llmSetup.imageLlm && { imageLlm: llmSetup.imageLlm }),
         ...(storedSession ? { storageState: storedSession } : {}),
-        systemPrompt: 'You are a form-filling agent. RULES: (1) ONE action at a time. (2) TOP TO BOTTOM — start at the topmost unanswered field, never skip ahead. (3) DO NOT TOUCH any question that is even slightly cut off at the bottom of the screen — if the question text, any answer choice, or any part of the field is cut off or not fully visible, DO NOT interact with it. A scroller will bring it into view and you will handle it next time. (4) Before reporting done, scan top to bottom and confirm every 100% visible question is answered. (5) NEVER scroll or navigate.',
+        systemPrompt: 'You are a form-filling agent. RULES: (1) ONE action at a time. (2) TOP TO BOTTOM — start at the topmost unanswered field, never skip ahead. (3) DO NOT TOUCH any question that is even slightly cut off at the bottom of the screen. (4) Before reporting done, scan top to bottom and confirm every 100% visible question is answered. (5) When done with all fully visible fields, IMMEDIATELY report done. Do NOT use the wait action. Reporting done IS what triggers scrolling. (6) NEVER scroll or navigate.',
       });
 
       // 7a. Attach StagehandObserver for enriched blocker detection (optional)
