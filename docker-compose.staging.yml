@@ -7,12 +7,9 @@
 #
 # For manual operations, use scripts/deploy.sh or deploy-server API.
 #
-# Staging deployment for GhostHands — identical to prod but with staging-specific defaults
-#
-# Differences from production:
-#   - GH_ENVIRONMENT=staging (reported in health endpoints)
-#   - Deploy server bound to 0.0.0.0:8000 (for VALET access)
-#   - Lower resource limits (staging instances are smaller)
+# All services use host networking to match deploy-server Docker API deploys
+# (which also create containers with NetworkMode: 'host'). This prevents
+# port conflicts when both deploy paths run in sequence.
 #
 # Usage:
 #   ECR_IMAGE=<registry>/ghosthands:staging-<sha> docker compose -f docker-compose.staging.yml up -d
@@ -22,8 +19,7 @@ services:
   api:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "packages/ghosthands/src/api/server.ts"]
-    ports:
-      - "0.0.0.0:${GH_API_PORT:-3100}:3100"
+    network_mode: host
     env_file: .env
     environment:
       - NODE_ENV=production
@@ -50,8 +46,6 @@ services:
         max-file: "3"
 
   # Deploy Server — receives deploy commands from VALET's DeployService
-  # Uses host networking so it can health-check containers it creates
-  # (which also run on host network via Docker API deploys)
   deploy-server:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "scripts/deploy-server.ts"]
@@ -89,8 +83,7 @@ services:
   worker:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "packages/ghosthands/src/workers/main.ts"]
-    ports:
-      - "0.0.0.0:${GH_WORKER_PORT:-3101}:3101"
+    network_mode: host
     env_file: .env
     environment:
       - NODE_ENV=production
