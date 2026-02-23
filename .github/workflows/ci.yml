@@ -130,12 +130,12 @@ jobs:
             docker push $ECR_REGISTRY/$ECR_REPOSITORY:staging
           fi
 
-  # ─── Deploy: Staging ──────────────────────────────────────────
+  # ─── Deploy: Staging (notify VALET after ASG is updated) ─────
 
   deploy-staging:
     name: Deploy Staging
     runs-on: ubuntu-latest
-    needs: [docker, test-integration]
+    needs: [docker, deploy-asg]
     if: github.event_name == 'push'
     environment: staging
     steps:
@@ -227,13 +227,13 @@ jobs:
           fi
 
   # ─── Deploy to ASG instances (SSH) ────────────────────────────
-  # After Docker push + staging notification, SSH to each running
-  # ASG instance and pull/restart the new image.
+  # FIRST: SSH to each running ASG instance and pull/restart the
+  # new image. VALET notification happens after this succeeds.
 
   deploy-asg:
     name: Deploy to ASG Fleet
     runs-on: ubuntu-latest
-    needs: [docker, deploy-staging]
+    needs: [docker, test-integration]
     if: github.event_name == 'push'
     environment: ${{ needs.docker.outputs.environment }}
     steps:
@@ -268,12 +268,12 @@ jobs:
         run: rm -f ~/.ssh/valet-worker.pem
 
   # ─── Deploy: Production ───────────────────────────────────────
-  # Only triggers on main branch pushes, after staging succeeds
+  # Only triggers on main branch pushes, after ASG is updated
 
   deploy-production:
     name: Deploy Production
     runs-on: ubuntu-latest
-    needs: [docker, deploy-staging]
+    needs: [docker, deploy-asg]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     environment: production
     steps:
