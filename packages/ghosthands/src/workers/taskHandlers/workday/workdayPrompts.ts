@@ -16,9 +16,11 @@ ABSOLUTE RULE #2 — FULLY VISIBLE ONLY: Before interacting with ANY field, chec
 
 ABSOLUTE RULE #3 — ONE ATTEMPT PER FIELD: You may type into a given field AT MOST ONCE. After you type a value and click elsewhere, that field is DONE. Do NOT go back and re-type. Even if the field appears empty after you typed, trust that your input was registered and move to the next field. Typing into the same field multiple times causes duplicate text (e.g. "WuWuWu" instead of "Wu").
 
-ABSOLUTE RULE #4 — NO TAB KEY: NEVER press the Tab key to move between fields. Instead, after filling a field, CLICK on empty whitespace to deselect, then CLICK directly on the next field you want to fill. Tab can jump to the wrong field.
+ABSOLUTE RULE #4 — CLICK BEFORE TYPING: NEVER type unless you have just clicked on a text input field and can see it is focused (blue border or cursor visible). Typing without a focused field causes the page to jump to a random location. Always: 1) CLICK the field, 2) confirm it is focused, 3) THEN type.
 
-ABSOLUTE RULE #5 — NEVER NAVIGATE: Do NOT click "Save and Continue", "Next", "Submit", "Back", or any button that navigates to another page. When you are done filling visible fields, simply STOP taking actions. I handle all navigation myself.`;
+ABSOLUTE RULE #5 — NO TAB KEY: NEVER press the Tab key to move between fields. Instead, after filling a field, CLICK on empty whitespace to deselect, then CLICK directly on the next field you want to fill. Tab can jump to the wrong field.
+
+ABSOLUTE RULE #6 — NEVER NAVIGATE: Do NOT click "Save and Continue", "Next", "Submit", "Back", or any button that navigates to another page. When you are done filling visible fields, simply STOP taking actions. I handle all navigation myself.`;
 
 // ---------------------------------------------------------------------------
 // Common interaction patterns (reused across page-specific prompts)
@@ -126,6 +128,8 @@ ${dataBlock}`;
 export const EXPERIENCE_ENTRY_RULES = `ABSOLUTE RULE — SCROLL DOWN ONLY: You ARE allowed to scroll DOWN on this page to reveal more fields for this entry. Each scroll must be at least 40 pixels. You may ONLY scroll DOWN — NEVER scroll up. Scrolling up is STRICTLY FORBIDDEN because it will bring previous entries into view and cause you to overwrite their data. If you cannot find a field, keep scrolling DOWN — it is always below you, never above.
 
 RULE — ONE ATTEMPT PER FIELD: You may type into a given field AT MOST ONCE. After you type a value and click elsewhere, that field is DONE. Do NOT go back and re-type. Even if the field appears empty after you typed, trust that your input was registered and move to the next field. Typing into the same field multiple times causes duplicate text (e.g. "WuWuWu" instead of "Wu").
+
+RULE — CLICK BEFORE TYPING: NEVER type unless you have just clicked on a text input field and can see it is focused (blue border or cursor visible). Typing without a focused field causes the page to jump to a random location. Always: 1) CLICK the field, 2) confirm it is focused, 3) THEN type.
 
 RULE — NO TAB KEY: NEVER press the Tab key to move between fields. Instead, after filling a field, CLICK on empty whitespace to deselect, then CLICK directly on the next field you want to fill. Tab can jump to the wrong field.
 
