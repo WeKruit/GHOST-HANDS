@@ -254,13 +254,17 @@ export class JobExecutor {
         action_limit: costTracker.getActionLimit(),
       });
 
-      // 1a. Notify VALET that the job is now running
+      // 1a. Notify VALET that the job is now running (include kasm_url if available)
+      const kasmUrl = process.env.KASM_SESSION_URL;
+      if (kasmUrl) {
+        progress.setKasmUrl(kasmUrl);
+      }
       if (job.callback_url) {
         callbackNotifier.notifyRunning(
           job.id,
           job.callback_url,
           job.valet_task_id,
-          undefined,
+          kasmUrl ? { kasm_url: kasmUrl } : undefined,
           this.workerId,
         ).catch((err) => {
           getLogger().warn('Running callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });

@@ -57,6 +57,8 @@ export interface CallbackPayload {
     image_cost_usd: number;
     reasoning_cost_usd: number;
   } | null;
+  /** Kasm session URL for live browser view (WEK-162) */
+  kasm_url?: string;
   completed_at: string;
 }
 
@@ -122,8 +124,14 @@ export class CallbackNotifier {
       total_tokens: job.total_tokens || 0,
     };
 
-    // Sprint 3: Mode tracking fields
+    // WEK-162: Include Kasm session URL if available (from job metadata or env)
     const jobMeta = typeof job.metadata === 'object' ? (job.metadata || {}) : {};
+    const kasmUrl = jobMeta.kasm_session_url || jobMeta.kasm_url || process.env.KASM_SESSION_URL;
+    if (kasmUrl) {
+      payload.kasm_url = kasmUrl;
+    }
+
+    // Sprint 3: Mode tracking fields
     if (job.execution_mode) {
       payload.execution_mode = job.execution_mode;
     }
@@ -154,9 +162,10 @@ export class CallbackNotifier {
     jobId: string,
     callbackUrl: string,
     valetTaskId?: string | null,
-    metadata?: { execution_mode?: string; manual_id?: string | null },
+    metadata?: { execution_mode?: string; manual_id?: string | null; kasm_url?: string },
     workerId?: string,
   ): Promise<boolean> {
+    const kasmUrl = metadata?.kasm_url || process.env.KASM_SESSION_URL;
     const payload: CallbackPayload = {
       job_id: jobId,
       valet_task_id: valetTaskId || null,
@@ -164,6 +173,7 @@ export class CallbackNotifier {
       ...(workerId && { worker_id: workerId }),
       completed_at: new Date().toISOString(),
       ...(metadata?.execution_mode && { execution_mode: metadata.execution_mode }),
+      ...(kasmUrl && { kasm_url: kasmUrl }),
     };
     return this.sendWithRetry(callbackUrl, payload);
   }
@@ -178,7 +188,9 @@ export class CallbackNotifier {
     valetTaskId?: string | null,
     workerId?: string,
     cost?: { total_cost_usd: number; action_count: number; total_tokens: number },
+    kasmUrl?: string,
   ): Promise<boolean> {
+    const resolvedKasmUrl = kasmUrl || process.env.KASM_SESSION_URL;
     const payload: CallbackPayload = {
       job_id: jobId,
       valet_task_id: valetTaskId || null,
@@ -186,6 +198,7 @@ export class CallbackNotifier {
       ...(workerId && { worker_id: workerId }),
       interaction: interactionData,
       ...(cost && { cost }),
+      ...(resolvedKasmUrl && { kasm_url: resolvedKasmUrl }),
       completed_at: new Date().toISOString(),
     };
     return this.sendWithRetry(callbackUrl, payload);
@@ -199,12 +212,15 @@ export class CallbackNotifier {
     callbackUrl: string,
     valetTaskId?: string | null,
     workerId?: string,
+    kasmUrl?: string,
   ): Promise<boolean> {
+    const resolvedKasmUrl = kasmUrl || process.env.KASM_SESSION_URL;
     const payload: CallbackPayload = {
       job_id: jobId,
       valet_task_id: valetTaskId || null,
       status: 'resumed',
       ...(workerId && { worker_id: workerId }),
+      ...(resolvedKasmUrl && { kasm_url: resolvedKasmUrl }),
       completed_at: new Date().toISOString(),
     };
     return this.sendWithRetry(callbackUrl, payload);

@@ -78,6 +78,8 @@ export interface ProgressEventData {
   execution_mode?: 'cookbook' | 'magnitude';
   manual_id?: string;
   step_cost_cents?: number;
+  /** Kasm session URL for live browser view (WEK-162) */
+  kasm_url?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +165,7 @@ export class ProgressTracker {
   private pendingEmit: ProgressEventData | null = null;
   private executionMode?: 'cookbook' | 'magnitude';
   private manualId?: string;
+  private kasmUrl?: string;
 
   constructor(opts: ProgressTrackerOptions) {
     this.jobId = opts.jobId;
@@ -188,6 +191,11 @@ export class ProgressTracker {
   setExecutionMode(mode: 'cookbook' | 'magnitude', manualId?: string): void {
     this.executionMode = mode;
     this.manualId = manualId;
+  }
+
+  /** Set the Kasm session URL for live view (WEK-162). */
+  setKasmUrl(url: string): void {
+    this.kasmUrl = url;
   }
 
   /** Called when an action starts. Infers the step and emits progress. */
@@ -230,6 +238,7 @@ export class ProgressTracker {
       eta_ms: this.estimateEta(elapsedMs),
       ...(this.executionMode && { execution_mode: this.executionMode }),
       ...(this.manualId && { manual_id: this.manualId }),
+      ...(this.kasmUrl && { kasm_url: this.kasmUrl }),
     };
   }
 
