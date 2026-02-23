@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { BrowserAutomationAdapter } from '../../../adapters/types.js';
-import type { PlatformConfig, PageState, PageType } from './types.js';
+import type { PlatformConfig, PageState, PageType, ScannedField, ScanResult } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Base rules (generic — works for most ATS platforms)
@@ -83,7 +83,7 @@ function deriveEducationLevel(degree: string): string {
   return degree; // Pass through as-is if no match
 }
 
-function findBestAnswer(label: string, qaMap: Record<string, string>): string | null {
+export function findBestAnswer(label: string, qaMap: Record<string, string>): string | null {
   const norm = normalizeLabel(label);
   if (!norm) return null;
 
@@ -525,7 +525,878 @@ ${FIELD_INTERACTION_RULES}
 ${dataBlock}`;
   }
 
-  // --- Programmatic DOM Helpers ---
+  // --- Scan-First Field Discovery ---
+
+  async scanPageFields(adapter: BrowserAutomationAdapter): Promise<ScanResult> {
+    // Shim esbuild's __name helper in the browser context.
+    // esbuild's --keep-names wraps const arrow functions with __name() which doesn't
+    // exist in the browser. Defining it globally once covers all page.evaluate calls.
+    await adapter.page.evaluate('if(typeof __name==="undefined"){window.__name=function(f){return f}}');
+
+    // Clean stale scan attributes from any previous scan cycle to avoid selector collisions
+    await adapter.page.evaluate(() => {
+      document.querySelectorAll('[data-gh-scan-idx]').forEach(el => el.removeAttribute('data-gh-scan-idx'));
+    });
+
+    const viewportHeight = await adapter.page.evaluate(() => window.innerHeight);
+    const scrollHeight = await adapter.page.evaluate(() => document.documentElement.scrollHeight);
+
+    // Scroll to top
+    await adapter.page.evaluate(() => window.scrollTo(0, 0));
+    await adapter.page.waitForTimeout(500);
+
+    const allFields: ScannedField[] = [];
+    const seenSelectors = new Set<string>();
+    let nextIdx = 0;
+
+    // Scroll through page in 70% viewport steps (overlap catches fields at edges)
+    let currentScroll = 0;
+    const maxScroll = Math.max(0, scrollHeight - viewportHeight);
+    const maxSteps = 15;
+    let steps = 0;
+
+    while (steps < maxSteps) {
+      const rawFields = await this.collectVisibleFields(adapter, nextIdx);
+
+      for (const field of rawFields) {
+        if (!seenSelectors.has(field.selector)) {
+          seenSelectors.add(field.selector);
+          allFields.push(field);
+          nextIdx++;
+        }
+      }
+
+      if (currentScroll >= maxScroll) break;
+
+      const nextScroll = Math.min(currentScroll + Math.round(viewportHeight * 0.7), maxScroll);
+      await adapter.page.evaluate((y: number) => window.scrollTo(0, y), nextScroll);
+      await adapter.page.waitForTimeout(400);
+      currentScroll = nextScroll;
+      steps++;
+    }
+
+    // Scroll back to top
+    await adapter.page.evaluate(() => window.scrollTo(0, 0));
+    await adapter.page.waitForTimeout(300);
+
+    // Sort by page position (top to bottom)
+    allFields.sort((a, b) => a.absoluteY - b.absoluteY);
+
+    console.log(`[GenericConfig] Scan complete: ${allFields.length} field(s) found across ${steps + 1} viewport(s)`);
+    return { fields: allFields, scrollHeight, viewportHeight };
+  }
+
+  /**
+   * Collect all form fields visible in the current viewport.
+   * Runs inside page.evaluate — all logic must be browser-compatible.
+   */
+  private async collectVisibleFields(
+    adapter: BrowserAutomationAdapter,
+    startIdx: number,
+  ): Promise<ScannedField[]> {
+    return adapter.page.evaluate((startIdxArg: number) => {
+      const vh = window.innerHeight;
+      const scrollY = window.scrollY;
+      const fields: any[] = [];
+      let idx = startIdxArg;
+
+      // --- Label extraction helper (8 strategies) ---
+      const extractLabel = (el: Element): string => {
+        let label = '';
+        const htmlEl = el as HTMLInputElement;
+
+        // 1. Associated <label> element
+        if ('labels' in htmlEl && htmlEl.labels?.length) {
+          label = (htmlEl.labels[0].textContent || '').trim();
+        }
+        // 2. aria-label
+        if (!label) label = el.getAttribute('aria-label') || '';
+        // 3. aria-labelledby
+        if (!label) {
+          const labelledBy = el.getAttribute('aria-labelledby');
+          if (labelledBy) {
+            const labelEl = document.getElementById(labelledBy);
+            if (labelEl) label = (labelEl.textContent || '').trim();
+          }
+        }
+        // 4. Placeholder
+        if (!label) label = el.getAttribute('placeholder') || '';
+        // 5. label[for] matching id
+        if (!label && htmlEl.id) {
+          const forLabel = document.querySelector('label[for="' + CSS.escape(htmlEl.id) + '"]');
+          if (forLabel) label = (forLabel.textContent || '').trim();
+        }
+        // 6. Parent container label
+        if (!label) {
+          const parent = el.closest('[class*="field"], [class*="form-group"], [class*="question"], fieldset, [class*="input"]');
+          if (parent) {
+            const lbl = parent.querySelector('label, legend, [class*="label"]');
+            if (lbl && !lbl.contains(el)) label = (lbl.textContent || '').trim();
+          }
+        }
+        // 7. Preceding sibling
+        if (!label) {
+          const prev = el.previousElementSibling;
+          if (prev && (prev.tagName === 'LABEL' || prev.tagName === 'SPAN' || prev.tagName === 'DIV')) {
+            const t = (prev.textContent || '').trim();
+            if (t.length < 80) label = t;
+          }
+        }
+        // 8. name or id fallback
+        if (!label) label = htmlEl.name || htmlEl.id || '';
+
+        return label.substring(0, 120);
+      };
+
+      // --- Visibility check helper ---
+      const isVisible = (el: Element): boolean => {
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 5 || rect.height < 5) return false;
+        if (rect.bottom < 0 || rect.top > vh) return false;
+        if (el.getAttribute('aria-hidden') === 'true') return false;
+        const st = window.getComputedStyle(el);
+        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+        return true;
+      };
+
+      // --- Build stable CSS selector ---
+      const buildSelector = (el: Element, scanIdx: number): string => {
+        if (el.id) return '#' + CSS.escape(el.id);
+        const testId = el.getAttribute('data-testid');
+        if (testId) return '[data-testid="' + testId + '"]';
+        const autoId = el.getAttribute('data-automation-id');
+        if (autoId) return '[data-automation-id="' + autoId + '"]';
+        // Reuse existing scan attribute if element was already tagged (prevents
+        // duplicate selectors when the same element is visible across scroll steps)
+        const existingIdx = el.getAttribute('data-gh-scan-idx');
+        if (existingIdx) return '[data-gh-scan-idx="' + existingIdx + '"]';
+        el.setAttribute('data-gh-scan-idx', String(scanIdx));
+        return '[data-gh-scan-idx="' + scanIdx + '"]';
+      };
+
+      // --- Check if element is inside a disabled fieldset ---
+      const isInsideDisabledFieldset = (el: Element): boolean => {
+        const fs = el.closest('fieldset');
+        return fs !== null && (fs as HTMLFieldSetElement).disabled;
+      };
+
+      const isRequired = (el: Element): boolean => {
+        return (el as HTMLInputElement).required
+          || el.getAttribute('aria-required') === 'true'
+          || (el.closest('[class*="required"]') !== null);
+      };
+
+      // ── 1. Text inputs + textareas ──
+      const textInputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+        'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="number"], input:not([type]), textarea'
+      );
+      for (const input of textInputs) {
+        if (input.disabled || (input as HTMLInputElement).readOnly) continue;
+        if ((input as HTMLInputElement).type === 'hidden') continue;
+        if (!isVisible(input)) continue;
+        if (isInsideDisabledFieldset(input)) continue;
+        const rect = input.getBoundingClientRect();
+        const sel = buildSelector(input, idx);
+        fields.push({
+          id: 'field-' + idx,
+          kind: 'text',
+          fillStrategy: 'native_setter',
+          selector: sel,
+          label: extractLabel(input),
+          currentValue: (input.value || '').trim(),
+          absoluteY: rect.top + scrollY,
+          isRequired: isRequired(input),
+          filled: false,
+        });
+        idx++;
+      }
+
+      // ── 2. Native <select> ──
+      const selects = document.querySelectorAll<HTMLSelectElement>('select:not([disabled])');
+      for (const select of selects) {
+        if (!isVisible(select)) continue;
+        if (isInsideDisabledFieldset(select)) continue;
+        const rect = select.getBoundingClientRect();
+        const sel = buildSelector(select, idx);
+        // Filter out placeholder options (empty value + generic text)
+        const options = Array.from(select.options).filter(o => {
+          if (o.value === '' || o.disabled) return false;
+          const t = o.text.trim().toLowerCase();
+          if (t === '' || t.startsWith('select') || t.startsWith('choose') || t.startsWith('please') || t === '--' || t === '---' || t === 'none') return false;
+          return true;
+        }).map(o => o.text.trim());
+        fields.push({
+          id: 'field-' + idx,
+          kind: 'select',
+          fillStrategy: 'native_setter',
+          selector: sel,
+          label: extractLabel(select),
+          currentValue: select.selectedIndex > 0 ? (select.options[select.selectedIndex]?.text || '').trim() : '',
+          options,
+          absoluteY: rect.top + scrollY,
+          isRequired: isRequired(select),
+          filled: false,
+        });
+        idx++;
+      }
+
+      // ── 3. Custom dropdowns ──
+      // Broad detection: ARIA roles + haspopup (any value) + aria-expanded +
+      // class-name patterns for styled select/dropdown/picker components.
+      const ddSelector =
+        '[role="combobox"], [role="listbox"], ' +
+        '[aria-haspopup], ' +                            // any haspopup value
+        '[aria-expanded]:not(input):not(textarea), ' +   // expandable non-inputs
+        '[class*="select"]:not(select), ' +              // class-based (not native <select>)
+        '[class*="dropdown"], [class*="picker"]';
+      const customDropdowns = document.querySelectorAll(ddSelector);
+      const seenDDElements = new Set<Element>();
+      const NAV_EXCLUDE = 'nav, header, [role="navigation"], [role="menubar"], [role="menu"], [role="toolbar"]';
+
+      for (const dd of customDropdowns) {
+        // --- Exclusion filters ---
+        if (dd.getAttribute('aria-disabled') === 'true') continue;
+        if (dd.closest('select')) continue;                // inside native <select>
+        if (dd.tagName === 'SELECT') continue;             // IS a native <select> (handled in section 2)
+        if (dd.tagName === 'INPUT') continue;              // text inputs with aria-expanded
+        if (dd.tagName === 'TEXTAREA') continue;
+        if (!isVisible(dd)) continue;
+        if (isInsideDisabledFieldset(dd)) continue;
+        if (dd.closest(NAV_EXCLUDE)) continue;             // nav/header/menu elements
+
+        // Skip elements that are clearly not form dropdowns:
+        // links, plain images, icons, list items in a nav context
+        const tag = dd.tagName;
+        if (tag === 'A' || tag === 'IMG' || tag === 'SVG' || tag === 'LI') continue;
+
+        // Deduplicate: skip if this element or an ancestor was already added
+        if (seenDDElements.has(dd)) continue;
+        const parentDD = dd.parentElement?.closest(ddSelector);
+        if (parentDD && seenDDElements.has(parentDD)) continue;
+        // Also skip if a child was already added (we want the outermost)
+        let childAlreadySeen = false;
+        for (const seen of seenDDElements) {
+          if (dd.contains(seen)) { childAlreadySeen = true; break; }
+        }
+        if (childAlreadySeen) continue;
+        seenDDElements.add(dd);
+
+        const rect = dd.getBoundingClientRect();
+        const inputChild = dd.querySelector('input') as HTMLInputElement | null;
+        const currentValue = inputChild?.value?.trim() || '';
+        const displayText = (dd.textContent || '').trim();
+        const displayLower = displayText.toLowerCase();
+
+        // --- Determine if empty or already filled ---
+        const placeholderWords = ['select', 'choose', 'please', '--', '---', 'none', 'pick'];
+        const looksLikePlaceholder = placeholderWords.some(p => displayLower.startsWith(p)) || displayLower === '';
+
+        // If the element has a concrete input value and it's not placeholder text, it's filled
+        if (currentValue && !looksLikePlaceholder) continue;
+
+        // For elements without an input child: check if display text is just the label
+        // (e.g., "Country/Region" shows as both label and button text when nothing is selected)
+        // In that case it's EMPTY and should be included.
+        // Only skip if display text looks like a real selected value (not the label, not placeholder)
+        if (!currentValue && !looksLikePlaceholder && displayText.length > 0 && displayText.length < 100) {
+          const ddLabel = extractLabel(dd);
+          // If the display text doesn't match its own label, it's probably an already-selected value — skip
+          const normDisplay = displayLower.replace(/[^a-z0-9]/g, '');
+          const normLabel = ddLabel.toLowerCase().replace(/[^a-z0-9]/g, '');
+          if (normLabel && normDisplay && !normDisplay.includes(normLabel) && !normLabel.includes(normDisplay)) {
+            continue; // display text ≠ label → likely a real value is selected
+          }
+        }
+
+        const sel = buildSelector(dd, idx);
+        fields.push({
+          id: 'field-' + idx,
+          kind: 'custom_dropdown',
+          fillStrategy: 'click_option',
+          selector: sel,
+          label: extractLabel(dd),
+          currentValue,
+          absoluteY: rect.top + scrollY,
+          isRequired: isRequired(dd),
+          filled: false,
+        });
+        idx++;
+      }
+
+      // ── 4. Native radio groups ──
+      const radiosByName: Record<string, HTMLInputElement[]> = {};
+      const radios = document.querySelectorAll<HTMLInputElement>('input[type="radio"]:not([disabled])');
+      for (const r of radios) {
+        if (!r.name) continue;
+        if (!isVisible(r)) continue;
+        if (isInsideDisabledFieldset(r)) continue;
+        if (!radiosByName[r.name]) radiosByName[r.name] = [];
+        radiosByName[r.name].push(r);
+      }
+      for (const [groupName, groupRadios] of Object.entries(radiosByName)) {
+        const hasChecked = groupRadios.some(r => r.checked);
+        const firstRadio = groupRadios[0];
+        const rect = firstRadio.getBoundingClientRect();
+
+        // Extract question text from fieldset/legend or container
+        let questionText = '';
+        const fieldset = firstRadio.closest('fieldset');
+        if (fieldset) {
+          const legend = fieldset.querySelector('legend');
+          if (legend) questionText = (legend.textContent || '').trim();
+        }
+        if (!questionText) {
+          const container = firstRadio.closest('[role="group"], [role="radiogroup"]');
+          if (container) {
+            const labelledBy = container.getAttribute('aria-labelledby');
+            if (labelledBy) {
+              const labelEl = document.getElementById(labelledBy);
+              if (labelEl) questionText = (labelEl.textContent || '').trim();
+            }
+            if (!questionText) questionText = container.getAttribute('aria-label') || '';
+          }
+        }
+        if (!questionText) {
+          const parent = firstRadio.closest('[class*="question"], [class*="field"], [class*="form-group"], fieldset, section');
+          if (parent) {
+            const lbl = parent.querySelector('label, legend, [class*="label"], [class*="question-text"], h3, h4, p');
+            if (lbl && !lbl.querySelector('input[type="radio"]')) {
+              questionText = (lbl.textContent || '').trim();
+            }
+          }
+        }
+        if (!questionText) {
+          let prev = firstRadio.parentElement?.previousElementSibling;
+          if (!prev) prev = firstRadio.parentElement?.parentElement?.previousElementSibling;
+          if (prev) {
+            const t = (prev.textContent || '').trim();
+            if (t.length > 5 && t.length < 200) questionText = t;
+          }
+        }
+
+        // Extract option texts
+        const options: string[] = [];
+        for (const r of groupRadios) {
+          let optText = '';
+          if (r.id) {
+            const lbl = document.querySelector('label[for="' + CSS.escape(r.id) + '"]');
+            if (lbl) optText = (lbl.textContent || '').trim();
+          }
+          if (!optText && r.labels?.length) optText = (r.labels[0].textContent || '').trim();
+          if (!optText) {
+            const parentLabel = r.closest('label');
+            if (parentLabel) optText = (parentLabel.textContent || '').trim();
+          }
+          if (!optText) optText = r.value || '';
+          options.push(optText);
+        }
+
+        // Use first radio's selector as the group entry point
+        const sel = buildSelector(firstRadio, idx);
+        fields.push({
+          id: 'field-' + idx,
+          kind: 'radio',
+          fillStrategy: 'click_option',
+          selector: sel,
+          label: questionText,
+          currentValue: hasChecked ? 'checked' : '',
+          options,
+          groupKey: groupName,
+          absoluteY: rect.top + scrollY,
+          isRequired: isRequired(firstRadio),
+          filled: false,
+        });
+        idx++;
+      }
+
+      // ── 5. ARIA radiogroups ──
+      const ariaGroups = document.querySelectorAll('[role="radiogroup"]');
+      for (const group of ariaGroups) {
+        if ((group as HTMLElement).getAttribute('aria-disabled') === 'true') continue;
+        if (!isVisible(group)) continue;
+        if (isInsideDisabledFieldset(group)) continue;
+        if (group.closest('nav, header, [role="navigation"], [role="menubar"], [role="menu"], [role="toolbar"]')) continue;
+        const rect = group.getBoundingClientRect();
+        const groupRadioEls = group.querySelectorAll('[role="radio"]');
+        let hasChecked = false;
+        for (const r of groupRadioEls) {
+          if (r.getAttribute('aria-checked') === 'true') { hasChecked = true; break; }
+        }
+
+        let questionText = '';
+        const labelledBy = group.getAttribute('aria-labelledby');
+        if (labelledBy) {
+          const labelEl = document.getElementById(labelledBy);
+          if (labelEl) questionText = (labelEl.textContent || '').trim();
+        }
+        if (!questionText) questionText = group.getAttribute('aria-label') || '';
+        if (!questionText) {
+          const parent = group.closest('[class*="question"], [class*="field"], fieldset, section');
+          if (parent) {
+            const lbl = parent.querySelector('label, legend, [class*="label"], [class*="question-text"], h3, h4, p');
+            if (lbl && !lbl.querySelector('[role="radio"]')) questionText = (lbl.textContent || '').trim();
+          }
+        }
+
+        const options: string[] = [];
+        for (const radio of groupRadioEls) {
+          let optText = radio.getAttribute('aria-label') || '';
+          if (!optText) {
+            const labelId = radio.getAttribute('aria-labelledby');
+            if (labelId) {
+              const lbl = document.getElementById(labelId);
+              if (lbl) optText = (lbl.textContent || '').trim();
+            }
+          }
+          if (!optText) optText = (radio.textContent || '').trim();
+          options.push(optText);
+        }
+
+        const sel = buildSelector(group, idx);
+        fields.push({
+          id: 'field-' + idx,
+          kind: 'aria_radio',
+          fillStrategy: 'click_option',
+          selector: sel,
+          label: questionText,
+          currentValue: hasChecked ? 'checked' : '',
+          options,
+          absoluteY: rect.top + scrollY,
+          isRequired: isRequired(group),
+          filled: false,
+        });
+        idx++;
+      }
+
+      // ── 5b. Standalone ARIA radios (not inside a radiogroup) ──
+      const standaloneRadios = document.querySelectorAll('[role="radio"]');
+      const standaloneByContainer: Record<string, Element[]> = {};
+      for (const radio of standaloneRadios) {
+        if (radio.closest('[role="radiogroup"]')) continue; // already handled in 5
+        if (radio.getAttribute('aria-disabled') === 'true') continue;
+        if (!isVisible(radio)) continue;
+        if (isInsideDisabledFieldset(radio)) continue;
+        if (radio.closest('nav, header, [role="navigation"], [role="menubar"], [role="menu"], [role="toolbar"]')) continue;
+        // Group by nearest question/field container
+        const container = radio.closest('[class*="question"], [class*="field"], [class*="form-group"], fieldset, section, [class*="radio"]') || radio.parentElement;
+        const key = container ? (container.getAttribute('data-gh-scan-idx') || container.id || container.className.substring(0, 40) || 'standalone') : 'standalone';
+        if (!standaloneByContainer[key]) standaloneByContainer[key] = [];
+        standaloneByContainer[key].push(radio);
+      }
+      for (const [containerKey, groupRadios] of Object.entries(standaloneByContainer)) {
+        let hasChecked = false;
+        for (const r of groupRadios) {
+          if (r.getAttribute('aria-checked') === 'true') { hasChecked = true; break; }
+        }
+        const firstRadio = groupRadios[0];
+        const rect = firstRadio.getBoundingClientRect();
+
+        // Extract question text
+        let questionText = '';
+        const container = firstRadio.closest('[class*="question"], [class*="field"], [class*="form-group"], fieldset, section');
+        if (container) {
+          const lbl = container.querySelector('label, legend, [class*="label"], [class*="question-text"], h3, h4, p');
+          if (lbl && !lbl.querySelector('[role="radio"]')) questionText = (lbl.textContent || '').trim();
+        }
+        if (!questionText) {
+          const labelledBy = firstRadio.getAttribute('aria-labelledby');
+          if (labelledBy) {
+            const lbl = document.getElementById(labelledBy);
+            if (lbl) questionText = (lbl.textContent || '').trim();
+          }
+        }
+        if (!questionText) questionText = firstRadio.getAttribute('aria-label') || '';
+
+        // Extract option texts
+        const options: string[] = [];
+        for (const r of groupRadios) {
+          let optText = r.getAttribute('aria-label') || '';
+          if (!optText) {
+            const labelId = r.getAttribute('aria-labelledby');
+            if (labelId) {
+              const lbl = document.getElementById(labelId);
+              if (lbl) optText = (lbl.textContent || '').trim();
+            }
+          }
+          if (!optText) optText = (r.textContent || '').trim();
+          options.push(optText);
+        }
+
+        const sel = buildSelector(firstRadio, idx);
+        fields.push({
+          id: 'field-' + idx,
+          kind: 'aria_radio',
+          fillStrategy: 'click_option',
+          selector: sel,
+          label: questionText,
+          currentValue: hasChecked ? 'checked' : '',
+          options,
+          absoluteY: rect.top + scrollY,
+          isRequired: isRequired(firstRadio),
+          filled: false,
+        });
+        idx++;
+      }
+
+      // ── 6. Checkboxes ──
+      const checkboxes = document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]:not([disabled])');
+      for (const cb of checkboxes) {
+        if (!isVisible(cb)) continue;
+        if (isInsideDisabledFieldset(cb)) continue;
+        const rect = cb.getBoundingClientRect();
+        const sel = buildSelector(cb, idx);
+        fields.push({
+          id: 'field-' + idx,
+          kind: 'checkbox',
+          fillStrategy: 'click',
+          selector: sel,
+          label: extractLabel(cb),
+          currentValue: cb.checked ? 'checked' : '',
+          absoluteY: rect.top + scrollY,
+          isRequired: isRequired(cb),
+          filled: false,
+        });
+        idx++;
+      }
+
+      // ── 7. Date inputs ──
+      const dateInputs = document.querySelectorAll<HTMLInputElement>('input[type="date"]:not([disabled])');
+      for (const input of dateInputs) {
+        if (!isVisible(input)) continue;
+        if (isInsideDisabledFieldset(input)) continue;
+        const rect = input.getBoundingClientRect();
+        const sel = buildSelector(input, idx);
+        fields.push({
+          id: 'field-' + idx,
+          kind: 'date',
+          fillStrategy: 'native_setter',
+          selector: sel,
+          label: extractLabel(input),
+          currentValue: (input.value || '').trim(),
+          absoluteY: rect.top + scrollY,
+          isRequired: isRequired(input),
+          filled: false,
+        });
+        idx++;
+      }
+
+      // ── 8. File inputs ──
+      const fileInputs = document.querySelectorAll<HTMLInputElement>('input[type="file"]:not([disabled])');
+      for (const fi of fileInputs) {
+        if (isInsideDisabledFieldset(fi)) continue;
+        const hasFiles = fi.files && fi.files.length > 0;
+        // Check visibility of file input or its label/wrapper
+        let vis = isVisible(fi);
+        if (!vis) {
+          const lbl = fi.id ? document.querySelector('label[for="' + CSS.escape(fi.id) + '"]') : null;
+          const wrap = fi.closest('[class*="upload"], [class*="file"], [class*="resume"]');
+          const proxy = lbl || wrap || fi.parentElement;
+          if (proxy && proxy !== fi) vis = isVisible(proxy);
+        }
+        if (!vis) continue;
+        const rect = fi.getBoundingClientRect();
+        const sel = buildSelector(fi, idx);
+        fields.push({
+          id: 'field-' + idx,
+          kind: 'file',
+          fillStrategy: 'set_input_files',
+          selector: sel,
+          label: extractLabel(fi),
+          currentValue: hasFiles ? 'has_file' : '',
+          absoluteY: (rect.height > 0 ? rect.top : 0) + scrollY,
+          isRequired: isRequired(fi),
+          filled: false,
+        });
+        idx++;
+      }
+
+      // ── 9. Upload buttons (no file input) ──
+      const uploadWords = ['upload', 'attach', 'choose file', 'select file', 'browse',
+        'add file', 'add resume', 'add cv', 'add document', 'add cover letter',
+        'drag', 'drop file', 'drop your', 'drop here'];
+      const uploadEls = document.querySelectorAll(
+        'button, [role="button"], a[href], label[for], [class*="upload"], [class*="dropzone"], [class*="drop-zone"], [class*="file-upload"], [class*="attach"]'
+      );
+      for (const el of uploadEls) {
+        if (!isVisible(el)) continue;
+        const text = (el.textContent || '').trim().toLowerCase().replace(/\s+/g, ' ');
+        if (text.length > 150) continue;
+        if (text === 'submit' || text === 'next' || text === 'continue' || text === 'save') continue;
+        let isUpload = false;
+        for (const w of uploadWords) { if (text.includes(w)) { isUpload = true; break; } }
+        if (!isUpload) continue;
+        // Check if file already uploaded nearby
+        const container = el.closest('[class*="upload"], [class*="file"], [class*="resume"], form, fieldset, section') || el.parentElement;
+        if (container) {
+          const ct = (container.textContent || '').toLowerCase();
+          if (ct.includes('.pdf') || ct.includes('.doc') || ct.includes('uploaded') || ct.includes('attached') || ct.includes('remove file')) continue;
+        }
+        const rect = el.getBoundingClientRect();
+        const sel = buildSelector(el, idx);
+        fields.push({
+          id: 'field-' + idx,
+          kind: 'upload_button',
+          fillStrategy: 'llm_act',
+          selector: sel,
+          label: text.substring(0, 60),
+          currentValue: '',
+          absoluteY: rect.top + scrollY,
+          isRequired: false,
+          filled: false,
+        });
+        idx++;
+      }
+
+      // ── 10. Contenteditable divs ──
+      const editables = document.querySelectorAll('[contenteditable="true"]');
+      for (const el of editables) {
+        if (!isVisible(el)) continue;
+        const rect = el.getBoundingClientRect();
+        const content = (el as HTMLElement).textContent?.trim() || '';
+        const isEmpty = content.length === 0 || (el as HTMLElement).innerHTML === '<br>';
+        const sel = buildSelector(el, idx);
+        fields.push({
+          id: 'field-' + idx,
+          kind: 'contenteditable',
+          fillStrategy: 'llm_act',
+          selector: sel,
+          label: extractLabel(el),
+          currentValue: isEmpty ? '' : content.substring(0, 50),
+          absoluteY: rect.top + scrollY,
+          isRequired: isRequired(el),
+          filled: false,
+        });
+        idx++;
+      }
+
+      return fields;
+    }, startIdx) as Promise<ScannedField[]>;
+  }
+
+  async fillScannedField(
+    adapter: BrowserAutomationAdapter,
+    field: ScannedField,
+    answer: string,
+  ): Promise<boolean> {
+    switch (field.fillStrategy) {
+      case 'native_setter':
+        return this.fillByNativeSetter(adapter, field, answer);
+      case 'click_option':
+        return this.fillByClickOption(adapter, field, answer);
+      case 'click':
+        return this.fillByClick(adapter, field);
+      case 'set_input_files':
+        // Handled separately by resume upload logic in smartApplyHandler
+        return false;
+      case 'keyboard_type':
+        return this.fillByKeyboardType(adapter, field, answer);
+      case 'llm_act':
+        // Handled by LLM phase in smartApplyHandler
+        return false;
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * Fill a text input, textarea, or native select via native value setter + events.
+   */
+  private async fillByNativeSetter(
+    adapter: BrowserAutomationAdapter,
+    field: ScannedField,
+    answer: string,
+  ): Promise<boolean> {
+    if (field.kind === 'select') {
+      // For native selects, find the best matching option first
+      const normAnswer = normalizeLabel(answer);
+      const bestOption = field.options?.find(o => normalizeLabel(o) === normAnswer)
+        || field.options?.find(o => normalizeLabel(o).includes(normAnswer))
+        || field.options?.find(o => normAnswer.includes(normalizeLabel(o)));
+      if (!bestOption) return false;
+
+      return adapter.page.evaluate(
+        ({ sel, value }: { sel: string; value: string }) => {
+          const select = document.querySelector(sel) as HTMLSelectElement | null;
+          if (!select) return false;
+          const option = Array.from(select.options).find(o => o.text.trim() === value);
+          if (!option) return false;
+          const nativeSetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+          if (nativeSetter) nativeSetter.call(select, option.value);
+          else select.value = option.value;
+          select.dispatchEvent(new Event('input', { bubbles: true }));
+          select.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        },
+        { sel: field.selector, value: bestOption },
+      );
+    }
+
+    // Text input or textarea
+    return adapter.page.evaluate(
+      ({ sel, value }: { sel: string; value: string }) => {
+        const input = document.querySelector(sel) as HTMLInputElement | HTMLTextAreaElement | null;
+        if (!input) return false;
+        if (input.value && input.value.trim() !== '') return false; // Already filled
+        const proto = input.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (nativeSetter) nativeSetter.call(input, value);
+        else input.value = value;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
+        return true;
+      },
+      { sel: field.selector, value: answer },
+    );
+  }
+
+  /**
+   * Fill a radio group or custom dropdown by scrolling into view and clicking.
+   */
+  private async fillByClickOption(
+    adapter: BrowserAutomationAdapter,
+    field: ScannedField,
+    answer: string,
+  ): Promise<boolean> {
+    // Scroll into view first
+    await adapter.page.evaluate(
+      (sel: string) => document.querySelector(sel)?.scrollIntoView({ block: 'center', behavior: 'instant' }),
+      field.selector,
+    );
+    await adapter.page.waitForTimeout(300);
+
+    if (field.kind === 'radio') {
+      return this.fillNativeRadioBySelector(adapter, field, answer);
+    }
+    if (field.kind === 'aria_radio') {
+      return this.fillAriaRadioBySelector(adapter, field, answer);
+    }
+    if (field.kind === 'custom_dropdown') {
+      // Reuse existing searchable/clickable dropdown logic
+      const hasInput = await adapter.page.evaluate(
+        (sel: string) => !!document.querySelector(sel)?.querySelector('input'),
+        field.selector,
+      );
+      if (hasInput) {
+        return (await this.fillSearchableDropdown(adapter, field.selector, answer)) > 0;
+      }
+      return (await this.fillClickableDropdown(adapter, field.selector, answer)) > 0;
+    }
+    return false;
+  }
+
+  private async fillNativeRadioBySelector(
+    adapter: BrowserAutomationAdapter,
+    field: ScannedField,
+    answer: string,
+  ): Promise<boolean> {
+    if (!field.groupKey || !field.options) return false;
+    const normAnswer = answer.toLowerCase().trim();
+
+    // Find the best matching option
+    let bestIdx = -1;
+    let bestScore = 0;
+    for (let i = 0; i < field.options.length; i++) {
+      const normOpt = field.options[i].toLowerCase().trim();
+      if (normOpt === normAnswer) { bestIdx = i; break; }
+      if (normOpt.includes(normAnswer) && 80 > bestScore) { bestScore = 80; bestIdx = i; }
+      if (normAnswer.includes(normOpt) && normOpt.length >= 2 && 60 > bestScore) { bestScore = 60; bestIdx = i; }
+    }
+    if (bestIdx < 0) return false;
+
+    return adapter.page.evaluate(
+      ({ groupName, optIdx }: { groupName: string; optIdx: number }) => {
+        const radios = Array.from(
+          document.querySelectorAll<HTMLInputElement>('input[type="radio"][name="' + CSS.escape(groupName) + '"]:not([disabled])')
+        );
+        const target = radios[optIdx];
+        if (!target) return false;
+        target.click();
+        target.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      },
+      { groupName: field.groupKey, optIdx: bestIdx },
+    );
+  }
+
+  private async fillAriaRadioBySelector(
+    adapter: BrowserAutomationAdapter,
+    field: ScannedField,
+    answer: string,
+  ): Promise<boolean> {
+    if (!field.options) return false;
+    const normAnswer = answer.toLowerCase().trim();
+
+    let bestIdx = -1;
+    let bestScore = 0;
+    for (let i = 0; i < field.options.length; i++) {
+      const normOpt = field.options[i].toLowerCase().trim();
+      if (normOpt === normAnswer) { bestIdx = i; break; }
+      if (normOpt.includes(normAnswer) && 80 > bestScore) { bestScore = 80; bestIdx = i; }
+      if (normAnswer.includes(normOpt) && normOpt.length >= 2 && 60 > bestScore) { bestScore = 60; bestIdx = i; }
+    }
+    if (bestIdx < 0) return false;
+
+    return adapter.page.evaluate(
+      ({ sel, optIdx }: { sel: string; optIdx: number }) => {
+        const group = document.querySelector(sel);
+        if (!group) return false;
+        const radios = group.querySelectorAll('[role="radio"]');
+        const target = radios[optIdx] as HTMLElement | undefined;
+        if (!target) return false;
+        target.click();
+        return true;
+      },
+      { sel: field.selector, optIdx: bestIdx },
+    );
+  }
+
+  /**
+   * Fill a checkbox by clicking it.
+   */
+  private async fillByClick(
+    adapter: BrowserAutomationAdapter,
+    field: ScannedField,
+  ): Promise<boolean> {
+    await adapter.page.evaluate(
+      (sel: string) => document.querySelector(sel)?.scrollIntoView({ block: 'center', behavior: 'instant' }),
+      field.selector,
+    );
+    await adapter.page.waitForTimeout(200);
+
+    return adapter.page.evaluate(
+      (sel: string) => {
+        const el = document.querySelector(sel) as HTMLInputElement | null;
+        if (!el) return false;
+        if (el.checked) return false; // Already checked
+        el.click();
+        return true;
+      },
+      field.selector,
+    );
+  }
+
+  /**
+   * Fill a field by focusing and typing (for segmented date fields etc).
+   */
+  private async fillByKeyboardType(
+    adapter: BrowserAutomationAdapter,
+    field: ScannedField,
+    answer: string,
+  ): Promise<boolean> {
+    try {
+      const locator = adapter.page.locator(field.selector).first();
+      await locator.scrollIntoViewIfNeeded();
+      await locator.click();
+      await adapter.page.waitForTimeout(200);
+      await adapter.page.keyboard.type(answer, { delay: 50 });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // --- Programmatic DOM Helpers (legacy, kept for backward compatibility) ---
 
   async fillTextFieldsProgrammatically(
     adapter: BrowserAutomationAdapter,

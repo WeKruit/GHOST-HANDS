@@ -34,6 +34,73 @@ export interface PageState {
 }
 
 // ---------------------------------------------------------------------------
+// Scan-first field discovery types
+// ---------------------------------------------------------------------------
+
+/** What kind of form field was detected. */
+export type FieldKind =
+  | 'text'            // input[type=text|email|tel|url|number], input:not([type]), textarea
+  | 'select'          // native <select>
+  | 'custom_dropdown' // ARIA combobox/listbox/aria-haspopup
+  | 'radio'           // native radio group (by name)
+  | 'aria_radio'      // role="radiogroup"
+  | 'checkbox'        // input[type=checkbox]
+  | 'date'            // input[type=date] or segmented
+  | 'file'            // input[type=file]
+  | 'contenteditable' // contenteditable div
+  | 'upload_button'   // upload/attach button (no file input)
+  | 'unknown';
+
+/** How a scanned field should be filled. */
+export type FillStrategy =
+  | 'native_setter'   // page.evaluate with native setter (text, select)
+  | 'click_option'    // scroll into view, click trigger, click option (radios, custom dropdowns)
+  | 'click'           // simple click (checkboxes)
+  | 'set_input_files' // Playwright setInputFiles (file upload)
+  | 'keyboard_type'   // focus + type (segmented dates)
+  | 'llm_act';        // LLM fallback
+
+/** A single form field discovered during the scan phase. */
+export interface ScannedField {
+  /** Unique ID for this scan session (e.g. "field-0", "field-1") */
+  id: string;
+  /** What kind of field this is */
+  kind: FieldKind;
+  /** How we plan to fill it */
+  fillStrategy: FillStrategy;
+  /** CSS selector that uniquely identifies this field (or its trigger) */
+  selector: string;
+  /** The label text extracted via label-finding strategies */
+  label: string;
+  /** Current value (empty string if unfilled) */
+  currentValue: string;
+  /** For select/radio/custom_dropdown: available option texts */
+  options?: string[];
+  /** For radio groups: the group name (native) or ARIA group selector */
+  groupKey?: string;
+  /** Absolute Y position on the page (rect.top + scrollY) for ordering */
+  absoluteY: number;
+  /** Whether this field appears to be required */
+  isRequired: boolean;
+  /** The matching QA answer, if found during fill phase */
+  matchedAnswer?: string;
+  /** Whether this field was filled during the current fill cycle */
+  filled: boolean;
+  /** Platform-specific metadata (e.g. Workday date segments) */
+  platformMeta?: Record<string, string>;
+}
+
+/** Result of scanning an entire page for form fields. */
+export interface ScanResult {
+  /** All fields found on the page, sorted by absoluteY (top to bottom) */
+  fields: ScannedField[];
+  /** Page scroll height at time of scan */
+  scrollHeight: number;
+  /** Viewport height */
+  viewportHeight: number;
+}
+
+// ---------------------------------------------------------------------------
 // PlatformConfig interface
 // ---------------------------------------------------------------------------
 
@@ -112,7 +179,26 @@ export interface PlatformConfig {
    */
   buildPagePrompt(pageType: PageType, dataBlock: string): string;
 
-  // --- Programmatic DOM Helpers ---
+  // --- Scan-First Field Discovery ---
+
+  /**
+   * Scan the entire page to collect metadata on all form fields.
+   * Scrolls through the page, collects field data at each viewport position,
+   * deduplicates, then scrolls back to top.
+   */
+  scanPageFields(adapter: BrowserAutomationAdapter): Promise<ScanResult>;
+
+  /**
+   * Fill a single field by its scan result, using the appropriate strategy.
+   * Returns true if the field was successfully filled.
+   */
+  fillScannedField(
+    adapter: BrowserAutomationAdapter,
+    field: ScannedField,
+    answer: string,
+  ): Promise<boolean>;
+
+  // --- Programmatic DOM Helpers (legacy, kept for backward compatibility) ---
 
   /**
    * Platform-specific dropdown detection and filling.
