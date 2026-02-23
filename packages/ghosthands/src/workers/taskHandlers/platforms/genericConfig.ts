@@ -6,17 +6,30 @@ import type { PlatformConfig, PageState, PageType } from './types.js';
 // Base rules (generic — works for most ATS platforms)
 // ---------------------------------------------------------------------------
 
-const GENERIC_BASE_RULES = `YOUR ROLE: You are a form-filling assistant. Your ONLY job is to type data into the empty fields currently visible on screen. Nothing else. A separate system handles scrolling, page navigation, and detecting new fields. You NEVER need to worry about what is off-screen or on the next page.
+const GENERIC_BASE_RULES = `YOUR ROLE: You are a form-filling assistant. You can ONLY see what is currently on screen. You have NO ability to reveal more content. Another system handles scrolling after you finish.
 
-RULES:
-1. FILL empty fields CURRENTLY VISIBLE on screen using the data below. Work top to bottom.
-2. SKIP fields that already have text or a selection.
-3. SKIP fields that have no matching data (e.g. Middle Name, Address Line 2) — do NOT try to find them or navigate to them.
-4. You MAY click dropdowns, radio buttons, checkboxes, "Add Another", "Upload", and other form controls to fill fields.
-5. DO NOT click Next, Continue, Submit, Save, or any navigation button. Another system handles that.
-6. DO NOT scroll, press Tab to navigate, or try to discover more fields. Another system handles that.
-7. DO NOT navigate to a URL, reload the page, or use the address bar.
-8. When every visible empty field is filled (or has no matching data), IMMEDIATELY report done. Do not look for more fields.`;
+RULES — follow in strict order:
+
+1. Work strictly TOP TO BOTTOM. Start with the TOPMOST unanswered field and fill it. Then move to the next one below it. Do NOT skip ahead.
+
+2. FILL every empty field that is 100% FULLY VISIBLE on screen using the data below.
+
+3. SKIP fields that already have text or a selection.
+
+4. SKIP fields with no matching data (e.g. Middle Name, Address Line 2).
+
+5. DO NOT TOUCH any question or field that is even SLIGHTLY cut off by the bottom edge of the screen. This means:
+   - If the question TEXT is cut off at the bottom → DO NOT answer it. Leave it alone.
+   - If some ANSWER CHOICES (radio buttons, checkboxes, dropdown options) are cut off or missing at the bottom → DO NOT answer it. Leave it alone.
+   - If a text field or dropdown is cut off at the bottom → DO NOT interact with it. Leave it alone.
+   - If you are unsure whether you can see the COMPLETE question AND ALL of its answer options → DO NOT answer it. Leave it alone.
+   Another system will scroll it fully into view, and the NEXT iteration of this agent will handle it then. You will get another chance. There is ZERO reason to touch a partially visible question.
+
+6. You MAY click dropdowns, radio buttons, checkboxes, "Add Another", "Upload", and other form controls — but ONLY for questions that are 100% fully visible.
+
+7. DO NOT click any button that says Next, Continue, Submit, Save, or similar.
+
+8. Before reporting done, mentally scan from the TOP of the screen to the BOTTOM: did you answer every FULLY VISIBLE question? If you missed any, go back and answer it NOW. Do not report done until every fully visible question above the cut-off point has been answered.`;
 
 const FIELD_INTERACTION_RULES = `HOW TO FILL:
 - Text fields: Click, type the value, click away to deselect.
@@ -496,6 +509,266 @@ ${dataBlock}`;
     return filled;
   }
 
+  /**
+   * Fill custom (non-native) dropdowns: ARIA comboboxes, listboxes, and
+   * custom div-based selects. Handles both type-to-search and click-to-select.
+   * Uses Playwright APIs to click options directly (no scroll needed).
+   */
+  async fillCustomDropdownsProgrammatically(
+    adapter: BrowserAutomationAdapter,
+    qaMap: Record<string, string>,
+  ): Promise<number> {
+    // 1. Gather visible custom dropdowns and their labels
+    const dropdownData = await adapter.page.evaluate(() => {
+      const vh = window.innerHeight;
+      const results: Array<{
+        selector: string;
+        label: string;
+        isCombobox: boolean;
+        hasInputChild: boolean;
+        currentValue: string;
+      }> = [];
+
+      // Find ARIA combobox/listbox triggers
+      const triggers = document.querySelectorAll(
+        '[role="combobox"], [role="listbox"], [aria-haspopup="listbox"], [aria-haspopup="true"]'
+      );
+
+      for (let i = 0; i < triggers.length; i++) {
+        const el = triggers[i] as HTMLElement;
+        if (el.getAttribute('aria-disabled') === 'true') continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.bottom < 0 || rect.top > vh) continue;
+
+        // Skip if already inside a native <select>
+        if (el.closest('select')) continue;
+
+        // Check current value
+        const inputChild = el.querySelector('input') as HTMLInputElement | null;
+        const currentValue = inputChild?.value?.trim()
+          || el.getAttribute('aria-activedescendant')
+          || '';
+
+        // Skip if it already has a meaningful value (not placeholder text)
+        const displayText = (el.textContent || '').trim().toLowerCase();
+        const isPlaceholder = !currentValue && (
+          displayText.startsWith('select') || displayText.startsWith('choose')
+          || displayText.startsWith('please') || displayText.startsWith('--')
+          || displayText === '' || displayText === 'none'
+        );
+
+        // If it has a real value and it's not a placeholder, skip
+        if (currentValue && !isPlaceholder) continue;
+        // If it doesn't look like a placeholder either, it might already be filled
+        if (!isPlaceholder && displayText.length > 0 && displayText.length < 50) continue;
+
+        // Build a unique selector for this element
+        let selector = '';
+        if (el.id) {
+          selector = '#' + CSS.escape(el.id);
+        } else if (el.getAttribute('data-testid')) {
+          selector = '[data-testid="' + el.getAttribute('data-testid') + '"]';
+        } else if (el.getAttribute('aria-labelledby')) {
+          selector = '[aria-labelledby="' + el.getAttribute('aria-labelledby') + '"]';
+        } else {
+          // Fallback: use role + nth-of-type index
+          const role = el.getAttribute('role') || '';
+          const allSameRole = document.querySelectorAll('[role="' + role + '"]');
+          let idx = 0;
+          for (let j = 0; j < allSameRole.length; j++) {
+            if (allSameRole[j] === el) { idx = j; break; }
+          }
+          selector = '[role="' + role + '"]:nth(' + idx + ')';
+        }
+
+        // Find label
+        let label = '';
+        const labelledBy = el.getAttribute('aria-labelledby');
+        if (labelledBy) {
+          const labelEl = document.getElementById(labelledBy);
+          if (labelEl) label = labelEl.textContent?.trim() || '';
+        }
+        if (!label) label = el.getAttribute('aria-label') || '';
+        if (!label) {
+          // Check preceding sibling or parent for label text
+          const prev = el.previousElementSibling;
+          if (prev && prev.tagName === 'LABEL') label = prev.textContent?.trim() || '';
+          if (!label) {
+            const parent = el.closest('[class*="field"], [class*="form-group"], [class*="question"], fieldset');
+            if (parent) {
+              const lbl = parent.querySelector('label, legend, [class*="label"]');
+              if (lbl) label = lbl.textContent?.trim() || '';
+            }
+          }
+        }
+
+        results.push({
+          selector,
+          label,
+          isCombobox: el.getAttribute('role') === 'combobox' || !!inputChild,
+          hasInputChild: !!inputChild,
+          currentValue,
+        });
+      }
+
+      return results;
+    });
+
+    let filled = 0;
+
+    for (const dd of dropdownData) {
+      const answer = findBestAnswer(dd.label, qaMap);
+      if (!answer) continue;
+
+      try {
+        if (dd.isCombobox && dd.hasInputChild) {
+          // Type-to-search combobox: click, clear, type the answer, wait for options, pick best match
+          filled += await this.fillSearchableDropdown(adapter, dd.selector, answer);
+        } else {
+          // Click-to-open dropdown: click to open, find matching option, click it
+          filled += await this.fillClickableDropdown(adapter, dd.selector, answer);
+        }
+      } catch (err) {
+        console.warn(`[GenericConfig] Custom dropdown fill failed for "${dd.label}": ${err}`);
+      }
+    }
+
+    return filled;
+  }
+
+  /**
+   * Fill a searchable combobox: click to focus, type the answer, pick the matching option.
+   */
+  private async fillSearchableDropdown(
+    adapter: BrowserAutomationAdapter,
+    triggerSelector: string,
+    answer: string,
+  ): Promise<number> {
+    const trigger = adapter.page.locator(triggerSelector).first();
+    await trigger.click();
+    await adapter.page.waitForTimeout(300);
+
+    // Find and clear the input inside
+    const input = trigger.locator('input').first();
+    await input.fill('');
+    await adapter.page.waitForTimeout(100);
+    await input.fill(answer);
+    await adapter.page.waitForTimeout(800); // Wait for search/filter
+
+    // Find the best matching option in any open listbox/menu
+    const picked = await adapter.page.evaluate((ans) => {
+      const normAns = ans.toLowerCase().trim();
+      // Look for open option lists
+      const options = document.querySelectorAll(
+        '[role="option"], [role="listbox"] li, [class*="option"], [class*="menu-item"], [class*="dropdown-item"]'
+      );
+      let bestMatch: Element | null = null;
+      let bestScore = 0;
+
+      for (let i = 0; i < options.length; i++) {
+        const opt = options[i] as HTMLElement;
+        const rect = opt.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        const text = (opt.textContent || '').trim().toLowerCase();
+        if (!text) continue;
+
+        // Exact match
+        if (text === normAns) { bestMatch = opt; bestScore = 100; break; }
+        // Contains
+        if (text.includes(normAns) && text.length < normAns.length * 3) {
+          const score = 50 + (normAns.length / text.length) * 30;
+          if (score > bestScore) { bestScore = score; bestMatch = opt; }
+        }
+        if (normAns.includes(text) && text.length > 2) {
+          const score = 40 + (text.length / normAns.length) * 30;
+          if (score > bestScore) { bestScore = score; bestMatch = opt; }
+        }
+      }
+
+      if (bestMatch) {
+        (bestMatch as HTMLElement).click();
+        return true;
+      }
+      return false;
+    }, answer);
+
+    if (picked) {
+      await adapter.page.waitForTimeout(300);
+      return 1;
+    }
+
+    // Fallback: press Enter to accept the top suggestion
+    await adapter.page.keyboard.press('Enter');
+    await adapter.page.waitForTimeout(300);
+    return 1;
+  }
+
+  /**
+   * Fill a click-to-open dropdown: click trigger, find the matching option in the
+   * popup, and click it. Uses Playwright's auto-scroll within the popup element.
+   */
+  private async fillClickableDropdown(
+    adapter: BrowserAutomationAdapter,
+    triggerSelector: string,
+    answer: string,
+  ): Promise<number> {
+    // Click to open
+    const trigger = adapter.page.locator(triggerSelector).first();
+    await trigger.click();
+    await adapter.page.waitForTimeout(500);
+
+    // Find and click the best matching option
+    const normAnswer = answer.toLowerCase().trim();
+
+    // Try role="option" first, then common patterns
+    const optionSelectors = [
+      '[role="option"]',
+      '[role="listbox"] li',
+      '[role="menu"] [role="menuitem"]',
+      '[class*="option"]',
+      '[class*="menu-item"]',
+      '[class*="dropdown-item"]',
+      'li[data-value]',
+    ];
+
+    for (const optSel of optionSelectors) {
+      const options = adapter.page.locator(optSel);
+      const count = await options.count();
+      if (count === 0) continue;
+
+      let bestIdx = -1;
+      let bestScore = 0;
+
+      for (let i = 0; i < count; i++) {
+        const text = (await options.nth(i).textContent() || '').trim().toLowerCase();
+        if (!text) continue;
+
+        if (text === normAnswer) { bestIdx = i; bestScore = 100; break; }
+        if (text.includes(normAnswer)) {
+          const score = 50 + (normAnswer.length / text.length) * 30;
+          if (score > bestScore) { bestScore = score; bestIdx = i; }
+        }
+        if (normAnswer.includes(text) && text.length > 2) {
+          const score = 40 + (text.length / normAnswer.length) * 30;
+          if (score > bestScore) { bestScore = score; bestIdx = i; }
+        }
+      }
+
+      if (bestIdx >= 0) {
+        // Playwright's .click() auto-scrolls within scroll containers — no page scroll needed
+        await options.nth(bestIdx).click({ force: true });
+        await adapter.page.waitForTimeout(300);
+        return 1;
+      }
+    }
+
+    // No match found — close the dropdown by pressing Escape
+    await adapter.page.keyboard.press('Escape');
+    await adapter.page.waitForTimeout(200);
+    return 0;
+  }
+
   async fillDateFieldsProgrammatically(
     adapter: BrowserAutomationAdapter,
     _qaMap: Record<string, string>,
@@ -560,59 +833,180 @@ ${dataBlock}`;
   }
 
   async hasEmptyVisibleFields(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    // NOTE: Do NOT define named functions (const fn = ...) inside page.evaluate —
+    // esbuild's --keep-names injects __name() wrappers that don't exist in the browser context.
     return adapter.page.evaluate(() => {
-      // Check text inputs and textareas
-      const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
-        'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="number"], input:not([type]), textarea'
-      );
-      for (const input of inputs) {
+      const vh = window.innerHeight;
+
+      // Inline visibility check — repeated per section to avoid __name crash
+      // checks: non-zero size, in viewport, not display:none/hidden/opacity:0, not aria-hidden
+
+      // 1. Text inputs and textareas
+      const inputs = document.querySelectorAll('input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="number"], input[type="password"], input:not([type]), textarea');
+      for (let i = 0; i < inputs.length; i++) {
+        const input = inputs[i] as HTMLInputElement;
+        if (input.disabled || input.readOnly || input.type === 'hidden') continue;
         const rect = input.getBoundingClientRect();
         if (rect.width < 20 || rect.height < 10) continue;
-        if (input.disabled || input.readOnly) continue;
-        if (input.type === 'hidden') continue;
-        if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+        if (rect.bottom < 0 || rect.top > vh) continue;
         if (input.getAttribute('aria-hidden') === 'true') continue;
-
-        const style = window.getComputedStyle(input);
-        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
-
+        const st = window.getComputedStyle(input);
+        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
         if (!input.value || input.value.trim() === '') return true;
       }
 
-      // Check unfilled <select> elements
-      const selects = document.querySelectorAll<HTMLSelectElement>('select');
-      for (const select of selects) {
-        if (select.disabled) continue;
+      // 2. Unfilled <select> elements
+      const selects = document.querySelectorAll('select:not([disabled])');
+      for (let i = 0; i < selects.length; i++) {
+        const select = selects[i] as HTMLSelectElement;
         const rect = select.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) continue;
-        if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+        if (rect.bottom < 0 || rect.top > vh) continue;
         if (select.selectedIndex <= 0) return true;
       }
 
-      // Check unchecked required checkboxes
-      const checkboxes = document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
-      for (const cb of checkboxes) {
-        if (cb.checked || cb.disabled) continue;
+      // 3. Required checkboxes
+      const checkboxes = document.querySelectorAll('input[type="checkbox"]:not([disabled])');
+      for (let i = 0; i < checkboxes.length; i++) {
+        const cb = checkboxes[i] as HTMLInputElement;
+        if (cb.checked) continue;
         const rect = cb.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) continue;
-        if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+        if (rect.bottom < 0 || rect.top > vh) continue;
         if (cb.required || cb.getAttribute('aria-required') === 'true') return true;
       }
 
-      // Check radio button groups where none is selected
-      const radioGroups = new Map<string, boolean>();
-      const radios = document.querySelectorAll<HTMLInputElement>('input[type="radio"]:not([disabled])');
-      for (const radio of radios) {
-        const name = radio.name;
-        if (!name) continue;
+      // 4a. Native radio groups with no selection
+      const radioGroups: Record<string, boolean> = {};
+      const radios = document.querySelectorAll('input[type="radio"]:not([disabled])');
+      for (let i = 0; i < radios.length; i++) {
+        const radio = radios[i] as HTMLInputElement;
+        if (!radio.name) continue;
         const rect = radio.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) continue;
-        if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
-        if (!radioGroups.has(name)) radioGroups.set(name, false);
-        if (radio.checked) radioGroups.set(name, true);
+        if (rect.bottom < 0 || rect.top > vh) continue;
+        if (!(radio.name in radioGroups)) radioGroups[radio.name] = false;
+        if (radio.checked) radioGroups[radio.name] = true;
       }
-      for (const [, hasSelection] of radioGroups) {
-        if (!hasSelection) return true; // Found a visible radio group with no selection
+      for (const name in radioGroups) {
+        if (!radioGroups[name]) return true;
+      }
+
+      // 4b. ARIA radiogroups — custom div/span radio buttons (Google Careers, Workday, etc.)
+      const ariaRadioGroups = document.querySelectorAll('[role="radiogroup"]');
+      for (let i = 0; i < ariaRadioGroups.length; i++) {
+        const group = ariaRadioGroups[i] as HTMLElement;
+        if (group.getAttribute('aria-disabled') === 'true') continue;
+        const rect = group.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.bottom < 0 || rect.top > vh) continue;
+        // Check if any radio in this group is selected
+        const groupRadios = group.querySelectorAll('[role="radio"]');
+        let hasChecked = false;
+        for (let j = 0; j < groupRadios.length; j++) {
+          if (groupRadios[j].getAttribute('aria-checked') === 'true') { hasChecked = true; break; }
+        }
+        if (!hasChecked) return true;
+      }
+
+      // 4c. Standalone ARIA radios not inside a radiogroup
+      const standaloneRadios = document.querySelectorAll('[role="radio"]');
+      for (let i = 0; i < standaloneRadios.length; i++) {
+        const sr = standaloneRadios[i] as HTMLElement;
+        if (sr.getAttribute('aria-disabled') === 'true') continue;
+        // Skip if already inside a radiogroup (handled above)
+        if (sr.closest('[role="radiogroup"]')) continue;
+        const rect = sr.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.bottom < 0 || rect.top > vh) continue;
+        if (sr.getAttribute('aria-checked') !== 'true') return true;
+      }
+
+      // 5. File upload inputs (visible OR hidden behind styled button/label)
+      const fileInputs = document.querySelectorAll('input[type="file"]');
+      for (let i = 0; i < fileInputs.length; i++) {
+        const fi = fileInputs[i] as HTMLInputElement;
+        if (fi.disabled) continue;
+        if (fi.files && fi.files.length > 0) continue;
+        const fiRect = fi.getBoundingClientRect();
+        // Visible file input in viewport
+        if (fiRect.width > 0 && fiRect.height > 0 && fiRect.bottom >= 0 && fiRect.top <= vh) return true;
+        // Hidden file input — check if its label/wrapper is visible
+        const lbl = fi.id ? document.querySelector('label[for="' + fi.id + '"]') : null;
+        const wrap = fi.closest('[class*="upload"], [class*="file"], [class*="drop"], [class*="resume"], [class*="attach"]');
+        const proxy = lbl || wrap || fi.parentElement;
+        if (proxy && proxy !== fi) {
+          const pr = proxy.getBoundingClientRect();
+          if (pr.width > 0 && pr.height > 0 && pr.bottom >= 0 && pr.top <= vh) return true;
+        }
+      }
+
+      // 6. Upload / attach / file buttons and dropzones (broad keyword matching)
+      const uploadWords = [
+        'upload', 'attach', 'choose file', 'select file', 'browse',
+        'add file', 'add resume', 'add cv', 'add document', 'add cover letter',
+        'drag', 'drop file', 'drop your', 'drop here',
+      ];
+      const interactives = document.querySelectorAll(
+        'button, [role="button"], a[href], label[for], [class*="upload"], [class*="dropzone"], [class*="drop-zone"], [class*="file-upload"], [class*="attach"]'
+      );
+      for (let i = 0; i < interactives.length; i++) {
+        const el = interactives[i];
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.bottom < 0 || rect.top > vh) continue;
+        const st = window.getComputedStyle(el);
+        if (st.display === 'none' || st.visibility === 'hidden') continue;
+        const text = (el.textContent || '').trim().toLowerCase().replace(/\s+/g, ' ');
+        if (text.length > 150) continue;
+        let matchesUpload = false;
+        for (let k = 0; k < uploadWords.length; k++) {
+          if (text.indexOf(uploadWords[k]) !== -1) { matchesUpload = true; break; }
+        }
+        if (!matchesUpload) continue;
+        // Skip nav buttons that happen to say these words
+        if (text === 'submit' || text === 'next' || text === 'continue' || text === 'save' || text === 'sign in' || text === 'log in') continue;
+        // Check if file already uploaded nearby
+        const container = el.closest('[class*="upload"], [class*="file"], [class*="resume"], [class*="attach"], form, fieldset, section') || el.parentElement;
+        if (container) {
+          const ct = (container.textContent || '').toLowerCase();
+          if (ct.indexOf('.pdf') !== -1 || ct.indexOf('.doc') !== -1 || ct.indexOf('uploaded') !== -1 || ct.indexOf('attached') !== -1 || ct.indexOf('remove file') !== -1 || ct.indexOf('delete file') !== -1 || ct.indexOf('replace') !== -1) continue;
+        }
+        return true;
+      }
+
+      // 7. Custom ARIA dropdown/combobox components
+      const customDropdowns = document.querySelectorAll(
+        '[role="combobox"], [role="listbox"], [aria-haspopup="listbox"], [aria-haspopup="true"]'
+      );
+      for (let i = 0; i < customDropdowns.length; i++) {
+        const dd = customDropdowns[i] as HTMLElement;
+        if (dd.getAttribute('aria-disabled') === 'true') continue;
+        const rect = dd.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.bottom < 0 || rect.top > vh) continue;
+        const st = window.getComputedStyle(dd);
+        if (st.display === 'none' || st.visibility === 'hidden') continue;
+        const val = dd.getAttribute('aria-activedescendant')
+          || (dd.querySelector('[aria-selected="true"]') || {} as any).textContent?.trim()
+          || (dd as any).value?.trim()
+          || '';
+        if (val) continue; // has a value
+        const displayText = (dd.textContent || '').trim().toLowerCase();
+        if (displayText.indexOf('select') === 0 || displayText.indexOf('choose') === 0 || displayText.indexOf('please select') === 0 || displayText.indexOf('-- select') === 0 || displayText.indexOf('pick') === 0) return true;
+      }
+
+      // 8. Content-editable divs (rich text fields)
+      const editables = document.querySelectorAll('[contenteditable="true"]');
+      for (let i = 0; i < editables.length; i++) {
+        const el = editables[i] as HTMLElement;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.bottom < 0 || rect.top > vh) continue;
+        const st = window.getComputedStyle(el);
+        if (st.display === 'none' || st.visibility === 'hidden') continue;
+        const text = el.textContent?.trim() || '';
+        if (text.length === 0 || el.innerHTML === '<br>') return true;
       }
 
       return false;

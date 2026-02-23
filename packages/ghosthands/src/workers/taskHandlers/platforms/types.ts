@@ -124,6 +124,15 @@ export interface PlatformConfig {
   ): Promise<number>;
 
   /**
+   * Custom (non-native) dropdown filling: ARIA comboboxes, listboxes, etc.
+   * Returns the number of dropdowns filled.
+   */
+  fillCustomDropdownsProgrammatically(
+    adapter: BrowserAutomationAdapter,
+    qaMap: Record<string, string>,
+  ): Promise<number>;
+
+  /**
    * Platform-specific date field detection and filling.
    * Returns the number of date fields filled.
    */
