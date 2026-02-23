@@ -6,7 +6,7 @@ import type { PlatformConfig, PageState, PageType } from './types.js';
 // Base rules (generic — works for most ATS platforms)
 // ---------------------------------------------------------------------------
 
-const GENERIC_BASE_RULES = `YOUR ROLE: You are a form-filling assistant. You can ONLY see what is currently on screen. You have NO ability to reveal more content. Another system handles scrolling after you finish.
+const GENERIC_BASE_RULES = `YOUR ROLE: You are a form-filling assistant. You can ONLY see what is currently on screen. You have NO ability to reveal more content. Scrolling happens ONLY after you report done — reporting done IS the trigger for scrolling.
 
 RULES — follow in strict order:
 
@@ -14,22 +14,25 @@ RULES — follow in strict order:
 
 2. FILL every empty field that is 100% FULLY VISIBLE on screen using the data below.
 
-3. SKIP fields that already have text or a selection.
+3. SKIP fields that already have text, a selection, or a checked checkbox. NEVER uncheck a checkbox that is already checked. NEVER clear a field that already has a value.
 
 4. SKIP fields with no matching data (e.g. Middle Name, Address Line 2).
 
-5. DO NOT TOUCH any question or field that is even SLIGHTLY cut off by the bottom edge of the screen. This means:
-   - If the question TEXT is cut off at the bottom → DO NOT answer it. Leave it alone.
-   - If some ANSWER CHOICES (radio buttons, checkboxes, dropdown options) are cut off or missing at the bottom → DO NOT answer it. Leave it alone.
-   - If a text field or dropdown is cut off at the bottom → DO NOT interact with it. Leave it alone.
-   - If you are unsure whether you can see the COMPLETE question AND ALL of its answer options → DO NOT answer it. Leave it alone.
-   Another system will scroll it fully into view, and the NEXT iteration of this agent will handle it then. You will get another chance. There is ZERO reason to touch a partially visible question.
+5. CRITICAL — CUT-OFF DETECTION: Before answering ANY question near the bottom half of the screen, ask yourself: "Can I see the COMPLETE question text AND every single answer option?" If the answer is no — or if an expected answer choice (like "No" or "Yes") is missing — the question is CUT OFF. DO NOT TOUCH IT.
+   How to tell a question is cut off:
+   - The question is near the bottom of the screen
+   - You can see some answer choices but not all (e.g. you see "Yes" but not "No")
+   - The answer you need to select is not visible even though it should obviously exist
+   - The question text runs off the bottom edge
+   If ANY of these are true: DO NOT interact with the question. Just report done. The scroller will bring it fully into view and you will answer it next time.
 
 6. You MAY click dropdowns, radio buttons, checkboxes, "Add Another", "Upload", and other form controls — but ONLY for questions that are 100% fully visible.
 
-7. DO NOT click any button that says Next, Continue, Submit, Save, or similar.
+7. NEVER click any button that says Next, Continue, Submit, Submit Application, Save, Send, or similar. You are ONLY here to fill fields — NEVER to submit or advance the application. If you see a review/summary page, report done immediately.
 
-8. Before reporting done, mentally scan from the TOP of the screen to the BOTTOM: did you answer every FULLY VISIBLE question? If you missed any, go back and answer it NOW. Do not report done until every fully visible question above the cut-off point has been answered.`;
+8. Before reporting done, mentally scan from the TOP of the screen to the BOTTOM: did you answer every FULLY VISIBLE question? If you missed any, go back and answer it NOW.
+
+9. When all fully visible questions are handled, IMMEDIATELY report done. Do NOT use the wait action. Reporting done is how you tell the system to scroll.`;
 
 const FIELD_INTERACTION_RULES = `HOW TO FILL:
 - Text fields: Click, type the value, click away to deselect.
@@ -89,9 +92,10 @@ function findBestAnswer(label: string, qaMap: Record<string, string>): string | 
     if (normalizeLabel(q) === norm) return a;
   }
 
-  // Pass 2: label contains a Q&A key
+  // Pass 2: label contains a Q&A key (e.g. label="First Name *" contains key="First Name")
   for (const [q, a] of Object.entries(qaMap)) {
-    if (norm.includes(normalizeLabel(q))) return a;
+    const normQ = normalizeLabel(q);
+    if (normQ.length >= 3 && norm.includes(normQ)) return a;
   }
 
   // Pass 3: Q&A key contains label (short labels like "Gender")
@@ -99,12 +103,32 @@ function findBestAnswer(label: string, qaMap: Record<string, string>): string | 
     if (normalizeLabel(q).includes(norm) && norm.length >= 3) return a;
   }
 
-  // Pass 4: significant word overlap
+  // Pass 4: significant word overlap — but only if ALL distinguishing words in the
+  // label also appear in the key. This prevents "Middle Name" matching "First Name"
+  // just because they share the word "Name".
   const normWords = norm.split(/\s+/).filter(w => w.length > 2);
+  if (normWords.length === 0) return null;
+
+  // Generic/common words that shouldn't count as distinguishing
+  const GENERIC_WORDS = new Set(['name', 'number', 'address', 'date', 'line', 'code', 'url', 'type', 'level', 'status', 'field', 'info', 'the', 'your', 'please', 'enter', 'select', 'provide']);
+
+  // Find distinguishing words in the label (words that are NOT generic)
+  const distinguishingWords = normWords.filter(w => !GENERIC_WORDS.has(w));
+
   for (const [q, a] of Object.entries(qaMap)) {
     const qWords = normalizeLabel(q).split(/\s+/).filter(w => w.length > 2);
     const overlap = normWords.filter(w => qWords.includes(w));
-    if (overlap.length >= 2 || (overlap.length >= 1 && normWords.length <= 2)) return a;
+
+    // If label has distinguishing words, ALL of them must appear in the key
+    if (distinguishingWords.length > 0) {
+      const distinguishingOverlap = distinguishingWords.filter(w => qWords.includes(w));
+      if (distinguishingOverlap.length === distinguishingWords.length && overlap.length >= 2) {
+        return a;
+      }
+    } else if (overlap.length >= 2) {
+      // All words are generic — require at least 2 word overlap
+      return a;
+    }
   }
 
   return null;
@@ -148,7 +172,6 @@ export class GenericPlatformConfig implements PlatformConfig {
       ));
       const clickableTexts = clickables.map(el => {
         const raw = (el.textContent || el.getAttribute('value') || el.getAttribute('aria-label') || '').trim();
-        // Collapse whitespace and take first 60 chars to avoid grabbing entire paragraphs from links
         return raw.replace(/\s+/g, ' ').substring(0, 60).toLowerCase();
       });
 
@@ -158,7 +181,23 @@ export class GenericPlatformConfig implements PlatformConfig {
         t === 'apply on company site' || t === 'apply to this job'
       );
 
-      // Sign-in detection — check clickable elements AND form fields
+      // Submit button (distinct from Apply — means "submit this application")
+      const hasSubmitButton = clickableTexts.some(t =>
+        t === 'submit' || t === 'submit application' || t === 'submit my application'
+      );
+
+      // Review page signals — text that indicates this is a review/summary page
+      const hasReviewSignals = bodyText.includes('review your application')
+        || bodyText.includes('review & apply') || bodyText.includes('review and apply')
+        || bodyText.includes('review application') || bodyText.includes('application summary')
+        || bodyText.includes('review & submit') || bodyText.includes('review and submit');
+
+      // Job description signals — text that indicates this is a job listing, not a form
+      const hasJobDescription = bodyText.includes('job description') || bodyText.includes('responsibilities')
+        || bodyText.includes('qualifications') || bodyText.includes('about the role')
+        || bodyText.includes('about this job') || bodyText.includes('what you\'ll do');
+
+      // Sign-in detection
       const hasPasswordField = document.querySelectorAll('input[type="password"]').length > 0;
       const hasEmailField = document.querySelectorAll('input[type="email"]').length > 0;
       const hasSignInWithGoogle = bodyText.includes('sign in with google') || bodyText.includes('continue with google');
@@ -166,28 +205,37 @@ export class GenericPlatformConfig implements PlatformConfig {
         t === 'sign in' || t === 'log in' || t === 'login' ||
         t === 'sign in with google' || t === 'continue with google'
       );
-
-      // A page is login-related if it has sign-in form fields OR a sign-in button/link
       const isLoginPage = hasPasswordField || hasSignInWithGoogle ||
         (hasEmailField && hasSignInClickable) || hasSignInClickable;
 
-      const hasFormInputs = document.querySelectorAll('input[type="text"], input[type="email"], input[type="tel"], textarea, select').length > 3;
+      // Native inputs + ARIA-based form controls
+      const hasFormInputs = document.querySelectorAll(
+        'input[type="text"], input[type="email"], input[type="tel"], textarea, select, [role="combobox"], [role="radiogroup"], [role="radio"]:not([aria-checked="true"]), [role="listbox"], [contenteditable="true"], input[type="file"]'
+      ).length > 2;
+
       const hasConfirmation = bodyText.includes('thank you') || bodyText.includes('application received') || bodyText.includes('successfully submitted');
 
-      return { hasApplyButton, isLoginPage, hasSignInClickable, hasSignInWithGoogle, hasFormInputs, hasConfirmation };
+      return { hasApplyButton, hasSubmitButton, hasReviewSignals, hasJobDescription, isLoginPage, hasSignInClickable, hasSignInWithGoogle, hasFormInputs, hasConfirmation };
     });
 
     if (signals.hasConfirmation && !signals.hasFormInputs) {
       return { page_type: 'confirmation', page_title: 'Confirmation' };
     }
 
-    // Job listing: has an Apply button and no form fields → user needs to click Apply
-    if (signals.hasApplyButton && !signals.hasFormInputs) {
+    // Review page: has review signals — MUST check before Apply button since
+    // review pages often have an "Apply" button that means "submit"
+    if (signals.hasReviewSignals) {
+      return { page_type: 'review', page_title: 'Review' };
+    }
+
+    // Job listing: has an Apply button AND looks like a job posting (description text
+    // or no form fields). NOT a review page (checked above).
+    if (signals.hasApplyButton && (signals.hasJobDescription || !signals.hasFormInputs)) {
       return { page_type: 'job_listing', page_title: 'Job Listing', has_apply_button: true };
     }
 
-    // Login: has sign-in button/link (even without form fields — the form may be on the next page)
-    if (signals.isLoginPage && !signals.hasApplyButton) {
+    // Login: has sign-in button/link
+    if (signals.isLoginPage) {
       return { page_type: 'login', page_title: 'Sign-In', has_sign_in_with_google: signals.hasSignInWithGoogle };
     }
 
@@ -226,8 +274,9 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
       const headingText = headings.map(h => (h.textContent || '').toLowerCase()).join(' ');
       const allText = headingText + ' ' + bodyText.substring(0, 3000);
 
+      // Native inputs + ARIA-based form controls (Google Careers, Workday, etc.)
       const allEditableInputs = document.querySelectorAll(
-        'input[type="text"]:not([readonly]):not([disabled]), textarea:not([readonly]):not([disabled]), input[type="email"]:not([readonly]):not([disabled]), input[type="tel"]:not([readonly]):not([disabled]), select:not([disabled])'
+        'input[type="text"]:not([readonly]):not([disabled]), textarea:not([readonly]):not([disabled]), input[type="email"]:not([readonly]):not([disabled]), input[type="tel"]:not([readonly]):not([disabled]), select:not([disabled]), [role="combobox"], [role="listbox"], [role="radiogroup"], [role="radio"], [contenteditable="true"], input[type="file"]'
       );
       const hasAnyEditableInputs = allEditableInputs.length > 0;
 
@@ -374,17 +423,62 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
   buildQAMap(profile: Record<string, any>, qaOverrides: Record<string, string>): Record<string, string> {
     const map: Record<string, string> = {};
 
-    // Basic profile fields
-    if (profile.first_name) map['First Name'] = profile.first_name;
-    if (profile.last_name) map['Last Name'] = profile.last_name;
-    if (profile.email) map['Email'] = profile.email;
-    if (profile.phone) map['Phone'] = profile.phone;
+    // Basic profile fields (include common label variations for DOM text fill)
+    if (profile.first_name) {
+      map['First Name'] = profile.first_name;
+      map['Given Name'] = profile.first_name;
+    }
+    if (profile.last_name) {
+      map['Last Name'] = profile.last_name;
+      map['Family Name'] = profile.last_name;
+      map['Surname'] = profile.last_name;
+    }
+    if (profile.email) {
+      map['Email'] = profile.email;
+      map['Email Address'] = profile.email;
+    }
+    if (profile.phone) {
+      map['Phone'] = profile.phone;
+      map['Phone Number'] = profile.phone;
+      map['Mobile'] = profile.phone;
+    }
 
     // Address
+    const addr = profile.address || {};
+    if (addr.street || profile.street) {
+      const street = addr.street || profile.street;
+      map['Street'] = street;
+      map['Address'] = street;
+      map['Address Line 1'] = street;
+    }
     if (profile.address?.city || profile.city) map['City'] = profile.address?.city || profile.city;
     if (profile.address?.state || profile.state) map['State'] = profile.address?.state || profile.state;
-    if (profile.address?.zip || profile.zip) map['Zip Code'] = profile.address?.zip || profile.zip;
+    if (profile.address?.zip || profile.zip) {
+      const zip = profile.address?.zip || profile.zip;
+      map['Zip Code'] = zip;
+      map['Zip'] = zip;
+      map['Postal Code'] = zip;
+    }
     if (profile.address?.country || profile.country) map['Country'] = profile.address?.country || profile.country;
+
+    // Professional
+    if (profile.linkedin_url) {
+      map['LinkedIn'] = profile.linkedin_url;
+      map['LinkedIn URL'] = profile.linkedin_url;
+    }
+    if (profile.portfolio_url || profile.website_url) {
+      map['Website'] = profile.portfolio_url || profile.website_url;
+      map['Portfolio'] = profile.portfolio_url || profile.website_url;
+    }
+    if (profile.current_company) {
+      map['Current Company'] = profile.current_company;
+      map['Employer'] = profile.current_company;
+      map['Company'] = profile.current_company;
+    }
+    if (profile.current_title) {
+      map['Current Title'] = profile.current_title;
+      map['Job Title'] = profile.current_title;
+    }
 
     // Education
     const eduArr = profile.education || [];
@@ -432,6 +526,136 @@ ${dataBlock}`;
   }
 
   // --- Programmatic DOM Helpers ---
+
+  async fillTextFieldsProgrammatically(
+    adapter: BrowserAutomationAdapter,
+    qaMap: Record<string, string>,
+  ): Promise<number> {
+    // Gather visible text-like inputs with their labels
+    const fieldData = await adapter.page.evaluate(() => {
+      const vh = window.innerHeight;
+      const results: Array<{ index: number; label: string; inputType: string; tagName: string }> = [];
+
+      const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+        'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="number"], input:not([type]), textarea'
+      );
+
+      inputs.forEach((input, i) => {
+        if (input.disabled || (input as HTMLInputElement).readOnly) return;
+        if ((input as HTMLInputElement).type === 'hidden') return;
+        // Skip already-filled fields
+        if (input.value && input.value.trim() !== '') return;
+        const rect = input.getBoundingClientRect();
+        if (rect.width < 20 || rect.height < 10) return;
+        if (rect.bottom < 0 || rect.top > vh) return;
+        if (input.getAttribute('aria-hidden') === 'true') return;
+        const st = window.getComputedStyle(input);
+        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return;
+
+        // Find the label via multiple strategies
+        let label = '';
+
+        // 1. Associated <label> element
+        if ('labels' in input && (input as HTMLInputElement).labels?.length) {
+          label = ((input as HTMLInputElement).labels![0].textContent || '').trim();
+        }
+
+        // 2. aria-label
+        if (!label) label = input.getAttribute('aria-label') || '';
+
+        // 3. aria-labelledby
+        if (!label) {
+          const labelledBy = input.getAttribute('aria-labelledby');
+          if (labelledBy) {
+            const labelEl = document.getElementById(labelledBy);
+            if (labelEl) label = (labelEl.textContent || '').trim();
+          }
+        }
+
+        // 4. Placeholder text (often descriptive on job sites)
+        if (!label) label = input.getAttribute('placeholder') || '';
+
+        // 5. label[for] matching input id
+        if (!label && input.id) {
+          const forLabel = document.querySelector(`label[for="${CSS.escape(input.id)}"]`);
+          if (forLabel) label = (forLabel.textContent || '').trim();
+        }
+
+        // 6. Parent/sibling label text
+        if (!label) {
+          const parent = input.closest('[class*="field"], [class*="form-group"], [class*="question"], fieldset, [class*="input"]');
+          if (parent) {
+            const lbl = parent.querySelector('label, legend, [class*="label"]');
+            if (lbl) label = (lbl.textContent || '').trim();
+          }
+        }
+
+        // 7. Preceding sibling label
+        if (!label) {
+          const prev = input.previousElementSibling;
+          if (prev && (prev.tagName === 'LABEL' || prev.tagName === 'SPAN' || prev.tagName === 'DIV')) {
+            const t = (prev.textContent || '').trim();
+            if (t.length < 80) label = t;
+          }
+        }
+
+        // 8. name or id attribute as last resort
+        if (!label) label = input.name || input.id || '';
+
+        results.push({
+          index: i,
+          label,
+          inputType: (input as HTMLInputElement).type || 'text',
+          tagName: input.tagName.toLowerCase(),
+        });
+      });
+
+      return results;
+    });
+
+    let filled = 0;
+
+    for (const field of fieldData) {
+      const answer = findBestAnswer(field.label, qaMap);
+      if (!answer) continue;
+
+      const didFill = await adapter.page.evaluate(
+        ({ idx, value }) => {
+          const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+            'input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="number"], input:not([type]), textarea'
+          );
+          const input = inputs[idx];
+          if (!input) return false;
+          // Double-check it's still empty (may have been filled by a previous iteration)
+          if (input.value && input.value.trim() !== '') return false;
+
+          // Use the NATIVE value setter to bypass React's override on the value property.
+          const proto = input.tagName === 'TEXTAREA'
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+          const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (nativeSetter) {
+            nativeSetter.call(input, value);
+          } else {
+            input.value = value;
+          }
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          // Also dispatch blur to trigger validation
+          input.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
+          return true;
+        },
+        { idx: field.index, value: answer },
+      );
+
+      if (didFill) {
+        filled++;
+        console.log(`[GenericConfig] DOM-filled "${field.label}" (${field.inputType})`);
+      }
+    }
+
+    return filled;
+  }
 
   async fillDropdownsProgrammatically(
     adapter: BrowserAutomationAdapter,
@@ -816,12 +1040,36 @@ ${dataBlock}`;
         if (rect.width === 0 || rect.height === 0) continue;
         if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
 
-        // Only check required checkboxes or ones near terms/conditions text
         const isRequired = cb.required || cb.getAttribute('aria-required') === 'true';
-        const nearbyText = (cb.parentElement?.textContent || '').toLowerCase();
-        const isTerms = nearbyText.includes('agree') || nearbyText.includes('acknowledge')
-          || nearbyText.includes('terms') || nearbyText.includes('consent')
-          || nearbyText.includes('privacy') || nearbyText.includes('certify');
+
+        // Search wider: parent, grandparent, associated label, and nearby container
+        let nearbyText = '';
+        // Direct label association
+        if (cb.id) {
+          const lbl = document.querySelector('label[for="' + CSS.escape(cb.id) + '"]');
+          if (lbl) nearbyText += ' ' + (lbl.textContent || '');
+        }
+        if (cb.labels?.length) {
+          for (const l of cb.labels) nearbyText += ' ' + (l.textContent || '');
+        }
+        // Walk up to 3 levels of parents for context text
+        let el: HTMLElement | null = cb.parentElement;
+        for (let depth = 0; depth < 3 && el; depth++) {
+          nearbyText += ' ' + (el.textContent || '');
+          el = el.parentElement;
+        }
+        nearbyText = nearbyText.toLowerCase();
+
+        const consentWords = [
+          'agree', 'acknowledge', 'terms', 'consent', 'privacy',
+          'certify', 'confirm', 'authorize', 'accept', 'understand',
+          'i have read', 'i agree', 'i consent', 'i acknowledge',
+          'i certify', 'i confirm', 'i understand', 'i accept',
+        ];
+        let isTerms = false;
+        for (const word of consentWords) {
+          if (nearbyText.includes(word)) { isTerms = true; break; }
+        }
 
         if (isRequired || isTerms) {
           cb.click();
@@ -830,6 +1078,265 @@ ${dataBlock}`;
       }
       return checked;
     });
+  }
+
+  async fillRadioButtonsProgrammatically(
+    adapter: BrowserAutomationAdapter,
+    qaMap: Record<string, string>,
+  ): Promise<number> {
+    // Gather visible radio groups with their question text and options
+    const groupData = await adapter.page.evaluate(() => {
+      const vh = window.innerHeight;
+      const results: Array<{
+        groupIndex: number;
+        questionText: string;
+        options: Array<{ text: string; optionIndex: number }>;
+        isAria: boolean;
+      }> = [];
+
+      // --- Native radio groups ---
+      const radiosByName: Record<string, HTMLInputElement[]> = {};
+      const radios = document.querySelectorAll<HTMLInputElement>('input[type="radio"]:not([disabled])');
+      for (const r of radios) {
+        if (!r.name) continue;
+        const rect = r.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.bottom < 0 || rect.top > vh) continue;
+        if (!radiosByName[r.name]) radiosByName[r.name] = [];
+        radiosByName[r.name].push(r);
+      }
+
+      let groupIdx = 0;
+      for (const [, groupRadios] of Object.entries(radiosByName)) {
+        // Skip if already has a selection
+        if (groupRadios.some(r => r.checked)) continue;
+
+        // Find question text from fieldset/legend, parent container label, or nearest heading
+        let questionText = '';
+        const firstRadio = groupRadios[0];
+
+        // Try fieldset > legend
+        const fieldset = firstRadio.closest('fieldset');
+        if (fieldset) {
+          const legend = fieldset.querySelector('legend');
+          if (legend) questionText = (legend.textContent || '').trim();
+        }
+
+        // Try aria-labelledby on the group container
+        if (!questionText) {
+          const container = firstRadio.closest('[role="group"], [role="radiogroup"]');
+          if (container) {
+            const labelledBy = container.getAttribute('aria-labelledby');
+            if (labelledBy) {
+              const labelEl = document.getElementById(labelledBy);
+              if (labelEl) questionText = (labelEl.textContent || '').trim();
+            }
+            if (!questionText) {
+              const ariaLabel = container.getAttribute('aria-label');
+              if (ariaLabel) questionText = ariaLabel;
+            }
+          }
+        }
+
+        // Try parent container with label/heading
+        if (!questionText) {
+          const parent = firstRadio.closest('[class*="question"], [class*="field"], [class*="form-group"], [class*="form-row"], fieldset, section, [data-testid]');
+          if (parent) {
+            const lbl = parent.querySelector('label, legend, [class*="label"], [class*="question-text"], h3, h4, p');
+            if (lbl && !lbl.querySelector('input[type="radio"]')) {
+              questionText = (lbl.textContent || '').trim();
+            }
+          }
+        }
+
+        // Try preceding sibling
+        if (!questionText) {
+          let prev = firstRadio.parentElement?.previousElementSibling;
+          if (!prev) prev = firstRadio.parentElement?.parentElement?.previousElementSibling;
+          if (prev) {
+            const t = (prev.textContent || '').trim();
+            if (t.length > 5 && t.length < 200) questionText = t;
+          }
+        }
+
+        const options: Array<{ text: string; optionIndex: number }> = [];
+        groupRadios.forEach((r, i) => {
+          let optText = '';
+          // label[for]
+          if (r.id) {
+            const lbl = document.querySelector(`label[for="${CSS.escape(r.id)}"]`);
+            if (lbl) optText = (lbl.textContent || '').trim();
+          }
+          // labels property
+          if (!optText && r.labels?.length) {
+            optText = (r.labels[0].textContent || '').trim();
+          }
+          // Parent label
+          if (!optText) {
+            const parentLabel = r.closest('label');
+            if (parentLabel) optText = (parentLabel.textContent || '').trim();
+          }
+          // Sibling text
+          if (!optText) {
+            const next = r.nextElementSibling || r.nextSibling;
+            if (next) optText = (next.textContent || '').trim();
+          }
+          // value attribute as last resort
+          if (!optText) optText = r.value || '';
+          options.push({ text: optText, optionIndex: i });
+        });
+
+        if (questionText || options.length > 0) {
+          results.push({ groupIndex: groupIdx, questionText, options, isAria: false });
+        }
+        groupIdx++;
+      }
+
+      // --- ARIA radiogroups ---
+      const ariaGroups = document.querySelectorAll('[role="radiogroup"]');
+      for (let g = 0; g < ariaGroups.length; g++) {
+        const group = ariaGroups[g] as HTMLElement;
+        if (group.getAttribute('aria-disabled') === 'true') continue;
+        const rect = group.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.bottom < 0 || rect.top > vh) continue;
+
+        // Skip if already has a selection
+        const groupRadioEls = group.querySelectorAll('[role="radio"]');
+        let hasChecked = false;
+        for (const r of groupRadioEls) {
+          if (r.getAttribute('aria-checked') === 'true') { hasChecked = true; break; }
+        }
+        if (hasChecked) continue;
+
+        // Find question text
+        let questionText = '';
+        const labelledBy = group.getAttribute('aria-labelledby');
+        if (labelledBy) {
+          const labelEl = document.getElementById(labelledBy);
+          if (labelEl) questionText = (labelEl.textContent || '').trim();
+        }
+        if (!questionText) questionText = group.getAttribute('aria-label') || '';
+        if (!questionText) {
+          const parent = group.closest('[class*="question"], [class*="field"], fieldset, section');
+          if (parent) {
+            const lbl = parent.querySelector('label, legend, [class*="label"], [class*="question-text"], h3, h4, p');
+            if (lbl && !lbl.querySelector('[role="radio"]')) {
+              questionText = (lbl.textContent || '').trim();
+            }
+          }
+        }
+
+        const options: Array<{ text: string; optionIndex: number }> = [];
+        for (let r = 0; r < groupRadioEls.length; r++) {
+          const radio = groupRadioEls[r] as HTMLElement;
+          let optText = radio.getAttribute('aria-label') || '';
+          if (!optText) {
+            const labelId = radio.getAttribute('aria-labelledby');
+            if (labelId) {
+              const lbl = document.getElementById(labelId);
+              if (lbl) optText = (lbl.textContent || '').trim();
+            }
+          }
+          if (!optText) optText = (radio.textContent || '').trim();
+          options.push({ text: optText, optionIndex: r });
+        }
+
+        if (questionText || options.length > 0) {
+          results.push({ groupIndex: g, questionText, options, isAria: true });
+        }
+      }
+
+      return results;
+    });
+
+    let filled = 0;
+
+    for (const group of groupData) {
+      // Match question text against qaMap
+      const answer = findBestAnswer(group.questionText, qaMap);
+      if (!answer) continue;
+
+      // Find the option that matches the answer
+      const normAnswer = answer.toLowerCase().trim();
+      let bestOption: typeof group.options[0] | null = null;
+      let bestScore = 0;
+
+      for (const opt of group.options) {
+        const normOpt = opt.text.toLowerCase().trim();
+        if (!normOpt) continue;
+
+        // Exact match
+        if (normOpt === normAnswer) { bestOption = opt; bestScore = 100; break; }
+        // Option contains answer
+        if (normOpt.includes(normAnswer)) {
+          const score = 80;
+          if (score > bestScore) { bestScore = score; bestOption = opt; }
+        }
+        // Answer contains option (e.g. answer="Yes" option="Yes, I am")
+        if (normAnswer.includes(normOpt) && normOpt.length >= 2) {
+          const score = 60;
+          if (score > bestScore) { bestScore = score; bestOption = opt; }
+        }
+      }
+
+      if (!bestOption) continue;
+
+      // Click the matching radio option
+      if (group.isAria) {
+        const clicked = await adapter.page.evaluate(
+          ({ gIdx, oIdx }) => {
+            const ariaGroups = document.querySelectorAll('[role="radiogroup"]');
+            const g = ariaGroups[gIdx];
+            if (!g) return false;
+            const radios = g.querySelectorAll('[role="radio"]');
+            const target = radios[oIdx] as HTMLElement | undefined;
+            if (!target) return false;
+            target.click();
+            return true;
+          },
+          { gIdx: group.groupIndex, oIdx: bestOption.optionIndex },
+        );
+        if (clicked) {
+          filled++;
+          console.log(`[GenericConfig] DOM-filled radio "${group.questionText}" → "${bestOption.text}"`);
+        }
+      } else {
+        // Native radio: click via Playwright for proper event handling
+        const clicked = await adapter.page.evaluate(
+          ({ groupName, oIdx }) => {
+            const radiosByName: Record<string, HTMLInputElement[]> = {};
+            const allRadios = document.querySelectorAll<HTMLInputElement>('input[type="radio"]:not([disabled])');
+            for (const r of allRadios) {
+              if (!r.name) continue;
+              if (!radiosByName[r.name]) radiosByName[r.name] = [];
+              radiosByName[r.name].push(r);
+            }
+            // Find the group by iterating in the same order as the gather phase
+            const groupNames = Object.keys(radiosByName).filter(name => {
+              return !radiosByName[name].some(r => r.checked);
+            });
+            const name = groupNames[groupName];
+            if (!name) return false;
+            const radios = radiosByName[name];
+            const target = radios[oIdx];
+            if (!target) return false;
+            target.click();
+            target.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+          },
+          { groupName: group.groupIndex, oIdx: bestOption.optionIndex },
+        );
+        if (clicked) {
+          filled++;
+          console.log(`[GenericConfig] DOM-filled radio "${group.questionText}" → "${bestOption.text}"`);
+        }
+      }
+
+      await adapter.page.waitForTimeout(300);
+    }
+
+    return filled;
   }
 
   async hasEmptyVisibleFields(adapter: BrowserAutomationAdapter): Promise<boolean> {

@@ -95,7 +95,7 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
 
     // Remove dangerous actions the LLM should never use.
     // Scroll is handled by our orchestrator; navigation is handled by DOM code.
-    const blockedActions = new Set(['mouse:scroll', 'keyboard:tab', 'browser:nav', 'browser:nav:back', 'browser:tab:new', 'browser:tab:switch']);
+    const blockedActions = new Set(['mouse:scroll', 'mouse:drag', 'keyboard:tab', 'browser:nav', 'browser:nav:back', 'browser:tab:new', 'browser:tab:switch']);
     const agentAny = this.agent as any;
     agentAny.actions = agentAny.actions.filter(
       (a: { name: string }) => !blockedActions.has(a.name),

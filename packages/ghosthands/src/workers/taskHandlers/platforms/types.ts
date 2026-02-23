@@ -133,6 +133,26 @@ export interface PlatformConfig {
   ): Promise<number>;
 
   /**
+   * DOM-first text field filling: match visible text/email/tel/url inputs
+   * to qaMap entries by label and fill them programmatically.
+   * Returns the number of fields filled.
+   */
+  fillTextFieldsProgrammatically(
+    adapter: BrowserAutomationAdapter,
+    qaMap: Record<string, string>,
+  ): Promise<number>;
+
+  /**
+   * DOM-first radio button filling: match visible radio groups (native and ARIA)
+   * to qaMap entries by question text and click the matching option.
+   * Returns the number of radio groups filled.
+   */
+  fillRadioButtonsProgrammatically(
+    adapter: BrowserAutomationAdapter,
+    qaMap: Record<string, string>,
+  ): Promise<number>;
+
+  /**
    * Platform-specific date field detection and filling.
    * Returns the number of date fields filled.
    */

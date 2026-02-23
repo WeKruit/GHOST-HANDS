@@ -622,6 +622,27 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
     return filled;
   }
 
+  // Workday text fields use the same DOM approach as generic.
+  async fillTextFieldsProgrammatically(
+    adapter: BrowserAutomationAdapter,
+    qaMap: Record<string, string>,
+  ): Promise<number> {
+    // Reuse the generic implementation — Workday text inputs are standard DOM elements
+    const { GenericPlatformConfig } = await import('./genericConfig.js');
+    const generic = new GenericPlatformConfig();
+    return generic.fillTextFieldsProgrammatically(adapter, qaMap);
+  }
+
+  // Workday radio buttons use the same DOM approach as generic.
+  async fillRadioButtonsProgrammatically(
+    adapter: BrowserAutomationAdapter,
+    qaMap: Record<string, string>,
+  ): Promise<number> {
+    const { GenericPlatformConfig } = await import('./genericConfig.js');
+    const generic = new GenericPlatformConfig();
+    return generic.fillRadioButtonsProgrammatically(adapter, qaMap);
+  }
+
   // Workday has its own dropdown handling in fillDropdownsProgrammatically — no-op here.
   async fillCustomDropdownsProgrammatically(
     _adapter: BrowserAutomationAdapter,
