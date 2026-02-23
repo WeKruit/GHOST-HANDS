@@ -61,11 +61,13 @@ services:
       - GH_WORKER_HOST=worker
       - GH_WORKER_PORT=3101
       - GHOSTHANDS_DIR=/opt/ghosthands
+      - DOCKER_CONFIG_PATH=/docker-config/config.json
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
       - SSL_CERT_DIR=/etc/ssl/certs
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - .:/opt/ghosthands:ro
+      - /home/ubuntu/.docker:/docker-config:ro
     deploy:
       resources:
         limits:
