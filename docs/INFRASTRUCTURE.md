@@ -25,9 +25,10 @@
          EC2 Worker 1    EC2 Worker 2    EC2 Worker N
          (t3.large)      (t3.large)      (t3.large)
               │                │                │
-         Docker:           Docker:           Docker:
-         - GH API (3100)  - GH API (3100)  - GH API (3100)
-         - GH Worker(3101)- GH Worker(3101)- GH Worker(3101)
+         Docker (host net):  Docker (host net):  Docker (host net):
+         - GH API (3100)    - GH API (3100)    - GH API (3100)
+         - GH Worker (3101) - GH Worker (3101) - GH Worker (3101)
+         - Deploy Srv (8000)- Deploy Srv (8000)- Deploy Srv (8000)
 ```
 
 ### How It Works
@@ -35,7 +36,7 @@
 1. **VALET enqueues tasks** into pg-boss (Supabase Postgres)
 2. **AutoScaleService** runs every 60s, reads queue depth, calculates `desired = ceil(queueDepth / JOBS_PER_WORKER)`, clamped to `[min, max]`
 3. **AWS ASG** provisions/terminates EC2 instances to match desired capacity
-4. **Each EC2** runs a Docker container with GH API + Worker
+4. **Each EC2** runs 3 Docker containers (API, Worker, Deploy Server) — all on host networking
 5. **GH Worker** polls pg-boss for jobs, executes browser automation, sends callbacks to VALET
 6. **On scale-in:** ASG sends SIGTERM → worker drains in-flight jobs → calls `CompleteLifecycleAction` → instance terminates
 
@@ -45,6 +46,8 @@
 - **Golden AMI** — pre-baked with Docker + GH image for fast boot (~90s to healthy)
 - **Pull-based dispatch** — workers poll pg-boss, no inbound ports needed for job dispatch (ports still open for health checks and VNC)
 - **Ephemeral workers** — no persistent state on instances; all state is in Supabase
+- **Host networking** — all 3 containers use `network_mode: host` to avoid bridge/host conflicts between compose and Docker API deploys
+- **No .env file reads at runtime** — deploy-server uses `process.env` (populated by compose `env_file`), optionally augmented by AWS Secrets Manager at startup
 
 ---
 
@@ -62,6 +65,130 @@
 | **Key Pair** | `valet-worker` | SSH access | `~/.ssh/valet-worker.pem` |
 | **VPC** | `vpc-001f5437cfda3f468` | Default | us-east-1 |
 | **Subnet** | `subnet-069f1f6705a683148` | us-east-1a | Public subnet |
+
+---
+
+## CI/CD Deploy Pipeline
+
+### Pipeline Order
+
+```
+Push to staging/main
+  │
+  ├─ typecheck (parallel)
+  ├─ unit tests (parallel)
+  │
+  └─ integration tests (needs: typecheck)
+       │
+       └─ Docker Build & Push to ECR
+            │
+            └─ Deploy to ASG Fleet (SSH → deploy.sh)    ← EC2 updated FIRST
+                 │
+                 ├─ Deploy Staging (notify VALET webhook) ← VALET notified AFTER
+                 └─ Deploy Production (main branch only)
+```
+
+**Critical ordering:** ASG deploy runs BEFORE VALET notification. This ensures the deploy-server on EC2 has the new code before VALET tries to call it.
+
+### Two Deploy Paths
+
+| Path | Trigger | How It Works |
+|------|---------|-------------|
+| **ASG Deploy** (CI) | `git push` → GitHub Actions | SSH into each ASG instance → `git pull` → `deploy.sh` → `docker compose up -d` |
+| **VALET Auto-Deploy** (webhook) | CI notifies VALET webhook | VALET calls `POST /deploy` on deploy-server → Docker API creates new containers |
+
+Both paths update the same containers. `deploy.sh` removes standalone containers (from Docker API deploys) before running `docker compose up` to prevent port conflicts.
+
+### Deploy Server
+
+Each EC2 runs a deploy-server on port 8000 that accepts commands from VALET:
+
+| Endpoint | Auth | Purpose |
+|----------|------|---------|
+| `GET /health` | None | Worker health + active task count |
+| `GET /metrics` | None | CPU, memory, disk stats |
+| `GET /containers` | None | Running Docker containers |
+| `GET /workers` | None | Worker registry status |
+| `POST /deploy` | `X-Deploy-Secret` | Rolling deploy via Docker Engine API |
+| `POST /drain` | `X-Deploy-Secret` | Graceful worker drain |
+| `POST /cleanup` | `X-Deploy-Secret` | Disk cleanup (Docker prune + tmp + logs) |
+| `POST /admin/refresh-secrets` | `X-Deploy-Secret` | Re-fetch secrets from AWS Secrets Manager |
+
+### VALET Retry Logic
+
+VALET's `DeployService` retries failed deploy-server calls with exponential backoff (10s, 20s, 30s — max 3 attempts) before marking a sandbox deploy as failed.
+
+---
+
+## Secrets Management
+
+### How Secrets Reach EC2
+
+```
+AWS Secrets Manager (ghosthands/{environment})
+         │
+    EC2 bootstrap (UserData)
+         │
+    pull-secrets.sh → /opt/ghosthands/.env (600 perms)
+         │
+    docker compose env_file → process.env (in containers)
+         │
+    deploy-server also fetches AWS SM at startup (non-fatal)
+```
+
+1. **EC2 boots** → UserData script runs `pull-secrets.sh`
+2. **`pull-secrets.sh`** fetches JSON from AWS Secrets Manager (`ghosthands/staging`), converts to `.env` format, writes to `/opt/ghosthands/.env`
+3. **Docker compose** loads `.env` via `env_file:` directive → vars available in `process.env`
+4. **Deploy-server** also fetches from AWS SM at startup as an additional source (existing env vars take precedence)
+5. **Runtime-injected vars** (`GH_WORKER_ID`, `EC2_INSTANCE_ID`, `EC2_IP`) are set by UserData, NOT stored in AWS SM
+
+### Important: No .env File Reads in Code
+
+The deploy-server does **NOT** read `.env` files from disk at runtime. The `container-configs.ts` module reads `process.env` and filters to known prefixes (`DATABASE_`, `SUPABASE_`, `GH_`, `ANTHROPIC_`, `AWS_`, etc.) when creating new containers via Docker API.
+
+This avoids EACCES permission errors — the Docker containers run as the non-root `ghosthands` user, which cannot read host files owned by `ubuntu`.
+
+### Updating Secrets
+
+```bash
+# 1. Update in AWS Secrets Manager
+aws secretsmanager update-secret \
+  --secret-id ghosthands/staging \
+  --secret-string "$(cat updated-secrets.json)"
+
+# 2. Option A: Re-pull on EC2 (restarts containers)
+ssh -i ~/.ssh/valet-worker.pem ubuntu@<ip> \
+  "cd /opt/ghosthands && sudo bash scripts/pull-secrets.sh staging && docker compose down && docker compose up -d"
+
+# 3. Option B: Refresh via deploy-server API (no restart needed for deploy-server itself)
+curl -X POST http://<ip>:8000/admin/refresh-secrets \
+  -H "X-Deploy-Secret: $GH_DEPLOY_SECRET"
+```
+
+---
+
+## Docker Compose Configuration
+
+All 3 services use **host networking** (`network_mode: host`). No port mappings — services bind directly to host ports.
+
+| Service | Port | Command |
+|---------|------|---------|
+| `api` | 3100 | `bun packages/ghosthands/src/api/server.ts` |
+| `worker` | 3101 | `bun packages/ghosthands/src/workers/main.ts` |
+| `deploy-server` | 8000 | `bun scripts/deploy-server.ts` |
+
+### Compose Files
+
+| File | Environment | Difference |
+|------|-------------|-----------|
+| `docker-compose.prod.yml` | Production | No `GH_ENVIRONMENT` override |
+| `docker-compose.staging.yml` | Staging | Sets `GH_ENVIRONMENT=staging` |
+
+### Docker Container User
+
+The Dockerfile creates a non-root `ghosthands` user (line 102). All containers run as this user. This means:
+- Containers cannot read host files with restrictive permissions (e.g., `.env` with `600 ubuntu:ubuntu`)
+- Volume mounts (like `/opt/ghosthands:ro`) are accessible only if the host files are world-readable OR owned by the container user's UID
 
 ---
 
@@ -126,16 +253,23 @@
 | `AWS_SECRET_ACCESS_KEY` | (secret) | IAM credentials for ASG API calls |
 | `AWS_REGION` | `us-east-1` | AWS region |
 
-### GH Worker (.env on each EC2)
+### GH Worker (.env on each EC2 — sourced from AWS Secrets Manager)
 
 | Variable | Value | Description |
 |----------|-------|-------------|
 | `AWS_ASG_NAME` | `ghosthands-worker-asg` | Used by lifecycle hook |
 | `AWS_LIFECYCLE_HOOK_NAME` | `ghosthands-drain-hook` | Hook name for drain signal |
 | `AWS_REGION` | `us-east-1` | AWS region |
-| `GH_WORKER_ID` | (auto-generated per instance) | Unique UUID for each worker |
+| `GH_WORKER_ID` | (auto-generated per instance) | Unique UUID for each worker (injected by UserData) |
+| `EC2_INSTANCE_ID` | (auto-detected) | Instance ID (injected by UserData) |
+| `EC2_IP` | (auto-detected) | Public IP (injected by UserData) |
 | `JOB_DISPATCH_MODE` | `queue` | Pull from pg-boss |
 | `MAX_CONCURRENT_JOBS` | `1` | Single-task-per-worker |
+| `GH_DEPLOY_SECRET` | (secret) | Auth for deploy-server POST endpoints |
+| `GH_CREDENTIAL_KEY` | (secret) | 64 hex chars for AES-256-GCM encryption |
+| `GH_SERVICE_SECRET` | (secret) | API authentication key |
+| `DATABASE_URL` | (secret) | Supabase Postgres (transaction pooler) |
+| `DATABASE_DIRECT_URL` | (secret) | Supabase Postgres (direct, for migrations) |
 
 ---
 
@@ -342,4 +476,4 @@ When baking a new Golden AMI, run `setup-cleanup-cron.sh` before creating the im
 
 ---
 
-*Last updated: 2026-02-22*
+*Last updated: 2026-02-23*
