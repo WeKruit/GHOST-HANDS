@@ -622,6 +622,14 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
     return filled;
   }
 
+  // Workday has its own dropdown handling in fillDropdownsProgrammatically — no-op here.
+  async fillCustomDropdownsProgrammatically(
+    _adapter: BrowserAutomationAdapter,
+    _qaMap: Record<string, string>,
+  ): Promise<number> {
+    return 0;
+  }
+
   /**
    * Workday segmented date fields (MM/DD/YYYY) — click MM, type full digits,
    * Workday auto-advances through segments.

@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import path from 'node:path';
+import fs from 'node:fs';
 import type { TaskHandler, TaskContext, TaskResult, ValidationResult } from './types.js';
 import type { BrowserAutomationAdapter } from '../../adapters/types.js';
 import type { PlatformConfig, PageState, PageType } from './platforms/types.js';
@@ -47,6 +49,29 @@ export class SmartApplyHandler implements TaskHandler {
     // Build data prompt and QA map via platform config
     const dataPrompt = config.buildDataPrompt(userProfile, qaOverrides);
     const qaMap = config.buildQAMap(userProfile, qaOverrides);
+
+    // Resolve resume file path (if provided)
+    let resumePath: string | null = null;
+    if (userProfile.resume_path) {
+      const resolved = path.isAbsolute(userProfile.resume_path)
+        ? userProfile.resume_path
+        : path.resolve(process.cwd(), userProfile.resume_path);
+      if (fs.existsSync(resolved)) {
+        resumePath = resolved;
+        console.log(`[SmartApply] Resume found: ${resumePath}`);
+      } else {
+        console.warn(`[SmartApply] Resume not found at ${resolved} — skipping upload.`);
+      }
+    }
+
+    // Auto-attach resume to any file dialog the LLM or DOM triggers
+    if (resumePath) {
+      const rp = resumePath;
+      adapter.page.on('filechooser', async (chooser) => {
+        console.log(`[SmartApply] File chooser opened — attaching resume: ${rp}`);
+        await chooser.setFiles(rp);
+      });
+    }
 
     let pagesProcessed = 0;
     let lastPageSignature = '';
@@ -179,7 +204,7 @@ export class SmartApplyHandler implements TaskHandler {
             await progress.setStep(step as any);
 
             const fillPrompt = config.buildPagePrompt(pageState.page_type, dataPrompt);
-            const result = await this.fillPage(adapter, config, fillPrompt, qaMap, pageState.page_type);
+            const result = await this.fillPage(adapter, config, fillPrompt, qaMap, pageState.page_type, resumePath);
 
             if (result === 'review') {
               // fillPage detected this is actually the review page
@@ -605,11 +630,13 @@ ${dataPrompt}`,
     fillPrompt: string,
     qaMap: Record<string, string>,
     pageLabel: string,
+    resumePath?: string | null,
   ): Promise<'navigated' | 'review' | 'complete'> {
     const MAX_ROUNDS = 15;
     const MAX_LLM_CALLS = 8;
     let llmCalls = 0;
     let consecutiveNoProgress = 0;
+    let resumeUploaded = false;
 
     // Safety: check if this is actually the review page (misclassified)
     if (await this.checkIfReviewPage(adapter)) {
@@ -628,8 +655,18 @@ ${dataPrompt}`,
 
       // DOM-first fills (dropdowns, dates, checkboxes — no LLM cost)
       let domFills = 0;
+
+      // Resume upload via DOM (once per page, before other fills)
+      if (resumePath && !resumeUploaded) {
+        const uploaded = await this.uploadResumeIfPresent(adapter, resumePath);
+        if (uploaded) {
+          resumeUploaded = true;
+          domFills++;
+        }
+      }
       if (Object.keys(qaMap).length > 0) {
         domFills += await config.fillDropdownsProgrammatically(adapter, qaMap);
+        domFills += await config.fillCustomDropdownsProgrammatically(adapter, qaMap);
       }
       domFills += await config.fillDateFieldsProgrammatically(adapter, qaMap);
       domFills += await config.checkRequiredCheckboxes(adapter);
@@ -757,6 +794,34 @@ ${dataPrompt}`,
   }
 
   /**
+   * Detect file upload inputs on the page and upload the resume via DOM.
+   * Handles both visible <input type="file"> and button-triggered file dialogs.
+   * Returns true if a resume was uploaded.
+   */
+  private async uploadResumeIfPresent(
+    adapter: BrowserAutomationAdapter,
+    resumePath: string,
+  ): Promise<boolean> {
+    // Check for file input anywhere on the page (not just viewport — they're often hidden)
+    const hasFileInput = await adapter.page.evaluate(() => {
+      return document.querySelectorAll('input[type="file"]').length > 0;
+    });
+
+    if (!hasFileInput) return false;
+
+    try {
+      const fileInput = adapter.page.locator('input[type="file"]').first();
+      await fileInput.setInputFiles(resumePath);
+      console.log(`[SmartApply] Resume uploaded via DOM file input: ${resumePath}`);
+      await adapter.page.waitForTimeout(2000); // Wait for upload processing
+      return true;
+    } catch (err) {
+      console.warn(`[SmartApply] DOM resume upload failed: ${err}. LLM will try clicking upload button.`);
+      return false;
+    }
+  }
+
+  /**
    * Quick fingerprint of visible field values to detect whether the LLM changed anything.
    */
   private async getVisibleFieldValues(adapter: BrowserAutomationAdapter): Promise<string> {
@@ -775,7 +840,9 @@ ${dataPrompt}`,
   }
 
   /**
-   * Scroll the viewport down by 65% of the window height.
+   * Smart scroll: find the next actionable element below the viewport and scroll
+   * just enough to bring it into view. Falls back to 50% viewport jump if no
+   * specific target is found.
    * Returns true if the scroll position actually changed.
    */
   private async scrollDown(adapter: BrowserAutomationAdapter): Promise<boolean> {
@@ -784,9 +851,64 @@ ${dataPrompt}`,
 
     if (scrollBefore >= scrollMax - 10) return false; // Already at content bottom
 
-    await adapter.page.evaluate(() =>
-      window.scrollBy({ top: Math.round(window.innerHeight * 0.65), behavior: 'smooth' }),
-    );
+    // Find the Y position of the next actionable element below the viewport
+    const targetY = await adapter.page.evaluate(() => {
+      const vh = window.innerHeight;
+      const scrollY = window.scrollY;
+
+      // All the element types we care about (form fields, upload areas, buttons, custom controls)
+      const selectors = [
+        'input:not([type="hidden"]):not([disabled])',
+        'textarea:not([disabled])',
+        'select:not([disabled])',
+        '[contenteditable="true"]',
+        '[role="combobox"]',
+        '[role="listbox"]',
+        '[role="radiogroup"]',
+        '[role="radio"]',
+        '[aria-haspopup="listbox"]',
+        '[aria-haspopup="true"]',
+        'input[type="file"]',
+        'button',
+        '[role="button"]',
+        'label[for]',
+        '[class*="upload"]',
+        '[class*="dropzone"]',
+        '[class*="drop-zone"]',
+        '[class*="file-upload"]',
+        '[class*="attach"]',
+      ];
+
+      let closestBelow = Infinity;
+
+      for (let s = 0; s < selectors.length; s++) {
+        const els = document.querySelectorAll(selectors[s]);
+        for (let e = 0; e < els.length; e++) {
+          const rect = els[e].getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          const style = window.getComputedStyle(els[e]);
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+          // Element is below the viewport (or partially cut off at the bottom)
+          if (rect.top > vh - 20) {
+            const absTop = rect.top + scrollY;
+            if (absTop < closestBelow) closestBelow = absTop;
+          }
+        }
+      }
+
+      if (closestBelow === Infinity) {
+        // No specific target found — fall back to 50% viewport jump
+        return scrollY + Math.round(vh * 0.5);
+      }
+
+      // Scroll so the target element is ~20% from the top of the viewport
+      return Math.max(scrollY + 1, closestBelow - Math.round(vh * 0.2));
+    });
+
+    await adapter.page.evaluate((target: number) =>
+      window.scrollTo({ top: target, behavior: 'smooth' }),
+    targetY);
     await adapter.page.waitForTimeout(1200);
 
     const scrollAfter = await adapter.page.evaluate(() => window.scrollY);
