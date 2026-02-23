@@ -50,19 +50,20 @@ services:
         max-file: "3"
 
   # Deploy Server — receives deploy commands from VALET's DeployService
+  # Uses host networking so it can health-check containers it creates
+  # (which also run on host network via Docker API deploys)
   deploy-server:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "scripts/deploy-server.ts"]
-    ports:
-      - "0.0.0.0:${GH_DEPLOY_PORT:-8000}:8000"
+    network_mode: host
     env_file: .env
     environment:
       - NODE_ENV=production
       - GH_ENVIRONMENT=staging
       - GH_DEPLOY_PORT=8000
-      - GH_API_HOST=api
+      - GH_API_HOST=localhost
       - GH_API_PORT=3100
-      - GH_WORKER_HOST=worker
+      - GH_WORKER_HOST=localhost
       - GH_WORKER_PORT=3101
       - GHOSTHANDS_DIR=/opt/ghosthands
       - DOCKER_CONFIG_PATH=/docker-config/config.json
