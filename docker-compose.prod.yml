@@ -67,7 +67,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - .:/opt/ghosthands:ro
-      - /home/ubuntu/.docker:/docker-config:ro
+      - /home/ubuntu/.docker/config.json:/docker-config/config.json:ro
     deploy:
       resources:
         limits:
