@@ -8,19 +8,20 @@
  * These definitions replace docker-compose for deploy-server managed deploys.
  * The deploy-server uses these configs to create containers via Docker API.
  *
+ * Environment variables are sourced from process.env (populated by docker-compose
+ * env_file and/or AWS Secrets Manager), NOT from reading .env files on disk.
+ * This avoids EACCES permission errors when the container user differs from
+ * the file owner.
+ *
  * @module scripts/lib/container-configs
  * @see WEK-80
  */
 
-import * as fs from 'fs';
 import type { ContainerCreateConfig } from './docker-client';
 
 /** ECR registry base URL — reads from env, falls back to account default */
 const ECR_REGISTRY = process.env.ECR_REGISTRY ?? '168495702277.dkr.ecr.us-east-1.amazonaws.com';
 const ECR_REPOSITORY = process.env.ECR_REPOSITORY ?? 'ghosthands';
-
-/** Path to .env file on the EC2 host */
-const ENV_FILE_PATH = '/opt/ghosthands/.env';
 
 /**
  * Defines a deployable service container with health check,
@@ -48,20 +49,30 @@ export interface ServiceDefinition {
 }
 
 /**
- * Reads a .env file and returns an array of "KEY=VALUE" strings,
- * filtering out blank lines and comments.
+ * Prefixes of environment variable names that should be passed through
+ * to spawned containers. Only matching vars are forwarded — system vars
+ * like PATH, HOME, etc. are excluded.
+ */
+const PASSTHROUGH_PREFIXES = [
+  'DATABASE_', 'SUPABASE_', 'REDIS_', 'GH_', 'ANTHROPIC_', 'DEEPSEEK_',
+  'SILICONFLOW_', 'OPENAI_', 'AWS_', 'ECR_', 'CORS_', 'NODE_ENV',
+  'MAX_CONCURRENT_', 'JOB_DISPATCH_', 'GHOSTHANDS_', 'KASM_',
+];
+
+/**
+ * Build env vars array from process.env for passing to new containers.
+ * Filters to only include known GH/infra env vars (not system vars).
  *
- * Sync is acceptable here because this is called once at deploy time.
- *
- * @param path - Absolute path to the .env file
  * @returns Array of environment variable strings (e.g., ["FOO=bar", "BAZ=qux"])
  */
-export function loadEnvFile(path: string): string[] {
-  const content = fs.readFileSync(path, 'utf-8');
-  return content
-    .split('\n')
-    .filter((line: string) => line.trim() && !line.startsWith('#'))
-    .map((line: string) => line.trim());
+export function getEnvVarsFromProcess(): string[] {
+  const envVars: string[] = [];
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value && PASSTHROUGH_PREFIXES.some(p => key.startsWith(p))) {
+      envVars.push(`${key}=${value}`);
+    }
+  }
+  return envVars;
 }
 
 /**
@@ -184,7 +195,7 @@ export function getServiceConfigs(
   _environment: 'staging' | 'production',
 ): ServiceDefinition[] {
   const ecrImage = buildEcrImage(imageTag);
-  const envVars = loadEnvFile(ENV_FILE_PATH);
+  const envVars = getEnvVarsFromProcess();
 
   const services: ServiceDefinition[] = [
     buildApiService(ecrImage, envVars),

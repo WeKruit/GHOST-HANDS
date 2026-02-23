@@ -25,6 +25,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-auto-scaling": "^3.750.0",
+    "@aws-sdk/client-secrets-manager": "^3.995.0",
     "patchright": "^1.52.5"
   }
 }

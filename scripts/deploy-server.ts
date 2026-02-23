@@ -10,14 +10,20 @@
  *   GET  /version     — Returns deploy server version + current image info
  *   GET  /containers  — Returns running Docker containers (no auth)
  *   GET  /workers     — Returns worker registry status (no auth)
- *   POST /deploy      — Rolling deploy via Docker Engine API (requires X-Deploy-Secret)
- *   POST /drain       — Triggers graceful worker drain (requires X-Deploy-Secret)
- *   POST /cleanup     — Runs disk cleanup (Docker prune + tmp + logs) (requires X-Deploy-Secret)
- *   POST /rollback    — Stub for future rollback support (requires X-Deploy-Secret)
+ *   POST /deploy               — Rolling deploy via Docker Engine API (requires X-Deploy-Secret)
+ *   POST /drain                — Triggers graceful worker drain (requires X-Deploy-Secret)
+ *   POST /cleanup              — Runs disk cleanup (Docker prune + tmp + logs) (requires X-Deploy-Secret)
+ *   POST /rollback             — Stub for future rollback support (requires X-Deploy-Secret)
+ *   POST /admin/refresh-secrets — Re-fetch secrets from AWS Secrets Manager (requires X-Deploy-Secret)
  *
  * Auth:
  *   POST endpoints require X-Deploy-Secret header matching GH_DEPLOY_SECRET env var.
  *   GET endpoints are unauthenticated (monitoring/health checks).
+ *
+ * Secrets:
+ *   On startup, optionally loads secrets from AWS Secrets Manager
+ *   (`ghosthands/{GH_ENVIRONMENT}`). Existing env vars (from docker-compose env_file)
+ *   take precedence. AWS SM is non-fatal — if unavailable, process.env is used as-is.
  *
  * Usage:
  *   GH_DEPLOY_SECRET=<secret> bun scripts/deploy-server.ts
@@ -35,6 +41,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { execSync, exec } from 'node:child_process';
 
+import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
+
 import {
   pullImage,
   stopContainer,
@@ -46,6 +54,46 @@ import {
 } from './lib/docker-client';
 import { getEcrAuth, getEcrImageRef } from './lib/ecr-auth';
 import { getServiceConfigs, type ServiceDefinition } from './lib/container-configs';
+
+// ── AWS Secrets Manager ──────────────────────────────────────────────
+
+/**
+ * Optionally fetches secrets from AWS Secrets Manager and merges them
+ * into process.env. Existing env vars (from docker-compose env_file)
+ * take precedence — SM values are only set if the key is not already present.
+ *
+ * Non-fatal: if SM is unavailable (no IAM role, no secret, etc.), the
+ * deploy-server continues with whatever is already in process.env.
+ */
+async function loadSecretsFromAwsSm(): Promise<void> {
+  const environment = process.env.GH_ENVIRONMENT || 'staging';
+  const secretId = `ghosthands/${environment}`;
+  const region = process.env.AWS_REGION || 'us-east-1';
+
+  try {
+    const client = new SecretsManagerClient({ region });
+    const response = await client.send(new GetSecretValueCommand({ SecretId: secretId }));
+
+    if (response.SecretString) {
+      const secrets = JSON.parse(response.SecretString);
+      let loaded = 0;
+      for (const [key, value] of Object.entries(secrets)) {
+        if (typeof value === 'string' && !process.env[key]) {
+          // Only set if not already in process.env (env_file takes precedence)
+          process.env[key] = value;
+          loaded++;
+        }
+      }
+      console.log(`[deploy-server] Loaded ${loaded} secrets from AWS SM (${secretId})`);
+    }
+  } catch (err: any) {
+    console.warn(`[deploy-server] AWS Secrets Manager unavailable (${err.message}). Using process.env only.`);
+    // Non-fatal — graceful fallback to compose env_file vars
+  }
+}
+
+// Load secrets before anything else reads process.env
+await loadSecretsFromAwsSm();
 
 const DEPLOY_PORT = parseInt(process.env.GH_DEPLOY_PORT || '8000', 10);
 const DEPLOY_SECRET = process.env.GH_DEPLOY_SECRET;
@@ -623,6 +671,28 @@ if (typeof Bun !== 'undefined') {
           { success: false, message: 'Rollback not yet implemented. Redeploy with a previous image tag.' },
           { status: 501 },
         );
+      }
+
+      // ── POST /admin/refresh-secrets — Re-fetch secrets from AWS SM ──
+      if (url.pathname === '/admin/refresh-secrets' && req.method === 'POST') {
+        if (!verifySecret(req)) {
+          return Response.json(
+            { success: false, message: 'Unauthorized' },
+            { status: 401 },
+          );
+        }
+
+        console.log('[deploy-server] Refreshing secrets from AWS Secrets Manager...');
+        try {
+          await loadSecretsFromAwsSm();
+          return Response.json({ success: true, message: 'Secrets refreshed from AWS SM' });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return Response.json(
+            { success: false, message: `Secrets refresh failed: ${msg}` },
+            { status: 500 },
+          );
+        }
       }
 
       return Response.json({ error: 'not_found' }, { status: 404 });
