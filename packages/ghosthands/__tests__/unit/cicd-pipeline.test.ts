@@ -82,14 +82,14 @@ describe('CI/CD Workflow (ci.yml)', () => {
     expect(ci.jobs.docker.outputs).toHaveProperty('environment');
   });
 
-  test('deploy-staging depends on docker and test-integration', () => {
-    expect(ci.jobs['deploy-staging'].needs).toContain('docker');
-    expect(ci.jobs['deploy-staging'].needs).toContain('test-integration');
+  test('deploy-asg depends on docker and test-integration (runs before VALET notification)', () => {
+    expect(ci.jobs['deploy-asg'].needs).toContain('docker');
+    expect(ci.jobs['deploy-asg'].needs).toContain('test-integration');
   });
 
-  test('deploy-asg depends on docker and deploy-staging', () => {
-    expect(ci.jobs['deploy-asg'].needs).toContain('docker');
-    expect(ci.jobs['deploy-asg'].needs).toContain('deploy-staging');
+  test('deploy-staging depends on docker and deploy-asg (notifies VALET after EC2 update)', () => {
+    expect(ci.jobs['deploy-staging'].needs).toContain('docker');
+    expect(ci.jobs['deploy-staging'].needs).toContain('deploy-asg');
   });
 
   test('deploy-asg cleans up SSH key on failure', () => {
@@ -107,8 +107,8 @@ describe('CI/CD Workflow (ci.yml)', () => {
     expect(condition).toContain('push');
   });
 
-  test('deploy-production depends on deploy-staging', () => {
-    expect(ci.jobs['deploy-production'].needs).toContain('deploy-staging');
+  test('deploy-production depends on deploy-asg (notifies VALET after EC2 update)', () => {
+    expect(ci.jobs['deploy-production'].needs).toContain('deploy-asg');
   });
 });
 
