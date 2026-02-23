@@ -92,6 +92,13 @@ set -euo pipefail
 
 cd "${REMOTE_DIR}"
 
+# Pull latest compose/deploy scripts so on-disk files stay in sync
+# Detect branch from image tag: staging-<sha> → staging, <sha> → main
+GIT_BRANCH="staging"
+case "${IMAGE_TAG}" in staging-*) GIT_BRANCH="staging" ;; *) GIT_BRANCH="main" ;; esac
+echo "[remote] Pulling latest scripts from \$GIT_BRANCH..."
+git pull origin "\$GIT_BRANCH" --ff-only 2>/dev/null || echo "[remote] Git pull skipped (conflicts or not a git repo)"
+
 # ECR login
 echo "[remote] Logging into ECR..."
 aws ecr get-login-password --region "${REGION}" \
