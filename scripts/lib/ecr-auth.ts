@@ -37,7 +37,7 @@ const DEFAULT_REGISTRY = process.env.ECR_REGISTRY ?? '';
  * Path to Docker config.json inside the container (mounted from host).
  * Override with DOCKER_CONFIG_PATH env var.
  */
-const DOCKER_CONFIG_PATH = process.env.DOCKER_CONFIG_PATH ?? '/root/.docker/config.json';
+const DOCKER_CONFIG_PATH = process.env.DOCKER_CONFIG_PATH ?? '/docker-config/config.json';
 
 /**
  * In-memory cached token
