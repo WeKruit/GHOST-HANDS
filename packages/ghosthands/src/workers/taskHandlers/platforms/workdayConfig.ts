@@ -2,7 +2,7 @@ import { z } from 'zod';
 import path from 'node:path';
 import fs from 'node:fs';
 import type { BrowserAutomationAdapter } from '../../../adapters/types.js';
-import type { PlatformConfig, PageState, PageType } from './types.js';
+import type { PlatformConfig, PageState, PageType, ScannedField, ScanResult } from './types.js';
 import type { WorkdayUserProfile } from '../workdayTypes.js';
 import {
   WORKDAY_BASE_RULES,
@@ -331,7 +331,111 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
   }
 
   // =========================================================================
-  // Programmatic DOM Helpers
+  // Scan-First Field Discovery
+  // =========================================================================
+
+  async scanPageFields(adapter: BrowserAutomationAdapter): Promise<ScanResult> {
+    // Start with the generic scan
+    const { GenericPlatformConfig } = await import('./genericConfig.js');
+    const generic = new GenericPlatformConfig();
+    const scan = await generic.scanPageFields(adapter);
+
+    // Workday enhancement: detect "Select One" buttons as unfilled dropdowns
+    const workdayDropdowns = await adapter.page.evaluate(() => {
+      const fields: any[] = [];
+      const buttons = document.querySelectorAll('button');
+      for (let i = 0; i < buttons.length; i++) {
+        const btn = buttons[i];
+        if ((btn.textContent || '').trim() !== 'Select One') continue;
+        const rect = btn.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        // Already tagged by generic scan?
+        if (btn.getAttribute('data-gh-scan-idx')) continue;
+
+        // Extract label (walk up for label text)
+        let label = '';
+        let node: HTMLElement | null = btn.parentElement;
+        for (let d = 0; d < 10 && node; d++) {
+          const lbl = node.querySelector('label, [data-automation-id*="formLabel"]');
+          if (lbl && (lbl.textContent || '').trim() !== 'Select One') {
+            label = (lbl.textContent || '').trim();
+            break;
+          }
+          node = node.parentElement;
+        }
+        if (!label) {
+          const parent = btn.closest('[data-automation-id]');
+          if (parent) {
+            const t = (parent.textContent || '').replace(/Select One/g, '').replace(/Required/gi, '').replace(/[*]/g, '').trim();
+            if (t.length > 3 && t.length < 200) label = t;
+          }
+        }
+
+        const idx = 'wd-dd-' + i;
+        btn.setAttribute('data-gh-scan-idx', idx);
+        fields.push({
+          id: 'field-wd-dd-' + i,
+          kind: 'custom_dropdown',
+          fillStrategy: 'click_option',
+          selector: '[data-gh-scan-idx="' + idx + '"]',
+          label: label.substring(0, 120),
+          currentValue: '',
+          absoluteY: rect.top + window.scrollY,
+          isRequired: true,
+          filled: false,
+          platformMeta: { widgetType: 'workday_select_one' },
+        });
+      }
+      return fields;
+    }) as ScannedField[];
+
+    // Merge Workday-specific fields, avoiding duplicates by label
+    const existingLabels = new Set(scan.fields.map(f => f.label.toLowerCase()));
+    for (const wd of workdayDropdowns) {
+      if (!existingLabels.has(wd.label.toLowerCase())) {
+        scan.fields.push(wd);
+      }
+    }
+
+    // Re-sort by position
+    scan.fields.sort((a, b) => a.absoluteY - b.absoluteY);
+    return scan;
+  }
+
+  async fillScannedField(
+    adapter: BrowserAutomationAdapter,
+    field: ScannedField,
+    answer: string,
+  ): Promise<boolean> {
+    // Workday "Select One" dropdown — use the existing clickDropdownOption logic
+    if (field.platformMeta?.widgetType === 'workday_select_one') {
+      try {
+        const locator = adapter.page.locator(field.selector).first();
+        await locator.scrollIntoViewIfNeeded();
+        await adapter.page.waitForTimeout(200);
+        await locator.click();
+        await adapter.page.waitForTimeout(600);
+        const clicked = await this.clickDropdownOption(adapter, answer);
+        if (!clicked) {
+          await adapter.page.keyboard.press('Escape');
+          await adapter.page.waitForTimeout(300);
+          return false;
+        }
+        await adapter.page.waitForTimeout(500);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    // Everything else — delegate to generic
+    const { GenericPlatformConfig } = await import('./genericConfig.js');
+    const generic = new GenericPlatformConfig();
+    return generic.fillScannedField(adapter, field, answer);
+  }
+
+  // =========================================================================
+  // Programmatic DOM Helpers (legacy, kept for backward compatibility)
   // =========================================================================
 
   /**
