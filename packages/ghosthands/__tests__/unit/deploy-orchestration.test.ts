@@ -57,11 +57,11 @@ vi.mock('../../../../scripts/lib/docker-client', () => ({
 
 // Mock container-configs
 const mockGetServiceConfigs = vi.fn();
-const mockLoadEnvFile = vi.fn();
+const mockGetEnvVarsFromProcess = vi.fn();
 
 vi.mock('../../../../scripts/lib/container-configs', () => ({
   getServiceConfigs: (...args: unknown[]) => mockGetServiceConfigs(...args),
-  loadEnvFile: (...args: unknown[]) => mockLoadEnvFile(...args),
+  getEnvVarsFromProcess: (...args: unknown[]) => mockGetEnvVarsFromProcess(...args),
 }));
 
 // ── Types & Helpers ────────────────────────────────────────────────
@@ -246,7 +246,7 @@ describe('Deploy Orchestration Flow', () => {
     });
     mockPruneImages.mockResolvedValue({ spaceReclaimed: 1024 });
     mockGetServiceConfigs.mockReturnValue(buildDefaultServices());
-    mockLoadEnvFile.mockReturnValue(['DB_URL=postgres://localhost/db']);
+    mockGetEnvVarsFromProcess.mockReturnValue(['DB_URL=postgres://localhost/db']);
 
     // Mock global fetch for drain endpoint
     originalFetch = globalThis.fetch;
