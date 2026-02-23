@@ -167,7 +167,7 @@ async function main() {
         $3::jsonb,
         $4,
         'pending',
-        600, 1, 1,
+        1800, 1, 1,
         $5,
         $6::jsonb,
         $7::jsonb

@@ -27,7 +27,6 @@ import {
 } from './workdayPrompts.js';
 import { handleGoogleSignIn } from './googleSignIn.js';
 import { fillWithSmartScroll } from './smartScroll.js';
-import { centerNextEmptyField } from './domFillers.js';
 import { waitForPageLoad, clickNextWithErrorRecovery } from './navigation.js';
 
 // --- DOM Helpers ---
@@ -517,9 +516,10 @@ export async function handleExperiencePage(
   }
 
   // ==================== LLM fills everything else ====================
-  // Configurable max entries (defaults: 3 experiences, 2 educations)
-  const maxExperiences = (userProfile as any).max_experiences ?? 10;
-  const maxEducations = (userProfile as any).max_educations ?? 5;
+  // Configurable max entries
+  const maxExperiences = (userProfile as any).max_experiences ?? 2;
+  const maxEducations = (userProfile as any).max_educations ?? 1;
+  const maxSkills = (userProfile as any).max_skills ?? 3;
 
   const experiences = (userProfile.experience || []).slice(0, maxExperiences);
   const educations = (userProfile.education || []).slice(0, maxEducations);
@@ -572,17 +572,23 @@ export async function handleExperiencePage(
 
     const entryData = `You are filling WORK EXPERIENCE entry ${i + 1} of ${experiences.length}.
 
-CRITICAL: Find the heading "Work Experience ${i + 1}" on the page. IGNORE everything ABOVE that heading — those fields belong to previous entries and you must NOT interact with them. Only fill fields that appear BELOW the "Work Experience ${i + 1}" heading.
+ABSOLUTE RULE: Find the heading "Work Experience ${i + 1}" on the page. You must ONLY interact with fields that appear BELOW this heading. Everything above this heading belongs to previous entries — do NOT click, type, scroll to, or modify ANY field above "Work Experience ${i + 1}" under any circumstances. If you see fields with values that look "wrong" or different from what is listed below, but those fields are ABOVE the "Work Experience ${i + 1}" heading, they belong to a PREVIOUS entry and are CORRECT — leave them alone.
+
+IDENTIFYING YOUR FIELDS: The fields for this entry are EMPTY by default:
+  - Text fields will be BLANK (no text).
+  - Date fields will show "MM/YYYY" placeholders (not actual dates).
+  - The "I currently work here" checkbox will be UNCHECKED by default.
+If you see a field that already has a value (text, a date like "05/2024", or a CHECKED checkbox), it belongs to a PREVIOUS entry — do NOT touch it, do NOT uncheck it, do NOT modify it. YOUR fields are empty/unchecked and require scrolling DOWN to find.
 
 Fill ALL of these fields (scroll down if needed to find them):
   Job Title: ${exp.title}
   Company: ${exp.company}
   Location: ${exp.location || ''}
-  I currently work here: ${exp.currently_work_here ? 'YES — check the checkbox' : 'No — leave unchecked'}
+  I currently work here: ${exp.currently_work_here ? 'YES — check the checkbox' : 'No — the checkbox is already unchecked by default, do NOT touch any checkbox that is already checked'}
   From date: ${fromDate} — click on the "MM" text, then type "${fromDate.replace('/', '')}" as continuous digits.${toDateLine}
   Role Description: ${exp.description}
 
-REMEMBER: NEVER scroll up. All fields for this entry are BELOW the "Work Experience ${i + 1}" heading — keep scrolling DOWN to find them. The Role Description field is below the date fields.
+REMEMBER: NEVER scroll up. All fields for this entry are BELOW the "Work Experience ${i + 1}" heading — keep scrolling DOWN to find them. The order from top to bottom is: Job Title → Company → Location → Checkbox → Date fields → Role Description.
 
 RECOVERY: If at any point you see a heading for a PREVIOUS entry (e.g. "Work Experience ${i}" or earlier), you have scrolled too far up or are looking at the wrong area. Immediately scroll DOWN (at least 50 pixels per scroll) until you see the "Work Experience ${i + 1}" heading, then continue filling fields below it.
 
@@ -646,24 +652,30 @@ Do NOT click any "Add" buttons. Do NOT touch any other sections. Do NOT interact
     logger.info('Education entry done', { entry: i + 1, school: edu.school });
   }
 
-  // ==================== SKILLS + LINKEDIN (final scroll+LLM loop) ====================
+  // ==================== SKILLS + LINKEDIN ====================
+  const skillsToAdd = (userProfile.skills || []).slice(0, maxSkills);
+  const hasSkills = skillsToAdd.length > 0;
+  const hasLinkedin = !!userProfile.linkedin_url;
+
   let skillsLinkedinBlock = `CRITICAL — DO NOT TOUCH THESE SECTIONS:
 - "Websites" section: Do NOT click its "Add" button. Leave it empty.
 - "Certifications" section: Do NOT click its "Add" button. Leave it empty.
 - Do NOT click "Add" under Work Experience or Education — those are already filled.
+${!hasLinkedin ? '- "LinkedIn" / "Social Network URLs" section: Do NOT fill this field. Leave it completely empty.' : ''}
 
-Fill ONLY Skills and LinkedIn fields below. Skip any fields that already have values.
+Fill ONLY ${hasSkills ? 'Skills' : ''}${hasSkills && hasLinkedin ? ' and ' : ''}${hasLinkedin ? 'LinkedIn' : ''} fields below. Skip any fields that already have values.${!hasSkills && !hasLinkedin ? ' If all fields are filled, STOP immediately.' : ''}
 `;
 
-  if (userProfile.skills && userProfile.skills.length > 0) {
+  if (hasSkills) {
     skillsLinkedinBlock += `
-SKILLS (find the skills input field, usually has placeholder "Type to Add Skills"):
-  For EACH skill below: click the skills input, type the skill name, press ENTER to trigger the dropdown, then WAIT 3 seconds for the suggestions to load. IMPORTANT: You MUST click the matching option from the dropdown — just typing is NOT enough. If the correct option is NOT visible, clear the input (select all + delete) and scroll through the dropdown options (minimum 20 pixels per scroll) until you find it. After selecting, click on empty whitespace to dismiss the dropdown before typing the next skill.
-  Skills to add: ${userProfile.skills.map(s => `"${s}"`).join(', ')}
+SKILLS — OVERRIDE: The "one dropdown per turn" rule does NOT apply to skills. Add ALL skills in this turn without stopping.
+  To open the skills input, look for the small icon with three horizontal lines (≡ list icon) near the skills field. ALWAYS click this icon to open the dropdown — do NOT click on any grey skill tags/chips that may already be in the field, as that will NOT open the dropdown.
+  For EACH skill below, repeat this process: click the three-lines icon (≡), type the skill name, press ENTER to trigger the dropdown, WAIT 3 seconds for suggestions to load, then CLICK the matching option from the dropdown. After selecting, click on empty whitespace to dismiss the dropdown, then immediately proceed to the NEXT skill by clicking the three-lines icon again. Keep going until ALL skills are added. Do NOT stop after just one skill.
+  Skills to add: ${skillsToAdd.map(s => `"${s}"`).join(', ')}
 `;
   }
 
-  if (userProfile.linkedin_url) {
+  if (hasLinkedin) {
     skillsLinkedinBlock += `
 LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
   LinkedIn: ${userProfile.linkedin_url}
@@ -671,30 +683,59 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
 `;
   }
 
-  if (userProfile.skills?.length || userProfile.linkedin_url) {
-    const skillsPrompt = buildExperiencePrompt(skillsLinkedinBlock);
-    const MAX_SKILLS_ROUNDS = 15;
+  if (hasSkills || hasLinkedin) {
+    // Use buildExperienceEntryPrompt (scroll-down allowed) instead of buildExperiencePrompt
+    // (zero scrolling). The skills input field is often below the Skills heading, and the
+    // LLM needs permission to scroll down to find it.
+    const skillsPrompt = buildExperienceEntryPrompt(skillsLinkedinBlock);
 
-    for (let round = 1; round <= MAX_SKILLS_ROUNDS; round++) {
-      await centerNextEmptyField(adapter);
-      logger.debug('Skills/LinkedIn LLM round', { round, llmCall: llmCallCount + 1 });
-      await adapter.act(skillsPrompt);
-      llmCallCount++;
-      await adapter.page.waitForTimeout(1000);
+    // Scroll to the Skills section — try to find the actual input field first,
+    // fall back to the heading with block:'start' so content below is visible.
+    await adapter.page.evaluate(`
+      (() => {
+        // First, find the Skills heading
+        var headings = document.querySelectorAll('h2, h3, h4, h5, legend, [data-automation-id]');
+        var skillsHeading = null;
+        for (var i = 0; i < headings.length; i++) {
+          var text = (headings[i].textContent || '').toLowerCase();
+          if (text.includes('skill')) {
+            skillsHeading = headings[i];
+          }
+        }
+        if (!skillsHeading) return;
 
-      // Check if we can scroll further
-      const scrollBefore = await adapter.page.evaluate(() => window.scrollY);
-      const scrollMax = await adapter.page.evaluate(
-        () => document.documentElement.scrollHeight - window.innerHeight,
-      );
-      if (scrollBefore >= scrollMax - 10) break;
+        // Try to find the actual skills input field near the heading
+        // Walk up to the section container
+        var container = skillsHeading.parentElement;
+        for (var u = 0; u < 5 && container; u++) {
+          var inputs = container.querySelectorAll('input[type="text"], input:not([type])');
+          if (inputs.length >= 1) break;
+          container = container.parentElement;
+        }
 
-      await adapter.page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.65)));
-      await adapter.page.waitForTimeout(800);
+        // If we found an input in the skills section, scroll to it
+        if (container) {
+          var inputs = container.querySelectorAll('input[type="text"], input:not([type])');
+          for (var j = 0; j < inputs.length; j++) {
+            var inp = inputs[j];
+            var rect = inp.getBoundingClientRect();
+            if (rect.width > 20 && rect.height > 10) {
+              inp.scrollIntoView({ block: 'center', behavior: 'instant' });
+              return;
+            }
+          }
+        }
 
-      const scrollAfter = await adapter.page.evaluate(() => window.scrollY);
-      if (scrollAfter <= scrollBefore) break;
-    }
+        // Fallback: scroll heading to top so input below it is visible
+        skillsHeading.scrollIntoView({ block: 'start', behavior: 'instant' });
+      })()
+    `);
+    await adapter.page.waitForTimeout(500);
+
+    logger.debug('Skills/LinkedIn LLM call', { llmCall: llmCallCount + 1, skills: skillsToAdd.length, hasLinkedin });
+    await adapter.act(skillsPrompt);
+    llmCallCount++;
+    await adapter.page.waitForTimeout(1000);
   }
 
   logger.info('MyExperience page complete', { totalLlmCalls: llmCallCount, experiences: experiences.length, educations: educations.length });
