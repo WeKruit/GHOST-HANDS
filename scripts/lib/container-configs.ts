@@ -96,7 +96,7 @@ function buildApiService(ecrImage: string, envVars: string[]): ServiceDefinition
       },
     },
     healthEndpoint: 'http://localhost:3100/health',
-    healthTimeout: 30_000,
+    healthTimeout: 90_000,
     drainEndpoint: undefined,
     drainTimeout: 0,
     skipOnSelfUpdate: false,
@@ -127,7 +127,7 @@ function buildWorkerService(ecrImage: string, envVars: string[]): ServiceDefinit
       },
     },
     healthEndpoint: 'http://localhost:3101/worker/health',
-    healthTimeout: 30_000,
+    healthTimeout: 60_000,
     drainEndpoint: 'http://localhost:3101/worker/drain',
     drainTimeout: 60_000,
     skipOnSelfUpdate: false,
@@ -151,7 +151,7 @@ function buildDeployServerService(ecrImage: string, envVars: string[]): ServiceD
         Binds: [
           '/opt/ghosthands:/opt/ghosthands:ro',
           '/var/run/docker.sock:/var/run/docker.sock',
-          '/home/ubuntu/.docker:/docker-config:ro',
+          '/home/ubuntu/.docker/config.json:/docker-config/config.json:ro',
         ],
         RestartPolicy: {
           Name: 'unless-stopped',
