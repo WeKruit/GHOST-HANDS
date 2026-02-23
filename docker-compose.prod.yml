@@ -5,6 +5,10 @@
 # To bootstrap a fresh EC2 instance:
 #   docker compose -f docker-compose.prod.yml up -d
 #
+# All services use host networking to match deploy-server Docker API deploys
+# (which also create containers with NetworkMode: 'host'). This prevents
+# port conflicts when both deploy paths run in sequence.
+#
 # For manual operations, use scripts/deploy.sh or deploy-server API.
 #
 # Production deployment for GhostHands API + Worker
@@ -19,8 +23,7 @@ services:
   api:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "packages/ghosthands/src/api/server.ts"]
-    ports:
-      - "0.0.0.0:${GH_API_PORT:-3100}:3100"
+    network_mode: host
     env_file: .env
     environment:
       - NODE_ENV=production
@@ -46,8 +49,6 @@ services:
         max-file: "3"
 
   # Deploy Server — receives deploy commands from VALET's DeployService
-  # Uses host networking so it can health-check containers it creates
-  # (which also run on host network via Docker API deploys)
   deploy-server:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "scripts/deploy-server.ts"]
@@ -89,8 +90,7 @@ services:
   worker:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "packages/ghosthands/src/workers/main.ts"]
-    ports:
-      - "0.0.0.0:${GH_WORKER_PORT:-3101}:3101"
+    network_mode: host
     env_file: .env
     environment:
       - NODE_ENV=production
