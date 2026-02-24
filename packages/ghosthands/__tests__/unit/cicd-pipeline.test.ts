@@ -64,7 +64,7 @@ describe('CI/CD Workflow (ci.yml)', () => {
     expect(jobs).toContain('test-integration');
     expect(jobs).toContain('docker');
     expect(jobs).toContain('deploy-staging');
-    expect(jobs).toContain('deploy-asg');
+    expect(jobs).toContain('deploy-kamal');
     expect(jobs).toContain('deploy-production');
   });
 
@@ -82,17 +82,17 @@ describe('CI/CD Workflow (ci.yml)', () => {
     expect(ci.jobs.docker.outputs).toHaveProperty('environment');
   });
 
-  test('deploy-asg depends on docker (runs before VALET notification)', () => {
-    expect(ci.jobs['deploy-asg'].needs).toContain('docker');
+  test('deploy-kamal depends on docker (runs before VALET notification)', () => {
+    expect(ci.jobs['deploy-kamal'].needs).toContain('docker');
   });
 
-  test('deploy-staging depends on docker and deploy-asg (notifies VALET after EC2 update)', () => {
+  test('deploy-staging depends on docker and deploy-kamal (notifies VALET after Kamal deploy)', () => {
     expect(ci.jobs['deploy-staging'].needs).toContain('docker');
-    expect(ci.jobs['deploy-staging'].needs).toContain('deploy-asg');
+    expect(ci.jobs['deploy-staging'].needs).toContain('deploy-kamal');
   });
 
-  test('deploy-asg cleans up SSH key on failure', () => {
-    const steps = ci.jobs['deploy-asg'].steps;
+  test('deploy-kamal cleans up SSH key on failure', () => {
+    const steps = ci.jobs['deploy-kamal'].steps;
     const cleanupStep = steps.find((s: Record<string, unknown>) =>
       typeof s.name === 'string' && s.name.toLowerCase().includes('cleanup')
     );
@@ -106,8 +106,8 @@ describe('CI/CD Workflow (ci.yml)', () => {
     expect(condition).toContain('push');
   });
 
-  test('deploy-production depends on deploy-asg (notifies VALET after EC2 update)', () => {
-    expect(ci.jobs['deploy-production'].needs).toContain('deploy-asg');
+  test('deploy-production depends on deploy-kamal (notifies VALET after Kamal deploy)', () => {
+    expect(ci.jobs['deploy-production'].needs).toContain('deploy-kamal');
   });
 });
 
