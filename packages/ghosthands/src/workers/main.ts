@@ -364,9 +364,28 @@ async function main(): Promise<void> {
       logger.error('pg-boss error', { error: err.message });
     });
 
+    // Retry pg-boss startup with backoff — session-mode pool may be temporarily
+    // full during simultaneous container restarts (MaxClientsInSessionMode).
     logger.info('Starting pg-boss...');
-    await boss.start();
-    logger.info('pg-boss started');
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        await boss.start();
+        logger.info('pg-boss started', { attempt });
+        break;
+      } catch (err) {
+        const isPoolFull = err instanceof Error && err.message.includes('MaxClientsInSessionMode');
+        if (isPoolFull && attempt < 5) {
+          const delay = attempt * 2000; // 2s, 4s, 6s, 8s
+          logger.warn(`pg-boss startup failed (attempt ${attempt}/5, retrying in ${delay}ms)`, { error: (err as Error).message });
+          await new Promise(r => setTimeout(r, delay));
+          // Re-create boss instance (old one may have stale internal state)
+          boss = new PgBoss({ connectionString: directUrl, schema: 'pgboss', max: 2 });
+          boss.on('error', (e: Error) => logger.error('pg-boss error', { error: e.message }));
+        } else {
+          throw err; // Non-pool error or exhausted retries — crash worker
+        }
+      }
+    }
 
     consumer = new PgBossConsumer({
       boss,
