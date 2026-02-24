@@ -110,6 +110,11 @@ accessories:
       - /home/ubuntu/.docker/config.json:/docker-config/config.json:ro
     labels:
       gh.role: deploy-server
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"
 
 # --- Registry (ECR) ---
 # KAMAL_REGISTRY_PASSWORD must be set in .kamal/secrets (gitignored).
