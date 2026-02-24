@@ -41,6 +41,8 @@ export interface TaskContext {
   progress: ProgressTracker;
   credentials: Record<string, string> | null;
   dataPrompt: string;
+  /** Local file path to the downloaded resume, if a resume_ref was provided */
+  resumeFilePath?: string | null;
 }
 
 export interface TaskResult {
@@ -48,6 +50,10 @@ export interface TaskResult {
   data?: Record<string, any>;
   error?: string;
   screenshotUrl?: string;
+  /** When true, the browser stays open after handler completes (for manual takeover). */
+  keepBrowserOpen?: boolean;
+  /** When true, the job is paused at the review page awaiting user submission. */
+  awaitingUserReview?: boolean;
 }
 
 export interface ValidationResult {

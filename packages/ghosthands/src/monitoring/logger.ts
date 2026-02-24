@@ -118,18 +118,74 @@ function redactObject(obj: Record<string, unknown>): Record<string, unknown> {
   return result;
 }
 
+// --- Human-readable dev/test formatting ---
+
+/** ANSI color codes for terminal output */
+const COLORS = {
+  reset: '\x1b[0m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  cyan: '\x1b[36m',
+} as const;
+
+/** Map log levels to fixed-width labels and colors */
+const LEVEL_FORMAT: Record<LogLevel, { label: string; color: string }> = {
+  debug: { label: 'DEBUG', color: COLORS.dim },
+  info:  { label: 'INFO ', color: COLORS.cyan },
+  warn:  { label: 'WARN ', color: COLORS.yellow },
+  error: { label: 'ERROR', color: COLORS.red },
+};
+
+/** Keys to omit from the key=value context in human-readable mode */
+const DEV_OMIT_KEYS = new Set([
+  'level',
+  'msg',
+  'timestamp',
+  'service',
+  'workerId',
+]);
+
+/**
+ * Format a LogEntry as a human-readable single line for dev/test terminals.
+ *
+ * Output format:
+ *   HH:MM:SS LEVEL Message  key1=value1 key2=value2
+ */
+function formatDevLine(entry: LogEntry): string {
+  // Extract HH:MM:SS from ISO timestamp
+  const timePart = entry.timestamp.slice(11, 19); // "HH:MM:SS"
+
+  const { label, color } = LEVEL_FORMAT[entry.level];
+
+  // Collect extra context fields, skipping noise keys
+  const extras: string[] = [];
+  for (const [key, value] of Object.entries(entry)) {
+    if (DEV_OMIT_KEYS.has(key)) continue;
+    if (value === undefined || value === null) continue;
+    extras.push(`${key}=${String(value)}`);
+  }
+
+  const contextStr = extras.length > 0 ? `  ${extras.join(' ')}` : '';
+
+  return `${COLORS.dim}${timePart}${COLORS.reset} ${color}${label}${COLORS.reset} ${entry.msg}${COLORS.dim}${contextStr}${COLORS.reset}`;
+}
+
 // --- Logger class ---
 
 export class Logger {
   private level: LogLevel;
   private service: string;
   private context: Record<string, unknown>;
+  private useDevFormat: boolean;
 
   constructor(opts: LoggerOptions = {}) {
     const env = getEnv();
     this.level = opts.level ?? (env.NODE_ENV === 'production' ? 'info' : 'debug');
     this.service = opts.service ?? 'ghosthands';
     this.context = {};
+    this.useDevFormat = env.NODE_ENV === 'development' || env.NODE_ENV === 'test';
 
     if (opts.requestId) this.context.requestId = opts.requestId;
     if (opts.workerId) this.context.workerId = opts.workerId;
@@ -142,6 +198,7 @@ export class Logger {
       service: this.service,
     });
     child.context = { ...this.context, ...bindings };
+    child.useDevFormat = this.useDevFormat;
     return child;
   }
 
@@ -173,7 +230,7 @@ export class Logger {
       ...(data ? redactObject(data) : {}),
     };
 
-    const line = JSON.stringify(entry);
+    const line = this.useDevFormat ? formatDevLine(entry) : JSON.stringify(entry);
 
     switch (level) {
       case 'error':

@@ -1,21 +1,31 @@
 import { createClient } from '@supabase/supabase-js';
-import { Client as PgClient } from 'pg';
+import { Client as PgClient, Pool as PgPool } from 'pg';
+import { PgBoss } from 'pg-boss';
+import Redis from 'ioredis';
 import { JobPoller } from './JobPoller.js';
+import { PgBossConsumer } from './PgBossConsumer.js';
 import { JobExecutor } from './JobExecutor.js';
 import { registerBuiltinHandlers } from './taskHandlers/index.js';
+import { getLogger } from '../monitoring/logger.js';
+import { fetchEc2InstanceId, fetchEc2Ip, completeLifecycleAction } from './asg-lifecycle.js';
+
+const logger = getLogger({ service: 'Worker' });
 
 /**
  * GhostHands Worker Entry Point
  *
  * Long-running Node.js process that:
  * 1. Connects to Supabase (pooled for queries, direct for LISTEN/NOTIFY)
- * 2. Listens for gh_job_created notifications
- * 3. Polls for pending jobs using FOR UPDATE SKIP LOCKED
- * 4. Executes jobs via BrowserAgent.act()
- * 5. Updates job status and results in the database
- * 6. Sends heartbeats every 30s during execution
- * 7. Exposes a status HTTP server on GH_WORKER_PORT (default 3101)
+ * 2. Picks up jobs via pg-boss queue (queue mode) or LISTEN/NOTIFY polling (legacy mode)
+ * 3. Executes jobs via BrowserAgent.act()
+ * 4. Updates job status and results in the database
+ * 5. Sends heartbeats every 30s during execution
+ * 6. Exposes a status HTTP server on GH_WORKER_PORT (default 3101)
  *    so VALET/deploy.sh can check if it's safe to restart
+ *
+ * Job dispatch mode (JOB_DISPATCH_MODE env var):
+ *   queue  → pg-boss consumer (new, requires VALET to enqueue via TaskQueueService)
+ *   legacy → JobPoller with LISTEN/NOTIFY + polling (default)
  */
 
 function parseWorkerId(): string {
@@ -45,15 +55,19 @@ function requireEnv(name: string): string {
 }
 
 async function main(): Promise<void> {
-  console.log(`[Worker] Starting with ID: ${WORKER_ID}`);
+  const dispatchMode = process.env.JOB_DISPATCH_MODE === 'queue' ? 'queue' : 'legacy';
+  logger.info('Starting worker', { workerId: WORKER_ID, dispatchMode });
 
   // Register all built-in task handlers
   registerBuiltinHandlers();
-  console.log(`[Worker] Task handlers registered`);
+  logger.info('Task handlers registered');
 
   // Validate required environment variables
   const supabaseUrl = requireEnv('SUPABASE_URL');
-  const supabaseServiceKey = process.env.SUPABASE_SECRET_KEY || requireEnv('SUPABASE_SERVICE_KEY');
+  const supabaseServiceKey = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
+  if (!supabaseServiceKey) {
+    throw new Error('Missing required environment variable: SUPABASE_SECRET_KEY');
+  }
   // Prefer transaction-mode pooler (port 6543) to avoid session pool limits.
   // LISTEN/NOTIFY won't work through transaction pooler, but fallback polling handles it.
   const dbUrl = process.env.DATABASE_URL || process.env.SUPABASE_DIRECT_URL || requireEnv('DATABASE_DIRECT_URL');
@@ -71,58 +85,137 @@ async function main(): Promise<void> {
     keepAliveInitialDelayMillis: 10_000,
   });
 
-  console.log(`[Worker] Connecting to Postgres...`);
+  logger.info('Connecting to Postgres');
   await pgDirect.connect();
-  console.log(`[Worker] Postgres connection established`);
+  logger.info('Postgres connection established');
 
   // CONVENTION: Single-task-per-worker. Each worker processes one job at a time.
   // This simplifies concurrency, avoids browser session conflicts, and makes
   // cost tracking + HITL deterministic. Scale horizontally by adding workers.
   const maxConcurrent = 1;
 
+  // ── Redis for real-time progress streaming ─────────────────────
+  // Optional: if REDIS_URL is set, ProgressTracker publishes to Redis Streams
+  // for consumption by VALET SSE endpoint. Falls back to DB-only if not configured.
+  let redis: Redis | undefined;
+  const redisUrl = process.env.REDIS_URL;
+  if (redisUrl) {
+    try {
+      redis = new Redis(redisUrl, {
+        maxRetriesPerRequest: 3,
+        lazyConnect: true,
+        ...(redisUrl.startsWith('rediss://') && { tls: {} }),
+      });
+      await redis.connect();
+      logger.info('Redis connected for real-time streaming');
+    } catch (err) {
+      logger.warn('Redis connection failed — progress will use DB only', { error: err instanceof Error ? err.message : String(err) });
+      redis = undefined;
+    }
+  } else {
+    logger.info('No REDIS_URL configured — progress will use DB only');
+  }
+
+  // EC2/EC3: Create pg.Pool for LISTEN/NOTIFY and execution_attempt_id.
+  // MUST use direct URL (port 5432), not pgbouncer — LISTEN state is
+  // dropped by transaction pooler.
+  const directUrl = process.env.DATABASE_DIRECT_URL || process.env.SUPABASE_DIRECT_URL;
+  let pgPool: PgPool | undefined;
+  if (directUrl) {
+    pgPool = new PgPool({ connectionString: directUrl, max: 3 });
+    logger.info('Created pgPool for LISTEN/NOTIFY (direct URL)');
+  } else {
+    logger.warn('No DATABASE_DIRECT_URL or SUPABASE_DIRECT_URL — EC2/EC3 features disabled');
+  }
+
   const executor = new JobExecutor({
     supabase,
     workerId: WORKER_ID,
+    ...(redis && { redis }),
+    ...(pgPool && { pgPool }),
   });
 
-  const poller = new JobPoller({
-    supabase,
-    pgDirect,
-    workerId: WORKER_ID,
-    executor,
-    maxConcurrent,
-  });
+  // ── Dispatch mode: pg-boss queue vs legacy LISTEN/NOTIFY poller ──
+  let boss: PgBoss | undefined;
+  let poller: JobPoller | undefined;
+  let consumer: PgBossConsumer | undefined;
 
-  // Two-phase shutdown handler:
-  // - First signal: graceful shutdown (drain active jobs, release claimed jobs)
-  // - Second signal: force release jobs and exit immediately
+  // Unified interface so shutdown, heartbeat, and HTTP server work with both modes.
+  const getActiveJobCount = (): number =>
+    consumer ? consumer.activeJobCount : poller ? poller.activeJobCount : 0;
+  const getIsRunning = (): boolean =>
+    consumer ? consumer.isRunning : poller ? poller.isRunning : false;
+  const getCurrentJobId = (): string | null =>
+    consumer ? consumer.currentJobId : poller ? poller.currentJobId : null;
+  const releaseJobs = async (): Promise<void> => {
+    if (consumer) await consumer.releaseClaimedJobs();
+    else if (poller) await poller.releaseClaimedJobs();
+  };
+  const stopJobProcessor = async (): Promise<void> => {
+    if (consumer) await consumer.stop();
+    else if (poller) await poller.stop();
+  };
+
+  // Separate flags:
+  //   draining — set by /worker/drain HTTP endpoint (stop accepting new jobs)
+  //   shuttingDown — set by SIGTERM/SIGINT signal handler (full shutdown)
+  // This prevents the drain endpoint from causing SIGTERM to force-kill immediately.
+  let draining = false;
   let shuttingDown = false;
+
+  // Declare early so shutdown closure can reference it safely (avoids TDZ if
+  // SIGTERM arrives while fetchEc2InstanceId() is still in-flight).
+  let ec2InstanceId: string = 'unknown';
+
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) {
       // Second signal -- force shutdown
-      console.log(`[Worker] Received second ${signal}, forcing shutdown...`);
-      console.log(`[Worker] Force-releasing claimed jobs...`);
+      logger.warn('Received second signal, forcing shutdown', { signal, workerId: WORKER_ID });
+      logger.info('Force-releasing claimed jobs');
       try {
-        await poller.releaseClaimedJobs();
+        await releaseJobs();
       } catch (err) {
-        console.error(`[Worker] Force release failed:`, err);
+        logger.error('Force release failed', { error: err instanceof Error ? err.message : String(err) });
+      }
+      if (boss) {
+        try { await boss.stop({ graceful: false }); } catch { /* ignore */ }
       }
       try {
         await pgDirect.end();
       } catch {
         // Connection may already be closed
       }
-      console.log(`[Worker] ${WORKER_ID} force-killed`);
+      logger.info('Worker force-killed', { workerId: WORKER_ID });
       process.exit(1);
     }
 
     shuttingDown = true;
-    console.log(`[Worker] Received ${signal}, starting graceful shutdown...`);
-    console.log(`[Worker] Press Ctrl-C again to force-kill immediately`);
-    console.log(`[Worker] Draining ${poller.activeJobCount} active job(s)...`);
+    logger.info('Starting graceful shutdown', { signal, workerId: WORKER_ID, activeJobs: getActiveJobCount() });
 
-    await poller.stop();
+    await stopJobProcessor();
+    if (boss) {
+      try { await boss.stop({ graceful: true, timeout: 10_000 }); } catch { /* ignore */ }
+    }
     await deregisterWorker();
+
+    // Complete ASG lifecycle action if configured (signals ASG that
+    // this instance is ready to be terminated)
+    await completeLifecycleAction(ec2InstanceId);
+
+    // Close Redis connection
+    if (redis) {
+      try {
+        await redis.quit();
+        logger.info('Redis connection closed');
+      } catch {
+        // Connection may already be closed
+      }
+    }
+
+    // Close pgPool (EC2/EC3 LISTEN/NOTIFY)
+    if (pgPool) {
+      try { await pgPool.end(); } catch { /* already closed */ }
+    }
 
     try {
       await pgDirect.end();
@@ -130,7 +223,7 @@ async function main(): Promise<void> {
       // Connection may already be closed
     }
 
-    console.log(`[Worker] ${WORKER_ID} shut down gracefully`);
+    logger.info('Worker shut down gracefully', { workerId: WORKER_ID });
     process.exit(0);
   };
 
@@ -139,14 +232,20 @@ async function main(): Promise<void> {
 
   // Handle uncaught errors to prevent silent crashes
   process.on('unhandledRejection', (reason) => {
-    console.error(`[Worker] Unhandled rejection:`, reason);
+    logger.error('Unhandled rejection', { error: reason instanceof Error ? reason.message : String(reason) });
   });
 
   process.on('uncaughtException', (error) => {
-    console.error(`[Worker] Uncaught exception:`, error);
+    logger.error('Uncaught exception', { error: error instanceof Error ? error.message : String(error) });
     // Give time for logs to flush, then exit
     setTimeout(() => process.exit(1), 1000);
   });
+
+  // ── EC2 Instance Metadata ────────────────────────────────────────
+  // Auto-detect EC2 instance ID from the metadata service (IMDSv2).
+  // Falls back to EC2_INSTANCE_ID env var or 'unknown' for local dev.
+  ec2InstanceId = await fetchEc2InstanceId();
+  const ec2Ip = await fetchEc2Ip();
 
   // ── Worker Registry ────────────────────────────────────────────
   // UPSERT into gh_worker_registry so the fleet monitoring endpoint
@@ -154,22 +253,24 @@ async function main(): Promise<void> {
   // Registration MUST succeed before polling starts — if it fails after
   // retries, exit so Docker restarts the container.
   const targetWorkerId = process.env.GH_WORKER_ID || null;
-  const ec2InstanceId = process.env.EC2_INSTANCE_ID || 'unknown';
-  const ec2Ip = process.env.EC2_IP || 'unknown';
 
   const MAX_REGISTRATION_RETRIES = 3;
   for (let attempt = 1; attempt <= MAX_REGISTRATION_RETRIES; attempt++) {
     try {
+      const metadata = JSON.stringify({
+        ...(process.env.AWS_ASG_NAME ? { asg_name: process.env.AWS_ASG_NAME } : {}),
+      });
       await pgDirect.query(`
-        INSERT INTO gh_worker_registry (worker_id, status, target_worker_id, ec2_instance_id, ec2_ip, registered_at, last_heartbeat)
-        VALUES ($1, 'active', $2, $3, $4, NOW(), NOW())
+        INSERT INTO gh_worker_registry (worker_id, status, target_worker_id, ec2_instance_id, ec2_ip, registered_at, last_heartbeat, metadata)
+        VALUES ($1, 'active', $2, $3, $4, NOW(), NOW(), $5::jsonb)
         ON CONFLICT (worker_id) DO UPDATE SET
           status = 'active',
           target_worker_id = COALESCE($2, gh_worker_registry.target_worker_id),
-          ec2_instance_id = COALESCE($3, gh_worker_registry.ec2_instance_id),
-          ec2_ip = COALESCE($4, gh_worker_registry.ec2_ip),
+          ec2_instance_id = $3,
+          ec2_ip = $4,
+          metadata = $5::jsonb,
           last_heartbeat = NOW()
-      `, [WORKER_ID, targetWorkerId, ec2InstanceId, ec2Ip]);
+      `, [WORKER_ID, targetWorkerId, ec2InstanceId, ec2Ip, metadata]);
 
       // Verify the registration actually persisted
       const verify = await pgDirect.query(
@@ -179,35 +280,61 @@ async function main(): Promise<void> {
       if (!verify.rows[0]) {
         throw new Error(`Worker registration verification failed for ${WORKER_ID}`);
       }
-      console.log(`[Worker] Registered in gh_worker_registry (status: ${verify.rows[0].status})`);
+      logger.info('Registered in gh_worker_registry', { status: verify.rows[0].status, workerId: WORKER_ID });
       break; // Success
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (attempt < MAX_REGISTRATION_RETRIES) {
         const backoffMs = Math.pow(2, attempt) * 1000; // 2s, 4s
-        console.error(`[Worker] Registration attempt ${attempt}/${MAX_REGISTRATION_RETRIES} failed: ${errMsg} — retrying in ${backoffMs}ms`);
+        logger.error('Registration attempt failed', {
+          attempt,
+          maxAttempts: MAX_REGISTRATION_RETRIES,
+          error: errMsg,
+          retryInMs: backoffMs,
+        });
         await new Promise((r) => setTimeout(r, backoffMs));
       } else {
-        console.error(`[Worker] Registration failed after ${MAX_REGISTRATION_RETRIES} attempts: ${errMsg}`);
-        console.error(`[Worker] Cannot start without registry entry — exiting`);
+        logger.error('Registration failed after all retries', {
+          attempts: MAX_REGISTRATION_RETRIES,
+          error: errMsg,
+        });
         process.exit(1);
       }
     }
   }
 
-  // Heartbeat every 30s — updates last_heartbeat and current_job_id
+  // Heartbeat every 30s — updates last_heartbeat and current_job_id.
+  // Also marks stale workers (no heartbeat in 5 min) as offline.
   const HEARTBEAT_INTERVAL_MS = 30_000;
+  const STALE_THRESHOLD_MINUTES = 5;
   const heartbeatTimer = setInterval(async () => {
     try {
+      const heartbeatStatus = shuttingDown ? 'draining' : draining ? 'draining' : 'active';
       await pgDirect.query(`
         UPDATE gh_worker_registry
         SET last_heartbeat = NOW(),
             current_job_id = $2::UUID,
             status = $3
         WHERE worker_id = $1
-      `, [WORKER_ID, poller.currentJobId, shuttingDown ? 'draining' : 'active']);
+      `, [WORKER_ID, getCurrentJobId(), heartbeatStatus]);
+
+      // Self-cleaning: mark stale workers as offline (excludes self)
+      const staleResult = await pgDirect.query(`
+        UPDATE gh_worker_registry
+        SET status = 'offline', current_job_id = NULL
+        WHERE status = 'active'
+          AND last_heartbeat < NOW() - INTERVAL '${STALE_THRESHOLD_MINUTES} minutes'
+          AND worker_id != $1
+        RETURNING worker_id
+      `, [WORKER_ID]);
+      if (staleResult.rowCount && staleResult.rowCount > 0) {
+        logger.info('Marked stale workers offline', {
+          count: staleResult.rowCount,
+          workers: staleResult.rows.map((r: { worker_id: string }) => r.worker_id),
+        });
+      }
     } catch (err) {
-      console.warn(`[Worker] Heartbeat update failed:`, err instanceof Error ? err.message : err);
+      logger.warn('Heartbeat update failed', { error: err instanceof Error ? err.message : String(err) });
     }
   }, HEARTBEAT_INTERVAL_MS);
 
@@ -220,14 +347,47 @@ async function main(): Promise<void> {
         SET status = 'offline', current_job_id = NULL, last_heartbeat = NOW()
         WHERE worker_id = $1
       `, [WORKER_ID]);
-      console.log(`[Worker] Marked offline in gh_worker_registry`);
+      logger.info('Marked offline in gh_worker_registry', { workerId: WORKER_ID });
     } catch (err) {
-      console.warn(`[Worker] Failed to deregister:`, err instanceof Error ? err.message : err);
+      logger.warn('Failed to deregister', { error: err instanceof Error ? err.message : String(err) });
     }
   };
 
-  // Start polling
-  await poller.start();
+  // ── Start job processor ──────────────────────────────────────────
+  if (dispatchMode === 'queue') {
+    // pg-boss needs session-mode Postgres (direct URL, not pgbouncer)
+    const directUrl = process.env.DATABASE_DIRECT_URL || process.env.SUPABASE_DIRECT_URL || dbUrl;
+    boss = new PgBoss({
+      connectionString: directUrl,
+      schema: 'pgboss',
+    });
+
+    boss.on('error', (err: Error) => {
+      logger.error('pg-boss error', { error: err.message });
+    });
+
+    logger.info('Starting pg-boss...');
+    await boss.start();
+    logger.info('pg-boss started');
+
+    consumer = new PgBossConsumer({
+      boss,
+      pgDirect,
+      workerId: WORKER_ID,
+      executor,
+    });
+    await consumer.start();
+  } else {
+    // Legacy LISTEN/NOTIFY + polling mode
+    poller = new JobPoller({
+      supabase,
+      pgDirect,
+      workerId: WORKER_ID,
+      executor,
+      maxConcurrent,
+    });
+    await poller.start();
+  }
 
   // ── Worker Status HTTP Server ──────────────────────────────────────
   // Lightweight HTTP endpoint so VALET / deploy.sh can check worker state
@@ -249,21 +409,26 @@ async function main(): Promise<void> {
         if (url.pathname === '/worker/status') {
           return Response.json({
             worker_id: WORKER_ID,
-            active_jobs: poller.activeJobCount,
+            ec2_instance_id: ec2InstanceId,
+            ec2_ip: ec2Ip,
+            active_jobs: getActiveJobCount(),
             max_concurrent: maxConcurrent,
-            is_running: poller.isRunning,
-            is_draining: shuttingDown,
+            is_running: getIsRunning(),
+            is_draining: draining || shuttingDown,
+            dispatch_mode: dispatchMode,
+            asg_name: process.env.AWS_ASG_NAME || null,
             uptime_ms: Date.now() - startTime,
             timestamp: new Date().toISOString(),
           });
         }
 
         if (url.pathname === '/worker/health') {
-          const idle = poller.activeJobCount === 0 && !shuttingDown;
+          const isDraining = draining || shuttingDown;
+          const idle = getActiveJobCount() === 0 && !isDraining;
           return Response.json(
             {
-              status: idle ? 'idle' : shuttingDown ? 'draining' : 'busy',
-              active_jobs: poller.activeJobCount,
+              status: idle ? 'idle' : isDraining ? 'draining' : 'busy',
+              active_jobs: getActiveJobCount(),
               deploy_safe: idle,
             },
             { status: idle ? 200 : 503 },
@@ -271,22 +436,22 @@ async function main(): Promise<void> {
         }
 
         if (url.pathname === '/worker/drain' && req.method === 'POST') {
-          if (!shuttingDown) {
-            console.log(`[Worker] Drain requested via HTTP — stopping job pickup`);
-            shuttingDown = true;
+          if (!draining) {
+            logger.info('Drain requested via HTTP — stopping job pickup', { workerId: WORKER_ID });
+            draining = true;
             // Update registry status to draining
             pgDirect.query(
               `UPDATE gh_worker_registry SET status = 'draining' WHERE worker_id = $1`,
               [WORKER_ID]
             ).catch(() => {});
             // Stop accepting new jobs but let active ones finish
-            poller.stop().then(() => {
-              console.log(`[Worker] Drain complete — all jobs finished`);
+            stopJobProcessor().then(() => {
+              logger.info('Drain complete — all jobs finished', { workerId: WORKER_ID });
             });
           }
           return Response.json({
             status: 'draining',
-            active_jobs: poller.activeJobCount,
+            active_jobs: getActiveJobCount(),
             worker_id: WORKER_ID,
           });
         }
@@ -294,14 +459,17 @@ async function main(): Promise<void> {
         return Response.json({ error: 'not_found' }, { status: 404 });
       },
     });
-    console.log(`[Worker] Status server on port ${workerPort}`);
+    logger.info('Status server started', { port: workerPort });
   }
 
-  console.log(`[Worker] ${WORKER_ID} running (maxConcurrent=${maxConcurrent})`);
-  console.log(`[Worker] Listening for jobs on gh_job_created channel`);
+  logger.info('Worker running', {
+    workerId: WORKER_ID,
+    maxConcurrent,
+    dispatchMode,
+  });
 }
 
 main().catch((err) => {
-  console.error(`[Worker] Fatal error:`, err);
+  logger.error('Fatal error', { error: err instanceof Error ? err.message : String(err) });
   process.exit(1);
 });

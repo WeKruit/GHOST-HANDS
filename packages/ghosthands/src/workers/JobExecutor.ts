@@ -22,6 +22,10 @@ import { TraceRecorder } from '../engine/TraceRecorder.js';
 import { StagehandObserver } from '../engine/StagehandObserver.js';
 import type { MagnitudeAdapter } from '../adapters/magnitude.js';
 import { ThoughtThrottle, JOB_EVENT_TYPES } from '../events/JobEventTypes.js';
+import { ResumeDownloader, type ResumeRef } from './resumeDownloader.js';
+import { getLogger } from '../monitoring/logger.js';
+
+const logger = getLogger({ service: 'job-executor' });
 
 // Re-export AutomationJob from the canonical location for backward compat
 export type { AutomationJob } from './taskHandlers/types.js';
@@ -43,16 +47,19 @@ export interface JobExecutorOptions {
   sessionManager?: SessionManager;
   /** Postgres pool for LISTEN/NOTIFY (HITL resume signals) */
   pgPool?: pg.Pool;
+  /** Optional Redis client for real-time progress streaming via Redis Streams. */
+  redis?: import('ioredis').default;
   /** Timeout in seconds for human intervention (default: 300 = 5 minutes) */
   hitlTimeoutSeconds?: number;
 }
 
 // --- Error classification ---
 
-const ERROR_CLASSIFICATIONS: Array<{ pattern: RegExp; code: string }> = [
+export const ERROR_CLASSIFICATIONS: Array<{ pattern: RegExp; code: string }> = [
   { pattern: /budget.?exceeded/i, code: 'budget_exceeded' },
   { pattern: /action.?limit.?exceeded/i, code: 'action_limit_exceeded' },
   { pattern: /captcha/i, code: 'captcha_blocked' },
+  { pattern: /2fa|two.?factor|verification code|authenticator/i, code: '2fa_required' },
   { pattern: /login|sign.?in/i, code: 'login_required' },
   { pattern: /timeout/i, code: 'timeout' },
   { pattern: /rate.?limit/i, code: 'rate_limited' },
@@ -71,7 +78,8 @@ const RETRYABLE_ERRORS = new Set([
   'internal_error',
 ]);
 
-const HEARTBEAT_INTERVAL_MS = 30_000;
+const HEARTBEAT_INTERVAL_MS = 10_000;
+const MAX_HEARTBEAT_FAILURES = 3;
 const DEFAULT_HITL_TIMEOUT_SECONDS = 300; // 5 minutes
 const MAX_CRASH_RECOVERIES = 2;
 const BLOCKER_CONFIDENCE_THRESHOLD = 0.6;
@@ -81,10 +89,19 @@ const PERIODIC_BLOCKER_CHECK_MS = 30_000; // Periodic timer-based blocker check 
 const CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK = 3; // Check for blockers after this many consecutive action failures
 
 /** Error codes that should trigger HITL instead of immediate retry */
-const HITL_ELIGIBLE_ERRORS = new Set([
+export const HITL_ELIGIBLE_ERRORS = new Set([
   'captcha_blocked',
   'login_required',
+  '2fa_required',
 ]);
+
+/** Classify an error message into an error code using ERROR_CLASSIFICATIONS. */
+export function classifyError(message: string): string {
+  for (const { pattern, code } of ERROR_CLASSIFICATIONS) {
+    if (pattern.test(message)) return code;
+  }
+  return 'internal_error';
+}
 
 // --- Platform detection ---
 
@@ -132,22 +149,35 @@ export class JobExecutor {
   private workerId: string;
   private sessionManager: SessionManager | null;
   private pgPool: pg.Pool | null;
+  private redis: import('ioredis').default | null;
   private hitlTimeoutSeconds: number;
   private blockerDetector = new BlockerDetector();
+  private resumeDownloader: ResumeDownloader;
+  private _cancelled = false;
+  private _activeAdapter: BrowserAutomationAdapter | null = null;
+  private _executionAttemptId: string | null = null;
 
   constructor(opts: JobExecutorOptions) {
     this.supabase = opts.supabase;
     this.workerId = opts.workerId;
     this.sessionManager = opts.sessionManager ?? null;
     this.pgPool = opts.pgPool ?? null;
+    this.redis = opts.redis ?? null;
     this.hitlTimeoutSeconds = opts.hitlTimeoutSeconds ?? DEFAULT_HITL_TIMEOUT_SECONDS;
+    this.resumeDownloader = new ResumeDownloader(opts.supabase);
   }
 
   async execute(job: AutomationJob): Promise<void> {
+    this._cancelled = false;
+    this._activeAdapter = null;
+    this._executionAttemptId = crypto.randomUUID();
     const heartbeat = this.startHeartbeat(job.id);
     let adapter: BrowserAutomationAdapter | null = null;
     let observer: StagehandObserver | undefined;
     let blockerCheckInterval: ReturnType<typeof setInterval> | null = null;
+    let resumeFilePath: string | null = null;
+    let fileChooserHandler: ((chooser: any) => Promise<void>) | null = null;
+    let cancelListenClient: pg.PoolClient | null = null;
 
     // Initialize cost tracker with budget limits
     const qualityPreset = resolveQualityPreset(job.input_data, job.metadata);
@@ -159,26 +189,63 @@ export class JobExecutor {
 
     const costService = new CostControlService(this.supabase);
 
-    // Initialize progress tracker
+    // Initialize progress tracker (with optional Redis Streams for real-time SSE)
     const progress = new ProgressTracker({
       jobId: job.id,
       supabase: this.supabase,
       workerId: this.workerId,
       estimatedTotalActions: costTracker.getActionLimit(),
+      ...(this.redis && { redis: this.redis }),
     });
 
     try {
-       // 0. Pre-flight budget check (skip in development)
+      // 0a. Stamp execution_attempt_id to prevent duplicate execution (EC3)
+      if (this.pgPool) {
+        await this.pgPool.query(
+          'UPDATE gh_automation_jobs SET execution_attempt_id = $1 WHERE id = $2',
+          [this._executionAttemptId, job.id],
+        );
+        logger.info('Stamped execution attempt', { jobId: job.id, executionAttemptId: this._executionAttemptId });
+      }
+
+      // 0b. Subscribe to instant cancel channel (EC2 — LISTEN/NOTIFY)
+      if (this.pgPool) {
+        try {
+          cancelListenClient = await this.pgPool.connect();
+          const cancelChannel = `gh_job_cancel_${job.id}`;
+          await cancelListenClient.query(`LISTEN "${cancelChannel}"`);
+          cancelListenClient.on('notification', (msg: pg.Notification) => {
+            if (msg.channel === cancelChannel) {
+              logger.info('Received instant cancel NOTIFY', { jobId: job.id });
+              this._cancelled = true;
+              if (this._activeAdapter) {
+                this._activeAdapter.stop().catch(() => {});
+              }
+            }
+          });
+        } catch (err) {
+          logger.warn('Failed to set up cancel LISTEN channel', {
+            jobId: job.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          // Non-fatal — heartbeat polling still catches cancellation
+          if (cancelListenClient) {
+            try { cancelListenClient.release(); } catch { /* noop */ }
+            cancelListenClient = null;
+          }
+        }
+      }
+
+      // 0. Pre-flight budget check (skip in development)
       const isDev = (process.env.NODE_ENV || 'development') === 'development';
       const preflight = isDev
         ? { allowed: true, remainingBudget: Infinity, taskBudget: 0 }
         : await costService.preflightBudgetCheck(
             job.user_id,
             qualityPreset,
-            job.job_type,
           );
       if (isDev) {
-        console.log(`[JobExecutor] Skipping budget preflight (NODE_ENV=development)`);
+        getLogger().debug('Skipping budget preflight', { nodeEnv: 'development' });
       }
       if (!preflight.allowed) {
         await this.updateJobStatus(job.id, 'failed', preflight.reason);
@@ -214,7 +281,7 @@ export class JobExecutor {
             action_count: 0,
             total_tokens: 0,
           }).catch((err) => {
-            console.warn(`[JobExecutor] Preflight failure callback failed for job ${job.id}:`, err);
+            getLogger().warn('Preflight failure callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           });
         }
         return;
@@ -232,16 +299,20 @@ export class JobExecutor {
         action_limit: costTracker.getActionLimit(),
       });
 
-      // 1a. Notify VALET that the job is now running
+      // 1a. Notify VALET that the job is now running (include kasm_url if available)
+      const kasmUrl = process.env.KASM_SESSION_URL;
+      if (kasmUrl) {
+        progress.setKasmUrl(kasmUrl);
+      }
       if (job.callback_url) {
         callbackNotifier.notifyRunning(
           job.id,
           job.callback_url,
           job.valet_task_id,
-          undefined,
+          kasmUrl ? { kasm_url: kasmUrl } : undefined,
           this.workerId,
         ).catch((err) => {
-          console.warn(`[JobExecutor] Running callback failed for job ${job.id}:`, err);
+          getLogger().warn('Running callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });
       }
 
@@ -281,7 +352,7 @@ export class JobExecutor {
               action_count: 0,
               total_tokens: 0,
             }).catch((err) => {
-              console.warn(`[JobExecutor] Validation failure callback failed for job ${job.id}:`, err);
+              getLogger().warn('Validation failure callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
             });
           }
           return;
@@ -294,6 +365,25 @@ export class JobExecutor {
 
       // 5. Build data prompt from input_data
       const dataPrompt = buildDataPrompt(job.input_data);
+
+      // 5a. Download resume if resume_ref is provided
+      const resumeRef = this.resolveResumeRef(job);
+      if (resumeRef) {
+        try {
+          resumeFilePath = await this.resumeDownloader.download(resumeRef, job.id);
+          await this.logJobEvent(job.id, JOB_EVENT_TYPES.RESUME_DOWNLOADED, {
+            source: resumeRef.storage_path ? 'supabase' : resumeRef.download_url ? 'url' : 's3',
+            file_path: resumeFilePath,
+          });
+          logger.info('Resume downloaded', { jobId: job.id, filePath: resumeFilePath });
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          await this.logJobEvent(job.id, JOB_EVENT_TYPES.RESUME_DOWNLOAD_FAILED, {
+            error: errMsg,
+          });
+          throw new Error(`Resume download failed: ${errMsg}`);
+        }
+      }
 
       // 6. Build LLM client config (may include separate image model)
       const llmSetup = this.buildLLMClient(job);
@@ -309,18 +399,21 @@ export class JobExecutor {
             });
           }
         } catch (err) {
-          console.warn(`[JobExecutor] Session load failed for job ${job.id}:`, err);
+          getLogger().warn('Session load failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         }
       }
 
       // 7. Create and start adapter
       const adapterType = (process.env.GH_BROWSER_ENGINE || 'magnitude') as AdapterType;
       adapter = createAdapter(adapterType);
+      this._activeAdapter = adapter;
+      const headless = process.env.GH_HEADLESS !== 'false'; // default true
       await adapter.start({
         url: job.target_url,
         llm: llmSetup.llm,
         ...(llmSetup.imageLlm && { imageLlm: llmSetup.imageLlm }),
         ...(storedSession ? { storageState: storedSession } : {}),
+        browserOptions: { headless },
       });
 
       // 7a. Attach StagehandObserver for enriched blocker detection (optional)
@@ -344,7 +437,7 @@ export class JobExecutor {
           }
         } catch (err) {
           // Observer is optional — don't fail the job if it can't attach
-          console.warn(`[JobExecutor] StagehandObserver init failed for job ${job.id}:`, err);
+          getLogger().warn('StagehandObserver init failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           observer = undefined;
         }
       }
@@ -354,7 +447,61 @@ export class JobExecutor {
         adapter.registerCredentials(credentials);
       }
 
-      // 8.5. Check for blockers after initial page navigation
+      // 8.5. Inject stored browser session (e.g. Google auth cookies)
+      if (this.sessionManager) try {
+        // Load Google session for Sign-in-with-Google flows
+        // Try multiple Google-related domains since the session may be stored under any of them
+        const googleDomains = ['accounts.google.com', 'mail.google.com', 'google.com'];
+        let googleSessionInjected = false;
+        for (const domain of googleDomains) {
+          if (googleSessionInjected) break;
+          const googleSession = await this.sessionManager.loadSession(job.user_id, domain);
+          if (googleSession) {
+            const cookies = (googleSession as any).cookies || [];
+            if (cookies.length > 0) {
+              await adapter.page.context().addCookies(cookies);
+              getLogger().info('Injected Google session cookies', { count: cookies.length, domain, userId: job.user_id });
+              googleSessionInjected = true;
+            }
+          }
+        }
+
+        // Also try loading session for the target domain
+        const injTargetDomain = new URL(job.target_url).hostname;
+        const targetSession = await this.sessionManager.loadSession(job.user_id, injTargetDomain);
+        if (targetSession) {
+          const cookies = (targetSession as any).cookies || [];
+          if (cookies.length > 0) {
+            await adapter.page.context().addCookies(cookies);
+            getLogger().info('Injected target domain session cookies', { count: cookies.length, domain: injTargetDomain });
+          }
+        }
+        // Reload page after cookie injection so Workday SSO picks up the Google session
+        if (googleSessionInjected) {
+          getLogger().info('Reloading page after session injection');
+          await adapter.page.reload({ waitUntil: 'networkidle' }).catch(() => {});
+          await adapter.page.waitForTimeout(2000);
+        }
+      } catch (err) {
+        // Session injection failure is non-fatal — worker can still try fresh login
+        getLogger().warn('Session injection failed (non-fatal)', { error: err instanceof Error ? err.message : String(err) });
+      }
+
+      // 8a. Auto-attach resume to file inputs via Playwright filechooser event.
+      // This covers ALL execution paths (handlers, cookbook, crash recovery).
+      if (resumeFilePath) {
+        fileChooserHandler = async (chooser: any) => {
+          try {
+            await chooser.setFiles(resumeFilePath!);
+            logger.info('Resume auto-attached via filechooser', { jobId: job.id });
+          } catch (err) {
+            logger.warn('filechooser setFiles failed', { jobId: job.id, error: String(err) });
+          }
+        };
+        adapter.page.on('filechooser', fileChooserHandler);
+      }
+
+      // 8.6. Check for blockers after initial page navigation
       const initiallyBlocked = await this.checkForBlockers(job, adapter, costTracker);
       if (initiallyBlocked) {
         throw new Error('Page blocked after initial navigation and HITL resolution failed');
@@ -379,6 +526,7 @@ export class JobExecutor {
         costTracker,
         progress,
         logEvent: logEventFn,
+        resumeFilePath,
       });
 
       // Track TraceRecorder for Magnitude path (manual training)
@@ -416,7 +564,7 @@ export class JobExecutor {
           const screenshotUrl = await this.uploadScreenshot(job.id, 'final', screenshotBuffer);
           screenshotUrls.push(screenshotUrl);
         } catch (err) {
-          console.warn(`[JobExecutor] Screenshot failed for job ${job.id}:`, err);
+          getLogger().warn('Screenshot failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         }
 
         // Save browser session
@@ -428,7 +576,7 @@ export class JobExecutor {
               await this.sessionManager.saveSession(job.user_id, job.target_url, sessionState);
             }
           } catch (err) {
-            console.warn(`[JobExecutor] Session save failed for job ${job.id}:`, err);
+            getLogger().warn('Session save failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           }
         }
 
@@ -470,7 +618,9 @@ export class JobExecutor {
           cookbook_steps: engineResult.cookbookSteps,
         });
 
-        await costService.recordJobCost(job.user_id, job.id, finalCost);
+        await costService.recordJobCost(job.user_id, job.id, finalCost).catch((err) => {
+          getLogger().warn('Failed to record cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+        });
 
         if (job.callback_url) {
           callbackNotifier.notifyFromJob({
@@ -486,11 +636,11 @@ export class JobExecutor {
             action_count: finalCost.actionCount,
             total_tokens: finalCost.inputTokens + finalCost.outputTokens,
           }).catch((err) => {
-            console.warn(`[JobExecutor] Callback notification failed for job ${job.id}:`, err);
+            getLogger().warn('Callback notification failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           });
         }
 
-        console.log(`[JobExecutor] Job ${job.id} completed via cookbook (steps=${engineResult.cookbookSteps}, cost=$${finalCost.totalCost.toFixed(4)})`);
+        getLogger().info('Job completed via cookbook', { jobId: job.id, cookbookSteps: engineResult.cookbookSteps, costUsd: finalCost.totalCost });
         return;
       }
 
@@ -505,101 +655,15 @@ export class JobExecutor {
 
       // 9a. Wire up event tracking with cost control + progress for Magnitude path
       const thoughtThrottle = new ThoughtThrottle(2000);
-
-      adapter.on('thought', (thought: string) => {
-        progress.recordThought(thought);
-        if (thoughtThrottle.shouldEmit()) {
-          this.logJobEvent(job.id, JOB_EVENT_TYPES.THOUGHT, {
-            content: thought.slice(0, 500),
-          });
-        }
-      });
-
-      // Track state for periodic blocker checks, URL monitoring, and failure escalation
-      let lastBlockerCheckTime = Date.now();
-      let consecutiveActionFailures = 0;
       const targetDomain = new URL(job.target_url).hostname;
-      let lastKnownUrl = job.target_url;
+      const blockerState = {
+        lastCheckTime: Date.now(),
+        consecutiveFailures: 0,
+        lastKnownUrl: job.target_url,
+      };
 
-      adapter.on('actionStarted', async (action: { variant: string }) => {
-        // Track consecutive failures: incremented on start, reset on actionDone
-        consecutiveActionFailures++;
-        costTracker.recordAction(); // throws ActionLimitExceededError if over limit
-        costTracker.recordModeStep('magnitude');
-        progress.onActionStarted(action.variant);
-        this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_STARTED, {
-          action: action.variant,
-          action_count: costTracker.getSnapshot().actionCount,
-        });
-
-        // If repeated action failures, check for blockers before continuing
-        if (consecutiveActionFailures >= CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK && adapter) {
-          try {
-            const blocked = await this.checkForBlockers(job, adapter, costTracker);
-            if (blocked) {
-              // HITL handled — the blocker was likely the root cause of failures
-            }
-          } catch {
-            // Non-fatal
-          }
-        }
-      });
-
-      adapter.on('actionDone', async (action: { variant: string }) => {
-        progress.onActionDone(action.variant);
-        consecutiveActionFailures = 0; // Reset on successful action
-        this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
-          action: action.variant,
-          action_count: costTracker.getSnapshot().actionCount,
-        });
-
-        // Periodic blocker check after actions (throttled)
-        const now = Date.now();
-        if (now - lastBlockerCheckTime >= BLOCKER_CHECK_INTERVAL_MS) {
-          lastBlockerCheckTime = now;
-          try {
-            // URL change detection — check if page navigated to a non-target domain
-            const currentUrl = await adapter!.getCurrentUrl();
-            if (currentUrl !== lastKnownUrl) {
-              lastKnownUrl = currentUrl;
-              try {
-                const currentDomain = new URL(currentUrl).hostname;
-                if (currentDomain !== targetDomain) {
-                  await this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
-                    from_domain: targetDomain,
-                    to_url: currentUrl,
-                  });
-                }
-              } catch {
-                // Invalid URL — skip domain comparison
-              }
-            }
-
-            // Use detectBlocker (DOM-only) for speed, not detectWithAdapter (which calls observe/LLM)
-            const blocked = await this.checkForBlockers(job, adapter!, costTracker);
-            if (blocked) {
-              // checkForBlockers already handled HITL flow internally
-            }
-          } catch (err) {
-            if ((err as Error).message?.includes('Blocker detected')) throw err;
-            // Detection errors are non-fatal
-          }
-        }
-      });
-
-      adapter.on('tokensUsed', (usage: TokenUsage) => {
-        costTracker.recordTokenUsage({
-          inputTokens: usage.inputTokens,
-          outputTokens: usage.outputTokens,
-          inputCost: usage.inputCost,
-          outputCost: usage.outputCost,
-        }); // throws BudgetExceededError if over budget
-        this.logJobEvent(job.id, JOB_EVENT_TYPES.TOKENS_USED, {
-          model: (usage as any).model || 'unknown',
-          input_tokens: usage.inputTokens,
-          output_tokens: usage.outputTokens,
-          cost_usd: usage.inputCost + usage.outputCost,
-        });
+      this.wireAdapterEvents(adapter, {
+        job, costTracker, progress, thoughtThrottle, blockerState, targetDomain,
       });
 
       // Start periodic blocker check timer (catches blockers even when adapter is stuck)
@@ -630,6 +694,7 @@ export class JobExecutor {
           progress,
           credentials,
           dataPrompt,
+          resumeFilePath,
         };
 
         try {
@@ -648,9 +713,9 @@ export class JobExecutor {
           }
 
           crashRecoveryAttempts++;
-          console.warn(
-            `[JobExecutor] Browser crash detected for job ${job.id}, recovery attempt ${crashRecoveryAttempts}/${MAX_CRASH_RECOVERIES}`,
-          );
+          getLogger().warn('Browser crash detected', {
+            jobId: job.id, attempt: crashRecoveryAttempts, maxAttempts: MAX_CRASH_RECOVERIES,
+          });
 
           await this.logJobEvent(job.id, 'browser_crash_detected', {
             attempt: crashRecoveryAttempts,
@@ -689,96 +754,19 @@ export class JobExecutor {
                 (adapter as MagnitudeAdapter).setObserver(observer);
               }
             } catch (err) {
-              console.warn(`[JobExecutor] StagehandObserver re-attach failed after crash recovery for job ${job.id}:`, err);
+              getLogger().warn('StagehandObserver re-attach failed after crash recovery', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
               observer = undefined;
             }
           }
 
           // Re-wire event handlers on the new adapter
           thoughtThrottle.reset();
-          adapter.on('thought', (thought: string) => {
-            progress.recordThought(thought);
-            if (thoughtThrottle.shouldEmit()) {
-              this.logJobEvent(job.id, JOB_EVENT_TYPES.THOUGHT, {
-                content: thought.slice(0, 500),
-              });
-            }
-          });
-          adapter.on('actionStarted', async (action: { variant: string }) => {
-            consecutiveActionFailures++;
-            costTracker.recordAction();
-            progress.onActionStarted(action.variant);
-            this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_STARTED, {
-              action: action.variant,
-              action_count: costTracker.getSnapshot().actionCount,
-            });
+          blockerState.lastCheckTime = Date.now();
+          blockerState.consecutiveFailures = 0;
+          blockerState.lastKnownUrl = job.target_url;
 
-            if (consecutiveActionFailures >= CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK && adapter) {
-              try {
-                const blocked = await this.checkForBlockers(job, adapter, costTracker);
-                if (blocked) {
-                  // HITL handled
-                }
-              } catch {
-                // Non-fatal
-              }
-            }
-          });
-          // Reset blocker check state after crash recovery
-          lastBlockerCheckTime = Date.now();
-          consecutiveActionFailures = 0;
-          lastKnownUrl = job.target_url;
-
-          adapter.on('actionDone', async (action: { variant: string }) => {
-            progress.onActionDone(action.variant);
-            consecutiveActionFailures = 0;
-            this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
-              action: action.variant,
-              action_count: costTracker.getSnapshot().actionCount,
-            });
-
-            // Periodic blocker check after actions (throttled)
-            const now = Date.now();
-            if (now - lastBlockerCheckTime >= BLOCKER_CHECK_INTERVAL_MS) {
-              lastBlockerCheckTime = now;
-              try {
-                const currentUrl = await adapter!.getCurrentUrl();
-                if (currentUrl !== lastKnownUrl) {
-                  lastKnownUrl = currentUrl;
-                  try {
-                    const currentDomain = new URL(currentUrl).hostname;
-                    if (currentDomain !== targetDomain) {
-                      await this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
-                        from_domain: targetDomain,
-                        to_url: currentUrl,
-                      });
-                    }
-                  } catch {
-                    // Invalid URL — skip domain comparison
-                  }
-                }
-                const blocked = await this.checkForBlockers(job, adapter!, costTracker);
-                if (blocked) {
-                  // checkForBlockers already handled HITL flow
-                }
-              } catch (err) {
-                if ((err as Error).message?.includes('Blocker detected')) throw err;
-              }
-            }
-          });
-          adapter.on('tokensUsed', (usage: TokenUsage) => {
-            costTracker.recordTokenUsage({
-              inputTokens: usage.inputTokens,
-              outputTokens: usage.outputTokens,
-              inputCost: usage.inputCost,
-              outputCost: usage.outputCost,
-            });
-            this.logJobEvent(job.id, JOB_EVENT_TYPES.TOKENS_USED, {
-              model: (usage as any).model || 'unknown',
-              input_tokens: usage.inputTokens,
-              output_tokens: usage.outputTokens,
-              cost_usd: usage.inputCost + usage.outputCost,
-            });
+          this.wireAdapterEvents(adapter, {
+            job, costTracker, progress, thoughtThrottle, blockerState, targetDomain,
           });
 
           await this.logJobEvent(job.id, 'browser_crash_recovered', {
@@ -792,7 +780,7 @@ export class JobExecutor {
         throw new Error('Task handler did not produce a result');
       }
 
-      if (!taskResult.success) {
+      if (!taskResult.success && !taskResult.keepBrowserOpen) {
         throw new Error(taskResult.error || `Task handler '${handler.type}' returned failure`);
       }
 
@@ -817,7 +805,7 @@ export class JobExecutor {
               url_pattern: ManualStore.urlToPattern(job.target_url),
             });
           } catch (err) {
-            console.warn(`[JobExecutor] Manual save failed for job ${job.id}:`, err);
+            getLogger().warn('Manual save failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           }
         }
       }
@@ -863,7 +851,7 @@ export class JobExecutor {
         );
         screenshotUrls.push(screenshotUrl);
       } catch (err) {
-        console.warn(`[JobExecutor] Screenshot failed for job ${job.id}:`, err);
+        getLogger().warn('Screenshot failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       }
 
       // 11.5. Save browser session for future reuse
@@ -878,14 +866,88 @@ export class JobExecutor {
             });
           }
         } catch (err) {
-          console.warn(`[JobExecutor] Session save failed for job ${job.id}:`, err);
+          getLogger().warn('Session save failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         }
       }
 
       // 12. Get final cost snapshot
       const finalCost = costTracker.getSnapshot();
 
-      // 13. Mark progress complete and flush
+      // 12.5. Save fresh session cookies back to DB after successful auth
+      if (this.sessionManager) try {
+        const freshState = await adapter.page.context().storageState();
+        // Save Google session (use mail.google.com for consistency with session persistence test)
+        await this.sessionManager.saveSession(
+          job.user_id,
+          'mail.google.com',
+          freshState as unknown as Record<string, unknown>,
+        );
+        // Save target domain session
+        const saveDomain = new URL(job.target_url).hostname;
+        await this.sessionManager.saveSession(
+          job.user_id,
+          saveDomain,
+          freshState as unknown as Record<string, unknown>,
+        );
+        getLogger().info('Saved fresh session cookies', { userId: job.user_id });
+      } catch (err) {
+        getLogger().warn('Session save failed (non-fatal)', { error: err instanceof Error ? err.message : String(err) });
+      }
+
+      // 13. Handle awaiting_user_review vs completed
+      if (taskResult.awaitingUserReview) {
+        // Job paused at review page — keep browser open
+        await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
+        await progress.flush();
+
+        const resultData = {
+          ...(taskResult.data || {}),
+          cost: {
+            input_tokens: finalCost.inputTokens,
+            output_tokens: finalCost.outputTokens,
+            total_cost_usd: finalCost.totalCost,
+            action_count: finalCost.actionCount,
+          },
+        };
+
+        await this.supabase
+          .from('gh_automation_jobs')
+          .update({
+            status: 'awaiting_user_review',
+            result_data: resultData,
+            result_summary: 'Application filled — waiting for user to review and submit',
+            screenshot_urls: screenshotUrls,
+            llm_cost_cents: Math.round(finalCost.totalCost * 100),
+            action_count: finalCost.actionCount,
+            total_tokens: finalCost.inputTokens + finalCost.outputTokens,
+          })
+          .eq('id', job.id);
+
+        await this.logJobEvent(job.id, 'awaiting_user_review', {
+          handler: handler.type,
+          action_count: finalCost.actionCount,
+          total_tokens: finalCost.inputTokens + finalCost.outputTokens,
+          cost_cents: Math.round(finalCost.totalCost * 100),
+        });
+
+        await costService.recordJobCost(job.user_id, job.id, finalCost).catch((err) => {
+          getLogger().warn('Failed to record cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+        });
+
+        getLogger().info('Job awaiting user review', { jobId: job.id, actionCount: finalCost.actionCount, costUsd: finalCost.totalCost });
+
+        // Keep heartbeat running and browser open — wait indefinitely
+        // The worker process must stay alive for the browser to remain open
+        getLogger().info('Browser is open for manual review, heartbeat continues');
+        getLogger().info('Press Ctrl+C to shut down the worker when done');
+
+        // Block indefinitely — the user will Ctrl+C when done
+        await new Promise<void>(() => {
+          // Never resolves — worker stays alive with browser open
+        });
+      }
+
+      // Normal completion flow
       await progress.setStep(ProgressStep.COMPLETED);
       await progress.flush();
 
@@ -930,8 +992,10 @@ export class JobExecutor {
         magnitude_steps: finalCost.actionCount,
       });
 
-      // 14. Record cost against user's monthly usage
-      await costService.recordJobCost(job.user_id, job.id, finalCost);
+      // 14. Record cost against user's monthly usage (best-effort, don't fail the job)
+      await costService.recordJobCost(job.user_id, job.id, finalCost).catch((err) => {
+        getLogger().warn('Failed to record cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+      });
 
       // 15. Fire VALET callback if configured
       if (job.callback_url) {
@@ -949,12 +1013,34 @@ export class JobExecutor {
           total_tokens: finalCost.inputTokens + finalCost.outputTokens,
         };
         callbackNotifier.notifyFromJob(jobRow).catch((err) => {
-          console.warn(`[JobExecutor] Callback notification failed for job ${job.id}:`, err);
+          getLogger().warn('Callback notification failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });
       }
 
-      console.log(`[JobExecutor] Job ${job.id} completed via ${handler.type} handler (actions=${finalCost.actionCount}, tokens=${finalCost.inputTokens + finalCost.outputTokens}, cost=$${finalCost.totalCost.toFixed(4)})`);
+      getLogger().info('Job completed via handler', { jobId: job.id, handler: handler.type, actionCount: finalCost.actionCount, totalTokens: finalCost.inputTokens + finalCost.outputTokens, costUsd: finalCost.totalCost });
     } catch (error: unknown) {
+      // Handle external cancellation (heartbeat detected cancelled status)
+      if (this._cancelled) {
+        getLogger().info('Job was cancelled by user', { jobId: job.id });
+        await progress.setStep(ProgressStep.FAILED);
+        await progress.flush();
+        const snapshot = costTracker.getSnapshot();
+        await costService.recordJobCost(job.user_id, job.id, snapshot).catch(() => {});
+        if (job.callback_url) {
+          callbackNotifier.notifyFromJob({
+            id: job.id,
+            valet_task_id: job.valet_task_id,
+            callback_url: job.callback_url,
+            status: 'cancelled',
+            worker_id: this.workerId,
+            llm_cost_cents: Math.round(snapshot.totalCost * 100),
+            action_count: snapshot.actionCount,
+            total_tokens: snapshot.inputTokens + snapshot.outputTokens,
+          }).catch(() => {});
+        }
+        return;
+      }
+
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorCode = this.classifyError(errorMessage);
 
@@ -967,7 +1053,7 @@ export class JobExecutor {
             // Blocker resolved (or detection didn't find one after error classification).
             // Try direct HITL as fallback since the error was classified as captcha/login.
             const resumed = await this.requestHumanIntervention(job, adapter, {
-              type: errorCode === 'captcha_blocked' ? 'captcha' : 'login',
+              type: errorCode === 'captcha_blocked' ? 'captcha' : errorCode === '2fa_required' ? '2fa' : 'login',
               confidence: 0.9,
               details: errorMessage,
               source: 'dom',
@@ -975,17 +1061,17 @@ export class JobExecutor {
             if (resumed) {
               const hitlSnapshot = costTracker.getSnapshot();
               await costService.recordJobCost(job.user_id, job.id, hitlSnapshot).catch((err) => {
-                console.warn(`[JobExecutor] Failed to record HITL partial cost for job ${job.id}:`, err);
+                getLogger().warn('Failed to record HITL partial cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
               });
-              console.log(`[JobExecutor] Job ${job.id} resumed after HITL intervention`);
+              getLogger().info('Job resumed after HITL intervention', { jobId: job.id });
               return;
             }
           } else {
             // checkForBlockers handled the HITL flow but the blocker couldn't be resolved
-            console.warn(`[JobExecutor] Job ${job.id} blocked and HITL could not resolve`);
+            getLogger().warn('Job blocked and HITL could not resolve', { jobId: job.id });
           }
         } catch (hitlErr) {
-          console.warn(`[JobExecutor] HITL intervention failed for job ${job.id}:`, hitlErr);
+          getLogger().warn('HITL intervention failed', { jobId: job.id, error: hitlErr instanceof Error ? hitlErr.message : String(hitlErr) });
           // Fall through to normal error handling
         }
       }
@@ -997,7 +1083,7 @@ export class JobExecutor {
 
       // Always record cost on failure (even zero cost for consistent accounting)
       await costService.recordJobCost(job.user_id, job.id, snapshot).catch((err) => {
-        console.warn(`[JobExecutor] Failed to record cost for job ${job.id}:`, err);
+        getLogger().warn('Failed to record cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       });
 
       // Fire VALET callback on failure too
@@ -1014,12 +1100,21 @@ export class JobExecutor {
           action_count: snapshot.actionCount,
           total_tokens: snapshot.inputTokens + snapshot.outputTokens,
         }).catch((err) => {
-          console.warn(`[JobExecutor] Callback notification failed for job ${job.id}:`, err);
+          getLogger().warn('Callback notification failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });
       }
     } finally {
       clearInterval(heartbeat);
+      this._activeAdapter = null;
+      this._executionAttemptId = null;
       if (blockerCheckInterval) clearInterval(blockerCheckInterval);
+      // Clean up cancel LISTEN subscription (EC2)
+      if (cancelListenClient) {
+        try {
+          await cancelListenClient.query(`UNLISTEN "gh_job_cancel_${job.id}"`);
+          cancelListenClient.release();
+        } catch { /* connection may already be closed */ }
+      }
       if (observer) {
         try { await observer.stop(); } catch { /* best-effort cleanup */ }
       }
@@ -1029,6 +1124,16 @@ export class JobExecutor {
         } catch {
           // Adapter may already be stopped
         }
+      }
+      // Remove filechooser listener
+      if (fileChooserHandler && adapter) {
+        try { adapter.page.off('filechooser', fileChooserHandler); } catch { /* page may be closed */ }
+      }
+      // Clean up downloaded resume file
+      if (resumeFilePath) {
+        this.resumeDownloader.cleanup(resumeFilePath).catch((err) => {
+          logger.warn('Resume cleanup failed', { jobId: job.id, error: String(err) });
+        });
       }
     }
   }
@@ -1045,7 +1150,7 @@ export class JobExecutor {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorCode = this.classifyError(errorMessage);
 
-    console.error(`[JobExecutor] Job ${job.id} failed (code=${errorCode}): ${errorMessage}`);
+    getLogger().error('Job failed', { jobId: job.id, errorCode, errorMessage });
 
     await this.logJobEvent(job.id, 'job_failed', {
       error_code: errorCode,
@@ -1080,7 +1185,7 @@ export class JobExecutor {
         })
         .eq('id', job.id);
 
-      console.log(`[JobExecutor] Job ${job.id} re-queued for retry ${job.retry_count + 1}/${job.max_retries} (backoff=${backoffSeconds}s)`);
+      getLogger().info('Job re-queued for retry', { jobId: job.id, retryCount: job.retry_count + 1, maxRetries: job.max_retries, backoffSeconds });
     } else {
       await this.supabase
         .from('gh_automation_jobs')
@@ -1095,6 +1200,104 @@ export class JobExecutor {
         })
         .eq('id', job.id);
     }
+  }
+
+  // --- Adapter Event Wiring ---
+
+  /**
+   * Wire adapter event handlers for cost tracking, progress, and blocker detection.
+   * Used both for initial Magnitude-path setup and after crash recovery.
+   */
+  private wireAdapterEvents(
+    adapter: BrowserAutomationAdapter,
+    opts: {
+      job: AutomationJob;
+      costTracker: CostTracker;
+      progress: ProgressTracker;
+      thoughtThrottle: ThoughtThrottle;
+      blockerState: { lastCheckTime: number; consecutiveFailures: number; lastKnownUrl: string };
+      targetDomain: string;
+    },
+  ): void {
+    const { job, costTracker, progress, thoughtThrottle, blockerState, targetDomain } = opts;
+
+    adapter.on('thought', (thought: string) => {
+      progress.recordThought(thought);
+      if (thoughtThrottle.shouldEmit()) {
+        this.logJobEvent(job.id, JOB_EVENT_TYPES.THOUGHT, {
+          content: thought.slice(0, 500),
+        });
+      }
+    });
+
+    adapter.on('actionStarted', async (action: { variant: string }) => {
+      blockerState.consecutiveFailures++;
+      costTracker.recordAction(); // throws ActionLimitExceededError if over limit
+      costTracker.recordModeStep('magnitude');
+      progress.onActionStarted(action.variant);
+      this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_STARTED, {
+        action: action.variant,
+        action_count: costTracker.getSnapshot().actionCount,
+      });
+
+      if (blockerState.consecutiveFailures >= CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK && adapter) {
+        try {
+          await this.checkForBlockers(job, adapter, costTracker);
+        } catch {
+          // Non-fatal
+        }
+      }
+    });
+
+    adapter.on('actionDone', async (action: { variant: string }) => {
+      progress.onActionDone(action.variant);
+      blockerState.consecutiveFailures = 0;
+      this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
+        action: action.variant,
+        action_count: costTracker.getSnapshot().actionCount,
+      });
+
+      const now = Date.now();
+      if (now - blockerState.lastCheckTime >= BLOCKER_CHECK_INTERVAL_MS) {
+        blockerState.lastCheckTime = now;
+        try {
+          const currentUrl = await adapter.getCurrentUrl();
+          if (currentUrl !== blockerState.lastKnownUrl) {
+            blockerState.lastKnownUrl = currentUrl;
+            try {
+              const currentDomain = new URL(currentUrl).hostname;
+              if (currentDomain !== targetDomain) {
+                await this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
+                  from_domain: targetDomain,
+                  to_url: currentUrl,
+                });
+              }
+            } catch {
+              // Invalid URL — skip domain comparison
+            }
+          }
+          await this.checkForBlockers(job, adapter, costTracker);
+        } catch (err) {
+          if ((err as Error).message?.includes('Blocker detected')) throw err;
+          // Detection errors are non-fatal
+        }
+      }
+    });
+
+    adapter.on('tokensUsed', (usage: TokenUsage) => {
+      costTracker.recordTokenUsage({
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        inputCost: usage.inputCost,
+        outputCost: usage.outputCost,
+      }); // throws BudgetExceededError if over budget
+      this.logJobEvent(job.id, JOB_EVENT_TYPES.TOKENS_USED, {
+        model: (usage as any).model || 'unknown',
+        input_tokens: usage.inputTokens,
+        output_tokens: usage.outputTokens,
+        cost_usd: usage.inputCost + usage.outputCost,
+      });
+    });
   }
 
   // --- Blocker Detection ---
@@ -1126,7 +1329,7 @@ export class JobExecutor {
       blockerResult = await this.blockerDetector.detectWithAdapter(adapter);
     } catch (err) {
       // Detection failure should not crash the job
-      console.warn(`[JobExecutor] Blocker detection failed for job ${job.id}:`, err);
+      getLogger().warn('Blocker detection failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       return false;
     }
 
@@ -1165,9 +1368,10 @@ export class JobExecutor {
           return false;
         }
 
-        console.warn(
-          `[JobExecutor] Job ${job.id} still blocked after resume (attempt ${attempt}/${MAX_POST_RESUME_CHECKS}): ${stillBlocked.type} (${stillBlocked.confidence})`,
-        );
+        getLogger().warn('Job still blocked after resume', {
+          jobId: job.id, attempt, maxAttempts: MAX_POST_RESUME_CHECKS,
+          blockerType: stillBlocked.type, confidence: stillBlocked.confidence,
+        });
 
         if (attempt < MAX_POST_RESUME_CHECKS) {
           // Re-pause and wait for another human intervention
@@ -1206,7 +1410,7 @@ export class JobExecutor {
       const screenshotBuffer = await adapter.screenshot();
       screenshotUrl = await this.uploadScreenshot(job.id, 'blocker', screenshotBuffer);
     } catch (err) {
-      console.warn(`[JobExecutor] HITL screenshot failed for job ${job.id}:`, err);
+      getLogger().warn('HITL screenshot failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
     }
 
     const pageUrl = await adapter.getCurrentUrl();
@@ -1274,7 +1478,7 @@ export class JobExecutor {
           total_tokens: costSnapshot.inputTokens + costSnapshot.outputTokens,
         } : undefined,
       ).catch((err) => {
-        console.warn(`[JobExecutor] HITL callback failed for job ${job.id}:`, err);
+        getLogger().warn('HITL callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       });
     }
 
@@ -1314,7 +1518,7 @@ export class JobExecutor {
 
       if (job.callback_url) {
         callbackNotifier.notifyResumed(job.id, job.callback_url, job.valet_task_id, this.workerId).catch((err) => {
-          console.warn(`[JobExecutor] Resume callback failed for job ${job.id}:`, err);
+          getLogger().warn('Resume callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });
       }
       return true;
@@ -1387,7 +1591,7 @@ export class JobExecutor {
       return this.readAndClearResolutionData(jobId);
     } catch (err) {
       client.release();
-      console.warn(`[JobExecutor] PG LISTEN failed for job ${jobId}, falling back to polling:`, err);
+      getLogger().warn('PG LISTEN failed, falling back to polling', { jobId, error: err instanceof Error ? err.message : String(err) });
       return this.waitForResumeViaPolling(jobId, timeoutSeconds);
     }
   }
@@ -1464,7 +1668,7 @@ export class JobExecutor {
 
       return { resumed: true, resolutionType, resolutionData };
     } catch (err) {
-      console.warn(`[JobExecutor] Failed to read resolution data for job ${jobId}:`, err);
+      getLogger().warn('Failed to read resolution data', { jobId, error: err instanceof Error ? err.message : String(err) });
       // Still resumed, just without resolution data
       return { resumed: true, resolutionType: 'manual' };
     }
@@ -1473,14 +1677,65 @@ export class JobExecutor {
   // --- Heartbeat ---
 
   private startHeartbeat(jobId: string): ReturnType<typeof setInterval> {
+    let consecutiveFailures = 0;
+
     return setInterval(async () => {
       try {
-        await this.supabase
+        const { data } = await this.supabase
           .from('gh_automation_jobs')
           .update({ last_heartbeat: new Date().toISOString() })
-          .eq('id', jobId);
+          .eq('id', jobId)
+          .select('status, execution_attempt_id')
+          .single();
+
+        // Heartbeat succeeded — reset failure counter (EC8)
+        consecutiveFailures = 0;
+
+        // Detect external cancellation (e.g. user clicked cancel in VALET)
+        if (data?.status === 'cancelled') {
+          getLogger().info('Job cancelled externally, stopping execution', { jobId });
+          this._cancelled = true;
+          if (this._activeAdapter) {
+            try { await this._activeAdapter.stop(); } catch { /* adapter may already be stopped */ }
+          }
+        }
+
+        // EC3: Verify execution_attempt_id — another worker may have taken over
+        if (
+          this._executionAttemptId &&
+          data?.execution_attempt_id &&
+          data.execution_attempt_id !== this._executionAttemptId
+        ) {
+          getLogger().warn('Execution attempt ID mismatch — another worker has claimed this job', {
+            jobId,
+            ours: this._executionAttemptId,
+            theirs: data.execution_attempt_id,
+          });
+          this._cancelled = true;
+          if (this._activeAdapter) {
+            try { await this._activeAdapter.stop(); } catch { /* adapter may already be stopped */ }
+          }
+        }
       } catch (err) {
-        console.warn(`[JobExecutor] Heartbeat failed for job ${jobId}:`, err);
+        // EC8: Track consecutive heartbeat failures
+        consecutiveFailures++;
+        getLogger().warn('Heartbeat failed', {
+          jobId,
+          consecutiveFailures,
+          error: err instanceof Error ? err.message : String(err),
+        });
+
+        if (consecutiveFailures >= MAX_HEARTBEAT_FAILURES) {
+          getLogger().error('Aborting job after consecutive heartbeat failures', {
+            jobId,
+            consecutiveFailures,
+            maxAllowed: MAX_HEARTBEAT_FAILURES,
+          });
+          this._cancelled = true;
+          if (this._activeAdapter) {
+            try { await this._activeAdapter.stop(); } catch { /* adapter may already be stopped */ }
+          }
+        }
       }
     }, HEARTBEAT_INTERVAL_MS);
   }
@@ -1520,7 +1775,7 @@ export class JobExecutor {
       });
     } catch (err) {
       // Event logging failures should not crash the job
-      console.warn(`[JobExecutor] Event log failed (${eventType}):`, err);
+      getLogger().warn('Event log failed', { eventType, error: err instanceof Error ? err.message : String(err) });
     }
   }
 
@@ -1593,6 +1848,44 @@ export class JobExecutor {
     return result;
   }
 
+  // --- Resume resolution ---
+
+  /**
+   * Resolve the resume reference from the job.
+   * Checks: job.resume_ref (DB column), metadata.resume_ref (backup), input_data.resume_path.
+   * Returns null if no resume or empty/invalid reference.
+   */
+  private resolveResumeRef(job: AutomationJob): ResumeRef | null {
+    // 1. Direct column (preferred)
+    const directRef = job.resume_ref;
+    if (directRef && typeof directRef === 'object') {
+      const ref = directRef as ResumeRef;
+      if (ref.storage_path || ref.download_url || ref.s3_key) {
+        return ref;
+      }
+    }
+
+    // 2. Backup in metadata
+    const metaRef = job.metadata?.resume_ref;
+    if (metaRef && typeof metaRef === 'object') {
+      const ref = metaRef as ResumeRef;
+      if (ref.storage_path || ref.download_url || ref.s3_key) {
+        return ref;
+      }
+    }
+
+    // 3. Legacy: input_data.resume_path as a download_url or storage_path
+    const legacyPath = job.input_data?.resume_path;
+    if (legacyPath && typeof legacyPath === 'string' && legacyPath.trim() !== '') {
+      if (legacyPath.startsWith('http://') || legacyPath.startsWith('https://')) {
+        return { download_url: legacyPath };
+      }
+      return { storage_path: legacyPath };
+    }
+
+    return null;
+  }
+
   // --- Screenshot upload ---
 
   private async uploadScreenshot(
@@ -1654,7 +1947,7 @@ export class JobExecutor {
         const el = await page.$(selector);
         if (el && await el.isVisible()) {
           await el.fill(code);
-          console.log(`[JobExecutor] Injected 2FA code via selector: ${selector}`);
+          getLogger().debug('Injected 2FA code via selector', { selector });
           await this.logJobEvent(jobId, JOB_EVENT_TYPES.CREDENTIAL_INJECTION_SUCCEEDED, {
             injection_type: 'code_entry',
             selector,
@@ -1670,7 +1963,7 @@ export class JobExecutor {
         // Selector may not be valid on this page, try next
       }
     }
-    console.warn('[JobExecutor] Could not find 2FA code input field — resuming without injection');
+    getLogger().warn('Could not find 2FA code input field, resuming without injection');
     await this.logJobEvent(jobId, JOB_EVENT_TYPES.CREDENTIAL_INJECTION_FAILED, {
       injection_type: 'code_entry',
       reason: 'no_matching_input_field',
@@ -1722,7 +2015,7 @@ export class JobExecutor {
           const el = await page.$(sel);
           if (el && await el.isVisible()) {
             await el.fill(username);
-            console.log(`[JobExecutor] Injected username via selector: ${sel}`);
+            getLogger().debug('Injected username via selector', { selector: sel });
             usernameInjected = true;
             break;
           }
@@ -1742,7 +2035,7 @@ export class JobExecutor {
           const el = await page.$(sel);
           if (el && await el.isVisible()) {
             await el.fill(password);
-            console.log(`[JobExecutor] Injected password via selector: ${sel}`);
+            getLogger().debug('Injected password via selector', { selector: sel });
             passwordInjected = true;
             break;
           }
@@ -1774,10 +2067,7 @@ export class JobExecutor {
   // --- Error classification ---
 
   private classifyError(message: string): string {
-    for (const { pattern, code } of ERROR_CLASSIFICATIONS) {
-      if (pattern.test(message)) return code;
-    }
-    return 'internal_error';
+    return classifyError(message);
   }
 
   // --- Browser crash detection & recovery ---
@@ -1835,7 +2125,7 @@ export class JobExecutor {
 
       return newAdapter;
     } catch (err) {
-      console.error(`[JobExecutor] Crash recovery failed for job ${job.id}:`, err);
+      getLogger().error('Crash recovery failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       return null;
     }
   }

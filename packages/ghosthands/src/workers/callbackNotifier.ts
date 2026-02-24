@@ -6,6 +6,8 @@
  * Callback failures are logged but never fail the job.
  */
 
+import { getLogger } from '../monitoring/logger.js';
+
 export interface InteractionInfo {
   type: string;
   screenshot_url?: string;
@@ -55,6 +57,8 @@ export interface CallbackPayload {
     image_cost_usd: number;
     reasoning_cost_usd: number;
   } | null;
+  /** Kasm session URL for live browser view (WEK-162) */
+  kasm_url?: string;
   completed_at: string;
 }
 
@@ -120,8 +124,14 @@ export class CallbackNotifier {
       total_tokens: job.total_tokens || 0,
     };
 
-    // Sprint 3: Mode tracking fields
+    // WEK-162: Include Kasm session URL if available (from job metadata or env)
     const jobMeta = typeof job.metadata === 'object' ? (job.metadata || {}) : {};
+    const kasmUrl = jobMeta.kasm_session_url || jobMeta.kasm_url || process.env.KASM_SESSION_URL;
+    if (kasmUrl) {
+      payload.kasm_url = kasmUrl;
+    }
+
+    // Sprint 3: Mode tracking fields
     if (job.execution_mode) {
       payload.execution_mode = job.execution_mode;
     }
@@ -152,9 +162,10 @@ export class CallbackNotifier {
     jobId: string,
     callbackUrl: string,
     valetTaskId?: string | null,
-    metadata?: { execution_mode?: string; manual_id?: string | null },
+    metadata?: { execution_mode?: string; manual_id?: string | null; kasm_url?: string },
     workerId?: string,
   ): Promise<boolean> {
+    const kasmUrl = metadata?.kasm_url || process.env.KASM_SESSION_URL;
     const payload: CallbackPayload = {
       job_id: jobId,
       valet_task_id: valetTaskId || null,
@@ -162,6 +173,7 @@ export class CallbackNotifier {
       ...(workerId && { worker_id: workerId }),
       completed_at: new Date().toISOString(),
       ...(metadata?.execution_mode && { execution_mode: metadata.execution_mode }),
+      ...(kasmUrl && { kasm_url: kasmUrl }),
     };
     return this.sendWithRetry(callbackUrl, payload);
   }
@@ -176,7 +188,9 @@ export class CallbackNotifier {
     valetTaskId?: string | null,
     workerId?: string,
     cost?: { total_cost_usd: number; action_count: number; total_tokens: number },
+    kasmUrl?: string,
   ): Promise<boolean> {
+    const resolvedKasmUrl = kasmUrl || process.env.KASM_SESSION_URL;
     const payload: CallbackPayload = {
       job_id: jobId,
       valet_task_id: valetTaskId || null,
@@ -184,6 +198,7 @@ export class CallbackNotifier {
       ...(workerId && { worker_id: workerId }),
       interaction: interactionData,
       ...(cost && { cost }),
+      ...(resolvedKasmUrl && { kasm_url: resolvedKasmUrl }),
       completed_at: new Date().toISOString(),
     };
     return this.sendWithRetry(callbackUrl, payload);
@@ -197,18 +212,22 @@ export class CallbackNotifier {
     callbackUrl: string,
     valetTaskId?: string | null,
     workerId?: string,
+    kasmUrl?: string,
   ): Promise<boolean> {
+    const resolvedKasmUrl = kasmUrl || process.env.KASM_SESSION_URL;
     const payload: CallbackPayload = {
       job_id: jobId,
       valet_task_id: valetTaskId || null,
       status: 'resumed',
       ...(workerId && { worker_id: workerId }),
+      ...(resolvedKasmUrl && { kasm_url: resolvedKasmUrl }),
       completed_at: new Date().toISOString(),
     };
     return this.sendWithRetry(callbackUrl, payload);
   }
 
   private async sendWithRetry(url: string, payload: CallbackPayload): Promise<boolean> {
+    const logger = getLogger();
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
         const controller = new AbortController();
@@ -227,18 +246,19 @@ export class CallbackNotifier {
         clearTimeout(timeoutId);
 
         if (response.ok) {
-          console.log(`[CallbackNotifier] Successfully notified ${url} for job ${payload.job_id}`);
+          logger.info('Callback notification succeeded', { url, jobId: payload.job_id });
           return true;
         }
 
-        console.warn(
-          `[CallbackNotifier] Callback returned ${response.status} for job ${payload.job_id} (attempt ${attempt + 1}/${MAX_RETRIES + 1})`
-        );
+        logger.warn('Callback returned non-OK status', {
+          url, jobId: payload.job_id, status: response.status,
+          attempt: attempt + 1, maxAttempts: MAX_RETRIES + 1,
+        });
       } catch (err) {
-        console.warn(
-          `[CallbackNotifier] Callback failed for job ${payload.job_id} (attempt ${attempt + 1}/${MAX_RETRIES + 1}):`,
-          err instanceof Error ? err.message : err
-        );
+        logger.warn('Callback request failed', {
+          jobId: payload.job_id, attempt: attempt + 1, maxAttempts: MAX_RETRIES + 1,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
 
       // Wait before retry (except on last attempt)
@@ -247,7 +267,7 @@ export class CallbackNotifier {
       }
     }
 
-    console.error(`[CallbackNotifier] All retry attempts exhausted for job ${payload.job_id} -> ${url}`);
+    logger.error('All callback retry attempts exhausted', { jobId: payload.job_id, url });
     return false;
   }
 }

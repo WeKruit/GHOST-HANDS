@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# NOTE: This script is for MANUAL operations only (SSH into EC2).
+# Automated deploys go through deploy-server.ts via Docker Engine API.
+# This script requires: aws CLI, docker CLI, docker compose, curl
+#
 # GhostHands Deploy Script
 #
 # Called by VALET's deployment controller on each EC2 instance.
@@ -241,6 +245,16 @@ cmd_deploy() {
     log "Graceful drain unavailable — using SIGTERM with 35s timeout"
   fi
   docker compose -f "$COMPOSE_FILE" stop -t 35 worker 2>/dev/null || true
+
+  # Stop any standalone containers (from deploy-server Docker API deploys)
+  # These use host networking and would conflict with compose containers
+  for name in ghosthands-api ghosthands-worker ghosthands-deploy-server; do
+    if docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
+      log "Removing standalone container: $name"
+      docker stop -t 10 "$name" 2>/dev/null || true
+      docker rm "$name" 2>/dev/null || true
+    fi
+  done
 
   # Restart compose services (API + default worker)
   docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
