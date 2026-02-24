@@ -267,8 +267,9 @@ export class WorkdayApplyHandler implements TaskHandler {
       // Contact info dropdowns
       'Country': profile.address.country,
       'Country/Territory': profile.address.country,
-      'State': profile.address.state,
-      'State/Province': profile.address.state,
+      // NOTE: State is intentionally NOT in the QA map. The profile stores abbreviations
+      // (e.g. "CA") but Workday dropdowns use full names ("California"). The LLM handles
+      // this mapping automatically via the data prompt.
       'Phone Device Type': profile.phone_device_type || 'Mobile',
       'Phone Type': profile.phone_device_type || 'Mobile',
       // Text field answers (used by fillTextFieldsProgrammatically too)

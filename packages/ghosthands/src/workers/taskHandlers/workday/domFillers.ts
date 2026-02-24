@@ -415,19 +415,71 @@ export async function clickDropdownOption(
 
   if (typedMatch) return true;
 
-  // Phase 3: The correct option is not visible after typing + Enter.
+  // Phase 2b: Try fallback search terms if the exact match wasn't found.
+  // E.g., "Business Analytics" → try "Business", then "Analytics"
+  const fallbackTerms = generateFallbackSearchTerms(searchText);
+  if (fallbackTerms.length > 0) {
+    getLogger().debug('Trying fallback search terms for dropdown', { original: searchText, fallbacks: fallbackTerms });
+
+    for (const fallback of fallbackTerms) {
+      // Clear the current search text
+      await adapter.page.keyboard.press('Control+a');
+      await adapter.page.waitForTimeout(100);
+      await adapter.page.keyboard.press('Backspace');
+      await adapter.page.waitForTimeout(300);
+
+      // Type the fallback term and press Enter
+      await adapter.page.keyboard.type(fallback, { delay: 50 });
+      await adapter.page.keyboard.press('Enter');
+      await adapter.page.waitForTimeout(1000);
+
+      // Check if a matching option appeared
+      const fallbackMatch = await adapter.page.evaluate((term: string) => {
+        const termLower = term.toLowerCase();
+        const options = document.querySelectorAll(
+          '[role="option"], [role="listbox"] li, ' +
+            '[data-automation-id*="promptOption"], [data-automation-id*="selectOption"]',
+        );
+        // First pass: option text starts with, equals, or contains the fallback term
+        for (const opt of options) {
+          const text = opt.textContent?.trim().toLowerCase() || '';
+          if (text === termLower || text.startsWith(termLower) || text.includes(termLower)) {
+            (opt as HTMLElement).click();
+            return true;
+          }
+        }
+        // Second pass: fallback term contains option text (partial match)
+        for (const opt of options) {
+          const text = opt.textContent?.trim().toLowerCase() || '';
+          if (text.length > 2 && termLower.includes(text)) {
+            (opt as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      }, fallback);
+
+      if (fallbackMatch) {
+        getLogger().debug('Fallback search term matched', { original: searchText, matchedFallback: fallback });
+        return true;
+      }
+    }
+  }
+
+  // Phase 3: The correct option is not visible after typing + Enter + fallback terms.
   // Use the LLM to scroll through the dropdown options (click the scrollbar)
   // and find then click the correct option.
-  getLogger().debug('Dropdown option not found after search, using LLM to scroll', { searchText });
+  getLogger().debug('Dropdown option not found after search and fallbacks, using LLM to scroll', { searchText });
 
+  const firstWord = searchText.split(/\s+/)[0] || searchText;
   const llmScrollPrompt = [
     `A dropdown menu is currently open on the page.`,
     `I need to find and select the option "${searchText}" (or the closest match).`,
-    `The correct option is NOT currently visible in the dropdown list.`,
-    `SCROLL through the dropdown options by clicking the dropdown's scrollbar or dragging it downward to reveal more options.`,
-    `After scrolling, look for "${searchText}" and click on it when you find it.`,
-    `If you reach the end of the list without finding an exact match, click the closest matching option.`,
-    `Do NOT click outside the dropdown or close it — only scroll within it and select the correct option.`,
+    `IMPORTANT: The exact value "${searchText}" may NOT exist in this dropdown.`,
+    `Strategy: First, try clearing the search field and typing a shorter term (e.g., just "${firstWord}" instead of "${searchText}"). Press Enter and wait for results. Then click the closest matching option.`,
+    `If that doesn't work, scroll through the dropdown (minimum 20px per scroll) and select the closest matching option you can find.`,
+    `Do NOT scroll through the entire list more than once. If you've scrolled through without finding an exact match, pick the best available option.`,
+    `Do NOT click outside the dropdown or close it — only search, scroll within it, and select an option.`,
   ].join('\n');
 
   try {
@@ -451,6 +503,40 @@ export async function clickDropdownOption(
   }
 
   return false;
+}
+
+/**
+ * Generate fallback search terms for when an exact dropdown match isn't found.
+ * Given a multi-word value, returns shorter/broader terms to try.
+ *
+ * E.g., "Business Analytics" → ["Business", "Analytics"]
+ * E.g., "Computer Science and Engineering" → ["Computer", "Engineering", "Science"]
+ */
+export function generateFallbackSearchTerms(original: string): string[] {
+  const stopWords = new Set(['of', 'and', 'in', 'the', 'a', 'an', 'for', 'to', 'with', 'or', 'at', 'by']);
+  const words = original.split(/\s+/).filter(w => w.length > 1);
+  const meaningfulWords = words.filter(w => !stopWords.has(w.toLowerCase()));
+
+  // No fallbacks for single-word values — the original is already as short as it gets
+  if (meaningfulWords.length <= 1 && words.length <= 1) return [];
+
+  const terms: string[] = [];
+
+  // Strategy 1: First meaningful word (usually the primary category)
+  // "Business Analytics" → "Business"
+  if (meaningfulWords.length > 0) {
+    terms.push(meaningfulWords[0]);
+  }
+
+  // Strategy 2: Other meaningful words, longest first for specificity
+  // "Business Analytics" → "Analytics"
+  for (const word of meaningfulWords.slice(1).sort((a, b) => b.length - a.length)) {
+    if (!terms.includes(word)) {
+      terms.push(word);
+    }
+  }
+
+  return terms;
 }
 
 /**
