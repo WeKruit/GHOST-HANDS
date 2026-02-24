@@ -634,9 +634,16 @@ Fill ALL of these fields (scroll down if needed to find them):
     3. Press ENTER to trigger the dropdown to filter/update.
     4. WAIT 3 seconds — do nothing during this time. Let the dropdown load.
     5. Look for "${edu.field_of_study}" in the dropdown list and CLICK on it. The field is NOT filled until you click the option.
-    6. If "${edu.field_of_study}" is NOT visible in the dropdown list: first, clear the input field (select all + delete), then scroll through the dropdown options. Each scroll must move at least 20 pixels. Keep scrolling until you find and click "${edu.field_of_study}".
+    6. If "${edu.field_of_study}" is NOT found in the dropdown (you see "No matches found" or the exact option simply does not exist in the list):
+       a. Clear the input field (click the X button next to the text, or select all + delete).
+       b. Type a SHORTER search term — use just the first word: "${edu.field_of_study.split(/\s+/)[0]}".
+       c. Press ENTER and WAIT 3 seconds for the dropdown to update.
+       d. Look for the CLOSEST matching option and CLICK it. For example, "Business Administration" is a reasonable match for "Business Analytics", and "Computer Science" is a reasonable match for "Computer Engineering".
+       e. If the first word yields no results either, try other individual words from "${edu.field_of_study}".
+       f. Do NOT scroll endlessly through the entire dropdown list. If the exact value doesn't exist, pick the closest available match using a shorter search term.
     7. After clicking the option, click on empty whitespace to dismiss the dropdown.
     DO NOT skip step 3 (Enter) or step 5 (click). Typing alone does NOT fill the field.
+    IMPORTANT: The exact value "${edu.field_of_study}" may NOT exist in this dropdown. That is OK — select the closest available match instead of scrolling forever.
   )
 
 Do NOT click any "Add" buttons. Do NOT touch any other sections. Do NOT interact with fields under any other "Education" heading.`;
@@ -652,48 +659,32 @@ Do NOT click any "Add" buttons. Do NOT touch any other sections. Do NOT interact
     logger.info('Education entry done', { entry: i + 1, school: edu.school });
   }
 
-  // ==================== SKILLS + LINKEDIN ====================
+  // ==================== SKILLS ====================
   const skillsToAdd = (userProfile.skills || []).slice(0, maxSkills);
   const hasSkills = skillsToAdd.length > 0;
   const hasLinkedin = !!userProfile.linkedin_url;
 
-  let skillsLinkedinBlock = `CRITICAL — DO NOT TOUCH THESE SECTIONS:
+  if (hasSkills) {
+    const skillsBlock = `CRITICAL — DO NOT TOUCH THESE SECTIONS:
 - "Websites" section: Do NOT click its "Add" button. Leave it empty.
 - "Certifications" section: Do NOT click its "Add" button. Leave it empty.
+- "Social Network URLs" / "LinkedIn" section: Do NOT fill this. Leave it empty.
 - Do NOT click "Add" under Work Experience or Education — those are already filled.
-${!hasLinkedin ? '- "LinkedIn" / "Social Network URLs" section: Do NOT fill this field. Leave it completely empty.' : ''}
 
-Fill ONLY ${hasSkills ? 'Skills' : ''}${hasSkills && hasLinkedin ? ' and ' : ''}${hasLinkedin ? 'LinkedIn' : ''} fields below. Skip any fields that already have values.${!hasSkills && !hasLinkedin ? ' If all fields are filled, STOP immediately.' : ''}
-`;
+Fill ONLY the Skills field. Skip any fields that already have values.
 
-  if (hasSkills) {
-    skillsLinkedinBlock += `
 SKILLS — OVERRIDE: The "one dropdown per turn" rule does NOT apply to skills. Add ALL skills in this turn without stopping.
   To open the skills input, look for the small icon with three horizontal lines (≡ list icon) near the skills field. ALWAYS click this icon to open the dropdown — do NOT click on any grey skill tags/chips that may already be in the field, as that will NOT open the dropdown.
   For EACH skill below, repeat this process: click the three-lines icon (≡), type the skill name, press ENTER to trigger the dropdown, WAIT 3 seconds for suggestions to load, then CLICK the matching option from the dropdown. After selecting, click on empty whitespace to dismiss the dropdown, then immediately proceed to the NEXT skill by clicking the three-lines icon again. Keep going until ALL skills are added. Do NOT stop after just one skill.
   Skills to add: ${skillsToAdd.map(s => `"${s}"`).join(', ')}
 `;
-  }
 
-  if (hasLinkedin) {
-    skillsLinkedinBlock += `
-LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
-  LinkedIn: ${userProfile.linkedin_url}
-  NOTE: The LinkedIn field is in the "Social Network URLs" section, which is DIFFERENT from the "Websites" section. Only fill the LinkedIn field.
-`;
-  }
-
-  if (hasSkills || hasLinkedin) {
-    // Use buildExperienceEntryPrompt (scroll-down allowed) instead of buildExperiencePrompt
-    // (zero scrolling). The skills input field is often below the Skills heading, and the
-    // LLM needs permission to scroll down to find it.
-    const skillsPrompt = buildExperienceEntryPrompt(skillsLinkedinBlock);
+    const skillsPrompt = buildExperienceEntryPrompt(skillsBlock);
 
     // Scroll to the Skills section — try to find the actual input field first,
     // fall back to the heading with block:'start' so content below is visible.
     await adapter.page.evaluate(`
       (() => {
-        // First, find the Skills heading
         var headings = document.querySelectorAll('h2, h3, h4, h5, legend, [data-automation-id]');
         var skillsHeading = null;
         for (var i = 0; i < headings.length; i++) {
@@ -704,8 +695,6 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
         }
         if (!skillsHeading) return;
 
-        // Try to find the actual skills input field near the heading
-        // Walk up to the section container
         var container = skillsHeading.parentElement;
         for (var u = 0; u < 5 && container; u++) {
           var inputs = container.querySelectorAll('input[type="text"], input:not([type])');
@@ -713,7 +702,6 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
           container = container.parentElement;
         }
 
-        // If we found an input in the skills section, scroll to it
         if (container) {
           var inputs = container.querySelectorAll('input[type="text"], input:not([type])');
           for (var j = 0; j < inputs.length; j++) {
@@ -726,14 +714,54 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
           }
         }
 
-        // Fallback: scroll heading to top so input below it is visible
         skillsHeading.scrollIntoView({ block: 'start', behavior: 'instant' });
       })()
     `);
     await adapter.page.waitForTimeout(500);
 
-    logger.debug('Skills/LinkedIn LLM call', { llmCall: llmCallCount + 1, skills: skillsToAdd.length, hasLinkedin });
+    logger.debug('Skills LLM call', { llmCall: llmCallCount + 1, skills: skillsToAdd.length });
     await adapter.act(skillsPrompt);
+    llmCallCount++;
+    await adapter.page.waitForTimeout(1000);
+  }
+
+  // ==================== LINKEDIN ====================
+  if (hasLinkedin) {
+    const linkedinBlock = `CRITICAL — DO NOT TOUCH THESE SECTIONS:
+- "Websites" section: Do NOT click its "Add" button. Leave it empty.
+- "Certifications" section: Do NOT click its "Add" button. Leave it empty.
+- "Skills" section: Already filled. Do NOT modify it.
+- Do NOT click "Add" under Work Experience or Education — those are already filled.
+
+Fill ONLY the LinkedIn field. Skip any fields that already have values.
+
+LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
+  LinkedIn: ${userProfile.linkedin_url}
+  NOTE: The LinkedIn field is in the "Social Network URLs" section, which is DIFFERENT from the "Websites" section. Only fill the LinkedIn field.
+`;
+
+    const linkedinPrompt = buildExperienceEntryPrompt(linkedinBlock);
+
+    // Scroll to the Social Network URLs section
+    await adapter.page.evaluate(`
+      (() => {
+        var headings = document.querySelectorAll('h2, h3, h4, h5, legend, [data-automation-id]');
+        var target = null;
+        for (var i = 0; i < headings.length; i++) {
+          var text = (headings[i].textContent || '').toLowerCase();
+          if (text.includes('social') || text.includes('linkedin')) {
+            target = headings[i];
+          }
+        }
+        if (target) {
+          target.scrollIntoView({ block: 'start', behavior: 'instant' });
+        }
+      })()
+    `);
+    await adapter.page.waitForTimeout(500);
+
+    logger.debug('LinkedIn LLM call', { llmCall: llmCallCount + 1 });
+    await adapter.act(linkedinPrompt);
     llmCallCount++;
     await adapter.page.waitForTimeout(1000);
   }
