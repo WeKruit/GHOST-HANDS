@@ -191,41 +191,6 @@ jobs:
             echo "::warning::VALET staging webhook returned HTTP ${HTTP_STATUS}."
           fi
 
-      - name: Update Kasm workspace image
-        if: env.KASM_API_URL != ''
-        env:
-          KASM_API_URL: ${{ secrets.KASM_API_URL }}
-          KASM_API_KEY: ${{ secrets.KASM_API_KEY }}
-          KASM_API_SECRET: ${{ secrets.KASM_API_SECRET }}
-          KASM_IMAGE_ID: ${{ secrets.KASM_IMAGE_ID }}
-          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ needs.docker.outputs.image_tag }}
-        run: |
-          echo "Updating Kasm workspace image to ${IMAGE_TAG}"
-
-          HTTP_STATUS=$(curl -s -o /tmp/kasm_response.txt -w "%{http_code}" \
-            -X POST "${KASM_API_URL}/api/public/update_image" \
-            -H "Content-Type: application/json" \
-            --max-time 30 \
-            -d "{
-              \"api_key\": \"${KASM_API_KEY}\",
-              \"api_key_secret\": \"${KASM_API_SECRET}\",
-              \"target_image\": {
-                \"image_id\": \"${KASM_IMAGE_ID}\",
-                \"docker_registry\": \"${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}\"
-              }
-            }")
-
-          echo "Kasm responded with HTTP ${HTTP_STATUS}"
-          cat /tmp/kasm_response.txt
-
-          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
-            echo "Kasm workspace image updated to ${IMAGE_TAG}."
-          else
-            echo "::warning::Kasm API returned HTTP ${HTTP_STATUS}."
-          fi
-
   # ─── Deploy to ASG instances (SSH) ────────────────────────────
   # FIRST: SSH to each running ASG instance and pull/restart the
   # new image. VALET notification happens after this succeeds.
@@ -262,6 +227,64 @@ jobs:
         run: |
           chmod +x scripts/deploy-to-asg.sh
           bash scripts/deploy-to-asg.sh "${{ needs.docker.outputs.image_tag }}"
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/valet-worker.pem
+
+  # ─── Rebuild Kasm image on Kasm server (SSH) ──────────────────
+  # Builds Dockerfile.kasm directly on the Kasm EC2 server.
+  # The image is ~8GB (full desktop + GH worker), so we build locally
+  # on the server rather than pushing through ECR.
+
+  deploy-kasm:
+    name: Rebuild Kasm Image
+    runs-on: ubuntu-latest
+    needs: [docker, test-integration]
+    if: github.event_name == 'push'
+    environment: ${{ needs.docker.outputs.environment }}
+    steps:
+      - name: Write SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SANDBOX_SSH_KEY }}" > ~/.ssh/valet-worker.pem
+          chmod 600 ~/.ssh/valet-worker.pem
+
+      - name: Rebuild Kasm image on server
+        env:
+          KASM_SERVER_IP: ${{ secrets.KASM_SERVER_IP }}
+          SSH_USER: ubuntu
+        run: |
+          if [ -z "$KASM_SERVER_IP" ]; then
+            echo "::warning::KASM_SERVER_IP not configured. Skipping Kasm image rebuild."
+            exit 0
+          fi
+
+          SSH_OPTS="-i ~/.ssh/valet-worker.pem -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+
+          echo "Rebuilding Kasm image on ${KASM_SERVER_IP}..."
+
+          ssh $SSH_OPTS ${SSH_USER}@${KASM_SERVER_IP} bash -s << 'REMOTE_SCRIPT'
+          set -e
+          cd /opt/GHOST-HANDS
+
+          # Pull latest code
+          sudo git config --global --add safe.directory /opt/GHOST-HANDS
+          sudo git fetch origin staging
+          sudo git reset --hard origin/staging
+
+          # Build the Kasm image
+          echo "Building ghosthands-kasm:latest..."
+          sudo docker build -f Dockerfile.kasm -t ghosthands-kasm:latest . 2>&1 | tail -5
+
+          # Prune dangling images to save disk
+          sudo docker image prune -f > /dev/null 2>&1 || true
+
+          echo "Kasm image rebuilt successfully."
+          sudo docker images ghosthands-kasm --format '{{.ID}} {{.Tag}} {{.CreatedAt}}'
+          REMOTE_SCRIPT
+
+          echo "Kasm image rebuild complete on ${KASM_SERVER_IP}."
 
       - name: Cleanup SSH key
         if: always()
@@ -328,37 +351,3 @@ jobs:
             echo "::warning::VALET production webhook returned HTTP ${HTTP_STATUS}."
           fi
 
-      - name: Update Kasm workspace image
-        if: env.KASM_API_URL != ''
-        env:
-          KASM_API_URL: ${{ secrets.KASM_API_URL }}
-          KASM_API_KEY: ${{ secrets.KASM_API_KEY }}
-          KASM_API_SECRET: ${{ secrets.KASM_API_SECRET }}
-          KASM_IMAGE_ID: ${{ secrets.KASM_IMAGE_ID }}
-          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ needs.docker.outputs.image_tag }}
-        run: |
-          echo "Updating Kasm workspace image to ${IMAGE_TAG}"
-
-          HTTP_STATUS=$(curl -s -o /tmp/kasm_response.txt -w "%{http_code}" \
-            -X POST "${KASM_API_URL}/api/public/update_image" \
-            -H "Content-Type: application/json" \
-            --max-time 30 \
-            -d "{
-              \"api_key\": \"${KASM_API_KEY}\",
-              \"api_key_secret\": \"${KASM_API_SECRET}\",
-              \"target_image\": {
-                \"image_id\": \"${KASM_IMAGE_ID}\",
-                \"docker_registry\": \"${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}\"
-              }
-            }")
-
-          echo "Kasm responded with HTTP ${HTTP_STATUS}"
-          cat /tmp/kasm_response.txt
-
-          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
-            echo "Kasm workspace image updated to ${IMAGE_TAG}."
-          else
-            echo "::warning::Kasm API returned HTTP ${HTTP_STATUS}."
-          fi
