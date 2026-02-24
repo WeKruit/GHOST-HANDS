@@ -1,10 +1,15 @@
 # docker-compose.staging.yml
-# Staging deployment for GhostHands — identical to prod but with staging-specific defaults
 #
-# Differences from production:
-#   - GH_ENVIRONMENT=staging (reported in health endpoints)
-#   - Deploy server bound to 0.0.0.0:8000 (for VALET access)
-#   - Lower resource limits (staging instances are smaller)
+# NOTE: This compose file is used for INITIAL EC2 SETUP only.
+# Subsequent deploys are handled by the deploy-server via Docker API.
+# To bootstrap a fresh EC2 instance:
+#   docker compose -f docker-compose.staging.yml up -d
+#
+# For manual operations, use scripts/deploy.sh or deploy-server API.
+#
+# All services use host networking to match deploy-server Docker API deploys
+# (which also create containers with NetworkMode: 'host'). This prevents
+# port conflicts when both deploy paths run in sequence.
 #
 # Usage:
 #   ECR_IMAGE=<registry>/ghosthands:staging-<sha> docker compose -f docker-compose.staging.yml up -d
@@ -14,8 +19,7 @@ services:
   api:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "packages/ghosthands/src/api/server.ts"]
-    ports:
-      - "127.0.0.1:${GH_API_PORT:-3100}:3100"
+    network_mode: host
     env_file: .env
     environment:
       - NODE_ENV=production
@@ -45,21 +49,24 @@ services:
   deploy-server:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "scripts/deploy-server.ts"]
-    ports:
-      - "${GH_DEPLOY_PORT:-8000}:8000"
+    network_mode: host
     env_file: .env
     environment:
       - NODE_ENV=production
       - GH_ENVIRONMENT=staging
       - GH_DEPLOY_PORT=8000
+      - GH_API_HOST=localhost
       - GH_API_PORT=3100
+      - GH_WORKER_HOST=localhost
       - GH_WORKER_PORT=3101
-      - GHOSTHANDS_DIR=/app
+      - GHOSTHANDS_DIR=/opt/ghosthands
+      - DOCKER_CONFIG_PATH=/docker-config/config.json
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
       - SSL_CERT_DIR=/etc/ssl/certs
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - .:/opt/ghosthands:ro
+      - /home/ubuntu/.docker/config.json:/docker-config/config.json:ro
     deploy:
       resources:
         limits:
@@ -76,8 +83,7 @@ services:
   worker:
     image: ${ECR_IMAGE:-ghosthands:latest}
     command: ["bun", "packages/ghosthands/src/workers/main.ts"]
-    ports:
-      - "127.0.0.1:${GH_WORKER_PORT:-3101}:3101"
+    network_mode: host
     env_file: .env
     environment:
       - NODE_ENV=production

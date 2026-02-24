@@ -17,6 +17,7 @@ COPY package.json bun.lock turbo.json ./
 
 # Copy package.json for workspace resolution
 COPY packages/ghosthands/package.json packages/ghosthands/
+COPY scripts/package.json scripts/
 
 # Install dependencies (magnitude-core and magnitude-extract come from npm)
 RUN bun install --frozen-lockfile
@@ -26,6 +27,7 @@ FROM deps AS build
 
 # Copy source
 COPY packages/ packages/
+COPY scripts/ scripts/
 COPY tsconfig.base.json ./
 
 # Build
@@ -90,6 +92,9 @@ COPY --from=build /app/package.json ./
 COPY --from=build /app/packages/ghosthands/dist ./packages/ghosthands/dist
 COPY --from=build /app/packages/ghosthands/src ./packages/ghosthands/src
 COPY --from=build /app/packages/ghosthands/package.json ./packages/ghosthands/
+
+# Copy scripts (deploy-server, docker-client, ecr-auth, container-configs)
+COPY --from=build /app/scripts ./scripts
 # Note: bun hoists all dependencies to root node_modules/, so
 # packages/ghosthands/node_modules/ typically doesn't exist.
 

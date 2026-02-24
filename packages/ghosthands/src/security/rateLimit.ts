@@ -1,6 +1,7 @@
 import { Context, Next } from 'hono';
 import { RATE_LIMITS, type UserTier, type Platform } from '../config/rateLimits.js';
 import { getAuth } from '../api/middleware/auth.js';
+import { getLogger } from '../monitoring/logger.js';
 
 // ─── Sliding Window Store ──────────────────────────────────────────
 // In-memory MVP. Swap for Redis ZSET in production.
@@ -271,9 +272,7 @@ export function rateLimitMiddleware() {
     // Check user tier limit first
     const tierResult = checkUserTierLimit(userId, tier);
     if (!tierResult.allowed) {
-      console.warn(
-        `[RateLimit] User ${userId} exceeded ${tier} tier limit (${tierResult.source}: ${tierResult.limit})`,
-      );
+      getLogger().warn('User exceeded tier limit', { userId, tier, source: tierResult.source, limit: tierResult.limit });
 
       c.header('X-RateLimit-Limit', String(tierResult.limit));
       c.header('X-RateLimit-Remaining', '0');
@@ -297,9 +296,7 @@ export function rateLimitMiddleware() {
       // Roll back the user tier records since this request is blocked
       rollbackUserTier(userId);
 
-      console.warn(
-        `[RateLimit] User ${userId} exceeded ${platform} platform limit (${platformResult.source}: ${platformResult.limit})`,
-      );
+      getLogger().warn('User exceeded platform limit', { userId, platform, source: platformResult.source, limit: platformResult.limit });
 
       c.header('X-RateLimit-Limit', String(platformResult.limit));
       c.header('X-RateLimit-Remaining', '0');

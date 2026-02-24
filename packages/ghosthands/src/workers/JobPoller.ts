@@ -1,6 +1,7 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { Client as PgClient, Notification } from "pg";
 import { JobExecutor } from "./JobExecutor.js";
+import { getLogger } from '../monitoring/logger.js';
 
 const POLL_INTERVAL_MS = 5_000;
 const DRAIN_TIMEOUT_MS = 30_000;
@@ -80,9 +81,9 @@ export class JobPoller {
         // Always release claimed jobs on shutdown, regardless of whether they completed
         // This ensures clean handoff to other workers even if process is force-killed
         if (this.activeJobs > 0) {
-            console.warn(
-                `[JobPoller] Shutdown with ${this.activeJobs} active jobs still running`
-            );
+            getLogger().warn('Shutdown with active jobs still running', {
+                activeJobs: this.activeJobs,
+            });
         }
         await this.releaseClaimedJobs();
     }
@@ -112,16 +113,15 @@ export class JobPoller {
             );
 
             if (result.rows && result.rows.length > 0) {
-                console.log(
-                    `[JobPoller] Released ${
-                        result.rows.length
-                    } job(s) back to queue: ${result.rows
-                        .map((j: { id: string }) => j.id)
-                        .join(", ")}`
-                );
+                getLogger().info('Released jobs back to queue', {
+                    count: result.rows.length,
+                    jobIds: result.rows.map((j: { id: string }) => j.id),
+                });
             }
         } catch (err) {
-            console.error("[JobPoller] Failed to release claimed jobs:", err);
+            getLogger().error('Failed to release claimed jobs', {
+                error: err instanceof Error ? err.message : String(err),
+            });
         }
     }
 
@@ -162,25 +162,27 @@ export class JobPoller {
 
             this.activeJobs++;
             this._currentJobId = job.id;
-            console.log(
-                `[JobPoller] Picked up job ${job.id} (type=${job.job_type}, active=${this.activeJobs}/${this.maxConcurrent})`
-            );
+            getLogger().info('Picked up job', {
+                jobId: job.id, jobType: job.job_type,
+                activeJobs: this.activeJobs, maxConcurrent: this.maxConcurrent,
+            });
 
             // Execute in background -- do NOT await
             this.executor
                 .execute(job)
                 .catch((err) => {
-                    console.error(
-                        `[JobPoller] Job ${job.id} executor error:`,
-                        err
-                    );
+                    getLogger().error('Job executor error', {
+                        jobId: job.id,
+                        error: err instanceof Error ? err.message : String(err),
+                    });
                 })
                 .finally(() => {
                     this.activeJobs--;
                     this._currentJobId = null;
-                    console.log(
-                        `[JobPoller] Job ${job.id} finished (active=${this.activeJobs}/${this.maxConcurrent})`
-                    );
+                    getLogger().info('Job finished', {
+                        jobId: job.id,
+                        activeJobs: this.activeJobs, maxConcurrent: this.maxConcurrent,
+                    });
                     // Try to pick up the next job
                     if (this.running && this.activeJobs < this.maxConcurrent) {
                         this.tryPickup();
@@ -200,40 +202,96 @@ export class JobPoller {
     /**
      * Detect and re-queue jobs that appear stuck (no heartbeat for 2+ minutes).
      * This handles worker crashes where a job was claimed but never completed.
+     *
+     * EC3: Before re-enqueueing, check if the job has form_submitted events.
+     * If it does, mark as completed instead of resetting to pending (prevent
+     * re-running a partially completed application). In either case, clear the
+     * execution_attempt_id to allow a new worker to claim it.
      */
     private async recoverStuckJobs(): Promise<void> {
         const STUCK_THRESHOLD_SECONDS = 120;
 
         try {
-            // Use direct pg query instead of supabase to avoid JWT issues
-            const result = await this.pgDirect.query(
+            // First, find stuck jobs
+            const stuckResult = await this.pgDirect.query(
                 `
-        UPDATE gh_automation_jobs
-        SET
-          status = 'pending',
-          worker_id = NULL,
-          error_details = jsonb_build_object(
-            'recovered_by', $1::TEXT,
-            'reason', 'stuck_job_recovery'
-          )
+        SELECT id FROM gh_automation_jobs
         WHERE status IN ('queued', 'running')
           AND last_heartbeat < NOW() - INTERVAL '${STUCK_THRESHOLD_SECONDS} seconds'
-        RETURNING id
       `,
-                [this.workerId]
             );
 
-            if (result.rows && result.rows.length > 0) {
-                console.log(
-                    `[JobPoller] Recovered ${
-                        result.rows.length
-                    } stuck job(s): ${result.rows
-                        .map((j: { id: string }) => j.id)
-                        .join(", ")}`
+            if (!stuckResult.rows || stuckResult.rows.length === 0) {
+                return;
+            }
+
+            const stuckJobIds = stuckResult.rows.map((j: { id: string }) => j.id);
+            getLogger().info('Found stuck jobs', { count: stuckJobIds.length, jobIds: stuckJobIds });
+
+            const requeued: string[] = [];
+            const completedDueToProgress: string[] = [];
+
+            for (const jobId of stuckJobIds) {
+                // EC3: Check if the job has any events indicating meaningful progress
+                // (form_submitted, or cookbook steps that indicate form-filling occurred)
+                const eventsResult = await this.pgDirect.query(
+                    `SELECT COUNT(*) as cnt FROM gh_job_events
+                     WHERE job_id = $1::UUID AND event_type IN ('form_submitted', 'cookbook_step_completed', 'step_completed')`,
+                    [jobId],
                 );
+                const hasFormSubmitted = parseInt(eventsResult.rows[0]?.cnt || '0', 10) > 0;
+
+                if (hasFormSubmitted) {
+                    // Job had meaningful progress — mark completed instead of re-running
+                    await this.pgDirect.query(
+                        `UPDATE gh_automation_jobs
+                         SET status = 'completed',
+                             completed_at = NOW(),
+                             worker_id = NULL,
+                             execution_attempt_id = NULL,
+                             result_summary = 'Completed (recovered from stuck state — form was submitted)',
+                             error_details = jsonb_build_object(
+                               'recovered_by', $1::TEXT,
+                               'reason', 'stuck_job_with_progress'
+                             )
+                         WHERE id = $2::UUID`,
+                        [this.workerId, jobId],
+                    );
+                    completedDueToProgress.push(jobId);
+                } else {
+                    // No meaningful progress — safe to re-queue
+                    await this.pgDirect.query(
+                        `UPDATE gh_automation_jobs
+                         SET status = 'pending',
+                             worker_id = NULL,
+                             execution_attempt_id = NULL,
+                             error_details = jsonb_build_object(
+                               'recovered_by', $1::TEXT,
+                               'reason', 'stuck_job_recovery'
+                             )
+                         WHERE id = $2::UUID`,
+                        [this.workerId, jobId],
+                    );
+                    requeued.push(jobId);
+                }
+            }
+
+            if (requeued.length > 0) {
+                getLogger().info('Re-queued stuck jobs (no progress)', {
+                    count: requeued.length,
+                    jobIds: requeued,
+                });
+            }
+            if (completedDueToProgress.length > 0) {
+                getLogger().info('Marked stuck jobs as completed (form was submitted)', {
+                    count: completedDueToProgress.length,
+                    jobIds: completedDueToProgress,
+                });
             }
         } catch (err) {
-            console.error("[JobPoller] Stuck job recovery failed:", err);
+            getLogger().error('Stuck job recovery failed', {
+                error: err instanceof Error ? err.message : String(err),
+            });
         }
     }
 }

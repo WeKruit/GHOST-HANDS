@@ -3,12 +3,14 @@ import { ApplyHandler } from './applyHandler.js';
 import { ScrapeHandler } from './scrapeHandler.js';
 import { FillFormHandler } from './fillFormHandler.js';
 import { CustomHandler } from './customHandler.js';
+import { WorkdayApplyHandler } from './workday/index.js';
 
 export function registerBuiltinHandlers(): void {
   taskHandlerRegistry.register(new ApplyHandler());
   taskHandlerRegistry.register(new ScrapeHandler());
   taskHandlerRegistry.register(new FillFormHandler());
   taskHandlerRegistry.register(new CustomHandler());
+  taskHandlerRegistry.register(new WorkdayApplyHandler());
 }
 
 export { taskHandlerRegistry } from './registry.js';

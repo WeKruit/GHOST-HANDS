@@ -1,4 +1,9 @@
 import { SupabaseClient } from '@supabase/supabase-js';
+import type Redis from 'ioredis';
+import { xaddEvent, setStreamTTL } from '../lib/redis-streams.js';
+import { getLogger } from '../monitoring/logger.js';
+
+const logger = getLogger({ service: 'progress-tracker' });
 
 // ---------------------------------------------------------------------------
 // Progress lifecycle steps for a job application flow
@@ -15,6 +20,7 @@ export const ProgressStep = {
   REVIEWING: 'reviewing',
   SUBMITTING: 'submitting',
   EXTRACTING_RESULTS: 'extracting_results',
+  AWAITING_USER_REVIEW: 'awaiting_user_review',
   COMPLETED: 'completed',
   FAILED: 'failed',
 } as const;
@@ -33,6 +39,7 @@ const STEP_ORDER: ProgressStep[] = [
   ProgressStep.REVIEWING,
   ProgressStep.SUBMITTING,
   ProgressStep.EXTRACTING_RESULTS,
+  ProgressStep.AWAITING_USER_REVIEW,
   ProgressStep.COMPLETED,
 ];
 
@@ -48,6 +55,7 @@ const STEP_DESCRIPTIONS: Record<ProgressStep, string> = {
   [ProgressStep.REVIEWING]: 'Reviewing submission',
   [ProgressStep.SUBMITTING]: 'Submitting application',
   [ProgressStep.EXTRACTING_RESULTS]: 'Extracting confirmation details',
+  [ProgressStep.AWAITING_USER_REVIEW]: 'Waiting for user to review and submit',
   [ProgressStep.COMPLETED]: 'Application complete',
   [ProgressStep.FAILED]: 'Job failed',
 };
@@ -70,6 +78,8 @@ export interface ProgressEventData {
   execution_mode?: 'cookbook' | 'magnitude';
   manual_id?: string;
   step_cost_cents?: number;
+  /** Kasm session URL for live browser view (WEK-162) */
+  kasm_url?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +145,8 @@ export interface ProgressTrackerOptions {
   estimatedTotalActions?: number;
   /** Minimum interval between DB writes (ms). Prevents flooding. Default: 2000 */
   throttleMs?: number;
+  /** Optional Redis client for real-time streaming via Redis Streams. */
+  redis?: Redis;
 }
 
 export class ProgressTracker {
@@ -143,6 +155,7 @@ export class ProgressTracker {
   private workerId: string;
   private estimatedTotalActions: number;
   private throttleMs: number;
+  private redis: Redis | null;
 
   private currentStep: ProgressStep = ProgressStep.QUEUED;
   private actionIndex = 0;
@@ -152,6 +165,7 @@ export class ProgressTracker {
   private pendingEmit: ProgressEventData | null = null;
   private executionMode?: 'cookbook' | 'magnitude';
   private manualId?: string;
+  private kasmUrl?: string;
 
   constructor(opts: ProgressTrackerOptions) {
     this.jobId = opts.jobId;
@@ -159,6 +173,7 @@ export class ProgressTracker {
     this.workerId = opts.workerId;
     this.estimatedTotalActions = opts.estimatedTotalActions ?? 30;
     this.throttleMs = opts.throttleMs ?? 2000;
+    this.redis = opts.redis ?? null;
   }
 
   /** Set the current step explicitly (for lifecycle transitions). */
@@ -176,6 +191,11 @@ export class ProgressTracker {
   setExecutionMode(mode: 'cookbook' | 'magnitude', manualId?: string): void {
     this.executionMode = mode;
     this.manualId = manualId;
+  }
+
+  /** Set the Kasm session URL for live view (WEK-162). */
+  setKasmUrl(url: string): void {
+    this.kasmUrl = url;
   }
 
   /** Called when an action starts. Infers the step and emits progress. */
@@ -218,6 +238,7 @@ export class ProgressTracker {
       eta_ms: this.estimateEta(elapsedMs),
       ...(this.executionMode && { execution_mode: this.executionMode }),
       ...(this.manualId && { manual_id: this.manualId }),
+      ...(this.kasmUrl && { kasm_url: this.kasmUrl }),
     };
   }
 
@@ -248,7 +269,20 @@ export class ProgressTracker {
     this.lastEmitTime = Date.now();
     this.pendingEmit = null;
 
-    // Write to gh_job_events
+    // 1. Publish to Redis Streams for real-time SSE consumption (fast path)
+    if (this.redis) {
+      try {
+        await xaddEvent(this.redis, this.jobId, {
+          ...snapshot,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (err) {
+        // Redis publish failure should never block job execution
+        logger.child({ jobId: this.jobId }).warn('Redis Stream publish failed', { error: String(err) });
+      }
+    }
+
+    // 2. Write to gh_job_events (audit trail — permanent record)
     try {
       await this.supabase.from('gh_job_events').insert({
         job_id: this.jobId,
@@ -258,24 +292,12 @@ export class ProgressTracker {
       });
     } catch (err) {
       // Progress logging should never crash the job
-      console.warn(`[ProgressTracker] Event write failed for job ${this.jobId}:`, err);
+      logger.child({ jobId: this.jobId }).warn('Event write failed', { error: String(err) });
     }
 
-    // Also update progress_pct + status_message on the job row itself
-    // (this is what Supabase Realtime picks up for the frontend)
-    try {
-      await this.supabase
-        .from('gh_automation_jobs')
-        .update({
-          status_message: snapshot.description,
-          metadata: {
-            progress: snapshot,
-          },
-        })
-        .eq('id', this.jobId);
-    } catch (err) {
-      console.warn(`[ProgressTracker] Job row update failed for job ${this.jobId}:`, err);
-    }
+    // NOTE: Previously also updated gh_automation_jobs.metadata.progress here,
+    // but this was duplicate storage. gh_job_events is now the single source
+    // of truth for progress data (WEK-71 progress dedup).
   }
 
   /** Emit progress, but throttled to avoid DB write storms. */
@@ -295,6 +317,15 @@ export class ProgressTracker {
   async flush(): Promise<void> {
     if (this.pendingEmit) {
       await this.emit();
+    }
+
+    // Set a 24-hour TTL on the Redis stream so it auto-cleans after retention period
+    if (this.redis) {
+      try {
+        await setStreamTTL(this.redis, this.jobId, 86400);
+      } catch (err) {
+        logger.child({ jobId: this.jobId }).warn('Failed to set stream TTL', { error: String(err) });
+      }
     }
   }
 }

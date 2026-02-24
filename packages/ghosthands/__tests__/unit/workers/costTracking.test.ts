@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach } from 'vitest';
-import { CostTracker, BudgetExceededError } from '../../../src/workers/costControl';
+import { CostTracker, BudgetExceededError, TASK_BUDGET } from '../../../src/workers/costControl';
 import { ProgressTracker } from '../../../src/workers/progressTracker';
 
 // ---------------------------------------------------------------------------
@@ -144,14 +144,14 @@ describe('CostTracker cost calculation', () => {
   });
 
   test('throws BudgetExceededError when cost exceeds task budget', () => {
-    // 'quality' preset has $0.30 budget
-    // Simulate a large usage that exceeds it
+    // Simulate a large usage that exceeds the quality preset budget
+    const overBudgetCost = TASK_BUDGET.quality + 0.05;
     expect(() => {
       tracker.recordTokenUsage({
         inputTokens: 100_000,
         outputTokens: 50_000,
-        inputCost: 0.20,
-        outputCost: 0.15,
+        inputCost: overBudgetCost / 2,
+        outputCost: overBudgetCost / 2,
       });
     }).toThrow(BudgetExceededError);
   });
