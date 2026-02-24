@@ -2485,14 +2485,48 @@ ${dataBlock}`;
         };
       });
 
-      // Review detection scans ALL buttons (page-wide) — a Submit button anywhere
-      // with no Next button anywhere means this is the review page.
+      // Review detection: Submit button present + no Next button.
+      // BUT single-page forms (like Lever) also have Submit + no Next.
+      // Only treat as review if there are no empty required fields remaining.
       const hasSubmit = allButtonTexts.some(b => b.text === 'submit' || b.text === 'submit application');
       const hasNext = allButtonTexts.some(b =>
         NEXT_TEXTS.indexOf(b.text) !== -1 || NEXT_INCLUDES.some(s => b.text.indexOf(s) !== -1)
       );
 
-      if (hasSubmit && !hasNext) return 'review_detected' as const;
+      if (hasSubmit && !hasNext) {
+        // Check for unfilled form fields — if any exist, this is a single-page
+        // form still being filled, NOT the review page.
+        const emptyInputs = Array.from(document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(
+          'input[type="text"]:not([readonly]):not([disabled]):not([type="hidden"]), ' +
+          'input[type="email"]:not([readonly]):not([disabled]), ' +
+          'input[type="tel"]:not([readonly]):not([disabled]), ' +
+          'textarea:not([readonly]):not([disabled]), ' +
+          'select:not([disabled])'
+        )).filter(el => {
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) return false; // hidden
+          const val = el.value?.trim() || '';
+          return val === '' || val === el.getAttribute('placeholder');
+        });
+
+        // Also check for unfilled radio groups (no option selected)
+        const radioGroups = new Set<string>();
+        document.querySelectorAll<HTMLInputElement>('input[type="radio"]').forEach(r => {
+          if (r.name) radioGroups.add(r.name);
+        });
+        let unfilledRadios = 0;
+        radioGroups.forEach(name => {
+          const checked = document.querySelector<HTMLInputElement>(`input[type="radio"][name="${name}"]:checked`);
+          if (!checked) unfilledRadios++;
+        });
+
+        if (emptyInputs.length > 0 || unfilledRadios > 0) {
+          // Still has unfilled fields — this is a single-page form, not review
+          return 'not_found' as const;
+        }
+
+        return 'review_detected' as const;
+      }
 
       // Only click buttons that are visible in the current viewport.
       // If the Next button is below the fold, the orchestrator will scroll to it.
