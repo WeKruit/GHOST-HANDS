@@ -78,7 +78,8 @@ const RETRYABLE_ERRORS = new Set([
   'internal_error',
 ]);
 
-const HEARTBEAT_INTERVAL_MS = 30_000;
+const HEARTBEAT_INTERVAL_MS = 10_000;
+const MAX_HEARTBEAT_FAILURES = 3;
 const DEFAULT_HITL_TIMEOUT_SECONDS = 300; // 5 minutes
 const MAX_CRASH_RECOVERIES = 2;
 const BLOCKER_CONFIDENCE_THRESHOLD = 0.6;
@@ -154,6 +155,7 @@ export class JobExecutor {
   private resumeDownloader: ResumeDownloader;
   private _cancelled = false;
   private _activeAdapter: BrowserAutomationAdapter | null = null;
+  private _executionAttemptId: string | null = null;
 
   constructor(opts: JobExecutorOptions) {
     this.supabase = opts.supabase;
@@ -168,12 +170,14 @@ export class JobExecutor {
   async execute(job: AutomationJob): Promise<void> {
     this._cancelled = false;
     this._activeAdapter = null;
+    this._executionAttemptId = crypto.randomUUID();
     const heartbeat = this.startHeartbeat(job.id);
     let adapter: BrowserAutomationAdapter | null = null;
     let observer: StagehandObserver | undefined;
     let blockerCheckInterval: ReturnType<typeof setInterval> | null = null;
     let resumeFilePath: string | null = null;
     let fileChooserHandler: ((chooser: any) => Promise<void>) | null = null;
+    let cancelListenClient: pg.PoolClient | null = null;
 
     // Initialize cost tracker with budget limits
     const qualityPreset = resolveQualityPreset(job.input_data, job.metadata);
@@ -195,6 +199,43 @@ export class JobExecutor {
     });
 
     try {
+      // 0a. Stamp execution_attempt_id to prevent duplicate execution (EC3)
+      if (this.pgPool) {
+        await this.pgPool.query(
+          'UPDATE gh_automation_jobs SET execution_attempt_id = $1 WHERE id = $2',
+          [this._executionAttemptId, job.id],
+        );
+        logger.info('Stamped execution attempt', { jobId: job.id, executionAttemptId: this._executionAttemptId });
+      }
+
+      // 0b. Subscribe to instant cancel channel (EC2 — LISTEN/NOTIFY)
+      if (this.pgPool) {
+        try {
+          cancelListenClient = await this.pgPool.connect();
+          const cancelChannel = `gh_job_cancel_${job.id}`;
+          await cancelListenClient.query(`LISTEN "${cancelChannel}"`);
+          cancelListenClient.on('notification', (msg: pg.Notification) => {
+            if (msg.channel === cancelChannel) {
+              logger.info('Received instant cancel NOTIFY', { jobId: job.id });
+              this._cancelled = true;
+              if (this._activeAdapter) {
+                this._activeAdapter.stop().catch(() => {});
+              }
+            }
+          });
+        } catch (err) {
+          logger.warn('Failed to set up cancel LISTEN channel', {
+            jobId: job.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          // Non-fatal — heartbeat polling still catches cancellation
+          if (cancelListenClient) {
+            try { cancelListenClient.release(); } catch { /* noop */ }
+            cancelListenClient = null;
+          }
+        }
+      }
+
       // 0. Pre-flight budget check (skip in development)
       const isDev = (process.env.NODE_ENV || 'development') === 'development';
       const preflight = isDev
@@ -1065,7 +1106,15 @@ export class JobExecutor {
     } finally {
       clearInterval(heartbeat);
       this._activeAdapter = null;
+      this._executionAttemptId = null;
       if (blockerCheckInterval) clearInterval(blockerCheckInterval);
+      // Clean up cancel LISTEN subscription (EC2)
+      if (cancelListenClient) {
+        try {
+          await cancelListenClient.query(`UNLISTEN "gh_job_cancel_${job.id}"`);
+          cancelListenClient.release();
+        } catch { /* connection may already be closed */ }
+      }
       if (observer) {
         try { await observer.stop(); } catch { /* best-effort cleanup */ }
       }
@@ -1628,14 +1677,19 @@ export class JobExecutor {
   // --- Heartbeat ---
 
   private startHeartbeat(jobId: string): ReturnType<typeof setInterval> {
+    let consecutiveFailures = 0;
+
     return setInterval(async () => {
       try {
         const { data } = await this.supabase
           .from('gh_automation_jobs')
           .update({ last_heartbeat: new Date().toISOString() })
           .eq('id', jobId)
-          .select('status')
+          .select('status, execution_attempt_id')
           .single();
+
+        // Heartbeat succeeded — reset failure counter (EC8)
+        consecutiveFailures = 0;
 
         // Detect external cancellation (e.g. user clicked cancel in VALET)
         if (data?.status === 'cancelled') {
@@ -1645,8 +1699,43 @@ export class JobExecutor {
             try { await this._activeAdapter.stop(); } catch { /* adapter may already be stopped */ }
           }
         }
+
+        // EC3: Verify execution_attempt_id — another worker may have taken over
+        if (
+          this._executionAttemptId &&
+          data?.execution_attempt_id &&
+          data.execution_attempt_id !== this._executionAttemptId
+        ) {
+          getLogger().warn('Execution attempt ID mismatch — another worker has claimed this job', {
+            jobId,
+            ours: this._executionAttemptId,
+            theirs: data.execution_attempt_id,
+          });
+          this._cancelled = true;
+          if (this._activeAdapter) {
+            try { await this._activeAdapter.stop(); } catch { /* adapter may already be stopped */ }
+          }
+        }
       } catch (err) {
-        getLogger().warn('Heartbeat failed', { jobId, error: err instanceof Error ? err.message : String(err) });
+        // EC8: Track consecutive heartbeat failures
+        consecutiveFailures++;
+        getLogger().warn('Heartbeat failed', {
+          jobId,
+          consecutiveFailures,
+          error: err instanceof Error ? err.message : String(err),
+        });
+
+        if (consecutiveFailures >= MAX_HEARTBEAT_FAILURES) {
+          getLogger().error('Aborting job after consecutive heartbeat failures', {
+            jobId,
+            consecutiveFailures,
+            maxAllowed: MAX_HEARTBEAT_FAILURES,
+          });
+          this._cancelled = true;
+          if (this._activeAdapter) {
+            try { await this._activeAdapter.stop(); } catch { /* adapter may already be stopped */ }
+          }
+        }
       }
     }, HEARTBEAT_INTERVAL_MS);
   }
