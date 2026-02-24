@@ -1864,7 +1864,12 @@ ${dataBlock}`;
       return 1;
     }
 
-    // Fallback: press Enter to accept the top suggestion
+    // Arrow-scroll fallback — the search/filter may not have worked (some comboboxes
+    // show all options without filtering). Try arrow-scrolling through the list.
+    const arrowMatch = await this.arrowScrollToOption(adapter, answer);
+    if (arrowMatch) return 1;
+
+    // Final fallback: press Enter to accept the top suggestion
     await adapter.page.keyboard.press('Enter');
     await adapter.page.waitForTimeout(300);
     return 1;
@@ -1873,6 +1878,7 @@ ${dataBlock}`;
   /**
    * Fill a click-to-open dropdown: click trigger, find the matching option in the
    * popup, and click it. Uses Playwright's auto-scroll within the popup element.
+   * 3-phase strategy: direct DOM match → type-ahead → arrow-scroll.
    */
   private async fillClickableDropdown(
     adapter: BrowserAutomationAdapter,
@@ -1929,10 +1935,126 @@ ${dataBlock}`;
       }
     }
 
-    // No match found — close the dropdown by pressing Escape
+    // Phase B: Type-ahead — many dropdowns jump to matching items when you type
+    const typeAheadPrefix = answer.substring(0, Math.min(3, answer.length));
+    console.log(`[GenericConfig] [Dropdown] Type-ahead: "${typeAheadPrefix}" for "${answer}"`);
+    await adapter.page.keyboard.type(typeAheadPrefix, { delay: 80 });
+    await adapter.page.waitForTimeout(500);
+
+    const typeAheadMatch = await adapter.page.evaluate((normAns: string) => {
+      const options = document.querySelectorAll(
+        '[role="option"], [role="listbox"] li, [role="menu"] [role="menuitem"], ' +
+        '[class*="option"], [class*="menu-item"], [class*="dropdown-item"], li[data-value]'
+      );
+      for (const opt of options) {
+        const rect = (opt as HTMLElement).getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        const text = (opt.textContent || '').trim().toLowerCase();
+        if (!text) continue;
+        if (text === normAns || text.includes(normAns) || (text.length > 2 && normAns.includes(text))) {
+          (opt as HTMLElement).click();
+          return true;
+        }
+      }
+      // Check focused/aria-selected option
+      const focused = document.querySelector(
+        '[role="option"][aria-selected="true"], [role="option"]:focus, [role="option"].highlighted'
+      );
+      if (focused) {
+        const fText = (focused.textContent || '').trim().toLowerCase();
+        if (fText === normAns || fText.includes(normAns) || (fText.length > 2 && normAns.includes(fText))) {
+          (focused as HTMLElement).click();
+          return true;
+        }
+      }
+      return false;
+    }, normAnswer);
+
+    if (typeAheadMatch) {
+      await adapter.page.waitForTimeout(300);
+      return 1;
+    }
+
+    // Verify dropdown is still open after type-ahead (some dropdowns close on unrecognized input)
+    const dropdownStillOpen = await adapter.page.evaluate(() => {
+      const listbox = document.querySelector('[role="listbox"], [role="menu"], [class*="dropdown-menu"]');
+      if (!listbox) return false;
+      const rect = (listbox as HTMLElement).getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+    if (!dropdownStillOpen) {
+      await trigger.click();
+      await adapter.page.waitForTimeout(500);
+    }
+
+    // Phase C: Arrow-scroll through options for virtualized/long lists
+    console.log(`[GenericConfig] [Dropdown] Arrow-scrolling through options for "${answer}"...`);
+    const arrowMatch = await this.arrowScrollToOption(adapter, answer);
+    if (arrowMatch) return 1;
+
+    // All phases failed — close and return 0
     await adapter.page.keyboard.press('Escape');
     await adapter.page.waitForTimeout(200);
     return 0;
+  }
+
+  /**
+   * Arrow-scroll through an open dropdown to find and click a matching option.
+   * Assumes dropdown is already open. Uses Home → repeated ArrowDown batches.
+   * Mirrors workdayConfig.ts clickDropdownOption() Phase 3.
+   */
+  private async arrowScrollToOption(
+    adapter: BrowserAutomationAdapter,
+    answer: string,
+  ): Promise<boolean> {
+    const normAnswer = answer.toLowerCase().trim();
+
+    await adapter.page.keyboard.press('Home');
+    await adapter.page.waitForTimeout(100);
+
+    const MAX_ATTEMPTS = 40; // ~120 options traversed (3 per step)
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      for (let k = 0; k < 3; k++) {
+        await adapter.page.keyboard.press('ArrowDown');
+        await adapter.page.waitForTimeout(80);
+      }
+
+      const result = await adapter.page.evaluate((normAns: string) => {
+        // Check focused/selected option first (ArrowDown moves focus)
+        const focused = document.querySelector(
+          '[role="option"][aria-selected="true"], [role="option"]:focus, ' +
+          '[role="option"].highlighted, [role="option"].active, ' +
+          'li.highlighted, li:focus, [class*="option"][class*="focused"]'
+        );
+        if (focused) {
+          const text = (focused.textContent || '').trim().toLowerCase();
+          if (text === normAns || text.includes(normAns) || (text.length > 2 && normAns.includes(text))) {
+            (focused as HTMLElement).click();
+            return 'clicked';
+          }
+        }
+
+        // Also scan all currently-rendered options
+        const options = document.querySelectorAll(
+          '[role="option"], [role="listbox"] li, [role="menu"] [role="menuitem"], ' +
+          '[class*="option"], [class*="menu-item"], [class*="dropdown-item"], li[data-value]'
+        );
+        for (const opt of options) {
+          const rect = (opt as HTMLElement).getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          const text = (opt.textContent || '').trim().toLowerCase();
+          if (text === normAns || text.includes(normAns) || (text.length > 2 && normAns.includes(text))) {
+            (opt as HTMLElement).click();
+            return 'clicked';
+          }
+        }
+        return 'not_found';
+      }, normAnswer);
+
+      if (result === 'clicked') return true;
+    }
+
+    return false;
   }
 
   async fillDateFieldsProgrammatically(
@@ -2487,16 +2609,18 @@ ${dataBlock}`;
 
       // Review detection: Submit button present + no Next button.
       // BUT single-page forms (like Lever) also have Submit + no Next.
-      // Only treat as review if there are no empty required fields remaining.
-      const hasSubmit = allButtonTexts.some(b => b.text === 'submit' || b.text === 'submit application');
+      // Only block review if REQUIRED fields are still empty (optional empties are OK).
+      const SUBMIT_TEXTS = ['submit', 'submit application', 'submit my application', 'submit this application', 'apply', 'apply now', 'send application'];
+      const hasSubmit = allButtonTexts.some(b =>
+        SUBMIT_TEXTS.indexOf(b.text) !== -1 || b.text.startsWith('submit')
+      );
       const hasNext = allButtonTexts.some(b =>
         NEXT_TEXTS.indexOf(b.text) !== -1 || NEXT_INCLUDES.some(s => b.text.indexOf(s) !== -1)
       );
 
       if (hasSubmit && !hasNext) {
-        // Check for unfilled form fields — if any exist, this is a single-page
-        // form still being filled, NOT the review page.
-        const emptyInputs = Array.from(document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(
+        // Gather all visible empty inputs
+        const allEmptyInputs = Array.from(document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(
           'input[type="text"]:not([readonly]):not([disabled]):not([type="hidden"]), ' +
           'input[type="email"]:not([readonly]):not([disabled]), ' +
           'input[type="tel"]:not([readonly]):not([disabled]), ' +
@@ -2509,19 +2633,38 @@ ${dataBlock}`;
           return val === '' || val === el.getAttribute('placeholder');
         });
 
-        // Also check for unfilled radio groups (no option selected)
+        // Only block review for REQUIRED empty fields (not optional ones like EEO)
+        const requiredEmpty = allEmptyInputs.filter(el => {
+          if (el.required || el.getAttribute('aria-required') === 'true') return true;
+          // Check associated label for * marker
+          const id = el.id;
+          if (id) {
+            const label = document.querySelector(`label[for="${id}"]`);
+            if (label && /\*/.test(label.textContent || '')) return true;
+          }
+          // Check parent/ancestor for required indicator
+          if (el.closest('.required, [class*="required"]')) return true;
+          return false;
+        });
+
+        // Check radio groups — only required ones block review
         const radioGroups = new Set<string>();
         document.querySelectorAll<HTMLInputElement>('input[type="radio"]').forEach(r => {
           if (r.name) radioGroups.add(r.name);
         });
-        let unfilledRadios = 0;
+        let unfilledRequiredRadios = 0;
         radioGroups.forEach(name => {
+          const radios = document.querySelectorAll<HTMLInputElement>(`input[type="radio"][name="${name}"]`);
+          const isRequired = Array.from(radios).some(r =>
+            r.required || r.getAttribute('aria-required') === 'true'
+          );
+          if (!isRequired) return;
           const checked = document.querySelector<HTMLInputElement>(`input[type="radio"][name="${name}"]:checked`);
-          if (!checked) unfilledRadios++;
+          if (!checked) unfilledRequiredRadios++;
         });
 
-        if (emptyInputs.length > 0 || unfilledRadios > 0) {
-          // Still has unfilled fields — this is a single-page form, not review
+        // Block review if: required fields are empty, OR many empties (form barely started)
+        if (requiredEmpty.length > 0 || unfilledRequiredRadios > 0 || allEmptyInputs.length >= 5) {
           return 'not_found' as const;
         }
 
