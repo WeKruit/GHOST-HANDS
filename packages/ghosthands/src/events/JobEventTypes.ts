@@ -73,6 +73,9 @@ export const JOB_EVENT_TYPES = {
   // Trace
   TRACE_RECORDING_STARTED: 'trace_recording_started',
   TRACE_RECORDING_COMPLETED: 'trace_recording_completed',
+
+  // Form submission (used by recovery to detect partial applications)
+  FORM_SUBMITTED: 'form_submitted',
 } as const;
 
 export type JobEventType = (typeof JOB_EVENT_TYPES)[keyof typeof JOB_EVENT_TYPES];

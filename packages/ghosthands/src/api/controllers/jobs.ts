@@ -7,6 +7,7 @@ import {
   CANCELLABLE_STATUSES,
   RETRYABLE_STATUSES,
 } from '../schemas/index.js';
+import { getLogger } from '../../monitoring/logger.js';
 
 const { Pool } = pg;
 
@@ -113,10 +114,25 @@ export class JobController {
     if (!job) return { notFound: true as const };
 
     if (!CANCELLABLE_STATUSES.includes(job.status)) {
+      // EC6: Structured logging for 409 cancel attempts on non-cancellable jobs
+      const terminalStates = ['completed', 'failed', 'cancelled'];
+      const reason = terminalStates.includes(job.status)
+        ? `job already in terminal state: ${job.status}`
+        : `job in non-cancellable state: ${job.status}`;
+
+      getLogger({ service: 'job-controller' }).warn('Cancel rejected — job not cancellable', {
+        jobId,
+        currentStatus: job.status,
+        requestedAction: 'cancel',
+        reason,
+        timestamp: new Date().toISOString(),
+      });
+
       return {
         notFound: false as const,
         notCancellable: true as const,
         current_status: job.status,
+        reason,
       };
     }
 

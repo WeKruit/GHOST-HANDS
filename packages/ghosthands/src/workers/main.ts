@@ -1,5 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
-import { Client as PgClient } from 'pg';
+import { Client as PgClient, Pool as PgPool } from 'pg';
 import { PgBoss } from 'pg-boss';
 import Redis from 'ioredis';
 import { JobPoller } from './JobPoller.js';
@@ -113,10 +113,23 @@ async function main(): Promise<void> {
     logger.info('No REDIS_URL configured — progress will use DB only');
   }
 
+  // EC2/EC3: Create pg.Pool for LISTEN/NOTIFY and execution_attempt_id.
+  // MUST use direct URL (port 5432), not pgbouncer — LISTEN state is
+  // dropped by transaction pooler.
+  const directUrl = process.env.DATABASE_DIRECT_URL || process.env.SUPABASE_DIRECT_URL;
+  let pgPool: PgPool | undefined;
+  if (directUrl) {
+    pgPool = new PgPool({ connectionString: directUrl, max: 3 });
+    logger.info('Created pgPool for LISTEN/NOTIFY (direct URL)');
+  } else {
+    logger.warn('No DATABASE_DIRECT_URL or SUPABASE_DIRECT_URL — EC2/EC3 features disabled');
+  }
+
   const executor = new JobExecutor({
     supabase,
     workerId: WORKER_ID,
     ...(redis && { redis }),
+    ...(pgPool && { pgPool }),
   });
 
   // ── Dispatch mode: pg-boss queue vs legacy LISTEN/NOTIFY poller ──
@@ -194,6 +207,11 @@ async function main(): Promise<void> {
       } catch {
         // Connection may already be closed
       }
+    }
+
+    // Close pgPool (EC2/EC3 LISTEN/NOTIFY)
+    if (pgPool) {
+      try { await pgPool.end(); } catch { /* already closed */ }
     }
 
     try {
