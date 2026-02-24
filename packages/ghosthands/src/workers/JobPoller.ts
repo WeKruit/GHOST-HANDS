@@ -232,10 +232,11 @@ export class JobPoller {
             const completedDueToProgress: string[] = [];
 
             for (const jobId of stuckJobIds) {
-                // EC3: Check if the job has any form_submitted events
+                // EC3: Check if the job has any events indicating meaningful progress
+                // (form_submitted, or cookbook steps that indicate form-filling occurred)
                 const eventsResult = await this.pgDirect.query(
                     `SELECT COUNT(*) as cnt FROM gh_job_events
-                     WHERE job_id = $1::UUID AND event_type = 'form_submitted'`,
+                     WHERE job_id = $1::UUID AND event_type IN ('form_submitted', 'cookbook_step_completed', 'step_completed')`,
                     [jobId],
                 );
                 const hasFormSubmitted = parseInt(eventsResult.rows[0]?.cnt || '0', 10) > 0;
