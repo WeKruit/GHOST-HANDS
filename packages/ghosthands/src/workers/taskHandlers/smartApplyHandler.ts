@@ -726,7 +726,7 @@ ${dataPrompt}`,
   ): Promise<'navigated' | 'review' | 'complete'> {
     const MAX_DEPTH = 3;     // max recursive retries on validation errors
     const MAX_CYCLES = 5;    // max scan-fill-rescan cycles (for conditional fields)
-    const MAX_LLM_CALLS = 6;
+    const MAX_LLM_CALLS = 100;
     let llmCalls = _llmCallsCarried;
 
     if (_depth >= MAX_DEPTH) {
@@ -853,7 +853,7 @@ ${dataPrompt}`,
 
           if (visibleFields.length > 0) {
             const groupContext = this.buildScanContextForLLM(visibleFields);
-            const enrichedPrompt = `${fillPrompt}\n\nFIELDS VISIBLE IN CURRENT VIEWPORT (${visibleFields.length} field(s) detected by scan):\n${groupContext}\n\nFill the fields listed above. They are currently visible and empty. Use the expected values shown where provided.\n\nADDITIONALLY: If you see any other visible empty required fields on screen (marked with * or "required") that are NOT listed above, fill those too. Some custom dropdowns or non-standard UI components may not appear in the scan. For dropdowns that don't have a text input, click them to open, then select the correct option.\n\nCRITICAL: NEVER skip a [REQUIRED] field (marked with * or [REQUIRED]). If no exact data is available, use your best judgment to pick the most reasonable answer. For example, "Degree Status" → "Completed" or "Graduated", "Visa Status" → "Authorized to work", etc. Required fields MUST be filled.\n\nIMPORTANT — STUCK FIELD RULE: If you type a value into a dropdown/autocomplete field and NO matching options appear in the dropdown list, the value is NOT available. Do NOT retry the same field. Do NOT try clicking arrows, pressing Enter, retyping, or scrolling the dropdown. Instead: select all text in the field, delete it to clear it, click somewhere else to close any popups, then move on to the next field. You get ONE attempt per field — if it doesn't match, clear it and move on.\n\nDo NOT scroll or click Next.`;
+            const enrichedPrompt = `${fillPrompt}\n\nFIELDS VISIBLE IN CURRENT VIEWPORT (${visibleFields.length} field(s) detected by scan):\n${groupContext}\n\nFill the fields listed above. They are currently visible and empty. Use the expected values shown where provided.\n\nADDITIONALLY: If you see any other visible empty required fields on screen (marked with * or "required") that are NOT listed above, fill those too. Some custom dropdowns or non-standard UI components may not appear in the scan. For dropdowns that don't have a text input, click them to open, then select the correct option.\n\nCRITICAL: NEVER skip a [REQUIRED] field (marked with * or [REQUIRED]). If no exact data is available, use your best judgment to pick the most reasonable answer. For example, "Degree Status" → "Completed" or "Graduated", "Visa Status" → "Authorized to work", etc. Required fields MUST be filled.\n\nIMPORTANT — STUCK FIELD RULE: If you type a value into a dropdown/autocomplete field and NO matching options appear in the dropdown list, the value is NOT available. Do NOT retry the same field or retype the same value. Instead: select all text in the field, delete it to clear it, click somewhere else to close any popups, then move on to the next field. You get ONE attempt per field — if it doesn't match, clear it and move on.\n\nDROPDOWN NAVIGATION: For click-to-open dropdowns (not search/type fields) showing a long list of options where the option you need is not visible, you MAY press ArrowDown repeatedly to scroll through options within the dropdown, then press Enter or click to select. This scrolls within the dropdown only, not the page.\n\nDo NOT scroll the page or click Next.`;
 
             const fieldsBefore = await this.getVisibleFieldValues(adapter);
             const checkedBefore = await this.getCheckedCheckboxes(adapter);
@@ -887,6 +887,76 @@ ${dataPrompt}`,
           await adapter.page.evaluate((y: number) => window.scrollTo(0, y), currentScrollPos);
           await adapter.page.waitForTimeout(400);
           llmScrollSteps++;
+        }
+      }
+
+      // ── POST-WALK CLEANUP ──
+      // After the viewport walk, fields at the viewport edge may have been seen
+      // but not filled (LLM reported them "cut off"). Scroll to each remaining
+      // unfilled field and attempt a targeted fill.
+      const postWalkUnfilled = scan.fields.filter(f =>
+        !f.filled && (!f.currentValue || f.currentValue.trim() === '') &&
+        f.kind !== 'file' && f.kind !== 'upload_button'
+      );
+
+      if (postWalkUnfilled.length > 0) {
+        console.log(`[SmartApply] [${pageLabel}] Post-walk cleanup: ${postWalkUnfilled.length} field(s) still unfilled`);
+
+        for (const field of postWalkUnfilled) {
+          const answer = field.matchedAnswer || findBestAnswer(field.label, qaMap);
+          if (!answer) continue;
+
+          // Scroll the field fully into view
+          if (field.selector) {
+            try {
+              await adapter.page.evaluate(
+                (sel: string) => document.querySelector(sel)?.scrollIntoView({ block: 'center' }),
+                field.selector,
+              );
+              await adapter.page.waitForTimeout(300);
+            } catch {}
+          }
+
+          try {
+            const ok = await config.fillScannedField(adapter, field, answer);
+            if (ok) {
+              field.filled = true;
+              domFills++;
+              console.log(`[SmartApply] [${pageLabel}] Post-walk filled "${field.label}" → "${answer.substring(0, 30)}${answer.length > 30 ? '...' : ''}" (${field.kind})`);
+            }
+          } catch (err) {
+            console.warn(`[SmartApply] [${pageLabel}] Post-walk DOM fill failed for "${field.label}": ${err}`);
+          }
+        }
+
+        // For fields that DOM fill couldn't handle, do one targeted LLM call
+        const stillUnfilled = postWalkUnfilled.filter(f => !f.filled);
+        if (stillUnfilled.length > 0 && llmCalls < MAX_LLM_CALLS + 2) {
+          // Scroll to the first unfilled field
+          const target = stillUnfilled[0];
+          if (target.selector) {
+            try {
+              await adapter.page.evaluate(
+                (sel: string) => document.querySelector(sel)?.scrollIntoView({ block: 'center' }),
+                target.selector,
+              );
+              await adapter.page.waitForTimeout(300);
+            } catch {}
+          }
+
+          const visibleFields = await this.scanVisibleUnfilledFields(adapter, config, qaMap);
+          if (visibleFields.length > 0) {
+            const groupContext = this.buildScanContextForLLM(visibleFields);
+            const cleanupPrompt = `${fillPrompt}\n\nFIELDS VISIBLE IN CURRENT VIEWPORT (${visibleFields.length} field(s) detected by scan):\n${groupContext}\n\nFill the fields listed above. They are currently visible and empty. Use the expected values shown where provided.\n\nCRITICAL: NEVER skip a [REQUIRED] field (marked with * or [REQUIRED]). If no exact data is available, use your best judgment to pick the most reasonable answer.\n\nDo NOT scroll the page or click Next.`;
+
+            console.log(`[SmartApply] [${pageLabel}] Post-walk LLM cleanup for ${visibleFields.length} remaining field(s): ${visibleFields.map(f => `"${f.label}"`).join(', ')}`);
+            try {
+              await this.safeAct(adapter, cleanupPrompt, pageLabel);
+              llmCalls++;
+            } catch (err) {
+              console.warn(`[SmartApply] [${pageLabel}] Post-walk LLM call failed: ${err instanceof Error ? err.message : err}`);
+            }
+          }
         }
       }
 
@@ -979,6 +1049,22 @@ ${dataPrompt}`,
         console.log(`[SmartApply] [${pageLabel}] Review page detected at content bottom.`);
         return 'review';
       }
+    }
+
+    // Fallback review detection: if clickNextButton() couldn't advance the page
+    // (no Next/Submit matched its patterns), check if we're on a single-page form
+    // that's done filling. If there's any submit-like button and few/no unfilled
+    // fields, treat as review so the user can take over.
+    const hasSubmitFallback = await adapter.page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a.btn'));
+      return btns.some(b => {
+        const text = (b.textContent || (b as HTMLInputElement).value || '').trim().toLowerCase();
+        return text.includes('submit') || text === 'apply' || text === 'apply now' || text === 'send application';
+      });
+    });
+    if (hasSubmitFallback) {
+      console.log(`[SmartApply] [${pageLabel}] Submit button present but clickNextButton() didn't match — treating as review.`);
+      return 'review';
     }
 
     console.log(`[SmartApply] [${pageLabel}] Page complete. LLM calls: ${llmCalls}`);
