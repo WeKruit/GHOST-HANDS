@@ -1,0 +1,4 @@
+network:
+  protocol: http
+  max_clients: 1
+  disconnect_clients: true
