@@ -59,5 +59,9 @@ resumeTemp*
 test-user-data*
 test-*-data*
 
+# Kamal
+.kamal/secrets
+config/deploy.*.yml
+
 # Magnitude source (backup of upstream monorepo)
 magnitude-source/
