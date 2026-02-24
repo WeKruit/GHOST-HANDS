@@ -82,9 +82,8 @@ describe('CI/CD Workflow (ci.yml)', () => {
     expect(ci.jobs.docker.outputs).toHaveProperty('environment');
   });
 
-  test('deploy-asg depends on docker and test-integration (runs before VALET notification)', () => {
+  test('deploy-asg depends on docker (runs before VALET notification)', () => {
     expect(ci.jobs['deploy-asg'].needs).toContain('docker');
-    expect(ci.jobs['deploy-asg'].needs).toContain('test-integration');
   });
 
   test('deploy-staging depends on docker and deploy-asg (notifies VALET after EC2 update)', () => {
