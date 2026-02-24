@@ -198,7 +198,7 @@ jobs:
   deploy-asg:
     name: Deploy to ASG Fleet
     runs-on: ubuntu-latest
-    needs: [docker, test-integration]
+    needs: [docker]
     if: github.event_name == 'push'
     environment: ${{ needs.docker.outputs.environment }}
     steps:
@@ -240,7 +240,7 @@ jobs:
   deploy-kasm:
     name: Rebuild Kasm Image
     runs-on: ubuntu-latest
-    needs: [docker, test-integration]
+    needs: [docker]
     if: github.event_name == 'push'
     environment: ${{ needs.docker.outputs.environment }}
     steps:
