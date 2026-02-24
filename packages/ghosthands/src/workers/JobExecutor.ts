@@ -152,6 +152,8 @@ export class JobExecutor {
   private hitlTimeoutSeconds: number;
   private blockerDetector = new BlockerDetector();
   private resumeDownloader: ResumeDownloader;
+  private _cancelled = false;
+  private _activeAdapter: BrowserAutomationAdapter | null = null;
 
   constructor(opts: JobExecutorOptions) {
     this.supabase = opts.supabase;
@@ -164,6 +166,8 @@ export class JobExecutor {
   }
 
   async execute(job: AutomationJob): Promise<void> {
+    this._cancelled = false;
+    this._activeAdapter = null;
     const heartbeat = this.startHeartbeat(job.id);
     let adapter: BrowserAutomationAdapter | null = null;
     let observer: StagehandObserver | undefined;
@@ -361,6 +365,7 @@ export class JobExecutor {
       // 7. Create and start adapter
       const adapterType = (process.env.GH_BROWSER_ENGINE || 'magnitude') as AdapterType;
       adapter = createAdapter(adapterType);
+      this._activeAdapter = adapter;
       const headless = process.env.GH_HEADLESS !== 'false'; // default true
       await adapter.start({
         url: job.target_url,
@@ -973,6 +978,28 @@ export class JobExecutor {
 
       getLogger().info('Job completed via handler', { jobId: job.id, handler: handler.type, actionCount: finalCost.actionCount, totalTokens: finalCost.inputTokens + finalCost.outputTokens, costUsd: finalCost.totalCost });
     } catch (error: unknown) {
+      // Handle external cancellation (heartbeat detected cancelled status)
+      if (this._cancelled) {
+        getLogger().info('Job was cancelled by user', { jobId: job.id });
+        await progress.setStep(ProgressStep.FAILED);
+        await progress.flush();
+        const snapshot = costTracker.getSnapshot();
+        await costService.recordJobCost(job.user_id, job.id, snapshot).catch(() => {});
+        if (job.callback_url) {
+          callbackNotifier.notifyFromJob({
+            id: job.id,
+            valet_task_id: job.valet_task_id,
+            callback_url: job.callback_url,
+            status: 'cancelled',
+            worker_id: this.workerId,
+            llm_cost_cents: Math.round(snapshot.totalCost * 100),
+            action_count: snapshot.actionCount,
+            total_tokens: snapshot.inputTokens + snapshot.outputTokens,
+          }).catch(() => {});
+        }
+        return;
+      }
+
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorCode = this.classifyError(errorMessage);
 
@@ -1037,6 +1064,7 @@ export class JobExecutor {
       }
     } finally {
       clearInterval(heartbeat);
+      this._activeAdapter = null;
       if (blockerCheckInterval) clearInterval(blockerCheckInterval);
       if (observer) {
         try { await observer.stop(); } catch { /* best-effort cleanup */ }
@@ -1602,10 +1630,21 @@ export class JobExecutor {
   private startHeartbeat(jobId: string): ReturnType<typeof setInterval> {
     return setInterval(async () => {
       try {
-        await this.supabase
+        const { data } = await this.supabase
           .from('gh_automation_jobs')
           .update({ last_heartbeat: new Date().toISOString() })
-          .eq('id', jobId);
+          .eq('id', jobId)
+          .select('status')
+          .single();
+
+        // Detect external cancellation (e.g. user clicked cancel in VALET)
+        if (data?.status === 'cancelled') {
+          getLogger().info('Job cancelled externally, stopping execution', { jobId });
+          this._cancelled = true;
+          if (this._activeAdapter) {
+            try { await this._activeAdapter.stop(); } catch { /* adapter may already be stopped */ }
+          }
+        }
       } catch (err) {
         getLogger().warn('Heartbeat failed', { jobId, error: err instanceof Error ? err.message : String(err) });
       }
