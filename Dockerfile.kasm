@@ -95,8 +95,13 @@ USER root
 COPY scripts/kasm-startup.sh /dockerstartup/custom_startup.sh
 RUN chmod +x /dockerstartup/custom_startup.sh
 
-# WEK-147: KasmVNC exclusive session config (max 1 client, disconnect others)
+# KasmVNC config
 COPY config/kasmvnc.yaml /etc/kasmvnc/kasmvnc.yaml
+
+# Generate snakeoil SSL cert (KasmVNC startup expects it even when protocol=http)
+RUN apt-get update && apt-get install -y --no-install-recommends ssl-cert \
+    && rm -rf /var/lib/apt/lists/* \
+    && make-ssl-cert generate-default-snakeoil
 
 # Expose GH worker API port (mapped in Kasm workspace config)
 EXPOSE 3100
