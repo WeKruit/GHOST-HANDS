@@ -69,7 +69,7 @@ export function createApp() {
   if (!poolUrl) {
     throw new Error('Missing DATABASE_URL, SUPABASE_DIRECT_URL, or DATABASE_DIRECT_URL environment variable');
   }
-  const pgPool = new Pool({ connectionString: poolUrl, max: 5 });
+  const pgPool = new Pool({ connectionString: poolUrl, max: 3, idleTimeoutMillis: 30_000 });
   const jobController = new JobController({ pool: pgPool });
 
   api.route('/jobs', createJobRoutes(jobController));
