@@ -763,7 +763,7 @@ Development compose with hot-reload:
 
 ### 10.3 Deploy Script
 
-`scripts/deploy.sh` -- Called by VALET's deployment controller on EC2 instances.
+`scripts/deploy-manual.sh` (formerly `deploy.sh`) -- Manual escape hatch for EC2 deployments. Primary deploys use Kamal (`config/deploy.yml`).
 
 Commands:
 - `deploy <image-tag>` -- Pull from ECR, gracefully drain worker, docker compose up, health check

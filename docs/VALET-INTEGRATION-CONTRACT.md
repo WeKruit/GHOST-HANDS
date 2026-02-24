@@ -1410,12 +1410,12 @@ EC2 Instance
 │   └── worker     → polls gh_automation_jobs
 ├── gh-worker-abc  → targeted worker (Docker container)
 ├── gh-worker-def  → targeted worker (Docker container)
-└── scripts/deploy.sh
+└── scripts/deploy-manual.sh
 ```
 
 ### 15.2 Deploy Script Commands
 
-VALET calls `scripts/deploy.sh` on each EC2 instance via SSH:
+VALET calls `scripts/deploy-manual.sh` on each EC2 instance via SSH:
 
 | Command | Description | Drain? |
 |---------|-------------|--------|
@@ -1433,12 +1433,12 @@ VALET calls `scripts/deploy.sh` on each EC2 instance via SSH:
 VALET should follow this sequence per EC2 instance:
 
 ```
-1. ./scripts/deploy.sh drain
+1. ./scripts/deploy-manual.sh drain
    → Worker stops picking up new jobs
    → Active jobs finish (up to 60s)
    → API stays running (status polling still works)
 
-2. ./scripts/deploy.sh deploy <new-tag>
+2. ./scripts/deploy-manual.sh deploy <new-tag>
    → Pull new image from ECR
    → Restart compose (API + worker)
    → Restart all targeted workers
@@ -1460,13 +1460,13 @@ Targeted workers are standalone Docker containers that VALET manages for routing
 **Start:**
 
 ```bash
-ssh ec2-host "./scripts/deploy.sh start-worker user-abc-123"
+ssh ec2-host "./scripts/deploy-manual.sh start-worker user-abc-123"
 ```
 
 **Stop:**
 
 ```bash
-ssh ec2-host "./scripts/deploy.sh stop-worker user-abc-123"
+ssh ec2-host "./scripts/deploy-manual.sh stop-worker user-abc-123"
 ```
 
 **Route a job to a specific worker** by passing `target_worker_id` in the job creation request:
