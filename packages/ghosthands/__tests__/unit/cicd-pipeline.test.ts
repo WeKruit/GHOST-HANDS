@@ -130,9 +130,9 @@ describe('Rollback Workflow (rollback.yml)', () => {
 // ── Deploy Scripts ──────────────────────────────────────────────
 
 describe('Deploy Scripts', () => {
-  test('deploy.sh exists and is executable', () => {
-    expect(fileExists('scripts/deploy.sh')).toBe(true);
-    expect(isExecutable('scripts/deploy.sh')).toBe(true);
+  test('deploy-manual.sh exists and is executable', () => {
+    expect(fileExists('scripts/deploy-manual.sh')).toBe(true);
+    expect(isExecutable('scripts/deploy-manual.sh')).toBe(true);
   });
 
   test('deploy-to-asg.sh exists and is executable', () => {

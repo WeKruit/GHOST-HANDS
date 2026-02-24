@@ -53,7 +53,7 @@ git push (main or staging)
 │  ✅ EC2 Deploy Server (port 8000)                               │
 │     scripts/deploy-server.ts — Bun HTTP server                  │
 │     1. Verifies X-Deploy-Secret header                          │
-│     2. Runs scripts/deploy.sh deploy <image_tag>                │
+│     2. Runs scripts/deploy-manual.sh deploy <image_tag>         │
 │        → ECR login, docker compose pull, graceful drain,        │
 │          compose up, health check, rollback on failure           │
 │     3. Returns { success, message } to VALET                    │
@@ -306,7 +306,8 @@ Configuration: copy `.env.deploy.example` to `.env.deploy`.
 
 Both include: API (3100), Worker (3101), Deploy Server (8000).
 
-`scripts/deploy.sh` auto-detects compose file based on `GH_ENVIRONMENT` env var.
+`scripts/deploy-manual.sh` auto-detects compose file based on `GH_ENVIRONMENT` env var.
+Primary deploys now use Kamal (`config/deploy.yml`).
 
 ---
 

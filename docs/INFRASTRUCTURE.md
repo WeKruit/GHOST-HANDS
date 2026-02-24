@@ -82,7 +82,7 @@ Push to staging/main
        │
        └─ Docker Build & Push to ECR
             │
-            └─ Deploy to ASG Fleet (SSH → deploy.sh)    ← EC2 updated FIRST
+            └─ Deploy via Kamal (rolling, boot.limit=1)  ← EC2 updated FIRST
                  │
                  ├─ Deploy Staging (notify VALET webhook) ← VALET notified AFTER
                  └─ Deploy Production (main branch only)

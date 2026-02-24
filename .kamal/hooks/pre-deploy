@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Kamal pre-deploy hook: graceful worker drain
+# Kamal pre-deploy hook: graceful worker drain on REMOTE hosts
 #
-# Checks if the GhostHands worker has active jobs and waits for it to
-# become idle before allowing Kamal to proceed with the deploy.
+# This hook runs on the DEPLOYER machine (CI runner), NOT on EC2.
+# It uses KAMAL_HOSTS (set by Kamal) to reach each target host's
+# worker health endpoint remotely over HTTP.
 #
 # The worker exposes /worker/health on port 3101 with a deploy_safe field.
-# This hook polls that endpoint every 2s for up to 120s (matching drain_timeout).
+# This hook drains and polls each host for up to 120s.
 #
 # Exit 0 = proceed with deploy
 # Exit 1 = abort deploy (worker stuck busy)
 
 WORKER_PORT="${GH_WORKER_PORT:-3101}"
-WORKER_URL="http://localhost:${WORKER_PORT}/worker/health"
 MAX_WAIT=120
 INTERVAL=2
 ATTEMPTS=$((MAX_WAIT / INTERVAL))
@@ -27,30 +27,59 @@ log()  { echo -e "${GREEN}[pre-deploy]${NC} $*"; }
 warn() { echo -e "${YELLOW}[pre-deploy]${NC} $*"; }
 err()  { echo -e "${RED}[pre-deploy]${NC} $*" >&2; }
 
-# Request graceful drain first (tells worker to stop polling for new jobs)
-log "Requesting worker drain on port ${WORKER_PORT}..."
-curl -sf -X POST "http://localhost:${WORKER_PORT}/worker/drain" > /dev/null 2>&1 || true
+# KAMAL_HOSTS is a comma-separated list of target hosts set by Kamal.
+# Fall back to localhost for local `kamal deploy` testing.
+if [ -z "${KAMAL_HOSTS:-}" ]; then
+  warn "KAMAL_HOSTS not set — assuming localhost (local deploy?)"
+  HOSTS="localhost"
+else
+  HOSTS="${KAMAL_HOSTS}"
+fi
 
-for i in $(seq 1 "$ATTEMPTS"); do
-  status=$(curl -sf "$WORKER_URL" 2>/dev/null) || {
-    # Worker endpoint not reachable — might be an older image or already stopped
-    warn "Worker health endpoint not reachable (attempt $i) — assuming safe to deploy"
-    exit 0
-  }
+OVERALL_OK=true
 
-  safe=$(echo "$status" | grep -o '"deploy_safe":[a-z]*' | cut -d: -f2)
+for host in $(echo "$HOSTS" | tr ',' ' '); do
+  WORKER_URL="http://${host}:${WORKER_PORT}/worker"
 
-  if [ "$safe" = "true" ]; then
-    log "Worker is idle — safe to deploy (checked in $((i * INTERVAL))s)"
-    exit 0
+  log "Draining worker on ${host}:${WORKER_PORT}..."
+
+  # Request graceful drain (tells worker to stop polling for new jobs)
+  curl -sf -X POST "${WORKER_URL}/drain" --connect-timeout 5 > /dev/null 2>&1 || true
+
+  HOST_OK=false
+  for i in $(seq 1 "$ATTEMPTS"); do
+    status=$(curl -sf "${WORKER_URL}/health" --connect-timeout 5 2>/dev/null) || {
+      # Worker endpoint not reachable — might be stopped or older image
+      warn "[${host}] Worker health endpoint not reachable (attempt $i) — assuming safe"
+      HOST_OK=true
+      break
+    }
+
+    safe=$(echo "$status" | grep -o '"deploy_safe":[a-z]*' | cut -d: -f2)
+
+    if [ "$safe" = "true" ]; then
+      log "[${host}] Worker is idle — safe to deploy (checked in $((i * INTERVAL))s)"
+      HOST_OK=true
+      break
+    fi
+
+    elapsed=$((i * INTERVAL))
+    active_jobs=$(echo "$status" | grep -o '"active_jobs":[0-9]*' | cut -d: -f2)
+    warn "[${host}] Worker busy (${active_jobs:-?} active jobs), waiting... ${elapsed}s/${MAX_WAIT}s"
+    sleep "$INTERVAL"
+  done
+
+  if [ "$HOST_OK" = "false" ]; then
+    err "[${host}] Worker still busy after ${MAX_WAIT}s"
+    OVERALL_OK=false
   fi
-
-  elapsed=$((i * INTERVAL))
-  active_jobs=$(echo "$status" | grep -o '"active_jobs":[0-9]*' | cut -d: -f2)
-  warn "Worker busy (${active_jobs:-?} active jobs), waiting... ${elapsed}s/${MAX_WAIT}s"
-  sleep "$INTERVAL"
 done
 
-err "Worker still busy after ${MAX_WAIT}s — aborting deploy"
-err "Run 'kamal deploy' again when the worker is idle, or use --skip-hooks to force"
-exit 1
+if [ "$OVERALL_OK" = "false" ]; then
+  err "One or more workers still busy — aborting deploy"
+  err "Run 'kamal deploy' again when workers are idle, or use --skip-hooks to force"
+  exit 1
+fi
+
+log "All workers drained — proceeding with deploy"
+exit 0

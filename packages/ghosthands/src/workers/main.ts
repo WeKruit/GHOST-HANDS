@@ -21,7 +21,7 @@ const logger = getLogger({ service: 'Worker' });
  * 4. Updates job status and results in the database
  * 5. Sends heartbeats every 30s during execution
  * 6. Exposes a status HTTP server on GH_WORKER_PORT (default 3101)
- *    so VALET/deploy.sh can check if it's safe to restart
+ *    so Kamal pre-deploy hook / deploy-manual.sh can check if it's safe to restart
  *
  * Job dispatch mode (JOB_DISPATCH_MODE env var):
  *   queue  → pg-boss consumer (new, requires VALET to enqueue via TaskQueueService)
@@ -407,7 +407,7 @@ async function main(): Promise<void> {
   }
 
   // ── Worker Status HTTP Server ──────────────────────────────────────
-  // Lightweight HTTP endpoint so VALET / deploy.sh can check worker state
+  // Lightweight HTTP endpoint so Kamal pre-deploy hook / deploy-manual.sh can check worker state
   // before initiating a deploy. Runs on GH_WORKER_PORT (default 3101).
   //
   // Endpoints:

@@ -153,14 +153,26 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Write SSH key
+      - name: Write SSH key and config
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SANDBOX_SSH_KEY }}" > ~/.ssh/valet-worker.pem
           chmod 600 ~/.ssh/valet-worker.pem
+          cat >> ~/.ssh/config <<SSH_EOF
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            IdentityFile ~/.ssh/valet-worker.pem
+          SSH_EOF
+          chmod 600 ~/.ssh/config
 
       - name: Install Kamal
         run: gem install kamal
+
+      - name: Write Kamal secrets
+        run: |
+          mkdir -p .kamal
+          echo "KAMAL_REGISTRY_PASSWORD=$(aws ecr get-login-password --region ${{ secrets.AWS_REGION }})" > .kamal/secrets
 
       - name: Discover ASG hosts and generate destination config
         id: discover

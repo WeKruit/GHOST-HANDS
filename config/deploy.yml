@@ -112,11 +112,14 @@ accessories:
       gh.role: deploy-server
 
 # --- Registry (ECR) ---
+# KAMAL_REGISTRY_PASSWORD must be set in .kamal/secrets (gitignored).
+# In CI, the workflow generates it via: aws ecr get-login-password
+# Locally, run: aws ecr get-login-password --region us-east-1
 registry:
   server: 168495702277.dkr.ecr.us-east-1.amazonaws.com
   username: AWS
   password:
-    - aws ecr get-login-password --region us-east-1
+    - KAMAL_REGISTRY_PASSWORD
 
 # --- Environment (non-sensitive, applied to all roles) ---
 env:
@@ -126,6 +129,7 @@ env:
     SSL_CERT_DIR: /etc/ssl/certs
 
 # --- SSH ---
+# StrictHostKeyChecking disabled via ~/.ssh/config in CI (ASG IPs are dynamic).
 ssh:
   user: ubuntu
   keys:
