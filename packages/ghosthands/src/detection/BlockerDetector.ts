@@ -227,7 +227,10 @@ export class BlockerDetector {
     try {
       const currentUrl = await adapter.getCurrentUrl();
       const urlResult = this.checkUrl(currentUrl);
-      if (urlResult && urlResult.confidence >= 0.8) return urlResult;
+      if (urlResult && urlResult.confidence >= 0.8) {
+        console.log(`[BlockerDetector] URL match: type=${urlResult.type} confidence=${urlResult.confidence} details="${urlResult.details}"`);
+        return urlResult;
+      }
     } catch {
       // getCurrentUrl() can fail if browser is disconnected
     }
@@ -235,17 +238,32 @@ export class BlockerDetector {
     // Pass 1: Fast DOM detection
     const domMatches = await this.runDOMDetection(adapter.page);
 
+    if (domMatches.length > 0) {
+      console.log(`[BlockerDetector] DOM found ${domMatches.length} match(es):`);
+      for (const m of domMatches) {
+        console.log(`  - type=${m.type} confidence=${m.confidence} source=${m.source} selector="${m.selector || 'text'}" details="${m.details}"`);
+      }
+    } else {
+      console.log(`[BlockerDetector] DOM detection: no matches`);
+    }
+
     // If DOM found a high-confidence blocker, return immediately (skip observe)
     const bestDOM = domMatches.length > 0
       ? domMatches.sort((a, b) => b.confidence - a.confidence)[0]
       : null;
 
     if (bestDOM && bestDOM.confidence >= 0.8) {
+      console.log(`[BlockerDetector] High-confidence DOM match — skipping observe(). Returning: type=${bestDOM.type} confidence=${bestDOM.confidence}`);
       return bestDOM;
     }
 
     // Pass 2: observe()-based detection
     const observeResult = await this.runObserveDetection(adapter);
+    if (observeResult) {
+      console.log(`[BlockerDetector] Observe result: type=${observeResult.type} confidence=${observeResult.confidence} details="${observeResult.details}"`);
+    } else {
+      console.log(`[BlockerDetector] Observe detection: no blockers found`);
+    }
 
     // No results from either pass
     if (!bestDOM && !observeResult) return null;
@@ -260,7 +278,7 @@ export class BlockerDetector {
     if (bestDOM && observeResult && bestDOM.type === observeResult.type) {
       // Same type from both sources: boost confidence
       const combinedConfidence = Math.min(1.0, bestDOM.confidence + observeResult.confidence * 0.3);
-      return {
+      const combined: BlockerResult = {
         type: bestDOM.type,
         confidence: combinedConfidence,
         selector: bestDOM.selector,
@@ -268,11 +286,15 @@ export class BlockerDetector {
         source: 'combined',
         observedElements: observeResult.observedElements,
       };
+      console.log(`[BlockerDetector] Combined result: type=${combined.type} confidence=${combined.confidence}`);
+      return combined;
     }
 
     // Different types — return the higher confidence one
     if (bestDOM && observeResult) {
-      return bestDOM.confidence >= observeResult.confidence ? bestDOM : observeResult;
+      const winner = bestDOM.confidence >= observeResult.confidence ? bestDOM : observeResult;
+      console.log(`[BlockerDetector] Returning higher-confidence result: type=${winner.type} confidence=${winner.confidence} source=${winner.source}`);
+      return winner;
     }
 
     return null;
@@ -336,11 +358,18 @@ export class BlockerDetector {
   private async runObserveDetection(adapter: BrowserAutomationAdapter): Promise<BlockerResult | null> {
     if (!adapter.observe) return null;
 
+    const OBSERVE_TIMEOUT_MS = 15_000; // 15s timeout — observe() has no built-in timeout
+
     let elements: ObservedElement[] | undefined;
     try {
-      elements = await adapter.observe(OBSERVE_INSTRUCTION);
+      elements = await Promise.race([
+        adapter.observe(OBSERVE_INSTRUCTION),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Observe timed out after 15s')), OBSERVE_TIMEOUT_MS),
+        ),
+      ]);
     } catch {
-      // observe() may fail if the page is in an unusual state; fall through
+      // observe() may fail or time out — fall through
       return null;
     }
 
