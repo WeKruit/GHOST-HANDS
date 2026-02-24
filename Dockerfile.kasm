@@ -95,6 +95,9 @@ USER root
 COPY scripts/kasm-startup.sh /dockerstartup/custom_startup.sh
 RUN chmod +x /dockerstartup/custom_startup.sh
 
+# WEK-147: KasmVNC exclusive session config (max 1 client, disconnect others)
+COPY config/kasmvnc.yaml /etc/kasmvnc/kasmvnc.yaml
+
 # Expose GH worker API port (mapped in Kasm workspace config)
 EXPOSE 3100
 

@@ -27,6 +27,9 @@ echo "[kasm-startup] GH_API_PORT=${GH_API_PORT:-3100}" | tee -a "$LOG"
 MISSING=""
 [ -z "${DATABASE_URL:-}" ] && MISSING="$MISSING DATABASE_URL"
 [ -z "${GH_SERVICE_SECRET:-}" ] && MISSING="$MISSING GH_SERVICE_SECRET"
+[ -z "${GH_CREDENTIAL_KEY:-}" ] && MISSING="$MISSING GH_CREDENTIAL_KEY"
+[ -z "${SUPABASE_URL:-}" ] && MISSING="$MISSING SUPABASE_URL"
+[ -z "${ANTHROPIC_API_KEY:-}" ] && MISSING="$MISSING ANTHROPIC_API_KEY"
 
 if [ -n "$MISSING" ]; then
     echo "[kasm-startup] WARNING: Missing env vars:$MISSING" | tee -a "$LOG"
