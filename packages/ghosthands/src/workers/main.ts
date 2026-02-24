@@ -119,8 +119,8 @@ async function main(): Promise<void> {
   const directUrl = process.env.DATABASE_DIRECT_URL || process.env.SUPABASE_DIRECT_URL;
   let pgPool: PgPool | undefined;
   if (directUrl) {
-    pgPool = new PgPool({ connectionString: directUrl, max: 3 });
-    logger.info('Created pgPool for LISTEN/NOTIFY (direct URL)');
+    pgPool = new PgPool({ connectionString: directUrl, max: 2, idleTimeoutMillis: 30_000 });
+    logger.info('Created pgPool for LISTEN/NOTIFY (direct URL, max: 2)');
   } else {
     logger.warn('No DATABASE_DIRECT_URL or SUPABASE_DIRECT_URL — EC2/EC3 features disabled');
   }
@@ -357,6 +357,7 @@ async function main(): Promise<void> {
     boss = new PgBoss({
       connectionString: directUrl,
       schema: 'pgboss',
+      max: 2, // limit session-mode connections (Supabase pool_size is small)
     });
 
     boss.on('error', (err: Error) => {
