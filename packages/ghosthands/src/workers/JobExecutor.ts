@@ -361,11 +361,13 @@ export class JobExecutor {
       // 7. Create and start adapter
       const adapterType = (process.env.GH_BROWSER_ENGINE || 'magnitude') as AdapterType;
       adapter = createAdapter(adapterType);
+      const headless = process.env.GH_HEADLESS !== 'false'; // default true
       await adapter.start({
         url: job.target_url,
         llm: llmSetup.llm,
         ...(llmSetup.imageLlm && { imageLlm: llmSetup.imageLlm }),
         ...(storedSession ? { storageState: storedSession } : {}),
+        browserOptions: { headless },
       });
 
       // 7a. Attach StagehandObserver for enriched blocker detection (optional)
