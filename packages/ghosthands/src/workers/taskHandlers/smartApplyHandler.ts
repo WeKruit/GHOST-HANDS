@@ -811,7 +811,7 @@ ${dataPrompt}`,
 
           if (visibleFields.length > 0) {
             const groupContext = this.buildScanContextForLLM(visibleFields);
-            const enrichedPrompt = `${fillPrompt}\n\nFIELDS VISIBLE IN CURRENT VIEWPORT (${visibleFields.length} field(s) to fill):\n${groupContext}\n\nFill ONLY the fields listed above. They are currently visible and empty. Use the expected values shown. Do NOT scroll or click Next.`;
+            const enrichedPrompt = `${fillPrompt}\n\nFIELDS VISIBLE IN CURRENT VIEWPORT (${visibleFields.length} field(s) detected by scan):\n${groupContext}\n\nFill the fields listed above. They are currently visible and empty. Use the expected values shown where provided.\n\nADDITIONALLY: If you see any other visible empty required fields on screen (marked with * or "required") that are NOT listed above, fill those too. Some custom dropdowns or non-standard UI components may not appear in the scan. For dropdowns that don't have a text input, click them to open, then select the correct option.\n\nCRITICAL: NEVER skip a [REQUIRED] field (marked with * or [REQUIRED]). If no exact data is available, use your best judgment to pick the most reasonable answer. For example, "Degree Status" → "Completed" or "Graduated", "Visa Status" → "Authorized to work", etc. Required fields MUST be filled.\n\nIMPORTANT — STUCK FIELD RULE: If you type a value into a dropdown/autocomplete field and NO matching options appear in the dropdown list, the value is NOT available. Do NOT retry the same field. Do NOT try clicking arrows, pressing Enter, retyping, or scrolling the dropdown. Instead: select all text in the field, delete it to clear it, click somewhere else to close any popups, then move on to the next field. You get ONE attempt per field — if it doesn't match, clear it and move on.\n\nDo NOT scroll or click Next.`;
 
             const fieldsBefore = await this.getVisibleFieldValues(adapter);
             const checkedBefore = await this.getCheckedCheckboxes(adapter);
@@ -969,6 +969,228 @@ ${dataPrompt}`,
       console.warn(`[SmartApply] DOM resume upload failed: ${err}. LLM will try clicking upload button.`);
       return false;
     }
+  }
+
+  /**
+   * Quick live-scan of unfilled fields visible in the current viewport.
+   * Unlike the full scanPageFields (which scrolls through the entire page),
+   * this only checks what's on screen right now — used before each LLM call
+   * so the prompt reflects the actual DOM state after conditional fields appear.
+   */
+  private async scanVisibleUnfilledFields(
+    adapter: BrowserAutomationAdapter,
+    _config: PlatformConfig,
+    qaMap: Record<string, string>,
+  ): Promise<ScannedField[]> {
+    // Use the platform's collectVisibleFields via a single-viewport scan
+    // by calling scanPageFields with the page already at the right scroll position.
+    // But that scrolls around — instead, use hasEmptyVisibleFields as a quick gate,
+    // then call the adapter's evaluate to get visible empty field data.
+    const visibleEmpty = await adapter.page.evaluate(() => {
+      const vh = window.innerHeight;
+      const results: Array<{ label: string; kind: string; selector: string; isRequired: boolean; options: string[] }> = [];
+
+      // Quick scan of visible empty form fields
+      const allInputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(
+        'input:not([type="hidden"]):not([type="file"]):not([type="radio"]):not([type="checkbox"]):not([disabled]):not([readonly]), ' +
+        'textarea:not([disabled]):not([readonly]), select:not([disabled])'
+      );
+      for (const el of allInputs) {
+        if (el.value && el.value.trim() !== '') continue;
+        if (el.tagName === 'SELECT' && (el as HTMLSelectElement).selectedIndex > 0) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 10 || rect.height < 5 || rect.bottom < 0 || rect.top > vh) continue;
+        const st = window.getComputedStyle(el);
+        if (st.display === 'none' || st.visibility === 'hidden') continue;
+        if (el.closest('nav, header, [role="navigation"]')) continue;
+
+        let label = '';
+        const htmlEl = el as HTMLInputElement;
+        if ('labels' in htmlEl && htmlEl.labels?.length) label = (htmlEl.labels[0].textContent || '').trim();
+        if (!label) label = el.getAttribute('aria-label') || '';
+        if (!label) label = el.getAttribute('placeholder') || '';
+        if (!label && htmlEl.id) {
+          const lbl = document.querySelector('label[for="' + CSS.escape(htmlEl.id) + '"]');
+          if (lbl) label = (lbl.textContent || '').trim();
+        }
+        if (!label) {
+          const parent = el.closest('[class*="field"], [class*="form-group"], [class*="question"], fieldset');
+          if (parent) {
+            const lbl = parent.querySelector('label, legend, [class*="label"]');
+            if (lbl && !lbl.contains(el)) label = (lbl.textContent || '').trim();
+          }
+        }
+        if (!label) label = htmlEl.name || htmlEl.id || '';
+        label = label.substring(0, 120);
+
+        const kind = el.tagName === 'SELECT' ? 'select' : 'text';
+        const selector = el.getAttribute('data-gh-scan-idx')
+          ? '[data-gh-scan-idx="' + el.getAttribute('data-gh-scan-idx') + '"]'
+          : (el.id ? '#' + CSS.escape(el.id) : '');
+        const options = el.tagName === 'SELECT'
+          ? Array.from((el as HTMLSelectElement).options).filter(o => o.value && !o.disabled).map(o => o.text.trim()).filter(Boolean)
+          : [];
+
+        results.push({ label, kind, selector, isRequired: htmlEl.required || el.getAttribute('aria-required') === 'true', options });
+      }
+
+      // Also check custom dropdowns and ARIA radios in viewport
+      const customEls = document.querySelectorAll(
+        '[role="combobox"], [role="listbox"], [aria-haspopup], [role="radiogroup"], [role="radio"]'
+      );
+      for (const el of customEls) {
+        if (el.closest('nav, header, [role="navigation"], [role="menubar"], [role="menu"]')) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 5 || rect.height < 5 || rect.bottom < 0 || rect.top > vh) continue;
+        const st = window.getComputedStyle(el);
+        if (st.display === 'none' || st.visibility === 'hidden') continue;
+
+        // Check if already filled
+        const inputChild = el.querySelector('input') as HTMLInputElement | null;
+        const hasValue = inputChild?.value?.trim();
+        if (hasValue) continue;
+        if (el.getAttribute('aria-checked') === 'true') continue;
+        const role = el.getAttribute('role') || '';
+        if (role === 'radiogroup') {
+          const checked = el.querySelector('[role="radio"][aria-checked="true"]');
+          if (checked) continue;
+        }
+
+        let label = '';
+        const labelledBy = el.getAttribute('aria-labelledby');
+        if (labelledBy) {
+          const lbl = document.getElementById(labelledBy);
+          if (lbl) label = (lbl.textContent || '').trim();
+        }
+        if (!label) label = el.getAttribute('aria-label') || '';
+        if (!label) {
+          const parent = el.closest('[class*="field"], [class*="form-group"], [class*="question"], fieldset');
+          if (parent) {
+            const lbl = parent.querySelector('label, legend, [class*="label"]');
+            if (lbl && !lbl.contains(el)) label = (lbl.textContent || '').trim();
+          }
+        }
+        label = label.substring(0, 120);
+        if (!label) continue;
+
+        const isRadio = role === 'radiogroup' || role === 'radio';
+        const kind = isRadio ? 'aria_radio' : 'custom_dropdown';
+        const selector = el.getAttribute('data-gh-scan-idx')
+          ? '[data-gh-scan-idx="' + el.getAttribute('data-gh-scan-idx') + '"]'
+          : (el.id ? '#' + CSS.escape(el.id) : '');
+
+        // Extract radio/dropdown options
+        const options: string[] = [];
+        if (isRadio) {
+          const radios = (role === 'radiogroup' ? el : el.parentElement)?.querySelectorAll('[role="radio"]');
+          if (radios) {
+            for (const r of radios) {
+              const t = r.getAttribute('aria-label') || (r.textContent || '').trim();
+              if (t) options.push(t);
+            }
+          }
+        }
+
+        results.push({ label, kind, selector, isRequired: el.getAttribute('aria-required') === 'true', options });
+      }
+
+      // Also check Material Design / proprietary styled selects (arrow icon detection)
+      const seenLabels = new Set(results.map(r => r.label.toLowerCase()));
+      const arrowEls: Element[] = [];
+      document.querySelectorAll('i, span').forEach(ael => {
+        const t = (ael.textContent || '').trim();
+        if (t === 'arrow_drop_down' || t === 'expand_more' || t === 'keyboard_arrow_down') {
+          arrowEls.push(ael);
+        }
+      });
+      for (const arrowEl of arrowEls) {
+        let container: Element | null = arrowEl.parentElement;
+        for (let up = 0; up < 5 && container; up++) {
+          const cRect = container.getBoundingClientRect();
+          if (cRect.width >= 80 && cRect.width <= 700 && cRect.height >= 20 && cRect.height <= 120) break;
+          container = container.parentElement;
+        }
+        if (!container || container === document.body) continue;
+        const cRect = container.getBoundingClientRect();
+        if (cRect.width < 5 || cRect.height < 5 || cRect.bottom < 0 || cRect.top > vh) continue;
+        const cSt = window.getComputedStyle(container);
+        if (cSt.display === 'none' || cSt.visibility === 'hidden') continue;
+        if (container.closest('nav, header, [role="navigation"], [role="menubar"], [role="menu"]')) continue;
+
+        // Check if filled
+        const mdInput = container.querySelector('input') as HTMLInputElement | null;
+        if (mdInput?.value?.trim()) continue;
+
+        // Extract label
+        let mdLabel = container.getAttribute('aria-label') || '';
+        if (!mdLabel) {
+          const lblBy = container.getAttribute('aria-labelledby');
+          if (lblBy) {
+            const lblEl = document.getElementById(lblBy);
+            if (lblEl) mdLabel = (lblEl.textContent || '').trim();
+          }
+        }
+        if (!mdLabel) {
+          const parent = container.closest('[class*="field"], [class*="form-group"], [class*="question"], fieldset');
+          if (parent) {
+            const lbl = parent.querySelector('label, legend, [class*="label"]');
+            if (lbl && !lbl.contains(container)) mdLabel = (lbl.textContent || '').trim();
+          }
+        }
+        if (!mdLabel) {
+          // Try preceding sibling
+          const prev = container.previousElementSibling;
+          if (prev && (prev.tagName === 'LABEL' || prev.tagName === 'SPAN' || prev.tagName === 'DIV')) {
+            const t = (prev.textContent || '').trim();
+            if (t.length < 80) mdLabel = t;
+          }
+        }
+        mdLabel = mdLabel.substring(0, 120);
+        if (!mdLabel) continue;
+        if (seenLabels.has(mdLabel.toLowerCase())) continue;
+        seenLabels.add(mdLabel.toLowerCase());
+
+        const mdSelector = container.getAttribute('data-gh-scan-idx')
+          ? '[data-gh-scan-idx="' + container.getAttribute('data-gh-scan-idx') + '"]'
+          : (container.id ? '#' + CSS.escape(container.id) : '');
+
+        results.push({
+          label: mdLabel,
+          kind: 'custom_dropdown',
+          selector: mdSelector,
+          isRequired: container.getAttribute('aria-required') === 'true' || (container.closest('[class*="required"]') !== null),
+          options: [],
+        });
+      }
+
+      return results;
+    });
+
+    // Deduplicate by label and match answers
+    const seen = new Set<string>();
+    const fields: ScannedField[] = [];
+    for (const raw of visibleEmpty) {
+      const key = raw.label + '|' + raw.kind;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const answer = findBestAnswer(raw.label, qaMap);
+      fields.push({
+        id: 'visible-' + fields.length,
+        kind: raw.kind as ScannedField['kind'],
+        fillStrategy: raw.kind === 'text' || raw.kind === 'select' ? 'native_setter' : 'click_option',
+        selector: raw.selector,
+        label: raw.label,
+        currentValue: '',
+        options: raw.options.length > 0 ? raw.options : undefined,
+        absoluteY: 0, // not used for LLM viewport scan
+        isRequired: raw.isRequired,
+        matchedAnswer: answer || undefined,
+        filled: false,
+      });
+    }
+
+    return fields;
   }
 
   /**
