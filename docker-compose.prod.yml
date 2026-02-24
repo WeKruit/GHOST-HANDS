@@ -9,7 +9,8 @@
 # (which also create containers with NetworkMode: 'host'). This prevents
 # port conflicts when both deploy paths run in sequence.
 #
-# For manual operations, use scripts/deploy.sh or deploy-server API.
+# For manual operations, use scripts/deploy-manual.sh or deploy-server API.
+# Primary deploys are now handled by Kamal (config/deploy.yml).
 #
 # Production deployment for GhostHands API + Worker
 #
@@ -45,8 +46,8 @@ services:
     logging:
       driver: ${LOG_DRIVER:-json-file}
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "50m"
+        max-file: "5"
 
   # Deploy Server — receives deploy commands from VALET's DeployService
   deploy-server:
@@ -78,8 +79,8 @@ services:
     logging:
       driver: ${LOG_DRIVER:-json-file}
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "50m"
+        max-file: "5"
 
   # GhostHands Worker (default instance, no target routing)
   # For VALET-routed workers, start via docker run with GH_WORKER_ID:
@@ -113,5 +114,5 @@ services:
     logging:
       driver: ${LOG_DRIVER:-json-file}
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "50m"
+        max-file: "5"

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Deploy GhostHands to all running ASG instances
+# Deploy GhostHands to all running ASG instances (LEGACY)
+#
+# NOTE: Primary deploys are now handled by Kamal (config/deploy.yml).
+# This script is kept as a manual fallback.
 #
 # Discovers running instances in the ASG via AWS API, SSHes to each,
 # pulls the new Docker image from ECR, and restarts services using
-# the existing deploy.sh script (graceful drain + health check).
+# deploy-manual.sh (graceful drain + health check).
 #
 # Usage:
 #   ./scripts/deploy-to-asg.sh <image-tag>
@@ -112,12 +115,15 @@ export AWS_REGION="${REGION}"
 echo "[remote] Pulling image: \$ECR_IMAGE"
 docker pull "\$ECR_IMAGE"
 
-# Use deploy.sh for graceful drain + restart
-if [ -f scripts/deploy.sh ]; then
-  echo "[remote] Running deploy.sh deploy ${IMAGE_TAG}"
+# Use deploy-manual.sh for graceful drain + restart
+if [ -f scripts/deploy-manual.sh ]; then
+  echo "[remote] Running deploy-manual.sh deploy ${IMAGE_TAG}"
+  bash scripts/deploy-manual.sh deploy "${IMAGE_TAG}"
+elif [ -f scripts/deploy.sh ]; then
+  echo "[remote] Running deploy.sh deploy ${IMAGE_TAG} (legacy name)"
   bash scripts/deploy.sh deploy "${IMAGE_TAG}"
 else
-  echo "[remote] deploy.sh not found — using docker compose directly"
+  echo "[remote] deploy script not found — using docker compose directly"
   COMPOSE_FILE="docker-compose.staging.yml"
   [ "\${GH_ENVIRONMENT:-staging}" = "production" ] && COMPOSE_FILE="docker-compose.prod.yml"
   docker compose -f "\$COMPOSE_FILE" up -d --remove-orphans
