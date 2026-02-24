@@ -99,9 +99,12 @@ RUN chmod +x /dockerstartup/custom_startup.sh
 COPY config/kasmvnc.yaml /etc/kasmvnc/kasmvnc.yaml
 
 # Generate snakeoil SSL cert (KasmVNC startup expects it even when protocol=http)
+# Must chmod /etc/ssl/private so kasm-user (uid 1000) can read the key
 RUN apt-get update && apt-get install -y --no-install-recommends ssl-cert \
     && rm -rf /var/lib/apt/lists/* \
-    && make-ssl-cert generate-default-snakeoil
+    && make-ssl-cert generate-default-snakeoil \
+    && chmod 755 /etc/ssl/private \
+    && chmod 644 /etc/ssl/private/ssl-cert-snakeoil.key
 
 # Expose GH worker API port (mapped in Kasm workspace config)
 EXPOSE 3100
