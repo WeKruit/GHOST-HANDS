@@ -295,6 +295,15 @@ export class SmartApplyHandler implements TaskHandler {
     const obviousResult = await this.detectObviousPage(adapter, currentUrl);
     if (obviousResult) return obviousResult;
 
+    // Tier 2.5: Platform-specific DOM detection — catches form pages, login, review, etc.
+    // without needing an LLM call. genericConfig.detectPageByDOM checks input counts,
+    // review signals, apply buttons, etc.
+    const domResult = await config.detectPageByDOM(adapter);
+    if (domResult) {
+      console.log(`[SmartApply] DOM detection classified page as: ${domResult.page_type}`);
+      return domResult;
+    }
+
     // Tier 3: LLM classification — the LLM sees the screenshot and decides
     try {
       const healthy = await this.isPageHealthy(adapter);
@@ -323,6 +332,29 @@ export class SmartApplyHandler implements TaskHandler {
       await this.throttleLlm(adapter);
       const llmResult = await adapter.extract(classificationPrompt, config.pageStateSchema);
       console.log(`[SmartApply] LLM classified page as: ${llmResult.page_type}`);
+
+      // SAFETY: If LLM says "account_creation" but the page has many form fields
+      // beyond email/password (name, phone, address, etc.), it's a regular form page.
+      // Amazon.jobs Contact Information on account.amazon.jobs triggers this false positive.
+      if (llmResult.page_type === 'account_creation') {
+        const formFieldCount = await adapter.page.evaluate(() => {
+          return document.querySelectorAll(
+            'input[type="text"]:not([readonly]):not([disabled]), ' +
+            'input[type="email"]:not([readonly]):not([disabled]), ' +
+            'input[type="tel"]:not([readonly]):not([disabled]), ' +
+            'textarea:not([readonly]):not([disabled]), ' +
+            'select:not([disabled]), ' +
+            '[role="combobox"]:not([aria-disabled="true"])'
+          ).length;
+        });
+
+        // Real account creation forms have at most ~4 fields (email, password, confirm, name).
+        // If there are 5+ form fields, this is a regular application form page.
+        if (formFieldCount >= 5) {
+          console.log(`[SmartApply] LLM said "account_creation" but page has ${formFieldCount} form fields — overriding to "questions"`);
+          return { ...llmResult, page_type: 'questions' as PageType };
+        }
+      }
 
       // SAFETY: If LLM says "review", double-check — many single-page forms
       // show a Submit button on every page, which fools the classification.
@@ -652,6 +684,16 @@ ${dataPrompt}`,
     );
 
     if (!result.success) {
+      // act() may time out even though account creation succeeded and the page
+      // transitioned (e.g. Amazon fills contact info after creating the account,
+      // and the agent keeps going until timeout). Check if the page has moved on.
+      const hasPasswordField = await adapter.page.evaluate(() =>
+        document.querySelectorAll('input[type="password"]').length > 0
+      );
+      if (!hasPasswordField) {
+        console.log('[SmartApply] act() reported failure but page has moved past account creation — continuing.');
+        return;
+      }
       throw new Error(`Failed to create account: ${result.message}`);
     }
 

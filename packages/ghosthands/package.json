@@ -16,6 +16,7 @@
         "worker": "bun src/workers/main.ts",
         "worker:dev": "bun --watch src/workers/main.ts",
         "worker:named": "bun src/workers/main.ts --worker-id=my-name",
+        "apply:web": "bun src/scripts/apply-web.ts",
         "apply:simple": "bun src/scripts/apply-simple.ts",
         "apply:workday": "bun src/scripts/apply-workday.ts",
         "apply:amazon": "bun src/scripts/apply-amazon.ts",
