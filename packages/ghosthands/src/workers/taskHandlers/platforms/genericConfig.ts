@@ -785,11 +785,13 @@ ${dataBlock}`;
         const inputChild = dd.querySelector('input') as HTMLInputElement | null;
         const currentValue = inputChild?.value?.trim() || '';
         const displayText = (dd.textContent || '').trim();
-        const displayLower = displayText.toLowerCase();
 
         // --- Determine if empty or already filled ---
+        // Strip material icon font ligatures (rendered as icons but appear as text in textContent)
+        const cleanDisplayText = displayText.replace(/\b(arrow_drop_down|expand_more|keyboard_arrow_down|unfold_more|close|clear|search|check|done|navigate_next|navigate_before)\b/g, '').trim();
+        const cleanDisplayLower = cleanDisplayText.toLowerCase();
         const placeholderWords = ['select', 'choose', 'please', '--', '---', 'none', 'pick'];
-        const looksLikePlaceholder = placeholderWords.some(p => displayLower.startsWith(p)) || displayLower === '';
+        const looksLikePlaceholder = placeholderWords.some(p => cleanDisplayLower.startsWith(p)) || cleanDisplayLower === '';
 
         // If the element has a concrete input value and it's not placeholder text, it's filled
         if (currentValue && !looksLikePlaceholder) continue;
@@ -798,10 +800,10 @@ ${dataBlock}`;
         // (e.g., "Country/Region" shows as both label and button text when nothing is selected)
         // In that case it's EMPTY and should be included.
         // Only skip if display text looks like a real selected value (not the label, not placeholder)
-        if (!currentValue && !looksLikePlaceholder && displayText.length > 0 && displayText.length < 100) {
+        if (!currentValue && !looksLikePlaceholder && cleanDisplayText.length > 0 && cleanDisplayText.length < 100) {
           const ddLabel = extractLabel(dd);
           // If the display text doesn't match its own label, it's probably an already-selected value — skip
-          const normDisplay = displayLower.replace(/[^a-z0-9]/g, '');
+          const normDisplay = cleanDisplayLower.replace(/[^a-z0-9]/g, '');
           const normLabel = ddLabel.toLowerCase().replace(/[^a-z0-9]/g, '');
           if (normLabel && normDisplay && !normDisplay.includes(normLabel) && !normLabel.includes(normDisplay)) {
             continue; // display text ≠ label → likely a real value is selected
@@ -818,6 +820,75 @@ ${dataBlock}`;
           currentValue,
           absoluteY: rect.top + scrollY,
           isRequired: isRequired(dd),
+          filled: false,
+        });
+        idx++;
+      }
+
+      // ── 3b. Styled selects with arrow indicators (Material Design, etc.) ──
+      // Google Careers and similar sites use proprietary dropdown components
+      // (VfPpkd-*, mdc-select, mat-select) with no standard ARIA attributes.
+      // Detect by finding material icon font ligatures ("arrow_drop_down", etc.)
+      // and walking up to the nearest form-field-sized container.
+      const arrowEls: Element[] = [];
+      document.querySelectorAll('i, span').forEach(el => {
+        const t = (el.textContent || '').trim();
+        if (t === 'arrow_drop_down' || t === 'expand_more' || t === 'keyboard_arrow_down') {
+          arrowEls.push(el);
+        }
+      });
+      for (const arrowEl of arrowEls) {
+        // Walk up to find the select-like container (max 5 levels)
+        let container: Element | null = arrowEl.parentElement;
+        for (let up = 0; up < 5 && container; up++) {
+          const cRect = container.getBoundingClientRect();
+          // Stop when we find a container that's form-field-sized
+          if (cRect.width >= 80 && cRect.width <= 700 && cRect.height >= 20 && cRect.height <= 120) break;
+          container = container.parentElement;
+        }
+        if (!container || container === document.body) continue;
+        if (!isVisible(container)) continue;
+        if (isInsideDisabledFieldset(container)) continue;
+        if (container.closest(NAV_EXCLUDE)) continue;
+
+        // Skip if this container or a child/parent was already detected in section 3
+        let alreadyDetected = false;
+        for (const seen of seenDDElements) {
+          if (container.contains(seen) || seen.contains(container) || container === seen) {
+            alreadyDetected = true;
+            break;
+          }
+        }
+        if (alreadyDetected) continue;
+
+        const mdLabel = extractLabel(container);
+        if (!mdLabel) continue;
+
+        // Check if filled (input child with value, or selected value text)
+        const mdInput = container.querySelector('input') as HTMLInputElement | null;
+        if (mdInput?.value?.trim()) continue;
+        // Check if display text looks like a real value (not just label + icon text)
+        const mdDisplay = (container.textContent || '').trim()
+          .replace(/\b(arrow_drop_down|expand_more|keyboard_arrow_down)\b/g, '').trim();
+        const mdNormDisplay = mdDisplay.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const mdNormLabel = mdLabel.toLowerCase().replace(/[^a-z0-9]/g, '');
+        // If display text differs from label, it's probably an already-selected value
+        if (mdNormDisplay && mdNormLabel && !mdNormDisplay.includes(mdNormLabel) && !mdNormLabel.includes(mdNormDisplay)) {
+          continue;
+        }
+
+        seenDDElements.add(container);
+        const cRect = container.getBoundingClientRect();
+        const sel = buildSelector(container, idx);
+        fields.push({
+          id: 'field-' + idx,
+          kind: 'custom_dropdown',
+          fillStrategy: 'llm_act', // proprietary dropdowns need LLM interaction
+          selector: sel,
+          label: mdLabel,
+          currentValue: '',
+          absoluteY: cRect.top + scrollY,
+          isRequired: isRequired(container),
           filled: false,
         });
         idx++;
