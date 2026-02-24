@@ -256,6 +256,9 @@ cmd_deploy() {
     fi
   done
 
+  # Remove stale compose containers to prevent name conflicts on re-create
+  docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
+
   # Restart compose services (API + default worker)
   docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
 
