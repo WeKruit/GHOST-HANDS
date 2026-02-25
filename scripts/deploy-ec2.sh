@@ -134,8 +134,8 @@ cmd_deploy_ec2() {
   info "  Image tag: $IMAGE_TAG"
   info "  Remote dir: $GHOSTHANDS_DIR"
 
-  # Run deploy.sh on EC2
-  ssh_ec2 "cd $GHOSTHANDS_DIR && sudo ./scripts/deploy.sh deploy $IMAGE_TAG"
+  # Run deploy-manual.sh on EC2 (formerly deploy.sh)
+  ssh_ec2 "cd $GHOSTHANDS_DIR && sudo ./scripts/deploy-manual.sh deploy $IMAGE_TAG"
 
   log "EC2 deploy complete"
 }
@@ -144,7 +144,7 @@ cmd_deploy_ec2() {
 cmd_status() {
   check_ssh_vars
   log "Checking EC2 status..."
-  ssh_ec2 "cd $GHOSTHANDS_DIR && sudo ./scripts/deploy.sh status"
+  ssh_ec2 "cd $GHOSTHANDS_DIR && sudo ./scripts/deploy-manual.sh status"
 }
 
 # ── Verify: Check /health/version endpoint ─────────────────────

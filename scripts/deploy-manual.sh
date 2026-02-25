@@ -1,26 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# NOTE: This script is for MANUAL operations only (SSH into EC2).
-# Automated deploys go through deploy-server.ts via Docker Engine API.
+# MANUAL ESCAPE HATCH — use this when Kamal is unavailable or broken.
+# Primary deploys are now handled by Kamal (config/deploy.yml).
+# Automated deploys go through CI → kamal deploy.
 # This script requires: aws CLI, docker CLI, docker compose, curl
 #
-# GhostHands Deploy Script
-#
-# Called by VALET's deployment controller on each EC2 instance.
-# VALET manages the rolling update strategy across its fleet.
+# GhostHands Manual Deploy Script (formerly deploy.sh)
 #
 # Usage:
-#   ./scripts/deploy.sh deploy <image-tag>   # Deploy specific ECR image tag
-#   ./scripts/deploy.sh deploy               # Deploy 'latest' tag
-#   ./scripts/deploy.sh rollback             # Rollback to previous image
-#   ./scripts/deploy.sh status               # Show current status
-#   ./scripts/deploy.sh drain                # Stop worker, keep API running
-#   ./scripts/deploy.sh health               # Exit 0 if healthy, 1 if not
-#   ./scripts/deploy.sh worker-status        # Check if worker is busy or idle
-#   ./scripts/deploy.sh start-worker <id>    # Start a targeted worker
-#   ./scripts/deploy.sh stop-worker <id>     # Stop a targeted worker
-#   ./scripts/deploy.sh list-workers         # List all targeted worker containers
+#   ./scripts/deploy-manual.sh deploy <image-tag>   # Deploy specific ECR image tag
+#   ./scripts/deploy-manual.sh deploy               # Deploy 'latest' tag
+#   ./scripts/deploy-manual.sh rollback             # Rollback to previous image
+#   ./scripts/deploy-manual.sh status               # Show current status
+#   ./scripts/deploy-manual.sh drain                # Stop worker, keep API running
+#   ./scripts/deploy-manual.sh health               # Exit 0 if healthy, 1 if not
+#   ./scripts/deploy-manual.sh worker-status        # Check if worker is busy or idle
+#   ./scripts/deploy-manual.sh start-worker <id>    # Start a targeted worker
+#   ./scripts/deploy-manual.sh stop-worker <id>     # Stop a targeted worker
+#   ./scripts/deploy-manual.sh list-workers         # List all targeted worker containers
 #
 # Required env vars (set by VALET before calling):
 #   ECR_REGISTRY    — e.g., 123456789.dkr.ecr.us-east-1.amazonaws.com

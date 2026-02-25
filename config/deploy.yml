@@ -1,0 +1,154 @@
+# Kamal 2 deployment configuration for GhostHands
+#
+# Replaces scripts/deploy-to-asg.sh as the primary deploy mechanism.
+# Manual fallback: scripts/deploy-manual.sh (formerly deploy.sh)
+#
+# Usage:
+#   kamal setup                      # First-time server provisioning
+#   kamal deploy                     # Deploy latest image
+#   kamal deploy --version <sha>     # Deploy specific commit
+#   kamal rollback                   # Rollback to previous version
+#   kamal lock status                # Check deploy lock
+#
+# Prerequisites:
+#   - gem install kamal (or brew install kamal)
+#   - AWS CLI configured (for ECR login)
+#   - SSH key at ~/.ssh/valet-worker.pem
+#
+# Architecture notes:
+#   - All roles use network_mode: host — kamal-proxy is DISABLED
+#   - Zero-downtime is fleet-level: boot.limit=1 deploys one host at a time
+#   - Secrets come from /opt/ghosthands/.env on each EC2 (via AWS Secrets Manager)
+#   - No Kamal secret management needed — env-file handles everything
+
+service: ghosthands
+image: 168495702277.dkr.ecr.us-east-1.amazonaws.com/ghosthands
+
+# --- Servers / Roles ---
+# Default hosts point to current ASG instance. In CI, a destination-specific
+# config overrides these with dynamically discovered ASG instance IPs.
+servers:
+  web:
+    hosts:
+      - 44.198.167.49
+    cmd: bun packages/ghosthands/src/api/server.ts
+    proxy: false
+    options:
+      network: host
+      memory: 512m
+      cpus: 1
+      user: ghosthands
+      env-file: /opt/ghosthands/.env
+    labels:
+      gh.role: api
+    env:
+      clear:
+        GH_API_PORT: "3100"
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"
+
+  worker:
+    hosts:
+      - 44.198.167.49
+    cmd: bun packages/ghosthands/src/workers/main.ts
+    proxy: false
+    options:
+      network: host
+      memory: 2g
+      cpus: 2
+      user: ghosthands
+      env-file: /opt/ghosthands/.env
+      volume:
+        - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    labels:
+      gh.role: worker
+    env:
+      clear:
+        GH_WORKER_PORT: "3101"
+        MAX_CONCURRENT_JOBS: "1"
+        DISPLAY: ":99"
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"
+
+# --- Deploy Server (accessory) ---
+# Managed separately from app roles — not updated on every deploy.
+# Boot with: kamal accessory boot deploy-server
+# Reboot with: kamal accessory reboot deploy-server
+accessories:
+  deploy-server:
+    image: 168495702277.dkr.ecr.us-east-1.amazonaws.com/ghosthands
+    roles:
+      - web
+    cmd: bun scripts/deploy-server.ts
+    options:
+      network: host
+      memory: 256m
+      cpus: 0.5
+      user: ghosthands
+      env-file: /opt/ghosthands/.env
+    env:
+      clear:
+        NODE_ENV: production
+        GH_DEPLOY_PORT: "8000"
+        GH_API_HOST: localhost
+        GH_API_PORT: "3100"
+        GH_WORKER_HOST: localhost
+        GH_WORKER_PORT: "3101"
+        GHOSTHANDS_DIR: /opt/ghosthands
+        DOCKER_CONFIG_PATH: /docker-config/config.json
+        SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+        SSL_CERT_DIR: /etc/ssl/certs
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/ghosthands:/opt/ghosthands:ro
+      - /home/ubuntu/.docker/config.json:/docker-config/config.json:ro
+    labels:
+      gh.role: deploy-server
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"
+
+# --- Registry (ECR) ---
+# KAMAL_REGISTRY_PASSWORD must be set in .kamal/secrets (gitignored).
+# In CI, the workflow generates it via: aws ecr get-login-password
+# Locally, run: aws ecr get-login-password --region us-east-1
+registry:
+  server: 168495702277.dkr.ecr.us-east-1.amazonaws.com
+  username: AWS
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+# --- Environment (non-sensitive, applied to all roles) ---
+env:
+  clear:
+    NODE_ENV: production
+    SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+    SSL_CERT_DIR: /etc/ssl/certs
+
+# --- SSH ---
+# StrictHostKeyChecking disabled via ~/.ssh/config in CI (ASG IPs are dynamic).
+ssh:
+  user: ubuntu
+  keys:
+    - ~/.ssh/valet-worker.pem
+  keys_only: true
+
+# --- Boot (rolling deploys) ---
+boot:
+  limit: 1
+
+# --- Deployment ---
+primary_role: web
+drain_timeout: 120
+retain_containers: 3
+
+# --- Hooks ---
+hooks_path: .kamal/hooks

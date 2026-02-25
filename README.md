@@ -20,7 +20,7 @@ GHOST-HANDS/
       config/            # Model catalog, rate limits, environment
     __tests__/           # Unit, integration, and E2E tests
   docs/                  # Technical documentation
-  scripts/               # deploy.sh (EC2 deployment)
+  scripts/               # deploy-manual.sh (EC2 deployment), Kamal config
   supabase-migration*.sql
 ```
 

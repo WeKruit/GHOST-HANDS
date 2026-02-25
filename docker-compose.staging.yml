@@ -5,7 +5,8 @@
 # To bootstrap a fresh EC2 instance:
 #   docker compose -f docker-compose.staging.yml up -d
 #
-# For manual operations, use scripts/deploy.sh or deploy-server API.
+# For manual operations, use scripts/deploy-manual.sh or deploy-server API.
+# Primary deploys are now handled by Kamal (config/deploy.yml).
 #
 # All services use host networking to match deploy-server Docker API deploys
 # (which also create containers with NetworkMode: 'host'). This prevents
@@ -42,8 +43,8 @@ services:
     logging:
       driver: ${LOG_DRIVER:-json-file}
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "50m"
+        max-file: "5"
 
   # Deploy Server — receives deploy commands from VALET's DeployService
   deploy-server:
@@ -76,8 +77,8 @@ services:
     logging:
       driver: ${LOG_DRIVER:-json-file}
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "50m"
+        max-file: "5"
 
   # GhostHands Worker (default instance, no target routing)
   worker:
@@ -107,5 +108,5 @@ services:
     logging:
       driver: ${LOG_DRIVER:-json-file}
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "50m"
+        max-file: "5"
