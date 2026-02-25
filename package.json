@@ -13,11 +13,15 @@
     "test:unit": "bun test packages/ghosthands/__tests__/unit",
     "test:integration": "bun test packages/ghosthands/__tests__/integration",
     "test:e2e": "bun test --concurrency 1 packages/ghosthands/__tests__/e2e",
-    "magnitude:update": "bun update magnitude-core magnitude-extract"
+    "magnitude:update": "bun update magnitude-core magnitude-extract",
+    "desktop:dev": "cd packages/desktop && bun run dev",
+    "desktop:build": "cd packages/desktop && bun run build",
+    "desktop:dist": "cd packages/desktop && bun run dist"
   },
   "packageManager": "bun@1.2.8^",
   "devDependencies": {
     "@aws-sdk/client-ecr": "^3.709.0",
+    "@types/bun": "^1.3.9",
     "turbo": "^2.4.4",
     "typescript": "5.8.2",
     "vitest": "^4.0.18",
