@@ -20,6 +20,8 @@ export class SmartApplyHandler implements TaskHandler {
   readonly type = 'smart_apply';
   readonly description = 'Fill out a job application on any ATS platform (multi-step), stopping before submission';
   private lastLlmCallTime = 0;
+  /** True after we've attempted native login — prevents re-trying login on Create Account pages */
+  loginAttempted = false;
 
   validate(inputData: Record<string, any>): ValidationResult {
     const errors: string[] = [];
@@ -134,6 +136,9 @@ export class SmartApplyHandler implements TaskHandler {
             } else {
               await this.handleGenericLogin(adapter, userProfile);
             }
+            // Track that login was attempted so detectObviousPage doesn't
+            // re-classify a Create Account page as login.
+            this.loginAttempted = true;
             break;
 
           case 'verification_code':
@@ -145,7 +150,7 @@ export class SmartApplyHandler implements TaskHandler {
             break;
 
           case 'account_creation':
-            await this.handleAccountCreation(adapter, dataPrompt);
+            await this.handleAccountCreation(adapter, dataPrompt, userProfile);
             break;
 
           case 'review':
@@ -197,6 +202,9 @@ export class SmartApplyHandler implements TaskHandler {
             ) {
               await progress.setStep(ProgressStep.UPLOADING_RESUME);
               await config.handleExperiencePage(adapter, userProfile, dataPrompt);
+              // Custom handler already filled the page — skip generic fillPage
+              // to avoid wasting LLM calls re-scanning filled fields.
+              break;
             }
 
             const step = (pageState.page_type === 'experience' || pageState.page_type === 'resume_upload')
@@ -413,19 +421,33 @@ export class SmartApplyHandler implements TaskHandler {
     // Quick DOM check for login (password field) and confirmation (thank you text)
     const obvious = await adapter.page.evaluate(() => {
       const bodyText = document.body.innerText.toLowerCase();
-      const hasPasswordField = document.querySelectorAll('input[type="password"]').length > 0;
+      const passwordFields = document.querySelectorAll('input[type="password"]:not([disabled])');
+      const hasPasswordField = passwordFields.length > 0;
+      // 2+ password fields (password + confirm) = account creation, not login
+      const hasConfirmPassword = passwordFields.length > 1;
+      const headings = Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]'));
+      const headingText = headings.map(h => (h.textContent || '').toLowerCase()).join(' ');
+      const isCreateAccountHeading = headingText.includes('create account')
+        || headingText.includes('register')
+        || headingText.includes('sign up');
       const hasConfirmation = bodyText.includes('thank you for applying')
         || bodyText.includes('application received')
         || bodyText.includes('successfully submitted')
         || bodyText.includes('application has been submitted');
-      return { hasPasswordField, hasConfirmation };
+      return { hasPasswordField, hasConfirmPassword, isCreateAccountHeading, hasConfirmation };
     });
 
     if (obvious.hasConfirmation) {
       return { page_type: 'confirmation', page_title: 'Confirmation' };
     }
 
-    if (obvious.hasPasswordField) {
+    // Account creation (confirm password or "Create Account" heading) — let
+    // platform-specific detectPageByDOM handle the nuance instead of
+    // misclassifying as login here.
+    // Also: after login has been attempted and failed, the page may still have
+    // password fields (Create Account form). Don't re-classify as login — let
+    // detectPageByDOM decide if it's account_creation.
+    if (obvious.hasPasswordField && !obvious.hasConfirmPassword && !obvious.isCreateAccountHeading && !this.loginAttempted) {
       return { page_type: 'login', page_title: 'Sign-In' };
     }
 
@@ -596,14 +618,167 @@ Click only ONE button, then report the task as done.`,
       return;
     }
 
-    // Generic login: look for SSO or sign-in buttons
+    // Non-Google login path: Google SSO → native email/password → account creation
     console.log('[SmartApply] On login page, looking for sign-in options...');
-    const loginResult = await adapter.act(
-      'Look for a "Sign in with Google" button, a Google icon/logo button, or a "Continue with Google" option and click it. If there is no Google sign-in option, look for "Sign In" or "Log In" button instead. Click ONLY ONE button, then report the task as done.',
-    );
-    if (!loginResult.success) {
-      console.warn(`[SmartApply] Login act() failed or timed out: ${loginResult.message}. Will retry on next loop iteration.`);
+    const password = profile.password || process.env.TEST_GMAIL_PASSWORD || '';
+
+    // Step 1: Check for a Google SSO button
+    const hasGoogleSSO = await adapter.page.evaluate(() => {
+      const els = document.querySelectorAll('a, button, [role="button"], [role="link"]');
+      for (const el of els) {
+        const text = (el.textContent || '').toLowerCase();
+        if (text.includes('google') && (text.includes('sign in') || text.includes('continue') || text.includes('log in'))) return true;
+        const img = el.querySelector('img[src*="google" i], img[alt*="google" i]');
+        if (img) return true;
+      }
+      return false;
+    });
+
+    if (hasGoogleSSO) {
+      console.log('[SmartApply] Google SSO button found — clicking...');
+      await adapter.act('Click the "Sign in with Google" button, Google icon/logo button, or "Continue with Google" option. Click ONLY ONE button, then report done.');
+      await this.waitForPageLoad(adapter);
+      return;
     }
+
+    // Step 2: No Google SSO — attempt native email/password login
+    console.log('[SmartApply] No Google SSO available — trying email/password login...');
+    const PASSWORD_SUFFIX = 'aA1!';
+
+    const formState = await adapter.page.evaluate(() => {
+      const hasEmail = !!document.querySelector(
+        'input[type="email"]:not([disabled]), input[autocomplete="email"]:not([disabled]), ' +
+        'input[name*="email" i]:not([disabled]), input[name*="user" i]:not([disabled])'
+      );
+      const hasPassword = !!document.querySelector('input[type="password"]:not([disabled])');
+      return { hasEmail, hasPassword };
+    });
+
+    if (formState.hasEmail || formState.hasPassword) {
+      // Helper: fill credentials and submit
+      const fillAndSubmit = async (pw: string) => {
+        if (formState.hasEmail) {
+          await adapter.page.evaluate((e: string) => {
+            const sels = [
+              'input[type="email"]', 'input[autocomplete="email"]',
+              'input[name*="email" i]', 'input[name*="user" i]',
+              'input[id*="email" i]', 'input[id*="user" i]',
+            ];
+            for (const sel of sels) {
+              const input = document.querySelector<HTMLInputElement>(sel + ':not([disabled])');
+              if (input && input.getBoundingClientRect().width > 0) {
+                input.focus();
+                input.value = e;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                break;
+              }
+            }
+          }, email);
+        }
+
+        if (formState.hasPassword && pw) {
+          await adapter.page.evaluate((p: string) => {
+            const input = document.querySelector<HTMLInputElement>('input[type="password"]:not([disabled])');
+            if (input && input.getBoundingClientRect().width > 0) {
+              input.focus();
+              input.value = p;
+              input.dispatchEvent(new Event('input', { bubbles: true }));
+              input.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          }, pw);
+        }
+
+        await adapter.page.waitForTimeout(300);
+
+        const clicked = await adapter.page.evaluate(() => {
+          const TEXTS = ['sign in', 'log in', 'login', 'submit', 'continue', 'next'];
+          const btns = document.querySelectorAll<HTMLElement>('button, input[type="submit"], [role="button"]');
+          for (const btn of btns) {
+            const text = (btn.textContent || (btn as HTMLInputElement).value || '').trim().toLowerCase();
+            if (TEXTS.some(t => text === t || (text.length < 30 && text.includes(t)))) {
+              btn.click();
+              return true;
+            }
+          }
+          const form = document.querySelector('form');
+          if (form) { form.requestSubmit(); return true; }
+          return false;
+        });
+
+        if (!clicked) {
+          await adapter.act('Click the "Sign In", "Log In", "Next", or "Continue" button. Click ONLY ONE button.');
+        }
+
+        await adapter.page.waitForTimeout(3000);
+        await this.waitForPageLoad(adapter);
+      };
+
+      // Helper: check for login errors
+      const checkLoginError = async (): Promise<string | null> => {
+        return adapter.page.evaluate(() => {
+          const patterns = ['incorrect', 'invalid', 'wrong', 'not found', "doesn't exist", 'does not exist',
+            'failed', 'try again', 'not recognized', 'no account', 'unable to sign'];
+          const alertEls = document.querySelectorAll(
+            '[role="alert"], .error, .alert-error, .alert-danger, ' +
+            '[class*="error-msg"], [class*="error-message"], [class*="errorMessage"]'
+          );
+          for (const el of alertEls) {
+            const rect = (el as HTMLElement).getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+            const text = (el.textContent || '').trim().toLowerCase();
+            if (text && patterns.some(p => text.includes(p))) return text.substring(0, 200);
+          }
+          return null;
+        });
+      };
+
+      // Try login with base password
+      await fillAndSubmit(password);
+
+      let loginError: string | null = null;
+      if (formState.hasPassword) {
+        loginError = await checkLoginError();
+
+        // If base password failed, try with suffix
+        if (loginError && password) {
+          console.log(`[SmartApply] Login failed with base password: "${loginError}" — retrying with strengthened password...`);
+          await fillAndSubmit(password + PASSWORD_SUFFIX);
+          loginError = await checkLoginError();
+        }
+
+        if (loginError) {
+          console.log(`[SmartApply] Login failed: "${loginError}" — navigating to account creation...`);
+
+          const clickedCreate = await adapter.page.evaluate(() => {
+            const TEXTS = ['create account', 'sign up', 'register', 'create an account',
+              "don't have an account", 'new user', 'get started', 'join now'];
+            const els = document.querySelectorAll('a, button, [role="button"], [role="link"], span');
+            for (const el of els) {
+              const text = (el.textContent || '').trim().toLowerCase();
+              if (TEXTS.some(t => text.includes(t))) {
+                (el as HTMLElement).click();
+                return true;
+              }
+            }
+            return false;
+          });
+
+          if (clickedCreate) {
+            console.log('[SmartApply] Clicked account creation link.');
+          } else {
+            await adapter.act('The login failed. Look for a "Create Account", "Sign Up", "Register", or "Don\'t have an account?" link and click it. Click ONLY ONE link.');
+          }
+          await this.waitForPageLoad(adapter);
+        }
+      }
+      return;
+    }
+
+    // Step 3: No form fields visible — use LLM to find sign-in or sign-up option
+    await adapter.act(
+      'This is a login page. First, look for a "Sign In" or "Log In" button and click it. Only if there is no sign-in option, click a "Create Account" or "Sign Up" link instead. Click ONLY ONE button, then report done.',
+    );
     await this.waitForPageLoad(adapter);
   }
 
@@ -667,17 +842,58 @@ Click only ONE button, then report the task as done.`,
   private async handleAccountCreation(
     adapter: BrowserAutomationAdapter,
     dataPrompt: string,
+    profile: Record<string, any>,
   ): Promise<void> {
     console.log('[SmartApply] Account creation page detected, filling in details...');
 
+    const email = profile.email || '';
+    const basePassword = profile.password || process.env.TEST_GMAIL_PASSWORD || '';
+    // Append suffix to satisfy stricter password requirements on job sites
+    const password = basePassword ? basePassword + 'aA1!' : 'GhApp2026!x';
+
+    // DOM-fill email and password first (keeps password out of LLM prompts)
+    await adapter.page.evaluate((e: string) => {
+      const sels = [
+        'input[type="email"]', 'input[autocomplete="email"]',
+        'input[data-automation-id*="email" i]',
+        'input[name*="email" i]', 'input[id*="email" i]',
+      ];
+      for (const sel of sels) {
+        const input = document.querySelector<HTMLInputElement>(sel + ':not([disabled])');
+        if (input && input.getBoundingClientRect().width > 0 && !input.value?.trim()) {
+          input.focus();
+          input.value = e;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          break;
+        }
+      }
+    }, email);
+
+    // Fill ALL visible password inputs (password + confirm password)
+    await adapter.page.evaluate((pw: string) => {
+      const inputs = document.querySelectorAll<HTMLInputElement>('input[type="password"]:not([disabled])');
+      for (const input of inputs) {
+        if (input.getBoundingClientRect().width > 0) {
+          input.focus();
+          input.value = pw;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
+    }, password);
+
+    await adapter.page.waitForTimeout(300);
+
+    // LLM handles the rest (name fields, terms checkboxes, submit button)
     const result = await adapter.act(
-      `Fill out the account creation form, then click "Create Account", "Register", "Continue", or "Next".
+      `Fill out the remaining account creation fields, then click "Create Account", "Register", "Continue", or "Next".
+
+The email and password fields should already be filled — do NOT clear or retype them.
 
 HOW TO FILL:
-- Use the email from the data mapping as both the username/email and for any confirmation fields.
-- If a password field exists, use a strong password: "GhApp2026!x" (capital letter, number, symbol, 12+ chars).
-- If a "confirm password" field exists, type the same password again.
-- Fill name, email, and other fields from the data mapping below.
+- Fill name and other fields from the data mapping below.
+- If there are checkboxes for terms/conditions or privacy policy, check them.
 - Report the task as done after clicking the registration button.
 
 ${dataPrompt}`,
@@ -1443,9 +1659,13 @@ ${dataPrompt}`,
       await adapter.page.keyboard.press('Escape');
       await adapter.page.waitForTimeout(200);
 
-      // Click a neutral area to trigger blur on any focused element.
-      // Use coordinates unlikely to hit a button (top-left corner of viewport).
-      await adapter.page.mouse.click(5, 5);
+      // Trigger blur on the active element to commit any pending values.
+      // Avoid clicking at fixed coordinates (could hit a nav link).
+      await adapter.page.evaluate(() => {
+        if (document.activeElement && document.activeElement !== document.body) {
+          (document.activeElement as HTMLElement).blur?.();
+        }
+      });
       await adapter.page.waitForTimeout(300);
     } catch {
       // Non-fatal — overlay may not exist
@@ -1676,7 +1896,11 @@ ${dataPrompt}`,
       const isReviewHeading = headings.some(h => (h.textContent || '').toLowerCase().includes('review'));
       if (!isReviewHeading) return false;
       const buttons = Array.from(document.querySelectorAll('button'));
-      const hasSubmit = buttons.some(b => (b.textContent?.trim().toLowerCase() || '') === 'submit');
+      const SUBMIT_TEXTS = ['submit', 'submit application', 'submit my application', 'submit this application', 'send application'];
+      const hasSubmit = buttons.some(b => {
+        const text = (b.textContent?.trim().toLowerCase() || '');
+        return SUBMIT_TEXTS.indexOf(text) !== -1 || text.startsWith('submit');
+      });
       if (!hasSubmit) return false;
       // Check entire page for any editable form elements
       const editableCount = document.querySelectorAll(

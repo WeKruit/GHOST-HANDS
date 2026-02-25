@@ -138,14 +138,29 @@ export class WorkdayPlatformConfig implements PlatformConfig {
   async detectPageByDOM(adapter: BrowserAutomationAdapter): Promise<PageState | null> {
     const domSignals = await adapter.page.evaluate(() => {
       const bodyText = document.body.innerText.toLowerCase();
-      const html = document.body.innerHTML.toLowerCase();
+      const headings = Array.from(document.querySelectorAll('h1, h2, h3, [data-automation-id*="pageHeader"], [role="heading"]'));
+      const headingText = headings.map(h => (h.textContent || '').toLowerCase()).join(' ');
+
+      // Check for "Create Account" as the PRIMARY heading/view — means
+      // the page IS an account creation form (even if it has a "Sign In" link).
+      const isCreateAccountView = headingText.includes('create account') || headingText.includes('register');
+      // Also check for confirm-password field (Create Account has 2 password inputs)
+      const passwordFields = document.querySelectorAll('input[type="password"]:not([disabled])');
+      const hasConfirmPassword = passwordFields.length > 1;
+
       return {
-        hasSignInWithGoogle: bodyText.includes('sign in with google') || bodyText.includes('continue with google') || html.includes('google') && bodyText.includes('sign in'),
+        hasSignInWithGoogle: bodyText.includes('sign in with google') || bodyText.includes('continue with google'),
         hasSignIn: bodyText.includes('sign in') || bodyText.includes('log in'),
         hasApplyButton: bodyText.includes('apply') && !bodyText.includes('application questions'),
         hasSubmitApplication: bodyText.includes('submit application') || bodyText.includes('submit your application'),
+        isCreateAccountView: isCreateAccountView || hasConfirmPassword,
       };
     });
+
+    // Create Account page — classify as account_creation, NOT login
+    if (domSignals.isCreateAccountView) {
+      return { page_type: 'account_creation', page_title: 'Workday Create Account' };
+    }
 
     if (domSignals.hasSignInWithGoogle || (domSignals.hasSignIn && !domSignals.hasApplyButton && !domSignals.hasSubmitApplication)) {
       return { page_type: 'login', page_title: 'Workday Sign-In', has_sign_in_with_google: domSignals.hasSignInWithGoogle };
@@ -189,12 +204,13 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
       // REVIEW page detection FIRST (review contains all section headings as summary)
       const hasSelectOneDropdowns = Array.from(document.querySelectorAll('button')).some(b => (b.textContent || '').trim() === 'Select One');
       const hasFormInputs = document.querySelectorAll('input[type="text"]:not([readonly]), textarea:not([readonly]), input[type="email"], input[type="tel"]').length > 0;
-      if (headingText.includes('review')) return 'review' as PageType;
-
       const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
       const buttonTexts = buttons.map(b => (b.textContent || '').trim().toLowerCase());
       const hasSubmitButton = buttonTexts.some(t => t === 'submit' || t === 'submit application');
       const hasSaveAndContinue = buttonTexts.some(t => t.includes('save and continue'));
+
+      // Review page: heading says "review" AND no form inputs / dropdowns to fill
+      if (headingText.includes('review') && !hasFormInputs && !hasSelectOneDropdowns && !hasSaveAndContinue) return 'review' as PageType;
       if (hasSubmitButton && !hasSaveAndContinue && !hasSelectOneDropdowns && !hasFormInputs) return 'review' as PageType;
 
       const allText = headingText + ' ' + bodyText.substring(0, 2000);
@@ -1098,7 +1114,11 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
           'input[type="text"]:not([readonly]), textarea:not([readonly]), input[type="email"], input[type="tel"]'
         ).length > 0;
         const hasSelectOne = buttons.some(b => (b.textContent?.trim() || '') === 'Select One');
-        const hasUncheckedRequired = document.querySelectorAll('input[type="checkbox"]:not(:checked)').length > 0;
+        // Only count VISIBLE unchecked checkboxes as blocking review
+        const hasUncheckedRequired = Array.from(document.querySelectorAll('input[type="checkbox"]:not(:checked)')).some(cb => {
+          const rect = (cb as HTMLElement).getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        });
 
         if (isReviewHeading || (!hasEditableInputs && !hasSelectOne && !hasUncheckedRequired)) {
           return 'review_detected';
@@ -1114,10 +1134,16 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
     if (result === 'not_found') {
       // Last resort: LLM with strict instruction
       console.warn('[Workday] DOM click failed, falling back to LLM act()');
-      await adapter.act(
-        'Click the "Save and Continue" button. Click ONLY that button and then STOP. Do absolutely nothing else. Do NOT click "Submit" or "Submit Application".',
-      );
-      return 'clicked';
+      try {
+        await adapter.act(
+          'Click the "Save and Continue" button. Click ONLY that button and then STOP. Do absolutely nothing else. Do NOT click "Submit" or "Submit Application".',
+        );
+        return 'clicked';
+      } catch {
+        // LLM also couldn't find a button — report not_found so caller
+        // doesn't assume navigation succeeded
+        return 'not_found';
+      }
     }
 
     return result as 'clicked' | 'review_detected' | 'not_found';
@@ -1460,10 +1486,11 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
       }
     }
 
-    // Workday login page — click "Sign in with Google"
-    console.log('[Workday] On login page, clicking Sign in with Google...');
+    // Workday login page — try Google SSO first, then native email/password
+    console.log('[Workday] On login page...');
 
-    let clicked = false;
+    // Step 1: Try Google SSO via Playwright selectors
+    let googleClicked = false;
     const googleBtnSelectors = [
       'button:has-text("Sign in with Google")',
       'button:has-text("Continue with Google")',
@@ -1475,28 +1502,250 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
         const btn = adapter.page.locator(sel).first();
         if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
           await btn.click();
-          clicked = true;
+          googleClicked = true;
           console.log('[Workday] Clicked "Sign in with Google" via Playwright locator.');
           break;
         }
       } catch { /* try next selector */ }
     }
 
-    if (!clicked) {
-      const result = await adapter.act(
-        'Look for a "Sign in with Google" button, a Google icon/logo button, or a "Continue with Google" option and click it. If there is no Google sign-in option, look for "Sign In" or "Log In" button instead.',
-      );
-      if (!result.success) {
-        console.warn(`[Workday] Google sign-in button not found, trying generic sign-in: ${result.message}`);
-        await adapter.act('Click the "Sign In", "Log In", or "Create Account" button.');
-      }
+    if (googleClicked) {
+      try {
+        await adapter.page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+        await adapter.page.waitForTimeout(3000);
+      } catch { /* non-fatal */ }
+      return;
     }
 
-    // Wait for page navigation
-    try {
-      await adapter.page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+    // Step 2: Detect page layout — Workday shows "Create Account" by default with
+    // a "Sign In" tab. We need to click the tab FIRST before filling credentials,
+    // otherwise we'd fill the Create Account form by mistake.
+    const pageContext = await adapter.page.evaluate(() => {
+      const passwordFields = document.querySelectorAll('input[type="password"]:not([disabled])');
+      const hasConfirmPassword = passwordFields.length > 1;
+      const headings = Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]'));
+      const headingText = headings.map(h => (h.textContent || '').toLowerCase()).join(' ');
+      const isCreateAccountView = hasConfirmPassword
+        || headingText.includes('create account')
+        || headingText.includes('register');
+
+      const signInTab = Array.from(
+        document.querySelectorAll('button, a, [role="tab"], [role="button"], [role="link"]')
+      ).find(el => {
+        const text = (el.textContent || '').trim().toLowerCase();
+        return text === 'sign in' || text === 'log in';
+      });
+
+      return {
+        isCreateAccountView,
+        hasSignInTab: !!signInTab,
+        hasPasswordField: passwordFields.length > 0,
+      };
+    });
+
+    console.log(`[Workday] Page context: createAccount=${pageContext.isCreateAccountView}, signInTab=${pageContext.hasSignInTab}, password=${pageContext.hasPasswordField}`);
+
+    // If we already tried login and landed back on Create Account page,
+    // don't loop — just return so the detection pipeline classifies as account_creation.
+    if (pageContext.isCreateAccountView && (profile as any)._loginAttempted) {
+      console.log('[Workday] Already tried login — returning to let account creation handler take over.');
+      return;
+    }
+
+    // If on Create Account view, click "Sign In" tab first to switch views
+    if (pageContext.isCreateAccountView && pageContext.hasSignInTab) {
+      console.log('[Workday] Create Account view — clicking Sign In tab first...');
+      const tabClicked = await adapter.page.evaluate(() => {
+        const els = document.querySelectorAll('button, a, [role="tab"], [role="button"], [role="link"]');
+        for (const el of els) {
+          const text = (el.textContent || '').trim().toLowerCase();
+          if (text === 'sign in' || text === 'log in') {
+            (el as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (tabClicked) {
+        await adapter.page.waitForTimeout(1500);
+      }
+    } else if (!pageContext.hasPasswordField) {
+      // No password field visible at all — LLM finds sign-in option
+      console.log('[Workday] No login form visible — using LLM to find sign-in...');
+      await adapter.act(
+        'Look for a "Sign in with Google" button or a "Sign In" link/tab and click it to open the sign-in form. Do NOT click "Create Account". Click ONLY ONE button, then report done.',
+      );
+      await adapter.page.waitForTimeout(2000);
+    }
+
+    // Helper: fill the sign-in modal/form and submit with the given password
+    const tryLogin = async (pw: string): Promise<string | null> => {
+      const fillResult = await adapter.page.evaluate((creds: { email: string; password: string }) => {
+        const modal = document.querySelector<HTMLElement>(
+          '[role="dialog"], [aria-modal="true"], [data-automation-id="popUpDialog"]'
+        );
+        const ctx: ParentNode = modal || document;
+
+        const emailSels = [
+          'input[type="email"]', 'input[autocomplete="email"]',
+          'input[name*="email" i]', 'input[name*="user" i]',
+          'input[id*="email" i]', 'input[data-automation-id*="email" i]',
+        ];
+        let emailInput: HTMLInputElement | null = null;
+        for (const sel of emailSels) {
+          const input = ctx.querySelector<HTMLInputElement>(sel + ':not([disabled])');
+          if (input && input.getBoundingClientRect().width > 0) {
+            emailInput = input;
+            break;
+          }
+        }
+        if (!emailInput) {
+          const pw = ctx.querySelector<HTMLInputElement>('input[type="password"]:not([disabled])');
+          if (pw) {
+            const form = pw.closest('form') || ctx;
+            const txt = form.querySelector<HTMLInputElement>(
+              'input[type="text"]:not([disabled]), input:not([type]):not([disabled])'
+            );
+            if (txt && txt.getBoundingClientRect().width > 0) emailInput = txt;
+          }
+        }
+
+        if (emailInput) {
+          emailInput.focus();
+          emailInput.value = creds.email;
+          emailInput.dispatchEvent(new Event('input', { bubbles: true }));
+          emailInput.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        const pwInput = ctx.querySelector<HTMLInputElement>('input[type="password"]:not([disabled])');
+        if (pwInput && pwInput.getBoundingClientRect().width > 0) {
+          pwInput.focus();
+          pwInput.value = creds.password;
+          pwInput.dispatchEvent(new Event('input', { bubbles: true }));
+          pwInput.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        if (!emailInput && !pwInput) return { filled: false, submitted: false };
+
+        const wdSubmit = ctx.querySelector<HTMLElement>(
+          '[data-automation-id="click_filter"][aria-label*="Sign In" i], ' +
+          '[data-automation-id="signInSubmitButton"]'
+        );
+        if (wdSubmit) {
+          wdSubmit.click();
+          return { filled: true, submitted: true };
+        }
+
+        const SIGNIN_TEXTS = ['sign in', 'log in', 'login'];
+        const btns = ctx.querySelectorAll<HTMLElement>(
+          'button, input[type="submit"], [role="button"]'
+        );
+        for (const btn of btns) {
+          const text = (btn.textContent || (btn as HTMLInputElement).value || '').trim().toLowerCase();
+          const ariaLabel = (btn.getAttribute('aria-label') || '').trim().toLowerCase();
+          const match = SIGNIN_TEXTS.some(t => text === t || ariaLabel === t);
+          if (match && !btn.matches('[role="tab"]')) {
+            btn.click();
+            return { filled: true, submitted: true };
+          }
+        }
+        const form = (pwInput || emailInput)?.closest('form');
+        if (form) { form.requestSubmit(); return { filled: true, submitted: true }; }
+        return { filled: true, submitted: false };
+      }, { email, password: pw });
+
+      if (fillResult.filled) {
+        console.log(`[Workday] Filled login form with email="${email}", pw=***. submitted=${fillResult.submitted}`);
+      } else {
+        console.log('[Workday] Could not find login form fields to fill.');
+        return null;
+      }
+
+      if (fillResult.filled && !fillResult.submitted) {
+        await adapter.act('Click the "Sign In" or "Log In" button to submit the login form. Do NOT click "Create Account". Click ONLY ONE button.');
+      }
+
       await adapter.page.waitForTimeout(3000);
-    } catch { /* non-fatal */ }
+
+      // Check for login errors
+      const loginError = await adapter.page.evaluate(() => {
+        const patterns = ['incorrect', 'invalid', 'wrong', 'not found', "doesn't exist",
+          'does not exist', 'failed', 'try again', 'not recognized', 'no account', 'unable'];
+        const alertEls = document.querySelectorAll(
+          '[role="alert"], [class*="error"], [class*="alert"], [data-automation-id*="error" i]'
+        );
+        for (const el of alertEls) {
+          const rect = (el as HTMLElement).getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          const text = (el.textContent || '').trim().toLowerCase();
+          if (text && patterns.some(p => text.includes(p))) return text.substring(0, 200);
+        }
+        return null;
+      });
+
+      return loginError;
+    };
+
+    // Step 3: Try login with base password
+    const PASSWORD_SUFFIX = 'aA1!';
+    let loginError = await tryLogin(password);
+
+    // Step 3b: If base password failed, try with suffix appended
+    if (loginError && password) {
+      console.log(`[Workday] Login failed with base password: "${loginError}" — retrying with strengthened password...`);
+      // Dismiss error / re-open sign-in form
+      await adapter.page.keyboard.press('Escape');
+      await adapter.page.waitForTimeout(500);
+      // Re-open Sign In if we're back on the main page
+      const needReopen = await adapter.page.evaluate(() => {
+        return !document.querySelector('[role="dialog"], [aria-modal="true"], [data-automation-id="popUpDialog"]');
+      });
+      if (needReopen) {
+        await adapter.page.evaluate(() => {
+          const els = document.querySelectorAll('button, a, [role="tab"], [role="button"], [role="link"]');
+          for (const el of els) {
+            const text = (el.textContent || '').trim().toLowerCase();
+            if (text === 'sign in' || text === 'log in') {
+              (el as HTMLElement).click();
+              return;
+            }
+          }
+        });
+        await adapter.page.waitForTimeout(1500);
+      }
+      loginError = await tryLogin(password + PASSWORD_SUFFIX);
+    }
+
+    // Mark that we attempted login
+    (profile as any)._loginAttempted = true;
+
+    // Step 4: Both passwords failed → navigate to account creation
+    if (loginError) {
+      console.log(`[Workday] Login failed: "${loginError}" — navigating to account creation...`);
+      // Close modal if open
+      await adapter.page.keyboard.press('Escape');
+      await adapter.page.waitForTimeout(500);
+
+      const clickedCreate = await adapter.page.evaluate(() => {
+        const TEXTS = ['create account', 'sign up', 'register', 'create an account',
+          "don't have an account", 'new user', 'get started'];
+        const els = document.querySelectorAll('a, button, [role="button"], [role="link"], [role="tab"], span');
+        for (const el of els) {
+          const text = (el.textContent || '').trim().toLowerCase();
+          if (TEXTS.some(t => text.includes(t))) {
+            (el as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (clickedCreate) {
+        console.log('[Workday] Clicked account creation option.');
+      } else {
+        await adapter.act('The login failed. Look for a "Create Account" tab or link and click it. Click ONLY ONE link.');
+      }
+      await adapter.page.waitForTimeout(2000);
+    }
   }
 
   // =========================================================================

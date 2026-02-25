@@ -205,8 +205,10 @@ export class GenericPlatformConfig implements PlatformConfig {
         t === 'sign in' || t === 'log in' || t === 'login' ||
         t === 'sign in with google' || t === 'continue with google'
       );
+      // Require password field OR Google SSO OR (email + sign-in button).
+      // A standalone "Sign In" link in a nav bar should NOT classify as login.
       const isLoginPage = hasPasswordField || hasSignInWithGoogle ||
-        (hasEmailField && hasSignInClickable) || hasSignInClickable;
+        (hasEmailField && hasSignInClickable);
 
       // Native inputs + ARIA-based form controls
       const hasFormInputs = document.querySelectorAll(
@@ -1869,10 +1871,11 @@ ${dataBlock}`;
     const arrowMatch = await this.arrowScrollToOption(adapter, answer);
     if (arrowMatch) return 1;
 
-    // Final fallback: press Enter to accept the top suggestion
-    await adapter.page.keyboard.press('Enter');
+    // Final fallback: press Escape to close the dropdown without selecting a
+    // potentially wrong value. Return 0 so the caller knows filling failed.
+    await adapter.page.keyboard.press('Escape');
     await adapter.page.waitForTimeout(300);
-    return 1;
+    return 0;
   }
 
   /**
@@ -2028,7 +2031,9 @@ ${dataBlock}`;
         );
         if (focused) {
           const text = (focused.textContent || '').trim().toLowerCase();
-          if (text === normAns || text.includes(normAns) || (text.length > 2 && normAns.includes(text))) {
+          // Require reasonable length overlap to avoid short substring false positives
+          // (e.g. "ted" matching inside "United States")
+          if (text === normAns || text.includes(normAns) || (text.length >= 4 && normAns.includes(text) && text.length >= normAns.length * 0.5)) {
             (focused as HTMLElement).click();
             return 'clicked';
           }
@@ -2043,7 +2048,7 @@ ${dataBlock}`;
           const rect = (opt as HTMLElement).getBoundingClientRect();
           if (rect.width === 0 || rect.height === 0) continue;
           const text = (opt.textContent || '').trim().toLowerCase();
-          if (text === normAns || text.includes(normAns) || (text.length > 2 && normAns.includes(text))) {
+          if (text === normAns || text.includes(normAns) || (text.length >= 4 && normAns.includes(text) && text.length >= normAns.length * 0.5)) {
             (opt as HTMLElement).click();
             return 'clicked';
           }
@@ -2153,6 +2158,7 @@ ${dataBlock}`;
       const vh = window.innerHeight;
       const results: Array<{
         groupIndex: number;
+        groupName: string;
         questionText: string;
         options: Array<{ text: string; optionIndex: number }>;
         isAria: boolean;
@@ -2171,7 +2177,7 @@ ${dataBlock}`;
       }
 
       let groupIdx = 0;
-      for (const [, groupRadios] of Object.entries(radiosByName)) {
+      for (const [radioName, groupRadios] of Object.entries(radiosByName)) {
         // Skip if already has a selection
         if (groupRadios.some(r => r.checked)) continue;
 
@@ -2251,7 +2257,7 @@ ${dataBlock}`;
         });
 
         if (questionText || options.length > 0) {
-          results.push({ groupIndex: groupIdx, questionText, options, isAria: false });
+          results.push({ groupIndex: groupIdx, groupName: radioName, questionText, options, isAria: false });
         }
         groupIdx++;
       }
@@ -2307,7 +2313,7 @@ ${dataBlock}`;
         }
 
         if (questionText || options.length > 0) {
-          results.push({ groupIndex: g, questionText, options, isAria: true });
+          results.push({ groupIndex: g, groupName: '', questionText, options, isAria: true });
         }
       }
 
@@ -2366,30 +2372,22 @@ ${dataBlock}`;
           console.log(`[GenericConfig] DOM-filled radio "${group.questionText}" → "${bestOption.text}"`);
         }
       } else {
-        // Native radio: click via Playwright for proper event handling
+        // Native radio: click via Playwright for proper event handling.
+        // Use the radio group's `name` attribute directly (stable across fill
+        // iterations) instead of an index into the unchecked-group list, which
+        // shifts as earlier groups get filled.
         const clicked = await adapter.page.evaluate(
-          ({ groupName, oIdx }) => {
-            const radiosByName: Record<string, HTMLInputElement[]> = {};
-            const allRadios = document.querySelectorAll<HTMLInputElement>('input[type="radio"]:not([disabled])');
-            for (const r of allRadios) {
-              if (!r.name) continue;
-              if (!radiosByName[r.name]) radiosByName[r.name] = [];
-              radiosByName[r.name].push(r);
-            }
-            // Find the group by iterating in the same order as the gather phase
-            const groupNames = Object.keys(radiosByName).filter(name => {
-              return !radiosByName[name].some(r => r.checked);
-            });
-            const name = groupNames[groupName];
-            if (!name) return false;
-            const radios = radiosByName[name];
+          ({ radioName, oIdx }) => {
+            const radios = Array.from(
+              document.querySelectorAll<HTMLInputElement>(`input[type="radio"][name="${CSS.escape(radioName)}"]:not([disabled])`)
+            );
             const target = radios[oIdx];
             if (!target) return false;
             target.click();
             target.dispatchEvent(new Event('change', { bubbles: true }));
             return true;
           },
-          { groupName: group.groupIndex, oIdx: bestOption.optionIndex },
+          { radioName: group.groupName, oIdx: bestOption.optionIndex },
         );
         if (clicked) {
           filled++;
@@ -2595,7 +2593,7 @@ ${dataBlock}`;
 
       const vh = window.innerHeight;
       const allButtons = Array.from(document.querySelectorAll<HTMLButtonElement | HTMLAnchorElement>(
-        'button, [role="button"], input[type="submit"], a.btn'
+        'button, [role="button"], input[type="submit"], a.btn, a[class*="btn"], a[class*="button"]'
       ));
 
       const allButtonTexts = allButtons.map(b => {
