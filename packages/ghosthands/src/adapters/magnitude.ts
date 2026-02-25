@@ -94,11 +94,13 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
     });
 
     // Wire Magnitude events to adapter events
+    // Forward the full action payload (variant, x, y, content, etc.)
+    // so TraceRecorder can use coordinates for elementFromPoint lookups.
     this.agent.events.on('actionStarted', (action) => {
-      this.emitter.emit('actionStarted', { variant: action.variant });
+      this.emitter.emit('actionStarted', { ...action });
     });
     this.agent.events.on('actionDone', (action) => {
-      this.emitter.emit('actionDone', { variant: action.variant });
+      this.emitter.emit('actionDone', { ...action });
     });
     this.agent.events.on('tokensUsed', (usage: ModelUsage) => {
       // Magnitude emits token counts but NOT costs.
