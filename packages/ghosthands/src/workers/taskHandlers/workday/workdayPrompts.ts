@@ -112,7 +112,9 @@ IMPORTANT INTERACTION PATTERNS:
 5. ${CHECKBOX_RULES}
 6. After filling each field, CLICK on empty whitespace to deselect before moving to the next field.
 
-If ALL visible fields already have values, STOP IMMEDIATELY — do nothing.
+BEFORE REPORTING DONE: Check for ANY "Add" buttons visible on screen for Work Experience or Education. If you see an "Add" button for a section that does NOT yet have an entry (no expanded form fields below it), you MUST click it to add an entry. Only report done when all sections either have filled entries or you have clicked their "Add" buttons AND filled the resulting fields.
+
+If ALL visible fields already have values AND no unfilled "Add" buttons for Work Experience or Education remain, STOP — do nothing.
 
 ${dataBlock}`;
 }
