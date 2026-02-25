@@ -6,14 +6,15 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
-    "dist": "electron-builder --mac"
+    "predist": "electron-vite build && node scripts/bundle-browsers.mjs",
+    "dist": "electron-builder --mac",
+    "postinstall": "patchright install chromium"
   },
   "dependencies": {
     "magnitude-core": "^0.3.1",
     "zod": "^3.24.0"
   },
   "devDependencies": {
-    "playwright": "^1.50.0",
     "electron": "^40.6.0",
     "electron-builder": "^26.8.0",
     "electron-vite": "^5.0.0",

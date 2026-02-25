@@ -1,0 +1,11 @@
+# Electron build output
+out/
+
+# Packaging output
+release/
+
+# Bundled browsers (copied during predist)
+playwright-browsers/
+
+# Environment
+.env

@@ -1085,6 +1085,12 @@ function extractCompanyFromUrl(url) {
     return "Unknown";
   }
 }
+if (electron.app.isPackaged) {
+  const bundledBrowsers = path.join(process.resourcesPath, "playwright-browsers");
+  if (fs.existsSync(bundledBrowsers)) {
+    process.env.PLAYWRIGHT_BROWSERS_PATH = bundledBrowsers;
+  }
+}
 try {
   const envPath = path.join(__dirname, "../../.env");
   const envContent = fs.readFileSync(envPath, "utf-8");

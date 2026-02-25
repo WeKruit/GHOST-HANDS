@@ -1,7 +1,16 @@
 import { app, BrowserWindow, shell } from 'electron';
 import { join } from 'path';
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { registerIpcHandlers } from './ipc';
+
+// In a packaged app, point Playwright/Patchright to the bundled Chromium binary.
+// The browser is bundled via extraResources at: <resources>/playwright-browsers/
+if (app.isPackaged) {
+  const bundledBrowsers = join(process.resourcesPath, 'playwright-browsers');
+  if (existsSync(bundledBrowsers)) {
+    process.env.PLAYWRIGHT_BROWSERS_PATH = bundledBrowsers;
+  }
+}
 
 // Load .env file into process.env (for TEST_GMAIL_PASSWORD, etc.)
 try {

@@ -3,7 +3,28 @@ productName: GhostHands
 directories:
   output: release
   buildResources: assets
+
+asar: true
+asarUnpack:
+  - "**/node_modules/magnitude-core/**"
+  - "**/node_modules/patchright/**"
+  - "**/node_modules/patchright-core/**"
+  - "**/node_modules/playwright/**"
+  - "**/node_modules/playwright-core/**"
+  - "**/node_modules/sharp/**"
+
+extraResources:
+  - from: cookbooks
+    to: cookbooks
+    filter:
+      - "**/*.json"
+  - from: playwright-browsers
+    to: playwright-browsers
+    filter:
+      - "**/*"
+
 mac:
+  identity: null
   category: public.app-category.developer-tools
   target:
     - target: dmg
