@@ -125,7 +125,7 @@ function buildWorkerService(ecrImage: string, envVars: string[]): ServiceDefinit
     config: {
       Image: ecrImage,
       Cmd: ['bun', 'packages/ghosthands/src/workers/main.ts'],
-      Env: [...envVars, 'GH_WORKER_PORT=3101', 'MAX_CONCURRENT_JOBS=1'],
+      Env: [...envVars, 'GH_WORKER_PORT=3101', 'MAX_CONCURRENT_JOBS=1', 'GH_HEADLESS=false'],
       HostConfig: {
         NetworkMode: 'host',
         RestartPolicy: {
