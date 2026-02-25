@@ -1,0 +1,27 @@
+{
+  "name": "@ghosthands/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "dist": "electron-builder --mac"
+  },
+  "dependencies": {
+    "magnitude-core": "^0.3.1",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.50.0",
+    "electron": "^40.6.0",
+    "electron-builder": "^26.8.0",
+    "electron-vite": "^5.0.0",
+    "@vitejs/plugin-react": "^4.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "~5.7.2"
+  }
+}
