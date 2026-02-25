@@ -16,7 +16,8 @@ RULES — follow in strict order:
 
 3. SKIP fields that already have text, a selection, or a checked checkbox. NEVER uncheck a checkbox that is already checked. NEVER clear a field that already has a value.
 
-4. SKIP fields with no matching data (e.g. Middle Name, Address Line 2).
+4. For OPTIONAL fields with no matching data (e.g. Middle Name, Address Line 2), skip them.
+   For REQUIRED fields (marked with * or "required") with no matching data, use your best judgment to provide a reasonable answer. Think about what makes sense given the applicant's profile, the role, and the company. For example: "How did you hear about us?" → "LinkedIn", "Desired salary" → a reasonable market rate, "Start date" → "As soon as possible", etc.
 
 5. CRITICAL — CUT-OFF DETECTION: Before answering ANY question near the bottom half of the screen, ask yourself: "Can I see the COMPLETE question text AND every single answer option?" If the answer is no — or if an expected answer choice (like "No" or "Yes") is missing — the question is CUT OFF. DO NOT TOUCH IT.
    How to tell a question is cut off:
@@ -39,7 +40,8 @@ const FIELD_INTERACTION_RULES = `HOW TO FILL:
 - Dropdowns: Click to open, type to filter, click the match. If no exact match, pick the closest option.
 - Radio buttons: Click the matching option.
 - Required checkboxes (terms, agreements): Check them.
-- If a field has no match in the data mapping (e.g. Middle Name, Address Line 2), skip it.
+- If an OPTIONAL field has no match in the data mapping (e.g. Middle Name, Address Line 2), skip it.
+- If a REQUIRED field has no exact match in the data mapping, use your best judgment to pick a reasonable answer that benefits the applicant. Consider the applicant's background, the job role, and common-sense defaults.
 - If stuck on a field after two tries, skip it and move on.`;
 
 // ---------------------------------------------------------------------------
@@ -93,14 +95,21 @@ export function findBestAnswer(label: string, qaMap: Record<string, string>): st
   }
 
   // Pass 2: label contains a Q&A key (e.g. label="First Name *" contains key="First Name")
+  // BUT the key must cover enough of the label to be a real match — a short key like
+  // "Name" (4 chars) should NOT match "First Name" (10 chars) because the label has
+  // a more specific qualifier. Require key length ≥ 60% of label length.
   for (const [q, a] of Object.entries(qaMap)) {
     const normQ = normalizeLabel(q);
-    if (normQ.length >= 3 && norm.includes(normQ)) return a;
+    if (normQ.length >= 3 && norm.includes(normQ) && normQ.length >= norm.length * 0.6) return a;
   }
 
-  // Pass 3: Q&A key contains label (short labels like "Gender")
+  // Pass 3: Q&A key contains label (short labels like "Gender", "Email")
+  // Guard: label must be ≥ 50% of key length to prevent incidental substring matches
+  // (e.g. "city" matching "ethnicity" because "ethnicity" ends in "city":
+  //  4/9 = 0.44 < 0.5 → blocked)
   for (const [q, a] of Object.entries(qaMap)) {
-    if (normalizeLabel(q).includes(norm) && norm.length >= 3) return a;
+    const normQ = normalizeLabel(q);
+    if (normQ.includes(norm) && norm.length >= 3 && norm.length >= normQ.length * 0.5) return a;
   }
 
   // Pass 4: significant word overlap — but only if ALL distinguishing words in the

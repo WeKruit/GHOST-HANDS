@@ -54,7 +54,8 @@ HOW TO FILL FIELDS:
 - ${DATE_FIELD_RULES(todayDate, todayFormatted, graduationDate)}
 - Radio buttons: click the correct option matching the data mapping.
 - ${CHECKBOX_RULES}
-- OPTIONAL FIELDS: Not every empty field needs filling. If a field has no matching value in the data mapping (e.g., Address Line 2, Middle Name, Suffix), leave it empty and move on.
+- OPTIONAL FIELDS: Not every empty field needs filling. If an OPTIONAL field has no matching value in the data mapping (e.g., Address Line 2, Middle Name, Suffix), leave it empty and move on.
+- REQUIRED FIELDS: If a REQUIRED field (marked with * or "required") has no exact match in the data mapping, use your best judgment to provide a reasonable answer that benefits the applicant. Think about what makes sense given the applicant's profile and the role they're applying for.
 
 TASK: Fill any empty form fields visible on screen, top to bottom. When done, report the task as complete.
 
@@ -78,7 +79,8 @@ HOW TO FILL FIELDS:
 - ${DATE_FIELD_RULES(todayDate, todayFormatted, graduationDate)}
 - Radio buttons: click the correct option matching the data mapping.
 - ${CHECKBOX_RULES}
-- OPTIONAL FIELDS: Not every empty field needs filling. If a field has no matching value in the data mapping, leave it empty and move on.
+- OPTIONAL FIELDS: Not every empty field needs filling. If an OPTIONAL field has no matching value in the data mapping, leave it empty and move on.
+- REQUIRED FIELDS: If a REQUIRED field (marked with * or "required") has no exact match in the data mapping, use your best judgment to provide a reasonable answer that benefits the applicant.
 
 TASK: You are on a "${pageDescription}" form page. Fill any empty questions/fields visible on screen, top to bottom. When done, report the task as complete.
 
@@ -101,6 +103,7 @@ HOW TO FILL FIELDS:
 - Radio buttons: click the correct option matching the data.
 - ${CHECKBOX_RULES}
 - After filling each field, click whitespace to deselect before the next field.
+- REQUIRED FIELDS: If a REQUIRED field (marked with * or "required") has no exact match in the data, use your best judgment to provide a reasonable answer that benefits the applicant.
 
 When done, report the task as complete.
 
@@ -122,6 +125,7 @@ HOW TO FILL:
 - The popup menu ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps other questions.
 - If typing doesn't produce a match, click whitespace to close, reopen, and try a shorter keyword. Never use arrow keys or mouse-scroll inside dropdowns.
 - ${CHECKBOX_RULES}
+- REQUIRED FIELDS: If a REQUIRED field has no exact match in the data mapping, use your best judgment — pick the most neutral/beneficial option for the applicant (e.g. "I do not wish to answer" for demographics).
 
 When all visible questions have answers, report the task as complete.
 
@@ -143,6 +147,7 @@ HOW TO FILL:
 - The popup menu ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps other questions.
 - If typing doesn't produce a match, click whitespace to close, reopen, and try a shorter keyword. Never use arrow keys or mouse-scroll inside dropdowns.
 - ${CHECKBOX_RULES}
+- REQUIRED FIELDS: If a REQUIRED field has no exact match in the data mapping, use your best judgment — pick the most neutral/beneficial option for the applicant (e.g. "I do not wish to answer" for demographics).
 
 When all visible questions have answers, report the task as complete.
 
@@ -161,7 +166,8 @@ HOW TO FILL FIELDS:
 - ${DROPDOWN_RULES}
 - Radio buttons: click the correct option matching the data mapping.
 - ${CHECKBOX_RULES}
-- OPTIONAL FIELDS: Not every empty field needs filling. If a field has no matching value in the data mapping, leave it empty and move on.
+- OPTIONAL FIELDS: Not every empty field needs filling. If an OPTIONAL field has no matching value in the data mapping, leave it empty and move on.
+- REQUIRED FIELDS: If a REQUIRED field (marked with * or "required") has no exact match in the data mapping, use your best judgment to provide a reasonable answer that benefits the applicant.
 
 TASK: Fill any empty form fields visible on screen, top to bottom. When done, report the task as complete.
 
