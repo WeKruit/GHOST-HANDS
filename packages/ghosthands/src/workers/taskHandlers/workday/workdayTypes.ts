@@ -27,8 +27,8 @@ export const WorkdayExperienceSchema = z.object({
   title: z.string(),
   location: z.string().optional(),
   currently_work_here: z.boolean().optional().default(false),
-  start_date: z.string(),
-  end_date: z.string(),
+  start_date: z.string().optional(),
+  end_date: z.string().optional(),
   description: z.string(),
 });
 
