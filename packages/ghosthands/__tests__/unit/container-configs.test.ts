@@ -2,38 +2,23 @@
  * WEK-83: Container Configuration Tests
  *
  * Unit tests for the container config definitions (scripts/lib/container-configs.ts).
- * Tests service definitions, env file parsing, and startup/shutdown ordering.
+ * Tests service definitions, env var passthrough from process.env, and startup/shutdown ordering.
  *
- * IMPORTANT: We do NOT use vi.mock('fs') because Bun's test runner runs all
- * test files in the same process, and vi.mock leaks across files — breaking
- * config/models.test.ts and api/models.test.ts which also use fs.readFileSync.
+ * getEnvVarsFromProcess reads from process.env (populated by docker-compose env_file
+ * and/or AWS Secrets Manager). Tests set process.env directly before calling.
  *
- * Instead:
- * - loadEnvFile tests use real temp files (tests actual parsing logic)
- * - getServiceConfigs tests spy on loadEnvFile (avoids needing /opt/ghosthands/.env)
+ * getServiceConfigs tests spy on getEnvVarsFromProcess to inject known env vars
+ * without polluting the real process.env.
  */
 
-import { describe, test, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
+import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as containerConfigs from '../../../../scripts/lib/container-configs';
 
 import {
-  loadEnvFile,
+  getEnvVarsFromProcess,
   getServiceConfigs,
   type ServiceDefinition,
 } from '../../../../scripts/lib/container-configs';
-
-// -- Temp file helpers for loadEnvFile tests --
-
-let tmpDir: string;
-
-function writeTmpEnv(content: string): string {
-  const envPath = path.join(tmpDir, '.env');
-  fs.writeFileSync(envPath, content, 'utf-8');
-  return envPath;
-}
 
 // -- Mock env vars for getServiceConfigs tests --
 
@@ -44,86 +29,100 @@ const SAMPLE_ENV_VARS = [
 ];
 
 describe('Container Configs Module', () => {
-  beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gh-configs-test-'));
-  });
-
   afterEach(() => {
     vi.restoreAllMocks();
-    try {
-      fs.rmSync(tmpDir, { recursive: true });
-    } catch {
-      // ignore cleanup errors
-    }
   });
 
-  describe('loadEnvFile', () => {
-    test('parses KEY=VALUE lines from env file', () => {
-      const envPath = writeTmpEnv('KEY1=value1\nKEY2=value2\n');
+  describe('getEnvVarsFromProcess', () => {
+    /** Helper: set env vars, call getEnvVarsFromProcess, then clean up */
+    function withEnv(vars: Record<string, string>, fn: (result: string[]) => void) {
+      const keys = Object.keys(vars);
+      const originals: Record<string, string | undefined> = {};
+      for (const k of keys) {
+        originals[k] = process.env[k];
+        process.env[k] = vars[k];
+      }
+      try {
+        const result = getEnvVarsFromProcess();
+        fn(result);
+      } finally {
+        for (const k of keys) {
+          if (originals[k] === undefined) {
+            delete process.env[k];
+          } else {
+            process.env[k] = originals[k];
+          }
+        }
+      }
+    }
 
-      const result = loadEnvFile(envPath);
-      expect(result).toEqual(['KEY1=value1', 'KEY2=value2']);
+    test('includes DATABASE_ prefixed vars', () => {
+      withEnv({ DATABASE_URL: 'postgres://localhost/db' }, (result) => {
+        expect(result).toContain('DATABASE_URL=postgres://localhost/db');
+      });
     });
 
-    test('filters out comment lines starting with #', () => {
-      const envPath = writeTmpEnv(
-        '# comment\nKEY1=value1\n# another comment\nKEY2=value2\n',
+    test('includes SUPABASE_ prefixed vars', () => {
+      withEnv({ SUPABASE_URL: 'https://example.supabase.co' }, (result) => {
+        expect(result).toContain('SUPABASE_URL=https://example.supabase.co');
+      });
+    });
+
+    test('includes GH_ prefixed vars', () => {
+      withEnv({ GH_SERVICE_SECRET: 'test-secret' }, (result) => {
+        expect(result).toContain('GH_SERVICE_SECRET=test-secret');
+      });
+    });
+
+    test('includes ANTHROPIC_ prefixed vars', () => {
+      withEnv({ ANTHROPIC_API_KEY: 'sk-ant-test' }, (result) => {
+        expect(result).toContain('ANTHROPIC_API_KEY=sk-ant-test');
+      });
+    });
+
+    test('includes NODE_ENV', () => {
+      withEnv({ NODE_ENV: 'production' }, (result) => {
+        expect(result).toContain('NODE_ENV=production');
+      });
+    });
+
+    test('excludes system vars like PATH, HOME, USER', () => {
+      // PATH, HOME, USER should already be set in process.env
+      const result = getEnvVarsFromProcess();
+      const hasSystemVar = result.some(
+        (v) => v.startsWith('PATH=') || v.startsWith('HOME=') || v.startsWith('USER='),
       );
-
-      const result = loadEnvFile(envPath);
-      expect(result).toEqual(['KEY1=value1', 'KEY2=value2']);
+      expect(hasSystemVar).toBe(false);
     });
 
-    test('filters out empty lines', () => {
-      const envPath = writeTmpEnv('KEY1=value1\n\n\nKEY2=value2\n\n');
-
-      const result = loadEnvFile(envPath);
-      expect(result).toEqual(['KEY1=value1', 'KEY2=value2']);
+    test('excludes vars with empty values', () => {
+      withEnv({ GH_EMPTY_VAR: '' }, (result) => {
+        expect(result.some((v) => v.startsWith('GH_EMPTY_VAR='))).toBe(false);
+      });
     });
 
-    test('handles comments, empty lines, and values with spaces', () => {
-      const content = [
-        '# comment',
-        'KEY1=value1',
-        '',
-        'KEY2=value2',
-        '# another comment',
-        'KEY3=value with spaces',
-      ].join('\n');
-
-      const envPath = writeTmpEnv(content);
-
-      const result = loadEnvFile(envPath);
-      expect(result).toEqual([
-        'KEY1=value1',
-        'KEY2=value2',
-        'KEY3=value with spaces',
-      ]);
-    });
-
-    test('trims whitespace from lines', () => {
-      const envPath = writeTmpEnv('  KEY1=value1  \n  KEY2=value2  \n');
-
-      const result = loadEnvFile(envPath);
-      expect(result).toEqual(['KEY1=value1', 'KEY2=value2']);
-    });
-
-    test('returns empty array for file with only comments and blanks', () => {
-      const envPath = writeTmpEnv('# just comments\n\n# nothing else\n');
-
-      const result = loadEnvFile(envPath);
-      expect(result).toEqual([]);
-    });
-
-    test('throws error when file does not exist', () => {
-      expect(() => loadEnvFile('/nonexistent/path/.env')).toThrow();
+    test('includes multiple matching prefixes', () => {
+      withEnv(
+        {
+          DATABASE_URL: 'pg://db',
+          REDIS_URL: 'redis://localhost',
+          AWS_REGION: 'us-east-1',
+          OPENAI_API_KEY: 'sk-test',
+        },
+        (result) => {
+          expect(result).toContain('DATABASE_URL=pg://db');
+          expect(result).toContain('REDIS_URL=redis://localhost');
+          expect(result).toContain('AWS_REGION=us-east-1');
+          expect(result).toContain('OPENAI_API_KEY=sk-test');
+        },
+      );
     });
   });
 
   describe('getServiceConfigs', () => {
     beforeEach(() => {
-      // Spy on loadEnvFile to avoid needing /opt/ghosthands/.env
-      vi.spyOn(containerConfigs, 'loadEnvFile').mockReturnValue(SAMPLE_ENV_VARS);
+      // Spy on getEnvVarsFromProcess to inject known env vars
+      vi.spyOn(containerConfigs, 'getEnvVarsFromProcess').mockReturnValue(SAMPLE_ENV_VARS);
     });
 
     test('returns exactly 3 services', () => {
@@ -148,7 +147,7 @@ describe('Container Configs Module', () => {
     test('all containers use the same ECR image built from the image tag', () => {
       const services = getServiceConfigs('staging-abc123', 'staging');
       const expectedImage =
-        '471112621974.dkr.ecr.us-east-1.amazonaws.com/wekruit/ghosthands:staging-abc123';
+        '168495702277.dkr.ecr.us-east-1.amazonaws.com/ghosthands:staging-abc123';
 
       for (const svc of services) {
         expect(svc.config.Image).toBe(expectedImage);
@@ -181,7 +180,7 @@ describe('Container Configs Module', () => {
       }
     });
 
-    test('environment variables from .env file are included in all containers', () => {
+    test('environment variables from process.env are included in all containers', () => {
       const services = getServiceConfigs('staging-abc123', 'staging');
 
       for (const svc of services) {
@@ -232,8 +231,7 @@ describe('Container Configs Module', () => {
       test('runs bun with correct command', () => {
         expect(getApiService().config.Cmd).toEqual([
           'bun',
-          'run',
-          'packages/ghosthands/dist/api/server.js',
+          'packages/ghosthands/src/api/server.ts',
         ]);
       });
     });
@@ -249,7 +247,7 @@ describe('Container Configs Module', () => {
       });
 
       test('has drain endpoint on port 3101', () => {
-        expect(getWorkerService().drainEndpoint).toBe('http://localhost:3101/drain');
+        expect(getWorkerService().drainEndpoint).toBe('http://localhost:3101/worker/drain');
       });
 
       test('has GH_WORKER_PORT=3101 in env', () => {
@@ -277,7 +275,7 @@ describe('Container Configs Module', () => {
       });
 
       test('has health endpoint on port 3101', () => {
-        expect(getWorkerService().healthEndpoint).toBe('http://localhost:3101/health');
+        expect(getWorkerService().healthEndpoint).toBe('http://localhost:3101/worker/health');
       });
 
       test('has 60-second drain timeout', () => {
@@ -333,8 +331,7 @@ describe('Container Configs Module', () => {
       test('runs deploy-server.ts script', () => {
         expect(getDeployService().config.Cmd).toEqual([
           'bun',
-          'run',
-          '/opt/ghosthands/scripts/deploy-server.ts',
+          'scripts/deploy-server.ts',
         ]);
       });
     });
@@ -376,7 +373,7 @@ describe('Container Configs Module', () => {
       test('builds correct ECR image reference from tag', () => {
         const services = getServiceConfigs('prod-v1.2.3', 'production');
         const expectedImage =
-          '471112621974.dkr.ecr.us-east-1.amazonaws.com/wekruit/ghosthands:prod-v1.2.3';
+          '168495702277.dkr.ecr.us-east-1.amazonaws.com/ghosthands:prod-v1.2.3';
 
         expect(services[0].config.Image).toBe(expectedImage);
       });

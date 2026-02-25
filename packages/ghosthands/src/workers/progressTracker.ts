@@ -1,4 +1,9 @@
 import { SupabaseClient } from '@supabase/supabase-js';
+import type Redis from 'ioredis';
+import { xaddEvent, setStreamTTL } from '../lib/redis-streams.js';
+import { getLogger } from '../monitoring/logger.js';
+
+const logger = getLogger({ service: 'progress-tracker' });
 
 // ---------------------------------------------------------------------------
 // Progress lifecycle steps for a job application flow
@@ -73,6 +78,8 @@ export interface ProgressEventData {
   execution_mode?: 'cookbook' | 'magnitude';
   manual_id?: string;
   step_cost_cents?: number;
+  /** Kasm session URL for live browser view (WEK-162) */
+  kasm_url?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +145,8 @@ export interface ProgressTrackerOptions {
   estimatedTotalActions?: number;
   /** Minimum interval between DB writes (ms). Prevents flooding. Default: 2000 */
   throttleMs?: number;
+  /** Optional Redis client for real-time streaming via Redis Streams. */
+  redis?: Redis;
 }
 
 export class ProgressTracker {
@@ -146,6 +155,7 @@ export class ProgressTracker {
   private workerId: string;
   private estimatedTotalActions: number;
   private throttleMs: number;
+  private redis: Redis | null;
 
   private currentStep: ProgressStep = ProgressStep.QUEUED;
   private actionIndex = 0;
@@ -155,6 +165,7 @@ export class ProgressTracker {
   private pendingEmit: ProgressEventData | null = null;
   private executionMode?: 'cookbook' | 'magnitude';
   private manualId?: string;
+  private kasmUrl?: string;
 
   constructor(opts: ProgressTrackerOptions) {
     this.jobId = opts.jobId;
@@ -162,6 +173,7 @@ export class ProgressTracker {
     this.workerId = opts.workerId;
     this.estimatedTotalActions = opts.estimatedTotalActions ?? 30;
     this.throttleMs = opts.throttleMs ?? 2000;
+    this.redis = opts.redis ?? null;
   }
 
   /** Set the current step explicitly (for lifecycle transitions). */
@@ -179,6 +191,11 @@ export class ProgressTracker {
   setExecutionMode(mode: 'cookbook' | 'magnitude', manualId?: string): void {
     this.executionMode = mode;
     this.manualId = manualId;
+  }
+
+  /** Set the Kasm session URL for live view (WEK-162). */
+  setKasmUrl(url: string): void {
+    this.kasmUrl = url;
   }
 
   /** Called when an action starts. Infers the step and emits progress. */
@@ -221,6 +238,7 @@ export class ProgressTracker {
       eta_ms: this.estimateEta(elapsedMs),
       ...(this.executionMode && { execution_mode: this.executionMode }),
       ...(this.manualId && { manual_id: this.manualId }),
+      ...(this.kasmUrl && { kasm_url: this.kasmUrl }),
     };
   }
 
@@ -251,7 +269,20 @@ export class ProgressTracker {
     this.lastEmitTime = Date.now();
     this.pendingEmit = null;
 
-    // Write to gh_job_events
+    // 1. Publish to Redis Streams for real-time SSE consumption (fast path)
+    if (this.redis) {
+      try {
+        await xaddEvent(this.redis, this.jobId, {
+          ...snapshot,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (err) {
+        // Redis publish failure should never block job execution
+        logger.child({ jobId: this.jobId }).warn('Redis Stream publish failed', { error: String(err) });
+      }
+    }
+
+    // 2. Write to gh_job_events (audit trail — permanent record)
     try {
       await this.supabase.from('gh_job_events').insert({
         job_id: this.jobId,
@@ -261,7 +292,7 @@ export class ProgressTracker {
       });
     } catch (err) {
       // Progress logging should never crash the job
-      console.warn(`[ProgressTracker] Event write failed for job ${this.jobId}:`, err);
+      logger.child({ jobId: this.jobId }).warn('Event write failed', { error: String(err) });
     }
 
     // NOTE: Previously also updated gh_automation_jobs.metadata.progress here,
@@ -286,6 +317,15 @@ export class ProgressTracker {
   async flush(): Promise<void> {
     if (this.pendingEmit) {
       await this.emit();
+    }
+
+    // Set a 24-hour TTL on the Redis stream so it auto-cleans after retention period
+    if (this.redis) {
+      try {
+        await setStreamTTL(this.redis, this.jobId, 86400);
+      } catch (err) {
+        logger.child({ jobId: this.jobId }).warn('Failed to set stream TTL', { error: String(err) });
+      }
     }
   }
 }

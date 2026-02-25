@@ -10,13 +10,20 @@
  *   GET  /version     — Returns deploy server version + current image info
  *   GET  /containers  — Returns running Docker containers (no auth)
  *   GET  /workers     — Returns worker registry status (no auth)
- *   POST /deploy      — Rolling deploy via Docker Engine API (requires X-Deploy-Secret)
- *   POST /drain       — Triggers graceful worker drain (requires X-Deploy-Secret)
- *   POST /rollback    — Stub for future rollback support (requires X-Deploy-Secret)
+ *   POST /deploy               — Rolling deploy via Docker Engine API (requires X-Deploy-Secret)
+ *   POST /drain                — Triggers graceful worker drain (requires X-Deploy-Secret)
+ *   POST /cleanup              — Runs disk cleanup (Docker prune + tmp + logs) (requires X-Deploy-Secret)
+ *   POST /rollback             — Stub for future rollback support (requires X-Deploy-Secret)
+ *   POST /admin/refresh-secrets — Re-fetch secrets from AWS Secrets Manager (requires X-Deploy-Secret)
  *
  * Auth:
  *   POST endpoints require X-Deploy-Secret header matching GH_DEPLOY_SECRET env var.
  *   GET endpoints are unauthenticated (monitoring/health checks).
+ *
+ * Secrets:
+ *   On startup, optionally loads secrets from AWS Secrets Manager
+ *   (`ghosthands/{GH_ENVIRONMENT}`). Existing env vars (from docker-compose env_file)
+ *   take precedence. AWS SM is non-fatal — if unavailable, process.env is used as-is.
  *
  * Usage:
  *   GH_DEPLOY_SECRET=<secret> bun scripts/deploy-server.ts
@@ -32,7 +39,9 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
-import { execSync } from 'node:child_process';
+import { execSync, exec } from 'node:child_process';
+
+import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 
 import {
   pullImage,
@@ -40,10 +49,51 @@ import {
   removeContainer,
   createContainer,
   startContainer,
+  listContainers,
   pruneImages,
 } from './lib/docker-client';
-import { getEcrAuth } from './lib/ecr-auth';
+import { getEcrAuth, getEcrImageRef } from './lib/ecr-auth';
 import { getServiceConfigs, type ServiceDefinition } from './lib/container-configs';
+
+// ── AWS Secrets Manager ──────────────────────────────────────────────
+
+/**
+ * Optionally fetches secrets from AWS Secrets Manager and merges them
+ * into process.env. Existing env vars (from docker-compose env_file)
+ * take precedence — SM values are only set if the key is not already present.
+ *
+ * Non-fatal: if SM is unavailable (no IAM role, no secret, etc.), the
+ * deploy-server continues with whatever is already in process.env.
+ */
+async function loadSecretsFromAwsSm(): Promise<void> {
+  const environment = process.env.GH_ENVIRONMENT || 'staging';
+  const secretId = `ghosthands/${environment}`;
+  const region = process.env.AWS_REGION || 'us-east-1';
+
+  try {
+    const client = new SecretsManagerClient({ region });
+    const response = await client.send(new GetSecretValueCommand({ SecretId: secretId }));
+
+    if (response.SecretString) {
+      const secrets = JSON.parse(response.SecretString);
+      let loaded = 0;
+      for (const [key, value] of Object.entries(secrets)) {
+        if (typeof value === 'string' && !process.env[key]) {
+          // Only set if not already in process.env (env_file takes precedence)
+          process.env[key] = value;
+          loaded++;
+        }
+      }
+      console.log(`[deploy-server] Loaded ${loaded} secrets from AWS SM (${secretId})`);
+    }
+  } catch (err: any) {
+    console.warn(`[deploy-server] AWS Secrets Manager unavailable (${err.message}). Using process.env only.`);
+    // Non-fatal — graceful fallback to compose env_file vars
+  }
+}
+
+// Load secrets before anything else reads process.env
+await loadSecretsFromAwsSm();
 
 const DEPLOY_PORT = parseInt(process.env.GH_DEPLOY_PORT || '8000', 10);
 const DEPLOY_SECRET = process.env.GH_DEPLOY_SECRET;
@@ -182,9 +232,10 @@ async function executeDeploy(imageTag: string): Promise<DeployResult | DeployFai
 
     // 2. Pull new image
     if (currentDeploy) currentDeploy.step = 'pull-image';
-    const fullImage = `${ecrAuth.registryUrl}/wekruit/ghosthands`;
-    console.log(`[deploy] Pulling image: ${fullImage}:${imageTag}`);
-    await pullImage(fullImage, imageTag, ecrAuth.token);
+    const fullImageRef = getEcrImageRef(imageTag);
+    const [imageName, tag] = fullImageRef.split(':') as [string, string];
+    console.log(`[deploy] Pulling image: ${fullImageRef}`);
+    await pullImage(imageName, tag, ecrAuth.token);
     console.log(`[deploy] Image pulled successfully`);
 
     // 3. Get service configs
@@ -192,8 +243,11 @@ async function executeDeploy(imageTag: string): Promise<DeployResult | DeployFai
     const services = getServiceConfigs(imageTag, currentEnvironment);
     console.log(`[deploy] Loaded ${services.length} service configs (env: ${currentEnvironment})`);
 
-    // 4. Stop phase (respect stopOrder — lower numbers stop first)
+    // 4. Stop phase — find ALL matching containers (docker-compose or deploy-server created)
+    //    Docker-compose names: ghosthands-api-1, ghosthands-worker-1
+    //    Deploy-server names: ghosthands-api, ghosthands-worker
     if (currentDeploy) currentDeploy.step = 'stop-services';
+    const allContainers = await listContainers(true);
     const stopOrder = [...services].sort((a, b) => a.stopOrder - b.stopOrder);
     for (const service of stopOrder) {
       if (service.skipOnSelfUpdate) {
@@ -201,25 +255,47 @@ async function executeDeploy(imageTag: string): Promise<DeployResult | DeployFai
         continue;
       }
 
-      console.log(`[deploy] Stopping ${service.name} (stopOrder: ${service.stopOrder})`);
+      // Find all containers whose name starts with the service name
+      // Docker names have a leading "/" in the API response
+      const matching = allContainers.filter((c) => {
+        const names: string[] = (c as Record<string, unknown>).Names as string[] ?? [];
+        return names.some((n: string) => {
+          const clean = n.replace(/^\//, '');
+          return clean === service.name || clean.startsWith(service.name + '-');
+        });
+      });
 
-      // Drain if endpoint exists
-      if (service.drainEndpoint) {
-        await drainService(service.drainEndpoint, service.drainTimeout);
+      if (matching.length === 0) {
+        console.log(`[deploy] No existing container found for ${service.name}`);
+        continue;
       }
 
-      try {
-        await stopContainer(service.name, 30);
-        await removeContainer(service.name);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[deploy] Failed to stop/remove ${service.name}: ${msg}`);
-        return {
-          success: false,
-          error: `Failed to stop service: ${msg}`,
-          failedStep: 'stop-services',
-          failedService: service.name,
-        };
+      for (const container of matching) {
+        const cName = ((container as Record<string, unknown>).Names as string[])?.[0]?.replace(/^\//, '') ?? 'unknown';
+        const cId = (container as Record<string, unknown>).Id as string;
+        console.log(`[deploy] Stopping ${cName} (${cId.slice(0, 12)})`);
+
+        // Drain if endpoint exists and container is running
+        const state = (container as Record<string, unknown>).State as string;
+        if (service.drainEndpoint && state === 'running') {
+          await drainService(service.drainEndpoint, service.drainTimeout);
+        }
+
+        try {
+          if (state === 'running') {
+            await stopContainer(cId, 30);
+          }
+          await removeContainer(cId);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[deploy] Failed to stop/remove ${cName}: ${msg}`);
+          return {
+            success: false,
+            error: `Failed to stop service: ${msg}`,
+            failedStep: 'stop-services',
+            failedService: service.name,
+          };
+        }
       }
     }
 
@@ -545,6 +621,42 @@ if (typeof Bun !== 'undefined') {
         }
       }
 
+      // ── POST /cleanup — Authenticated disk cleanup trigger ──────
+      if (url.pathname === '/cleanup' && req.method === 'POST') {
+        if (!verifySecret(req)) {
+          return Response.json(
+            { success: false, message: 'Unauthorized' },
+            { status: 401 },
+          );
+        }
+
+        console.log('[deploy-server] Disk cleanup requested');
+        try {
+          const output = await new Promise<string>((resolve, reject) => {
+            exec(
+              'bash /opt/ghosthands/scripts/disk-cleanup.sh 2>&1',
+              { encoding: 'utf-8', timeout: 120_000 },
+              (error, stdout, stderr) => {
+                if (error) {
+                  reject(new Error(stdout || stderr || error.message));
+                } else {
+                  resolve(stdout);
+                }
+              },
+            );
+          });
+          console.log('[deploy-server] Disk cleanup completed');
+          return Response.json({ success: true, message: 'Cleanup completed', output });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[deploy-server] Disk cleanup failed: ${msg}`);
+          return Response.json(
+            { success: false, message: `Cleanup failed: ${msg}` },
+            { status: 500 },
+          );
+        }
+      }
+
       // ── POST /rollback — Stub for future rollback support ──────
       if (url.pathname === '/rollback' && req.method === 'POST') {
         if (!verifySecret(req)) {
@@ -559,6 +671,28 @@ if (typeof Bun !== 'undefined') {
           { success: false, message: 'Rollback not yet implemented. Redeploy with a previous image tag.' },
           { status: 501 },
         );
+      }
+
+      // ── POST /admin/refresh-secrets — Re-fetch secrets from AWS SM ──
+      if (url.pathname === '/admin/refresh-secrets' && req.method === 'POST') {
+        if (!verifySecret(req)) {
+          return Response.json(
+            { success: false, message: 'Unauthorized' },
+            { status: 401 },
+          );
+        }
+
+        console.log('[deploy-server] Refreshing secrets from AWS Secrets Manager...');
+        try {
+          await loadSecretsFromAwsSm();
+          return Response.json({ success: true, message: 'Secrets refreshed from AWS SM' });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return Response.json(
+            { success: false, message: `Secrets refresh failed: ${msg}` },
+            { status: 500 },
+          );
+        }
       }
 
       return Response.json({ error: 'not_found' }, { status: 404 });

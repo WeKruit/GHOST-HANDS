@@ -20,9 +20,12 @@
     "@aws-sdk/client-ecr": "^3.709.0",
     "turbo": "^2.4.4",
     "typescript": "5.8.2",
-    "vitest": "^4.0.18"
+    "vitest": "^4.0.18",
+    "yaml": "^2.8.2"
   },
   "dependencies": {
+    "@aws-sdk/client-auto-scaling": "^3.750.0",
+    "@aws-sdk/client-secrets-manager": "^3.995.0",
     "patchright": "^1.52.5"
   }
 }

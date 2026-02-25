@@ -83,15 +83,22 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
       llmConfig = buildLlmConfig(options.llm);
     }
 
+    // Magnitude expects browser options wrapped as { launchOptions: { headless, ... } }
+    // not flat { headless }. See browserProvider.js: _createAndTrackContext checks
+    // 'launchOptions' in options and falls back to {} if missing.
+    const browserConfig = options.cdpUrl
+      ? { cdp: options.cdpUrl }
+      : options.browserOptions
+        ? { launchOptions: options.browserOptions }
+        : undefined;
+
     this.agent = await startBrowserAgent({
       url: options.url,
       llm: llmConfig,
       connectors: options.connectors,
       prompt: options.systemPrompt,
       narrate: false,
-      browser: options.cdpUrl
-        ? { cdp: options.cdpUrl }
-        : options.browserOptions as any,
+      ...(browserConfig && { browser: browserConfig }),
     });
 
     // Remove dangerous actions the LLM should never use.
@@ -103,11 +110,13 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
     );
 
     // Wire Magnitude events to adapter events
+    // Forward the full action payload (variant, x, y, content, etc.)
+    // so TraceRecorder can use coordinates for elementFromPoint lookups.
     this.agent.events.on('actionStarted', (action) => {
-      this.emitter.emit('actionStarted', { variant: action.variant });
+      this.emitter.emit('actionStarted', { ...action });
     });
     this.agent.events.on('actionDone', (action) => {
-      this.emitter.emit('actionDone', { variant: action.variant });
+      this.emitter.emit('actionDone', { ...action });
     });
     this.agent.events.on('tokensUsed', (usage: ModelUsage) => {
       // Magnitude emits token counts but NOT costs.

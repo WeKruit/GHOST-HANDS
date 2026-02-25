@@ -1,4 +1,5 @@
 import { SupabaseClient } from '@supabase/supabase-js';
+import { getLogger } from '../monitoring/logger.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -89,7 +90,7 @@ export const MONTHLY_BUDGET: Record<BudgetTier, number> = {
   free: 0.50,
   starter: 2.00,
   pro: 10.00,
-  premium: 10.00,
+  premium: 25.00,
   enterprise: 100.00,
 };
 
@@ -102,8 +103,8 @@ export const JOB_TYPE_ACTION_LIMITS: Record<string, number> = {
   scrape: 30,
   fill_form: 40,
   custom: 50,
-  workday_apply: 200,
-  smart_apply: 200,
+  workday_apply: 10000,
+  smart_apply: 10000,
 };
 
 // ---------------------------------------------------------------------------
@@ -342,6 +343,15 @@ export class CostControlService {
   /**
    * After a job completes (or fails), record its cost against the user's
    * monthly usage and log a cost event.
+   *
+   * Uses a Postgres RPC function (gh_increment_user_usage) to atomically
+   * increment the usage row. This avoids the read-then-write race condition
+   * that can occur when two workers finish at the same time: both would read
+   * the same total, add their cost client-side, and write back -- causing
+   * one update to be lost.
+   *
+   * The RPC uses INSERT ... ON CONFLICT DO UPDATE SET col = col + delta,
+   * which is atomic at the SQL level and safe under concurrent access.
    */
   async recordJobCost(
     userId: string,
@@ -351,37 +361,21 @@ export class CostControlService {
     const { periodStart, periodEnd } = getCurrentBillingPeriod();
     const tier = await this.resolveUserTier(userId);
 
-    // Upsert usage row with incremented values
-    // Using raw RPC to do an atomic increment
-    const { data: existing } = await this.supabase
-      .from('gh_user_usage')
-      .select('id, total_cost_usd, total_input_tokens, total_output_tokens, job_count')
-      .eq('user_id', userId)
-      .eq('period_start', periodStart)
-      .single();
+    // Atomic increment via Postgres RPC -- no read-then-write race
+    const { error: rpcError } = await this.supabase.rpc('gh_increment_user_usage', {
+      p_user_id: userId,
+      p_tier: tier,
+      p_period_start: periodStart,
+      p_period_end: periodEnd,
+      p_cost_usd: cost.totalCost,
+      p_input_tokens: cost.inputTokens,
+      p_output_tokens: cost.outputTokens,
+      p_job_count: 1,
+    });
 
-    if (existing) {
-      await this.supabase
-        .from('gh_user_usage')
-        .update({
-          total_cost_usd: existing.total_cost_usd + cost.totalCost,
-          total_input_tokens: existing.total_input_tokens + cost.inputTokens,
-          total_output_tokens: existing.total_output_tokens + cost.outputTokens,
-          job_count: existing.job_count + 1,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', existing.id);
-    } else {
-      await this.supabase.from('gh_user_usage').insert({
-        user_id: userId,
-        tier,
-        period_start: periodStart,
-        period_end: periodEnd,
-        total_cost_usd: cost.totalCost,
-        total_input_tokens: cost.inputTokens,
-        total_output_tokens: cost.outputTokens,
-        job_count: 1,
-      });
+    if (rpcError) {
+      getLogger().error('Atomic usage increment failed', { userId, error: rpcError.message });
+      throw new Error(`Failed to record job cost: ${rpcError.message}`);
     }
 
     // Log cost event in gh_job_events
