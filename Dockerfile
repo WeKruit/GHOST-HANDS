@@ -120,7 +120,7 @@ RUN chmod +x /dockerstartup/custom_startup.sh
 # KasmVNC config
 COPY config/kasmvnc.yaml /etc/kasmvnc/kasmvnc.yaml
 
-# Generate snakeoil SSL cert (KasmVNC startup expects it even when protocol=http)
+# Generate snakeoil SSL cert for KasmVNC HTTPS (kasmvnc.yaml: protocol=https)
 # Must chmod /etc/ssl/private so kasm-user (uid 1000) can read the key
 RUN apt-get update && apt-get install -y --no-install-recommends ssl-cert \
     && rm -rf /var/lib/apt/lists/* \

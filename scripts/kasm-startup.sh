@@ -15,6 +15,7 @@ if [ -z "${KASM_SESSION_URL:-}" ]; then
   EC2_IP=$(curl -sf --connect-timeout 2 http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
   if [ -n "$EC2_IP" ]; then
     export KASM_SESSION_URL="https://${EC2_IP}:6901"
+    echo "[kasm-startup] Auto-detected KASM_SESSION_URL=${KASM_SESSION_URL}"
   fi
 fi
 
