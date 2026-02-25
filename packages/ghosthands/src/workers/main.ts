@@ -1,85 +1,59 @@
 // ── Logging suppression ───────────────────────────────────────────────
-// Must run before any imports that transitively load magnitude-core / BAML.
-// ESM hoists `import` above top-level statements, so env vars set here
-// only help for runtime checks (like narrator). For the native BAML module
-// we also install a stdout/stderr filter below.
-process.env.BAML_LOG = 'off';
-process.env.MAGNITUDE_LOG_LEVEL = 'warn';
+// NOTE: BAML_LOG, MAGNITUDE_LOG_LEVEL, MAGNITUDE_NARRATE are set in
+// workerLauncher.ts (which runs BEFORE ESM hoists our imports).
+// The env vars below are fallbacks in case main.ts is run directly.
+process.env.BAML_LOG ??= 'off';
+process.env.MAGNITUDE_LOG_LEVEL ??= 'warn';
 // MAGNITUDE_NARRATE='false' is a truthy string — delete it entirely.
-delete process.env.MAGNITUDE_NARRATE;
+if (process.env.MAGNITUDE_NARRATE === 'false') delete process.env.MAGNITUDE_NARRATE;
 
-// ── Filter noisy BAML / narrator output from stdout & stderr ──────────
-// BAML's native Rust runtime writes [BAML INFO] blocks with full prompts
-// directly to stdout/stderr. The blocks look like:
-//   2026-02-24T23:56:58 [BAML INFO] Function CreatePartialRecipe:
-//       Client: Magnus (claude-sonnet-4-6) - 3367ms ...
-//       ---PROMPT---
-//       ... (huge prompt) ...
-//       ---LLM REPLY---
-//       ... (full response) ...
-//       ---Parsed Response (class PartialRecipe)---
-//       { ... }
-//   [23:56:58] INFO (agent): Partial recipe created   <-- our log, stop suppressing
-//
-// Strategy: when we see [BAML in a write, start suppressing. Keep suppressing
-// until we see a write whose trimmed content starts with "[" followed by
-// something other than "BAML" (i.e. our own bracketed log prefixes like
-// [Worker], [Workday], [23:57:03] INFO, etc.).
-const _origStdoutWrite = process.stdout.write.bind(process.stdout);
-const _origStderrWrite = process.stderr.write.bind(process.stderr);
+// ── stdout/stderr filter (safety net if run directly instead of via workerLauncher) ──
+// The workerLauncher.ts installs the proper filter before ESM imports hoist.
+// If main.ts is run directly, this installs a fallback filter.
+if (!(process.stdout.write as any).__ghFiltered) {
+  const _origStdoutWrite = process.stdout.write.bind(process.stdout);
+  const _origStderrWrite = process.stderr.write.bind(process.stderr);
+  let _suppressingBaml = false;
 
-let _suppressingBaml = false;
-
-function _suppress(
-  encodingOrCb?: BufferEncoding | ((err?: Error) => void),
-  cb?: (err?: Error) => void,
-): boolean {
-  const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
-  if (callback) callback();
-  return true;
-}
-
-function filterOutput(
-  chunk: any,
-  encodingOrCb?: BufferEncoding | ((err?: Error) => void),
-  cb?: (err?: Error) => void,
-  origWrite: typeof process.stdout.write = _origStdoutWrite,
-): boolean {
-  const str = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-
-  // Suppress narrator ◆ [act] lines (contains full prompt text)
-  if (str.includes('\u25C6 [act]')) {
-    return _suppress(encodingOrCb, cb);
+  function _suppress(
+    encodingOrCb?: BufferEncoding | ((err?: Error) => void),
+    cb?: (err?: Error) => void,
+  ): boolean {
+    const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+    if (callback) callback();
+    return true;
   }
 
-  // Detect start of a BAML block — suppress this write and enter suppression mode
-  if (str.includes('[BAML')) {
-    _suppressingBaml = true;
-    return _suppress(encodingOrCb, cb);
-  }
-
-  // While suppressing, check if this write is our own log output (exit suppression)
-  if (_suppressingBaml) {
-    // Our log lines start with "[" then a non-BAML token:
-    //   [Worker] ..., [Workday] ..., [23:57:03.845] INFO (agent): ...
-    //   [SmartApply] ..., [BlockerDetector] ..., [JobExecutor] ...
-    const trimmed = str.trimStart();
-    if (trimmed.startsWith('[') && !trimmed.startsWith('[BAML')) {
-      _suppressingBaml = false;
-      return origWrite(chunk, encodingOrCb as any, cb as any);
+  function filterOutput(
+    chunk: any,
+    encodingOrCb?: BufferEncoding | ((err?: Error) => void),
+    cb?: (err?: Error) => void,
+    origWrite: typeof process.stdout.write = _origStdoutWrite,
+  ): boolean {
+    const str = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+    if (str.includes('\u25C6 [act]')) return _suppress(encodingOrCb, cb);
+    if (str.includes('[BAML')) { _suppressingBaml = true; return _suppress(encodingOrCb, cb); }
+    if (_suppressingBaml) {
+      const trimmed = str.trimStart();
+      if (trimmed.startsWith('[') && !trimmed.startsWith('[BAML')) {
+        _suppressingBaml = false;
+        return origWrite(chunk, encodingOrCb as any, cb as any);
+      }
+      return _suppress(encodingOrCb, cb);
     }
-    // Still inside BAML block — suppress
-    return _suppress(encodingOrCb, cb);
+    return origWrite(chunk, encodingOrCb as any, cb as any);
   }
 
-  // Normal output — pass through
-  return origWrite(chunk, encodingOrCb as any, cb as any);
-}
+  const filteredStdout = ((chunk: any, encodingOrCb?: any, cb?: any) =>
+    filterOutput(chunk, encodingOrCb, cb, _origStdoutWrite)) as any;
+  filteredStdout.__ghFiltered = true;
+  process.stdout.write = filteredStdout;
 
-process.stdout.write = ((chunk: any, encodingOrCb?: any, cb?: any) =>
-  filterOutput(chunk, encodingOrCb, cb, _origStdoutWrite)) as any;
-process.stderr.write = ((chunk: any, encodingOrCb?: any, cb?: any) =>
-  filterOutput(chunk, encodingOrCb, cb, _origStderrWrite)) as any;
+  const filteredStderr = ((chunk: any, encodingOrCb?: any, cb?: any) =>
+    filterOutput(chunk, encodingOrCb, cb, _origStderrWrite)) as any;
+  filteredStderr.__ghFiltered = true;
+  process.stderr.write = filteredStderr;
+}
 
 import { createClient } from '@supabase/supabase-js';
 import { Client as PgClient, Pool as PgPool } from 'pg';

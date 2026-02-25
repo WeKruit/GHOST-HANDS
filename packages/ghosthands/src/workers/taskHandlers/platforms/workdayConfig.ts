@@ -1251,7 +1251,20 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
     await adapter.page.waitForTimeout(500);
 
     // ==================== DOM-ONLY: Upload Resume ====================
-    if (userProfile.resume_path) {
+    // Check if a resume is already uploaded (e.g. by JobExecutor filechooser handler)
+    const alreadyUploaded = await adapter.page.evaluate(() => {
+      const text = document.body.innerText.toLowerCase();
+      // Check for uploaded filename indicator or delete/remove button near file inputs
+      if (text.includes('successfully uploaded') || text.includes('.pdf') || text.includes('.docx')) {
+        const deleteBtn = document.querySelector('[data-automation-id="delete"], [aria-label*="delete" i], [aria-label*="remove" i]');
+        if (deleteBtn) return true;
+      }
+      return false;
+    });
+
+    if (alreadyUploaded) {
+      console.log('[Workday] [MyExperience] Resume already uploaded — skipping.');
+    } else if (userProfile.resume_path) {
       console.log('[Workday] [MyExperience] Uploading resume via DOM...');
       const resumePath = path.isAbsolute(userProfile.resume_path)
         ? userProfile.resume_path
@@ -1296,6 +1309,8 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
 - Do NOT add more than one work experience entry.
 - Do NOT add more than one education entry.
 
+IMPORTANT: This page has MULTIPLE sections — Work Experience, Education, Skills, and more. You MUST look for ALL sections, not just the first one. If you see that Work Experience is filled but you can also see an "Add" button under Education or an empty Education section, you MUST fill Education too. Do NOT report done just because one section is complete — check ALL visible sections first.
+
 MY EXPERIENCE PAGE DATA:
 `;
 
@@ -1332,10 +1347,10 @@ SKILLS: If any skills still need to be added (check if the skills section alread
   use the skills input (usually has placeholder "Type to Add Skills"):
   1. Click the skills input field
   2. Type the skill name (e.g. "Python")
-  3. Press Enter to search
-  4. WAIT 2 seconds for the autocomplete results to appear
-  5. Click the correct matching result from the dropdown
-  6. Click on empty whitespace to dismiss the dropdown
+  3. Press Enter ONCE to trigger the search — WAIT 3 seconds for results to load
+  4. Results appear in a dropdown below. Click the matching result OR press Enter AGAIN to select the top result
+  5. The skill appears as a chip/tag below the input — confirm it was added
+  6. Click on empty whitespace to dismiss any dropdown
   7. Repeat for each remaining skill
   Skills to add: ${userProfile.skills.map(s => `"${s}"`).join(', ')}
 `;
@@ -1351,10 +1366,13 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
 
     const fillPrompt = buildExperiencePrompt(dataBlock);
 
-    // Custom scroll+LLM loop: ALWAYS invoke LLM each round because fields
-    // are behind "Add" buttons that hasEmptyVisibleFields() can't detect.
-    const MAX_SCROLL_ROUNDS = 8;
-    const MAX_LLM_CALLS = 6;
+    // ── Scroll+LLM loop ──
+    // Strategy: linear scroll from top to bottom. Call LLM at each position.
+    // DO NOT use centerNextEmptyField here — it jumps back to the skills input
+    // every round (the first empty text field) and prevents us from ever
+    // reaching Education, LinkedIn, etc. below.
+    const MAX_SCROLL_ROUNDS = 10;
+    const MAX_LLM_CALLS = 8;
     let llmCallCount = 0;
 
     await adapter.page.evaluate(() => window.scrollTo(0, 0));
@@ -1362,18 +1380,13 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
 
     for (let round = 1; round <= MAX_SCROLL_ROUNDS; round++) {
       if (llmCallCount < MAX_LLM_CALLS) {
-        // On round 1, stay at the top of the page so the LLM sees "Add" buttons
-        // for Work Experience / Education. centerNextEmptyField would jump to
-        // the skills input (first empty text field) and skip those sections.
-        if (round > 1) {
-          await this.centerNextEmptyField(adapter);
-        }
         console.log(`[Workday] [MyExperience] LLM fill round ${round} (call ${llmCallCount + 1}/${MAX_LLM_CALLS})...`);
         await adapter.act(fillPrompt);
         llmCallCount++;
         await adapter.page.waitForTimeout(1000);
       }
 
+      // Linear scroll down — no jumping back
       const scrollBefore = await adapter.page.evaluate(() => window.scrollY);
       const scrollMax = await adapter.page.evaluate(
         () => document.documentElement.scrollHeight - window.innerHeight,
@@ -1384,7 +1397,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
         break;
       }
 
-      await adapter.page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.65)));
+      await adapter.page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.6)));
       await adapter.page.waitForTimeout(800);
 
       const scrollAfter = await adapter.page.evaluate(() => window.scrollY);
@@ -1404,78 +1417,78 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
    * Search open skill dropdown results for a matching option and click it.
    * Returns true if an option was clicked.
    */
+  /**
+   * Click a matching skill option from the Workday dropdown results.
+   * Uses Playwright locators scoped to the skills formField for proper event dispatch.
+   */
   private async findAndClickSkillOption(
     adapter: BrowserAutomationAdapter,
     skill: string,
   ): Promise<boolean> {
-    return adapter.page.evaluate((skillName: string) => {
-      const normSkill = skillName.toLowerCase().trim();
-      // Broad selector set covering Workday dropdown variants
-      const options = document.querySelectorAll(
-        '[role="option"], [role="listbox"] li, ' +
-        '[data-automation-id*="promptOption"], [data-automation-id*="selectOption"], ' +
-        '[data-automation-id*="searchOption"], ' +
-        '[class*="option"], [class*="menu-item"], [class*="multiselectItem"]'
-      );
+    const normSkill = skill.toLowerCase().trim();
 
-      let bestMatch: HTMLElement | null = null;
-      let bestScore = 0;
+    // Use Playwright locator for promptOption elements (Workday's dropdown items)
+    const options = adapter.page.locator('[data-automation-id="promptOption"]');
+    const count = await options.count();
 
-      for (const opt of options) {
-        const el = opt as HTMLElement;
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
-        const text = (el.textContent || '').trim().toLowerCase();
-        if (!text || text === 'no items.' || text === 'no results') continue;
-
-        // Exact match
-        if (text === normSkill) { bestMatch = el; bestScore = 100; break; }
-        // Option starts with skill name
-        if (text.startsWith(normSkill)) {
-          const score = 90;
-          if (score > bestScore) { bestScore = score; bestMatch = el; }
-        }
-        // Skill name starts with option text (e.g. option "Python" matches skill "Python (Programming)")
-        if (normSkill.startsWith(text)) {
-          const score = 85;
-          if (score > bestScore) { bestScore = score; bestMatch = el; }
-        }
-        // Option contains skill name
-        if (text.includes(normSkill) && text.length < normSkill.length * 3) {
-          const score = 70 + (normSkill.length / text.length) * 20;
-          if (score > bestScore) { bestScore = score; bestMatch = el; }
-        }
-        // Skill name contains option text (e.g. skill "Cloud Infrastructure" matches option "Cloud")
-        if (normSkill.includes(text) && text.length >= 3) {
-          const score = 60;
-          if (score > bestScore) { bestScore = score; bestMatch = el; }
-        }
-      }
-
-      if (bestMatch) {
-        bestMatch.click();
-        return true;
-      }
-
-      // If no fuzzy match, take the first non-empty visible option
-      for (const opt of options) {
-        const el = opt as HTMLElement;
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
-        const text = (el.textContent || '').trim().toLowerCase();
-        if (text && text !== 'no items.' && text !== 'no results') {
-          el.click();
-          return true;
-        }
-      }
-
+    if (count === 0) {
+      console.log(`[Workday] [Skills] No promptOption elements found in dropdown.`);
       return false;
-    }, skill);
+    }
+
+    let bestIdx = -1;
+    let bestScore = 0;
+
+    for (let i = 0; i < count; i++) {
+      const text = ((await options.nth(i).textContent()) || '').trim().toLowerCase();
+      if (!text || text === 'no items.' || text === 'no results') continue;
+
+      if (text === normSkill) { bestIdx = i; bestScore = 100; break; }
+      if (text.startsWith(normSkill) && 90 > bestScore) { bestScore = 90; bestIdx = i; }
+      if (normSkill.startsWith(text) && 85 > bestScore) { bestScore = 85; bestIdx = i; }
+      if (text.includes(normSkill) && text.length < normSkill.length * 3) {
+        const score = 70 + (normSkill.length / text.length) * 20;
+        if (score > bestScore) { bestScore = score; bestIdx = i; }
+      }
+      if (normSkill.includes(text) && text.length >= 3 && 60 > bestScore) { bestScore = 60; bestIdx = i; }
+    }
+
+    // If no fuzzy match, take the first valid option
+    if (bestIdx < 0) {
+      for (let i = 0; i < count; i++) {
+        const text = ((await options.nth(i).textContent()) || '').trim().toLowerCase();
+        if (text && text !== 'no items.' && text !== 'no results') {
+          bestIdx = i;
+          break;
+        }
+      }
+    }
+
+    if (bestIdx >= 0) {
+      const chosen = await options.nth(bestIdx).textContent();
+      console.log(`[Workday] [Skills] Clicking option: "${chosen?.trim()}"`);
+      await options.nth(bestIdx).click();
+      return true;
+    }
+
+    return false;
   }
 
   /**
-   * Programmatically fill the Workday skills typeahead field.
-   * Pattern: click input → type skill → press Enter → wait for results → click match.
+   * Programmatically fill the Workday skills multiselect field.
+   *
+   * Workday DOM structure:
+   *   [data-automation-id="formField-skills"]
+   *     [data-automation-id="multiSelectContainer"]
+   *       input[data-automation-id="searchBox"]   ← the text input
+   *     [data-automation-id="promptSearchButton"]  ← the ≡ icon
+   *   Dropdown results: [data-automation-id="promptOption"]
+   *
+   * Pattern per skill:
+   *   1. Click the searchBox input (scoped to skills formField)
+   *   2. Use locator.fill() to set the value (fires React-compatible input/change events)
+   *   3. Press Enter to trigger Workday server-side search
+   *   4. Wait for results, click best match via promptOption locator
    */
   private async fillSkillsProgrammatically(
     adapter: BrowserAutomationAdapter,
@@ -1483,107 +1496,195 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
   ): Promise<void> {
     console.log(`[Workday] [Skills] Filling ${skills.length} skills programmatically...`);
 
-    // Scroll down to find the skills section
-    const skillsFound = await adapter.page.evaluate(() => {
-      const labels = Array.from(document.querySelectorAll('label, [data-automation-id*="label"], span'));
-      for (const el of labels) {
-        const text = (el.textContent || '').trim().toLowerCase();
-        if (text.includes('skills') || text.includes('type to add')) {
-          el.scrollIntoView({ block: 'center' });
-          return true;
+    // Step 1: Scroll the skills section into view using page.evaluate (reliable)
+    const scrollResult = await adapter.page.evaluate(() => {
+      // Try exact Workday selectors first
+      const formField = document.querySelector('[data-automation-id="formField-skills"]');
+      if (formField) {
+        formField.scrollIntoView({ block: 'center', behavior: 'instant' });
+        return { found: true, via: 'formField-skills' };
+      }
+      const section = document.querySelector('#Skills-section') ||
+        document.querySelector('[aria-labelledby="Skills-section"]');
+      if (section) {
+        section.scrollIntoView({ block: 'center', behavior: 'instant' });
+        return { found: true, via: 'Skills-section' };
+      }
+      // Walk headings
+      const headings = document.querySelectorAll('h2, h3, h4, h5, legend');
+      for (const h of headings) {
+        if ((h.textContent || '').toLowerCase().includes('skill')) {
+          h.scrollIntoView({ block: 'center', behavior: 'instant' });
+          return { found: true, via: 'heading' };
         }
       }
-      // Also look for the input directly
-      const input = document.querySelector<HTMLInputElement>(
-        'input[placeholder*="Skills" i], input[placeholder*="skill" i], ' +
-        'input[data-automation-id*="skill" i], input[aria-label*="skill" i]'
-      );
-      if (input) {
-        input.scrollIntoView({ block: 'center' });
-        return true;
-      }
-      return false;
+      return { found: false, via: 'none' };
     });
 
-    if (!skillsFound) {
-      console.log('[Workday] [Skills] Skills input not found on page — LLM will handle.');
+    console.log(`[Workday] [Skills] Scroll result: ${JSON.stringify(scrollResult)}`);
+
+    if (!scrollResult.found) {
+      console.log('[Workday] [Skills] Skills section not found on page — LLM will handle.');
+      return;
+    }
+    await adapter.page.waitForTimeout(1000); // extra wait after scroll
+
+    // Step 2: Find the search input — try multiple strategies
+    // Tag the input via page.evaluate so Playwright can find it reliably
+    const inputTagged = await adapter.page.evaluate(() => {
+      // Strategy A: exact Workday selector
+      const formField = document.querySelector('[data-automation-id="formField-skills"]');
+      if (formField) {
+        const input = formField.querySelector('input[data-automation-id="searchBox"]') as HTMLInputElement;
+        if (input) {
+          input.setAttribute('data-gh-skills-input', 'true');
+          input.scrollIntoView({ block: 'center', behavior: 'instant' });
+          return { found: true, via: 'formField searchBox', placeholder: input.placeholder };
+        }
+        // Any input inside the skills formField
+        const anyInput = formField.querySelector('input') as HTMLInputElement;
+        if (anyInput) {
+          anyInput.setAttribute('data-gh-skills-input', 'true');
+          anyInput.scrollIntoView({ block: 'center', behavior: 'instant' });
+          return { found: true, via: 'formField any input', placeholder: anyInput.placeholder };
+        }
+      }
+
+      // Strategy B: find searchBox near Skills heading
+      const headings = document.querySelectorAll('h2, h3, h4, h5, legend, [id*="kills"]');
+      for (const h of headings) {
+        const text = (h.textContent || '').toLowerCase();
+        const id = (h.id || '').toLowerCase();
+        if (!text.includes('skill') && !id.includes('skill')) continue;
+        let container: HTMLElement | null = h.parentElement;
+        for (let u = 0; u < 8 && container; u++) {
+          const input = container.querySelector('input[data-automation-id="searchBox"]') as HTMLInputElement
+            || container.querySelector('input[type="text"]') as HTMLInputElement
+            || container.querySelector('input:not([type="hidden"])') as HTMLInputElement;
+          if (input && !input.disabled) {
+            input.setAttribute('data-gh-skills-input', 'true');
+            input.scrollIntoView({ block: 'center', behavior: 'instant' });
+            return { found: true, via: 'heading walk', placeholder: input.placeholder };
+          }
+          container = container.parentElement;
+        }
+      }
+
+      return { found: false, via: 'none', placeholder: '' };
+    });
+
+    console.log(`[Workday] [Skills] Input search result: ${JSON.stringify(inputTagged)}`);
+
+    if (!inputTagged.found) {
+      console.log('[Workday] [Skills] Could not find skills input — LLM will handle.');
       return;
     }
     await adapter.page.waitForTimeout(500);
 
+    // Now use Playwright locator on the tagged element
+    const searchInput = adapter.page.locator('[data-gh-skills-input="true"]').first();
+
     for (const skill of skills) {
       console.log(`[Workday] [Skills] Adding skill: "${skill}"...`);
 
-      // Find and click the skills input
-      const inputClicked = await adapter.page.evaluate(() => {
-        const sels = [
-          'input[placeholder*="Skills" i]', 'input[placeholder*="skill" i]',
-          'input[data-automation-id*="skill" i]', 'input[aria-label*="skill" i]',
-          'input[placeholder*="Type to Add" i]',
-        ];
-        for (const sel of sels) {
-          const input = document.querySelector<HTMLInputElement>(sel + ':not([disabled])');
-          if (input && input.getBoundingClientRect().width > 0) {
-            input.focus();
-            input.click();
-            return true;
-          }
+      // Re-check visibility (element might have moved after adding previous skill)
+      const inputVisible = await searchInput.isVisible().catch(() => false);
+      if (!inputVisible) {
+        // Try scrolling to it again
+        await adapter.page.evaluate(() => {
+          const el = document.querySelector('[data-gh-skills-input="true"]');
+          if (el) el.scrollIntoView({ block: 'center', behavior: 'instant' });
+        });
+        await adapter.page.waitForTimeout(500);
+        const retryVisible = await searchInput.isVisible().catch(() => false);
+        if (!retryVisible) {
+          console.log(`[Workday] [Skills] searchBox still not visible — skipping "${skill}".`);
+          continue;
         }
-        return false;
-      });
-
-      if (!inputClicked) {
-        console.log(`[Workday] [Skills] Could not find skills input for "${skill}" — skipping.`);
-        continue;
       }
 
+      // Click the input to focus it
+      await searchInput.click();
+      await adapter.page.waitForTimeout(200);
+
+      // Use locator.fill() — this properly dispatches React input/change events
+      // unlike keyboard.type() which only fires keydown/keypress/keyup
+      await searchInput.fill(skill);
       await adapter.page.waitForTimeout(300);
 
-      // Clear any existing text and type the skill name
-      await adapter.page.keyboard.press('Control+a');
-      await adapter.page.keyboard.press('Backspace');
-      await adapter.page.keyboard.type(skill, { delay: 50 });
-      await adapter.page.waitForTimeout(300);
+      // Verify the value was set
+      const inputVal = await searchInput.inputValue();
+      console.log(`[Workday] [Skills] Input value after fill: "${inputVal}"`);
 
-      // Press Enter to trigger the Workday server-side search
+      if (!inputVal) {
+        // fill() didn't take — try pressSequentially as fallback
+        console.log(`[Workday] [Skills] fill() didn't stick — trying pressSequentially...`);
+        await searchInput.click();
+        await adapter.page.waitForTimeout(200);
+        await searchInput.pressSequentially(skill, { delay: 100 });
+        await adapter.page.waitForTimeout(300);
+      }
+
+      // Press Enter to trigger Workday server-side search
       await adapter.page.keyboard.press('Enter');
-      await adapter.page.waitForTimeout(3000); // Wait for search results to load (server round-trip)
+      await adapter.page.waitForTimeout(3000);
 
-      // Look for matching option in dropdown results and click it
+      // Check for dropdown results and click best match
       let selected = await this.findAndClickSkillOption(adapter, skill);
 
-      // Retry with shorter search term if no results (some Workday instances
-      // have abbreviated skill names, e.g. "Python (Programming Language)")
+      if (!selected) {
+        // Try pressing Enter again — some Workday instances auto-select top result
+        console.log(`[Workday] [Skills] No dropdown match, pressing Enter to auto-select...`);
+        await adapter.page.keyboard.press('Enter');
+        await adapter.page.waitForTimeout(1000);
+
+        // Check if a chip/tag was added
+        const chipAdded = await adapter.page.evaluate((skillName: string) => {
+          const chips = document.querySelectorAll(
+            '[data-automation-id="multiSelectContainer"] [data-automation-id*="selectedItem"], ' +
+            '[data-automation-id="multiSelectContainer"] [data-automation-id*="chip"], ' +
+            '[data-automation-id="formField-skills"] [class*="chip"], ' +
+            '[data-automation-id="formField-skills"] [class*="pill"]'
+          );
+          const norm = skillName.toLowerCase();
+          for (const chip of chips) {
+            if ((chip.textContent || '').toLowerCase().includes(norm)) return true;
+          }
+          return false;
+        }, skill);
+
+        if (chipAdded) {
+          selected = true;
+        }
+      }
+
+      // Retry with shorter search term
       if (!selected && skill.length > 3) {
-        console.log(`[Workday] [Skills] No results for "${skill}" — retrying with shorter term...`);
-        // Clear and retype shorter term
-        await adapter.page.keyboard.press('Control+a');
-        await adapter.page.keyboard.press('Backspace');
+        console.log(`[Workday] [Skills] No results for "${skill}" — retrying shorter term...`);
         const shortTerm = skill.substring(0, Math.max(3, Math.floor(skill.length / 2)));
-        await adapter.page.keyboard.type(shortTerm, { delay: 50 });
+
+        await searchInput.click();
+        await adapter.page.waitForTimeout(200);
+        await searchInput.fill(shortTerm);
         await adapter.page.waitForTimeout(300);
         await adapter.page.keyboard.press('Enter');
         await adapter.page.waitForTimeout(3000);
+
         selected = await this.findAndClickSkillOption(adapter, skill);
+        if (!selected) {
+          await adapter.page.keyboard.press('Enter');
+          await adapter.page.waitForTimeout(1000);
+        }
       }
 
       if (selected) {
-        console.log(`[Workday] [Skills] Selected "${skill}" from dropdown.`);
+        console.log(`[Workday] [Skills] Added "${skill}".`);
       } else {
-        console.log(`[Workday] [Skills] Could not find "${skill}" in dropdown results — skipping.`);
-        // Dismiss dropdown without selecting
+        console.log(`[Workday] [Skills] Could not find "${skill}" in results — pressing Escape.`);
         await adapter.page.keyboard.press('Escape');
       }
 
       await adapter.page.waitForTimeout(500);
-
-      // Click whitespace to dismiss any lingering dropdown
-      await adapter.page.evaluate(() => {
-        if (document.activeElement instanceof HTMLElement) {
-          document.activeElement.blur();
-        }
-      });
-      await adapter.page.waitForTimeout(300);
     }
 
     console.log(`[Workday] [Skills] Done adding ${skills.length} skills.`);
