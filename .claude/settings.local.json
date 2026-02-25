@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find C:\\\\Users\\\\spenc\\\\Documents\\\\GitHub\\\\GHOST-HANDS\\\\packages\\\\ghosthands:*)",
+      "Bash(find C:\\\\Users\\\\spenc\\\\Documents\\\\GitHub\\\\GHOST-HANDS\\\\packages\\\\ghosthands\\\\src:*)"
+    ]
+  }
+}

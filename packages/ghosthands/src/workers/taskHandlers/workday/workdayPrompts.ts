@@ -14,11 +14,14 @@ export const WORKDAY_BASE_RULES = `ABSOLUTE RULE #1 — ZERO SCROLLING: You must
 
 ABSOLUTE RULE #2 — FULLY VISIBLE ONLY: Before interacting with ANY field, check that you can see the ENTIRE perimeter of its input box — all four edges (top, bottom, left, right) must be fully visible on screen. If even one edge of the box is cut off or hidden by the top or bottom of the screen, that field is OFF LIMITS. Do not click it, do not type in it, do not try to expand it, do not click anywhere near it — pretend it does not exist. Only interact with fields where you can see the complete box with space around it. When you run out of fully visible fields, STOP immediately and do nothing more. I will scroll the page for you and call you again.
 
-ABSOLUTE RULE #3 — ONE ATTEMPT PER FIELD: You may type into a given field AT MOST ONCE. After you type a value and click elsewhere, that field is DONE. Do NOT go back and re-type. Even if the field appears empty after you typed, trust that your input was registered and move to the next field. Typing into the same field multiple times causes duplicate text (e.g. "WuWuWu" instead of "Wu").
+ABSOLUTE RULE #3 — ONE ATTEMPT PER TEXT FIELD: You may type into a given TEXT INPUT field AT MOST ONCE. After you type a value and click elsewhere, that field is DONE. Do NOT go back and re-type. Even if the field appears empty after you typed, trust that your input was registered and move to the next field. Typing into the same field multiple times causes duplicate text (e.g. "WuWuWu" instead of "Wu").
+EXCEPTION — DROPDOWNS: If you attempted a dropdown but it is still showing "Select One" (meaning the selection did not register), you SHOULD retry it. Dropdowns do not have the duplicate-text problem, so retrying is safe.
 
-ABSOLUTE RULE #4 — NO TAB KEY: NEVER press the Tab key to move between fields. Instead, after filling a field, CLICK on empty whitespace to deselect, then CLICK directly on the next field you want to fill. Tab can jump to the wrong field.
+ABSOLUTE RULE #4 — CLICK BEFORE TYPING: NEVER type unless you have just clicked on a text input field and can see it is focused (blue border or cursor visible). Typing without a focused field causes the page to jump to a random location. Always: 1) CLICK the field, 2) confirm it is focused, 3) THEN type.
 
-ABSOLUTE RULE #5 — NEVER NAVIGATE: Do NOT click "Save and Continue", "Next", "Submit", "Back", or any button that navigates to another page. When you are done filling visible fields, simply STOP taking actions. I handle all navigation myself.`;
+ABSOLUTE RULE #5 — NO TAB KEY: NEVER press the Tab key to move between fields. Instead, after filling a field, CLICK on empty whitespace to deselect, then CLICK directly on the next field you want to fill. Tab can jump to the wrong field.
+
+ABSOLUTE RULE #6 — NEVER NAVIGATE: Do NOT click "Save and Continue", "Next", "Submit", "Back", or any button that navigates to another page. When you are done filling visible fields, simply STOP taking actions. I handle all navigation myself.`;
 
 // ---------------------------------------------------------------------------
 // Common interaction patterns (reused across page-specific prompts)
@@ -34,8 +37,9 @@ export const DROPDOWN_RULES = `DROPDOWNS: Fill ONLY ONE dropdown per turn. After
   Step 1: CLICK the dropdown button to open it.
   Step 2: TYPE your desired answer (e.g. "No", "Yes", "Male", "Website"). You MUST type — never skip this step.
   Step 3: WAIT 3 seconds. Do nothing during this time — let the dropdown filter and update.
-  Step 4: A dropdown LIST appears BELOW the button you clicked. Look inside that list for the option with a SOLID BLUE FILLED BACKGROUND — this is your match. Do NOT click the dropdown button again. The blue-filled option is BELOW the button, inside the popup list. Click that blue-filled option. Then click on empty whitespace to deselect.
-  Step 5: STOP. You are done for this turn. Do not fill any more fields — I will call you again.
+  Step 4: A dropdown LIST appears BELOW the button you clicked. Read the text of each visible option and CLICK the one whose text best matches your desired answer. Ignore background colors — just match the text. Then click on empty whitespace to deselect.
+  Step 5: VERIFY — after clicking whitespace, check the dropdown button text. If it still says "Select One", your selection did NOT register. Retry from Step 1 (click the dropdown again, type your answer, wait, and click the matching option). You may retry a dropdown up to 2 times.
+  Step 6: STOP. You are done for this turn. Do not fill any more fields — I will call you again.
   TRUST THE DROPDOWN: When you click a dropdown and options appear, those options ALWAYS belong to the dropdown you just clicked — even if the popup visually overlaps with other questions above or below. Do NOT second-guess which question the options belong to. Be confident and click your answer. NEVER use arrow keys. NEVER mouse-scroll inside dropdowns.`;
 
 /** How to interact with date fields. */
@@ -103,7 +107,7 @@ This is the "My Experience" page. Fill any EMPTY fields/sections that are FULLY 
 IMPORTANT INTERACTION PATTERNS:
 1. "Add" BUTTONS: ONLY click "Add" under "Work Experience" and "Education" sections. Do NOT click "Add" under "Websites" or "Certifications" — those must stay empty. If the form fields are already expanded (you can see Job Title, Company, etc.), do NOT click Add again.
 2. ${DROPDOWN_RULES}
-3. TYPEAHEAD FIELDS (e.g. Field of Study, Skills): Type the value, then press Enter to trigger the dropdown. WAIT 2-3 seconds for the suggestions to load. Then CLICK on the matching option in the dropdown list. If the correct option is not visible, click the dropdown scrollbar to scroll through the options until you find it.
+3. TYPEAHEAD FIELDS (e.g. Field of Study, Skills): Click the input, type the value, then press ENTER to trigger the dropdown. WAIT 3 seconds for the suggestions to load. Then CLICK on the matching option in the dropdown list — the field is NOT filled until you click the option. Just typing is NOT enough. If the EXACT option is NOT found (you see "No matches found" or the value doesn't exist in the list): clear the input (click the X button or select all + delete), type a SHORTER/BROADER search term (e.g., just the first word — "Business" instead of "Business Analytics"), press ENTER, wait 3 seconds, and click the closest matching option. Do NOT scroll endlessly through the entire dropdown — if the exact value doesn't exist, use a shorter term and select the best available match. After clicking, click on empty whitespace to dismiss.
 4. DATE FIELDS (MM/YYYY): Look for the text "MM" on screen — it is a tiny input box. Click DIRECTLY on the letters "MM". Do NOT click the calendar icon or the box showing "YYYY". After clicking "MM", type the digits continuously (e.g. "012026") and Workday auto-advances to YYYY. If the date shows "1900" or an error, do this recovery: click on the "MM" box, press Delete 6 times to clear it, then type the date digits again.
 5. ${CHECKBOX_RULES}
 6. After filling each field, CLICK on empty whitespace to deselect before moving to the next field.
@@ -113,19 +117,76 @@ If ALL visible fields already have values, STOP IMMEDIATELY — do nothing.
 ${dataBlock}`;
 }
 
+// ---------------------------------------------------------------------------
+// Experience entry base rules (scrolling ALLOWED within a single entry)
+// ---------------------------------------------------------------------------
+
+/**
+ * Base rules for filling a single work experience or education entry.
+ * Unlike WORKDAY_BASE_RULES, scrolling DOWN is explicitly ALLOWED so the LLM
+ * can reach fields that extend below the viewport (e.g. date fields,
+ * role description) without stopping prematurely.
+ */
+export const EXPERIENCE_ENTRY_RULES = `ABSOLUTE RULE — SCROLL DOWN ONLY: You ARE allowed to scroll DOWN on this page to reveal more fields for this entry. Each scroll must be at least 40 pixels. You may ONLY scroll DOWN — NEVER scroll up. Scrolling up is STRICTLY FORBIDDEN because it will bring previous entries into view and cause you to overwrite their data. If you cannot find a field, keep scrolling DOWN — it is always below you, never above.
+
+RULE — ONE ATTEMPT PER TEXT FIELD: You may type into a given TEXT INPUT field AT MOST ONCE. After you type a value and click elsewhere, that field is DONE. Do NOT go back and re-type. Even if the field appears empty after you typed, trust that your input was registered and move to the next field. Typing into the same field multiple times causes duplicate text (e.g. "WuWuWu" instead of "Wu").
+EXCEPTION — DROPDOWNS: If you attempted a dropdown but it is still showing "Select One" (meaning the selection did not register), you SHOULD retry it. Dropdowns do not have the duplicate-text problem, so retrying is safe.
+
+RULE — CLICK BEFORE TYPING: NEVER type unless you have just clicked on a text input field and can see it is focused (blue border or cursor visible). Typing without a focused field causes the page to jump to a random location. Always: 1) CLICK the field, 2) confirm it is focused, 3) THEN type.
+
+RULE — NO TAB KEY: NEVER press the Tab key to move between fields. Instead, after filling a field, CLICK on empty whitespace to deselect, then CLICK directly on the next field you want to fill. Tab can jump to the wrong field.
+
+RULE — NEVER NAVIGATE: Do NOT click "Save and Continue", "Next", "Submit", "Back", or any button that navigates to another page. Do NOT click any "Add" button. When you have filled ALL fields listed below, simply STOP taking actions.`;
+
+/**
+ * Build the prompt for filling a single work experience or education entry.
+ * Uses relaxed scrolling rules so the LLM can scroll within the entry.
+ */
+export function buildExperienceEntryPrompt(dataBlock: string): string {
+  return `${EXPERIENCE_ENTRY_RULES}
+
+You are on the "My Experience" page filling a SINGLE entry. Fill ALL the fields listed below — scroll down if needed to find them.
+
+INTERACTION PATTERNS:
+1. ${DROPDOWN_RULES}
+2. TYPEAHEAD FIELDS (e.g. Field of Study, Skills): Click the input, type the value, then press ENTER to trigger the dropdown. WAIT 3 seconds for the suggestions to load. Then CLICK on the matching option in the dropdown list — the field is NOT filled until you click the option. Just typing is NOT enough. If the EXACT option is NOT found (you see "No matches found" or the value doesn't exist in the list): clear the input (click the X button or select all + delete), type a SHORTER/BROADER search term (e.g., just the first word — "Business" instead of "Business Analytics"), press ENTER, wait 3 seconds, and click the closest matching option. Do NOT scroll endlessly through the entire dropdown — if the exact value doesn't exist, use a shorter term and select the best available match. After clicking, click on empty whitespace to dismiss.
+3. DATE FIELDS (MM/YYYY): Look for the text "MM" on screen — it is a tiny input box. Click DIRECTLY on the letters "MM". Do NOT click the calendar icon or the box showing "YYYY". After clicking "MM", type the digits continuously (e.g. "012026") and Workday auto-advances to YYYY. If the date shows "1900" or an error, do this recovery: click on the "MM" box, press Delete 6 times to clear it, then type the date digits again.
+4. ${CHECKBOX_RULES}
+5. After filling each field, CLICK on empty whitespace to deselect before moving to the next field.
+6. If a field already has a value, SKIP IT — do not re-enter or overwrite it.
+
+${dataBlock}
+
+After filling ALL fields listed above, STOP immediately.`;
+}
+
+/** Self-identification field values for prompt builders. */
+export interface SelfIdFields {
+  gender: string;
+  race_ethnicity: string;
+  veteran_status: string;
+  disability_status: string;
+}
+
 /**
  * Build the prompt for the Voluntary Self-Identification page (gender, race, veteran, disability).
  */
-export function buildVoluntaryDisclosurePrompt(): string {
+export function buildVoluntaryDisclosurePrompt(selfId: SelfIdFields): string {
+  // Extract short typing hints from the full values (first few distinctive words)
+  const genderHint = selfId.gender.split(/\s+/).slice(0, 1).join(' ');
+  const raceHint = selfId.race_ethnicity.split(/\s+/).slice(0, 1).join(' ');
+  const veteranHint = selfId.veteran_status.includes('not') ? 'not a protected' : selfId.veteran_status.split(/\s+/).slice(0, 3).join(' ');
+  const disabilityHint = selfId.disability_status.toLowerCase().startsWith('no') ? 'No' : selfId.disability_status.split(/\s+/).slice(0, 3).join(' ');
+
   return `${WORKDAY_BASE_RULES}
 
 This is a voluntary self-identification page. Fill any UNANSWERED questions that are FULLY visible on screen:
 1. If a dropdown already has an answer selected, SKIP IT.
 2. If empty: CLICK the dropdown, then TYPE the desired answer to filter:
-   - Gender → type "Male"
-   - Race/Ethnicity → type "Asian"
-   - Veteran Status → type "not a protected"
-   - Disability → type "do not wish"
+   - Gender → type "${genderHint}" then click "${selfId.gender}"
+   - Race/Ethnicity → type "${raceHint}" then click "${selfId.race_ethnicity}"
+   - Veteran Status → type "${veteranHint}" then click "${selfId.veteran_status}"
+   - Disability → type "${disabilityHint}" then click "${selfId.disability_status}"
    The popup menu that appears ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions.
 3. If typing doesn't produce a match, click whitespace to close, re-click the dropdown, and try a shorter keyword. NEVER use arrow keys. NEVER mouse-scroll inside dropdowns.
 4. ${CHECKBOX_RULES}
@@ -136,13 +197,15 @@ If ALL visible questions already have answers, STOP IMMEDIATELY.`;
 /**
  * Build the prompt for the Self-Identify page (typically disability status).
  */
-export function buildSelfIdentifyPrompt(): string {
+export function buildSelfIdentifyPrompt(selfId: SelfIdFields): string {
+  const disabilityHint = selfId.disability_status.toLowerCase().startsWith('no') ? 'No' : selfId.disability_status.split(/\s+/).slice(0, 3).join(' ');
+
   return `${WORKDAY_BASE_RULES}
 
 This is a self-identification page (often about disability status). Fill any UNANSWERED questions that are FULLY visible on screen:
 1. If a field/dropdown already has an answer selected, SKIP IT.
 2. If empty: CLICK the dropdown, then TYPE the desired answer to filter:
-   - Disability Status → type "do not wish"
+   - Disability Status → type "${disabilityHint}" then click "${selfId.disability_status}"
    - Any other question → type "Decline"
    The popup menu that appears ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions.
 3. If typing doesn't produce a match, click whitespace to close, re-click the dropdown, and try a shorter keyword. NEVER use arrow keys. NEVER mouse-scroll inside dropdowns.
