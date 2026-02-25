@@ -150,6 +150,23 @@ export class SmartApplyHandler implements TaskHandler {
             break;
 
           case 'account_creation':
+            // If we haven't tried login yet, try it first — many sites (e.g. Workday)
+            // show the Create Account page by default with an "Already have an account? Sign In" link.
+            // The login handler already knows how to click "Sign In" and try credentials.
+            if (!this.loginAttempted) {
+              console.log('[SmartApply] Account creation page detected but login not yet attempted — trying login first.');
+              if (config.handleLogin) {
+                await config.handleLogin(adapter, userProfile);
+              } else {
+                await this.handleGenericLogin(adapter, userProfile);
+              }
+              this.loginAttempted = true;
+              // Don't call handleAccountCreation here — let the main loop re-detect the page.
+              // If login succeeded, we'll land on the application form.
+              // If login failed, the login handler navigates to Create Account,
+              // and the next iteration will classify it as account_creation with loginAttempted=true.
+              break;
+            }
             await this.handleAccountCreation(adapter, dataPrompt, userProfile);
             break;
 
@@ -434,7 +451,16 @@ export class SmartApplyHandler implements TaskHandler {
         || bodyText.includes('application received')
         || bodyText.includes('successfully submitted')
         || bodyText.includes('application has been submitted');
-      return { hasPasswordField, hasConfirmPassword, isCreateAccountHeading, hasConfirmation };
+      // Count form fields — pages with many inputs are application forms, not login
+      const formFieldCount = document.querySelectorAll(
+        'input[type="text"]:not([readonly]):not([disabled]), ' +
+        'input[type="email"]:not([readonly]):not([disabled]), ' +
+        'input[type="tel"]:not([readonly]):not([disabled]), ' +
+        'textarea:not([readonly]):not([disabled]), ' +
+        'select:not([disabled]), ' +
+        '[role="combobox"]:not([aria-disabled="true"])'
+      ).length;
+      return { hasPasswordField, hasConfirmPassword, isCreateAccountHeading, hasConfirmation, formFieldCount };
     });
 
     if (obvious.hasConfirmation) {
@@ -447,7 +473,10 @@ export class SmartApplyHandler implements TaskHandler {
     // Also: after login has been attempted and failed, the page may still have
     // password fields (Create Account form). Don't re-classify as login — let
     // detectPageByDOM decide if it's account_creation.
-    if (obvious.hasPasswordField && !obvious.hasConfirmPassword && !obvious.isCreateAccountHeading && !this.loginAttempted) {
+    // Also: if the page has 5+ form fields, it's an application form that happens
+    // to have a password field somewhere (e.g. security question) — not a login page.
+    if (obvious.hasPasswordField && !obvious.hasConfirmPassword && !obvious.isCreateAccountHeading
+        && !this.loginAttempted && obvious.formFieldCount < 5) {
       return { page_type: 'login', page_title: 'Sign-In' };
     }
 
@@ -650,9 +679,60 @@ Click only ONE button, then report the task as done.`,
         'input[type="email"]:not([disabled]), input[autocomplete="email"]:not([disabled]), ' +
         'input[name*="email" i]:not([disabled]), input[name*="user" i]:not([disabled])'
       );
-      const hasPassword = !!document.querySelector('input[type="password"]:not([disabled])');
-      return { hasEmail, hasPassword };
+      const passwordFields = document.querySelectorAll('input[type="password"]:not([disabled])');
+      const hasPassword = passwordFields.length > 0;
+      // If there are 2+ password fields (password + confirm), this is a Create Account form
+      const isCreateAccountForm = passwordFields.length > 1;
+      const headings = Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]'));
+      const headingText = headings.map(h => (h.textContent || '').toLowerCase()).join(' ');
+      const hasCreateAccountHeading = headingText.includes('create account')
+        || headingText.includes('register') || headingText.includes('sign up');
+      // Look for a "Sign In" / "Log In" tab/link to switch to the login view
+      const signInLink = Array.from(
+        document.querySelectorAll('a, button, [role="tab"], [role="button"], [role="link"]')
+      ).find(el => {
+        const text = (el.textContent || '').trim().toLowerCase();
+        return text === 'sign in' || text === 'log in' || text === 'login'
+          || text.includes('already have an account');
+      });
+      return {
+        hasEmail, hasPassword,
+        isCreateAccountForm: isCreateAccountForm || hasCreateAccountHeading,
+        hasSignInLink: !!signInLink,
+      };
     });
+
+    // If we're on a Create Account form with a "Sign In" link, click it first
+    if (formState.isCreateAccountForm && formState.hasSignInLink) {
+      console.log('[SmartApply] On Create Account form — clicking Sign In link first...');
+      const clicked = await adapter.page.evaluate(() => {
+        const els = document.querySelectorAll('a, button, [role="tab"], [role="button"], [role="link"]');
+        for (const el of els) {
+          const text = (el.textContent || '').trim().toLowerCase();
+          if (text === 'sign in' || text === 'log in' || text === 'login'
+            || text.includes('already have an account')) {
+            (el as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (clicked) {
+        await adapter.page.waitForTimeout(1500);
+        // Re-check form state after switching to Sign In view
+        const newState = await adapter.page.evaluate(() => {
+          const hasEmail = !!document.querySelector(
+            'input[type="email"]:not([disabled]), input[autocomplete="email"]:not([disabled]), ' +
+            'input[name*="email" i]:not([disabled]), input[name*="user" i]:not([disabled])'
+          );
+          const hasPassword = !!document.querySelector('input[type="password"]:not([disabled])');
+          return { hasEmail, hasPassword };
+        });
+        formState.hasEmail = newState.hasEmail;
+        formState.hasPassword = newState.hasPassword;
+        formState.isCreateAccountForm = false;
+      }
+    }
 
     if (formState.hasEmail || formState.hasPassword) {
       // Helper: fill credentials and submit
@@ -1564,7 +1644,9 @@ ${dataPrompt}`,
         : '';
       const expectedValue = f.matchedAnswer
         ? ` → Fill with: "${f.matchedAnswer}"`
-        : '';
+        : f.isRequired
+          ? ' → No exact data available — use your best judgment to pick a reasonable answer that benefits the applicant'
+          : '';
       return `- "${f.label}" (${kind})${options}${expectedValue}${required}`;
     }).join('\n');
   }

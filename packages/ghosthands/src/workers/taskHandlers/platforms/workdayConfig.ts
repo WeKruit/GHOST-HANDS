@@ -55,14 +55,18 @@ function findBestDropdownAnswer(
     if (q.toLowerCase() === labelLower) return a;
   }
 
-  // Pass 2: Label contains the Q&A key
+  // Pass 2: Label contains the Q&A key — key must cover ≥ 60% of label length
   for (const [q, a] of Object.entries(qaMap)) {
-    if (labelLower.includes(q.toLowerCase())) return a;
+    const qLower = q.toLowerCase();
+    if (qLower.length >= 3 && labelLower.includes(qLower) && qLower.length >= labelLower.length * 0.6) return a;
   }
 
   // Pass 3: Q&A key contains the label (short labels like "Gender", "State")
+  // Guard: label must be ≥ 50% of key length to prevent incidental substring matches
+  // (e.g. "city" matching "ethnicity" because "ethnicity" ends in "city")
   for (const [q, a] of Object.entries(qaMap)) {
-    if (q.toLowerCase().includes(labelLower) && labelLower.length > 3) return a;
+    const qLower = q.toLowerCase();
+    if (qLower.includes(labelLower) && labelLower.length > 3 && labelLower.length >= qLower.length * 0.5) return a;
   }
 
   // Pass 4: Significant word overlap (for rephrased questions)
@@ -147,6 +151,18 @@ export class WorkdayPlatformConfig implements PlatformConfig {
       // Also check for confirm-password field (Create Account has 2 password inputs)
       const passwordFields = document.querySelectorAll('input[type="password"]:not([disabled])');
       const hasConfirmPassword = passwordFields.length > 1;
+      const hasPasswordField = passwordFields.length > 0;
+
+      // Count actual form fields — if the page has many inputs, it's an application
+      // form, not a login page (even if "sign in" text appears somewhere on the page)
+      const formFieldCount = document.querySelectorAll(
+        'input[type="text"]:not([readonly]):not([disabled]), ' +
+        'input[type="email"]:not([readonly]):not([disabled]), ' +
+        'input[type="tel"]:not([readonly]):not([disabled]), ' +
+        'textarea:not([readonly]):not([disabled]), ' +
+        'select:not([disabled]), ' +
+        '[role="combobox"]:not([aria-disabled="true"])'
+      ).length;
 
       return {
         hasSignInWithGoogle: bodyText.includes('sign in with google') || bodyText.includes('continue with google'),
@@ -154,6 +170,8 @@ export class WorkdayPlatformConfig implements PlatformConfig {
         hasApplyButton: bodyText.includes('apply') && !bodyText.includes('application questions'),
         hasSubmitApplication: bodyText.includes('submit application') || bodyText.includes('submit your application'),
         isCreateAccountView: isCreateAccountView || hasConfirmPassword,
+        hasPasswordField,
+        formFieldCount,
       };
     });
 
@@ -162,7 +180,18 @@ export class WorkdayPlatformConfig implements PlatformConfig {
       return { page_type: 'account_creation', page_title: 'Workday Create Account' };
     }
 
-    if (domSignals.hasSignInWithGoogle || (domSignals.hasSignIn && !domSignals.hasApplyButton && !domSignals.hasSubmitApplication)) {
+    // Only classify as login if the page actually looks like a login form:
+    // - Must have a password field OR a Google SSO button (not just "sign in" text)
+    // - Must NOT have many form fields (which would indicate an application form
+    //   that just happens to mention "sign in" somewhere on the page, e.g. header)
+    const looksLikeLoginForm = domSignals.hasPasswordField || domSignals.hasSignInWithGoogle;
+    const isApplicationForm = domSignals.formFieldCount >= 5;
+
+    if (domSignals.hasSignInWithGoogle && !isApplicationForm) {
+      return { page_type: 'login', page_title: 'Workday Sign-In', has_sign_in_with_google: true };
+    }
+
+    if (looksLikeLoginForm && !isApplicationForm && domSignals.hasSignIn && !domSignals.hasApplyButton && !domSignals.hasSubmitApplication) {
       return { page_type: 'login', page_title: 'Workday Sign-In', has_sign_in_with_google: domSignals.hasSignInWithGoogle };
     }
 
@@ -303,12 +332,26 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
       'Gender': p.gender || 'I do not wish to answer',
       'Race/Ethnicity': p.race_ethnicity || 'I do not wish to answer',
       'Race': p.race_ethnicity || 'I do not wish to answer',
-      'Ethnicity': p.race_ethnicity || 'I do not wish to answer',
+      // NOTE: Do NOT add bare 'Ethnicity' key — normalizeLabel("Ethnicity") = "ethnicity"
+      // which contains "city" as a suffix, causing "City" fields to match it.
+      // A dropdown labeled "Ethnicity" will still match via 'Race/Ethnicity' in Pass 3.
       'Veteran Status': p.veteran_status || 'I am not a protected veteran',
       'Are you a protected veteran': p.veteran_status || 'I am not a protected veteran',
       'Disability': p.disability_status || 'I do not wish to answer',
       'Disability Status': p.disability_status || 'I do not wish to answer',
       'Please indicate if you have a disability': p.disability_status || 'I do not wish to answer',
+      // Contact info
+      'Email': p.email,
+      'Email Address': p.email,
+      'Phone': p.phone,
+      'Phone Number': p.phone,
+      'City': p.address.city,
+      'Address Line 1': p.address.street,
+      'Street': p.address.street,
+      'Address': p.address.street,
+      'Postal Code': p.address.zip,
+      'Zip Code': p.address.zip,
+      'Zip': p.address.zip,
       // Contact info dropdowns
       'Country': p.address.country,
       'Country/Territory': p.address.country,
@@ -316,14 +359,22 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
       'State/Province': p.address.state,
       'Phone Device Type': p.phone_device_type || 'Mobile',
       'Phone Type': p.phone_device_type || 'Mobile',
-      // Text field answers
+      // Name fields — specific entries MUST come before generic "Name"
+      'First Name': p.first_name,
+      'Legal First Name': p.first_name,
+      'Given Name': p.first_name,
+      'Last Name': p.last_name,
+      'Legal Last Name': p.last_name,
+      'Family Name': p.last_name,
+      'Surname': p.last_name,
+      // Text field answers (signatures, generic name prompts)
       'Please enter your name': `${p.first_name} ${p.last_name}`,
       'Please enter your name:': `${p.first_name} ${p.last_name}`,
       'Enter your name': `${p.first_name} ${p.last_name}`,
       'Your name': `${p.first_name} ${p.last_name}`,
       'Full name': `${p.first_name} ${p.last_name}`,
+      'Full Name': `${p.first_name} ${p.last_name}`,
       'Signature': `${p.first_name} ${p.last_name}`,
-      'Name': `${p.first_name} ${p.last_name}`,
       'What is your desired salary?': 'Open to discussion',
       'Desired salary': 'Open to discussion',
       // User-provided Q&A overrides take highest priority
@@ -1212,6 +1263,11 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
       }
     }
 
+    // ==================== DOM-ONLY: Fill Skills ====================
+    if (userProfile.skills && userProfile.skills.length > 0) {
+      await this.fillSkillsProgrammatically(adapter, userProfile.skills);
+    }
+
     // ==================== LLM fills everything else ====================
     const exp = userProfile.experience?.[0];
     const edu = userProfile.education?.[0];
@@ -1250,10 +1306,19 @@ EDUCATION (click "Add" under Education section first):
 `;
     }
 
+    // Skills are handled programmatically BEFORE the LLM loop — see fillSkillsProgrammatically()
+    // Only fall back to LLM if programmatic fill didn't handle all skills.
     if (userProfile.skills && userProfile.skills.length > 0) {
       dataBlock += `
-SKILLS (find the skills input field, usually has placeholder "Type to Add Skills"):
-  For EACH skill below: click the skills input, type the skill name, WAIT for the autocomplete dropdown to appear, then press Enter to select the first match. After selecting, click on empty whitespace to dismiss the dropdown before typing the next skill.
+SKILLS: If any skills still need to be added (check if the skills section already shows tags/chips),
+  use the skills input (usually has placeholder "Type to Add Skills"):
+  1. Click the skills input field
+  2. Type the skill name (e.g. "Python")
+  3. Press Enter to search
+  4. WAIT 2 seconds for the autocomplete results to appear
+  5. Click the correct matching result from the dropdown
+  6. Click on empty whitespace to dismiss the dropdown
+  7. Repeat for each remaining skill
   Skills to add: ${userProfile.skills.map(s => `"${s}"`).join(', ')}
 `;
     }
@@ -1279,7 +1344,12 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
 
     for (let round = 1; round <= MAX_SCROLL_ROUNDS; round++) {
       if (llmCallCount < MAX_LLM_CALLS) {
-        await this.centerNextEmptyField(adapter);
+        // On round 1, stay at the top of the page so the LLM sees "Add" buttons
+        // for Work Experience / Education. centerNextEmptyField would jump to
+        // the skills input (first empty text field) and skip those sections.
+        if (round > 1) {
+          await this.centerNextEmptyField(adapter);
+        }
         console.log(`[Workday] [MyExperience] LLM fill round ${round} (call ${llmCallCount + 1}/${MAX_LLM_CALLS})...`);
         await adapter.act(fillPrompt);
         llmCallCount++;
@@ -1310,6 +1380,195 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
 
     console.log(`[Workday] [MyExperience] Page complete. Total LLM calls: ${llmCallCount}`);
     // NOTE: Navigation (clickNext) is handled by SmartApplyHandler after this returns
+  }
+
+  /**
+   * Search open skill dropdown results for a matching option and click it.
+   * Returns true if an option was clicked.
+   */
+  private async findAndClickSkillOption(
+    adapter: BrowserAutomationAdapter,
+    skill: string,
+  ): Promise<boolean> {
+    return adapter.page.evaluate((skillName: string) => {
+      const normSkill = skillName.toLowerCase().trim();
+      // Broad selector set covering Workday dropdown variants
+      const options = document.querySelectorAll(
+        '[role="option"], [role="listbox"] li, ' +
+        '[data-automation-id*="promptOption"], [data-automation-id*="selectOption"], ' +
+        '[data-automation-id*="searchOption"], ' +
+        '[class*="option"], [class*="menu-item"], [class*="multiselectItem"]'
+      );
+
+      let bestMatch: HTMLElement | null = null;
+      let bestScore = 0;
+
+      for (const opt of options) {
+        const el = opt as HTMLElement;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        const text = (el.textContent || '').trim().toLowerCase();
+        if (!text || text === 'no items.' || text === 'no results') continue;
+
+        // Exact match
+        if (text === normSkill) { bestMatch = el; bestScore = 100; break; }
+        // Option starts with skill name
+        if (text.startsWith(normSkill)) {
+          const score = 90;
+          if (score > bestScore) { bestScore = score; bestMatch = el; }
+        }
+        // Skill name starts with option text (e.g. option "Python" matches skill "Python (Programming)")
+        if (normSkill.startsWith(text)) {
+          const score = 85;
+          if (score > bestScore) { bestScore = score; bestMatch = el; }
+        }
+        // Option contains skill name
+        if (text.includes(normSkill) && text.length < normSkill.length * 3) {
+          const score = 70 + (normSkill.length / text.length) * 20;
+          if (score > bestScore) { bestScore = score; bestMatch = el; }
+        }
+        // Skill name contains option text (e.g. skill "Cloud Infrastructure" matches option "Cloud")
+        if (normSkill.includes(text) && text.length >= 3) {
+          const score = 60;
+          if (score > bestScore) { bestScore = score; bestMatch = el; }
+        }
+      }
+
+      if (bestMatch) {
+        bestMatch.click();
+        return true;
+      }
+
+      // If no fuzzy match, take the first non-empty visible option
+      for (const opt of options) {
+        const el = opt as HTMLElement;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        const text = (el.textContent || '').trim().toLowerCase();
+        if (text && text !== 'no items.' && text !== 'no results') {
+          el.click();
+          return true;
+        }
+      }
+
+      return false;
+    }, skill);
+  }
+
+  /**
+   * Programmatically fill the Workday skills typeahead field.
+   * Pattern: click input → type skill → press Enter → wait for results → click match.
+   */
+  private async fillSkillsProgrammatically(
+    adapter: BrowserAutomationAdapter,
+    skills: string[],
+  ): Promise<void> {
+    console.log(`[Workday] [Skills] Filling ${skills.length} skills programmatically...`);
+
+    // Scroll down to find the skills section
+    const skillsFound = await adapter.page.evaluate(() => {
+      const labels = Array.from(document.querySelectorAll('label, [data-automation-id*="label"], span'));
+      for (const el of labels) {
+        const text = (el.textContent || '').trim().toLowerCase();
+        if (text.includes('skills') || text.includes('type to add')) {
+          el.scrollIntoView({ block: 'center' });
+          return true;
+        }
+      }
+      // Also look for the input directly
+      const input = document.querySelector<HTMLInputElement>(
+        'input[placeholder*="Skills" i], input[placeholder*="skill" i], ' +
+        'input[data-automation-id*="skill" i], input[aria-label*="skill" i]'
+      );
+      if (input) {
+        input.scrollIntoView({ block: 'center' });
+        return true;
+      }
+      return false;
+    });
+
+    if (!skillsFound) {
+      console.log('[Workday] [Skills] Skills input not found on page — LLM will handle.');
+      return;
+    }
+    await adapter.page.waitForTimeout(500);
+
+    for (const skill of skills) {
+      console.log(`[Workday] [Skills] Adding skill: "${skill}"...`);
+
+      // Find and click the skills input
+      const inputClicked = await adapter.page.evaluate(() => {
+        const sels = [
+          'input[placeholder*="Skills" i]', 'input[placeholder*="skill" i]',
+          'input[data-automation-id*="skill" i]', 'input[aria-label*="skill" i]',
+          'input[placeholder*="Type to Add" i]',
+        ];
+        for (const sel of sels) {
+          const input = document.querySelector<HTMLInputElement>(sel + ':not([disabled])');
+          if (input && input.getBoundingClientRect().width > 0) {
+            input.focus();
+            input.click();
+            return true;
+          }
+        }
+        return false;
+      });
+
+      if (!inputClicked) {
+        console.log(`[Workday] [Skills] Could not find skills input for "${skill}" — skipping.`);
+        continue;
+      }
+
+      await adapter.page.waitForTimeout(300);
+
+      // Clear any existing text and type the skill name
+      await adapter.page.keyboard.press('Control+a');
+      await adapter.page.keyboard.press('Backspace');
+      await adapter.page.keyboard.type(skill, { delay: 50 });
+      await adapter.page.waitForTimeout(300);
+
+      // Press Enter to trigger the Workday server-side search
+      await adapter.page.keyboard.press('Enter');
+      await adapter.page.waitForTimeout(3000); // Wait for search results to load (server round-trip)
+
+      // Look for matching option in dropdown results and click it
+      let selected = await this.findAndClickSkillOption(adapter, skill);
+
+      // Retry with shorter search term if no results (some Workday instances
+      // have abbreviated skill names, e.g. "Python (Programming Language)")
+      if (!selected && skill.length > 3) {
+        console.log(`[Workday] [Skills] No results for "${skill}" — retrying with shorter term...`);
+        // Clear and retype shorter term
+        await adapter.page.keyboard.press('Control+a');
+        await adapter.page.keyboard.press('Backspace');
+        const shortTerm = skill.substring(0, Math.max(3, Math.floor(skill.length / 2)));
+        await adapter.page.keyboard.type(shortTerm, { delay: 50 });
+        await adapter.page.waitForTimeout(300);
+        await adapter.page.keyboard.press('Enter');
+        await adapter.page.waitForTimeout(3000);
+        selected = await this.findAndClickSkillOption(adapter, skill);
+      }
+
+      if (selected) {
+        console.log(`[Workday] [Skills] Selected "${skill}" from dropdown.`);
+      } else {
+        console.log(`[Workday] [Skills] Could not find "${skill}" in dropdown results — skipping.`);
+        // Dismiss dropdown without selecting
+        await adapter.page.keyboard.press('Escape');
+      }
+
+      await adapter.page.waitForTimeout(500);
+
+      // Click whitespace to dismiss any lingering dropdown
+      await adapter.page.evaluate(() => {
+        if (document.activeElement instanceof HTMLElement) {
+          document.activeElement.blur();
+        }
+      });
+      await adapter.page.waitForTimeout(300);
+    }
+
+    console.log(`[Workday] [Skills] Done adding ${skills.length} skills.`);
   }
 
   /**

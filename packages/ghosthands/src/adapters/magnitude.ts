@@ -88,6 +88,7 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
       llm: llmConfig,
       connectors: options.connectors,
       prompt: options.systemPrompt,
+      narrate: false,
       browser: options.cdpUrl
         ? { cdp: options.cdpUrl }
         : options.browserOptions as any,
