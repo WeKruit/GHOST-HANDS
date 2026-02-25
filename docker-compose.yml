@@ -49,8 +49,7 @@ services:
       - GH_WORKER_PORT=3101
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
       - SSL_CERT_DIR=/etc/ssl/certs
-      # For headed mode on a host with Xvfb, add DISPLAY=:99
-      # and mount: /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # Kasm desktop is built into the image (headed mode via KasmVNC)
       # For targeted routing, pass GH_WORKER_ID=<uuid> at docker run time
     volumes:
       - ./packages/ghosthands/src:/app/packages/ghosthands/src:ro

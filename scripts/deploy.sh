@@ -163,12 +163,11 @@ start_targeted_worker() {
     -e NODE_ENV=production \
     -e GH_WORKER_ID="$worker_id" \
     -e GH_WORKER_PORT="$status_port" \
-    -e DISPLAY=:99 \
+    -e GH_HEADLESS=false \
     -e MAX_CONCURRENT_JOBS="${MAX_CONCURRENT_JOBS:-1}" \
     -e SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     -e SSL_CERT_DIR=/etc/ssl/certs \
     -p "127.0.0.1:${status_port}:${status_port}" \
-    -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
     --memory=2g --cpus=2.0 \
     --restart unless-stopped \
     --label "$WORKER_LABEL" \

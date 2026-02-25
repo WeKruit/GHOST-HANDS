@@ -26,7 +26,7 @@ Each Kasm session = isolated Docker container with a full desktop + GH worker. E
 ## Prerequisites
 
 - AWS account with EC2 access
-- SSH key pair (e.g., `valet-worker.pem`)
+- SSH key pair (e.g., `wekruit-atm-server.pem`)
 - VALET deployed on Fly.io (staging or prod)
 - GH source code (GHOST-HANDS repo)
 
@@ -58,7 +58,7 @@ Each Kasm session = isolated Docker container with a full desktop + GH worker. E
 ## Step 2: Install Kasm Workspaces CE
 
 ```bash
-ssh -i ~/.ssh/valet-worker.pem ubuntu@<KASM_IP>
+ssh -i ~/.ssh/wekruit-atm-server.pem ubuntu@<KASM_IP>
 
 # Update system
 sudo apt update && sudo apt upgrade -y
