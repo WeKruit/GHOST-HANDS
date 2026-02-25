@@ -92,6 +92,9 @@ COPY --from=build /app/package.json ./
 COPY --from=build /app/packages/ghosthands/dist ./packages/ghosthands/dist
 COPY --from=build /app/packages/ghosthands/src ./packages/ghosthands/src
 COPY --from=build /app/packages/ghosthands/package.json ./packages/ghosthands/
+
+# Copy scripts (deploy-server, docker-client, ecr-auth, container-configs)
+COPY --from=build /app/scripts ./scripts
 # Note: bun hoists all dependencies to root node_modules/, so
 # packages/ghosthands/node_modules/ typically doesn't exist.
 

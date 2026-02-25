@@ -8,18 +8,20 @@
  * These definitions replace docker-compose for deploy-server managed deploys.
  * The deploy-server uses these configs to create containers via Docker API.
  *
+ * Environment variables are sourced from process.env (populated by docker-compose
+ * env_file and/or AWS Secrets Manager), NOT from reading .env files on disk.
+ * This avoids EACCES permission errors when the container user differs from
+ * the file owner.
+ *
  * @module scripts/lib/container-configs
  * @see WEK-80
  */
 
-import * as fs from 'fs';
 import type { ContainerCreateConfig } from './docker-client';
 
-/** ECR registry base URL */
-const ECR_REGISTRY = '471112621974.dkr.ecr.us-east-1.amazonaws.com/wekruit/ghosthands';
-
-/** Path to .env file on the EC2 host */
-const ENV_FILE_PATH = '/opt/ghosthands/.env';
+/** ECR registry base URL — reads from env, falls back to account default */
+const ECR_REGISTRY = process.env.ECR_REGISTRY ?? '168495702277.dkr.ecr.us-east-1.amazonaws.com';
+const ECR_REPOSITORY = process.env.ECR_REPOSITORY ?? 'ghosthands';
 
 /**
  * Defines a deployable service container with health check,
@@ -47,20 +49,30 @@ export interface ServiceDefinition {
 }
 
 /**
- * Reads a .env file and returns an array of "KEY=VALUE" strings,
- * filtering out blank lines and comments.
+ * Prefixes of environment variable names that should be passed through
+ * to spawned containers. Only matching vars are forwarded — system vars
+ * like PATH, HOME, etc. are excluded.
+ */
+const PASSTHROUGH_PREFIXES = [
+  'DATABASE_', 'SUPABASE_', 'REDIS_', 'GH_', 'ANTHROPIC_', 'DEEPSEEK_',
+  'SILICONFLOW_', 'OPENAI_', 'AWS_', 'ECR_', 'CORS_', 'NODE_ENV',
+  'MAX_CONCURRENT_', 'JOB_DISPATCH_', 'GHOSTHANDS_', 'KASM_',
+];
+
+/**
+ * Build env vars array from process.env for passing to new containers.
+ * Filters to only include known GH/infra env vars (not system vars).
  *
- * Sync is acceptable here because this is called once at deploy time.
- *
- * @param path - Absolute path to the .env file
  * @returns Array of environment variable strings (e.g., ["FOO=bar", "BAZ=qux"])
  */
-export function loadEnvFile(path: string): string[] {
-  const content = fs.readFileSync(path, 'utf-8');
-  return content
-    .split('\n')
-    .filter((line: string) => line.trim() && !line.startsWith('#'))
-    .map((line: string) => line.trim());
+export function getEnvVarsFromProcess(): string[] {
+  const envVars: string[] = [];
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value && PASSTHROUGH_PREFIXES.some(p => key.startsWith(p))) {
+      envVars.push(`${key}=${value}`);
+    }
+  }
+  return envVars;
 }
 
 /**
@@ -70,7 +82,7 @@ export function loadEnvFile(path: string): string[] {
  * @returns Full ECR image URI
  */
 function buildEcrImage(imageTag: string): string {
-  return `${ECR_REGISTRY}:${imageTag}`;
+  return `${ECR_REGISTRY}/${ECR_REPOSITORY}:${imageTag}`;
 }
 
 /**
@@ -81,7 +93,7 @@ function buildApiService(ecrImage: string, envVars: string[]): ServiceDefinition
     name: 'ghosthands-api',
     config: {
       Image: ecrImage,
-      Cmd: ['bun', 'run', 'packages/ghosthands/dist/api/server.js'],
+      Cmd: ['bun', 'packages/ghosthands/src/api/server.ts'],
       Env: [...envVars, 'GH_API_PORT=3100'],
       HostConfig: {
         NetworkMode: 'host',
@@ -95,7 +107,7 @@ function buildApiService(ecrImage: string, envVars: string[]): ServiceDefinition
       },
     },
     healthEndpoint: 'http://localhost:3100/health',
-    healthTimeout: 30_000,
+    healthTimeout: 90_000,
     drainEndpoint: undefined,
     drainTimeout: 0,
     skipOnSelfUpdate: false,
@@ -112,7 +124,7 @@ function buildWorkerService(ecrImage: string, envVars: string[]): ServiceDefinit
     name: 'ghosthands-worker',
     config: {
       Image: ecrImage,
-      Cmd: ['bun', 'run', 'packages/ghosthands/dist/workers/start.js'],
+      Cmd: ['bun', 'packages/ghosthands/src/workers/main.ts'],
       Env: [...envVars, 'GH_WORKER_PORT=3101', 'MAX_CONCURRENT_JOBS=1'],
       HostConfig: {
         NetworkMode: 'host',
@@ -125,9 +137,9 @@ function buildWorkerService(ecrImage: string, envVars: string[]): ServiceDefinit
         'gh.managed': 'true',
       },
     },
-    healthEndpoint: 'http://localhost:3101/health',
-    healthTimeout: 30_000,
-    drainEndpoint: 'http://localhost:3101/drain',
+    healthEndpoint: 'http://localhost:3101/worker/health',
+    healthTimeout: 60_000,
+    drainEndpoint: 'http://localhost:3101/worker/drain',
     drainTimeout: 60_000,
     skipOnSelfUpdate: false,
     startOrder: 2,
@@ -143,13 +155,14 @@ function buildDeployServerService(ecrImage: string, envVars: string[]): ServiceD
     name: 'ghosthands-deploy-server',
     config: {
       Image: ecrImage,
-      Cmd: ['bun', 'run', '/opt/ghosthands/scripts/deploy-server.ts'],
-      Env: [...envVars, 'GH_DEPLOY_PORT=8000'],
+      Cmd: ['bun', 'scripts/deploy-server.ts'],
+      Env: [...envVars, 'GH_DEPLOY_PORT=8000', 'DOCKER_CONFIG_PATH=/docker-config/config.json'],
       HostConfig: {
         NetworkMode: 'host',
         Binds: [
           '/opt/ghosthands:/opt/ghosthands:ro',
           '/var/run/docker.sock:/var/run/docker.sock',
+          '/home/ubuntu/.docker/config.json:/docker-config/config.json:ro',
         ],
         RestartPolicy: {
           Name: 'unless-stopped',
@@ -182,7 +195,7 @@ export function getServiceConfigs(
   _environment: 'staging' | 'production',
 ): ServiceDefinition[] {
   const ecrImage = buildEcrImage(imageTag);
-  const envVars = loadEnvFile(ENV_FILE_PATH);
+  const envVars = getEnvVarsFromProcess();
 
   const services: ServiceDefinition[] = [
     buildApiService(ecrImage, envVars),

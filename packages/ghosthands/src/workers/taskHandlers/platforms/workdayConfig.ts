@@ -13,6 +13,7 @@ import {
   buildSelfIdentifyPrompt,
   buildGenericPagePrompt,
   buildGoogleSignInFallbackPrompt,
+  type SelfIdFields,
 } from '../workdayPrompts.js';
 
 // Re-export for backward compatibility
@@ -115,6 +116,7 @@ export class WorkdayPlatformConfig implements PlatformConfig {
   readonly baseRules = WORKDAY_BASE_RULES;
   readonly needsCustomExperienceHandler = true;
   readonly authDomains = ['accounts.google.com', 'myworkdayjobs.com'];
+  private _selfIdFields: SelfIdFields | null = null;
 
   // =========================================================================
   // Page Detection
@@ -308,12 +310,18 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
     }
 
     // Voluntary self-identification
+    this._selfIdFields = {
+      gender: p.gender || 'I do not wish to answer',
+      race_ethnicity: p.race_ethnicity || 'I do not wish to answer',
+      veteran_status: p.veteran_status || 'I am not a protected veteran',
+      disability_status: p.disability_status || 'I do not wish to answer',
+    };
     parts.push('');
     parts.push('--- SELF-IDENTIFICATION ---');
-    parts.push(`Gender → ${p.gender || 'I do not wish to answer'}`);
-    parts.push(`Race/Ethnicity → ${p.race_ethnicity || 'I do not wish to answer'}`);
-    parts.push(`Veteran Status → ${p.veteran_status || 'I am not a protected veteran'}`);
-    parts.push(`Disability Status → ${p.disability_status || 'I do not wish to answer'}`);
+    parts.push(`Gender → ${this._selfIdFields.gender}`);
+    parts.push(`Race/Ethnicity → ${this._selfIdFields.race_ethnicity}`);
+    parts.push(`Veteran Status → ${this._selfIdFields.veteran_status}`);
+    parts.push(`Disability Status → ${this._selfIdFields.disability_status}`);
 
     parts.push('');
     parts.push('--- GENERAL ---');
@@ -389,9 +397,19 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
       case 'questions':
         return buildFormPagePrompt('application questions', dataBlock);
       case 'voluntary_disclosure':
-        return buildVoluntaryDisclosurePrompt(dataBlock);
+        return buildVoluntaryDisclosurePrompt(this._selfIdFields ?? {
+          gender: 'I do not wish to answer',
+          race_ethnicity: 'I do not wish to answer',
+          veteran_status: 'I am not a protected veteran',
+          disability_status: 'I do not wish to answer',
+        });
       case 'self_identify':
-        return buildSelfIdentifyPrompt(dataBlock);
+        return buildSelfIdentifyPrompt(this._selfIdFields ?? {
+          gender: 'I do not wish to answer',
+          race_ethnicity: 'I do not wish to answer',
+          veteran_status: 'I am not a protected veteran',
+          disability_status: 'I do not wish to answer',
+        });
       default:
         return buildGenericPagePrompt(dataBlock);
     }

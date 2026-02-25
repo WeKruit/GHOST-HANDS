@@ -23,6 +23,7 @@ import { StagehandObserver } from '../engine/StagehandObserver.js';
 import type { MagnitudeAdapter } from '../adapters/magnitude.js';
 import { ThoughtThrottle, JOB_EVENT_TYPES } from '../events/JobEventTypes.js';
 import { ResumeDownloader, type ResumeRef } from './resumeDownloader.js';
+import { ResumeProfileLoader } from '../db/resumeProfileLoader.js';
 import { getLogger } from '../monitoring/logger.js';
 
 const logger = getLogger({ service: 'job-executor' });
@@ -47,6 +48,8 @@ export interface JobExecutorOptions {
   sessionManager?: SessionManager;
   /** Postgres pool for LISTEN/NOTIFY (HITL resume signals) */
   pgPool?: pg.Pool;
+  /** Optional Redis client for real-time progress streaming via Redis Streams. */
+  redis?: import('ioredis').default;
   /** Timeout in seconds for human intervention (default: 300 = 5 minutes) */
   hitlTimeoutSeconds?: number;
 }
@@ -76,7 +79,8 @@ const RETRYABLE_ERRORS = new Set([
   'internal_error',
 ]);
 
-const HEARTBEAT_INTERVAL_MS = 30_000;
+const HEARTBEAT_INTERVAL_MS = 10_000;
+const MAX_HEARTBEAT_FAILURES = 3;
 const DEFAULT_HITL_TIMEOUT_SECONDS = 300; // 5 minutes
 const MAX_CRASH_RECOVERIES = 2;
 const BLOCKER_CONFIDENCE_THRESHOLD = 0.6;
@@ -147,26 +151,35 @@ export class JobExecutor {
   private workerId: string;
   private sessionManager: SessionManager | null;
   private pgPool: pg.Pool | null;
+  private redis: import('ioredis').default | null;
   private hitlTimeoutSeconds: number;
   private blockerDetector = new BlockerDetector();
   private resumeDownloader: ResumeDownloader;
+  private _cancelled = false;
+  private _activeAdapter: BrowserAutomationAdapter | null = null;
+  private _executionAttemptId: string | null = null;
 
   constructor(opts: JobExecutorOptions) {
     this.supabase = opts.supabase;
     this.workerId = opts.workerId;
     this.sessionManager = opts.sessionManager ?? null;
     this.pgPool = opts.pgPool ?? null;
+    this.redis = opts.redis ?? null;
     this.hitlTimeoutSeconds = opts.hitlTimeoutSeconds ?? DEFAULT_HITL_TIMEOUT_SECONDS;
     this.resumeDownloader = new ResumeDownloader(opts.supabase);
   }
 
   async execute(job: AutomationJob): Promise<void> {
+    this._cancelled = false;
+    this._activeAdapter = null;
+    this._executionAttemptId = crypto.randomUUID();
     const heartbeat = this.startHeartbeat(job.id);
     let adapter: BrowserAutomationAdapter | null = null;
     let observer: StagehandObserver | undefined;
     let blockerCheckInterval: ReturnType<typeof setInterval> | null = null;
     let resumeFilePath: string | null = null;
     let fileChooserHandler: ((chooser: any) => Promise<void>) | null = null;
+    let cancelListenClient: pg.PoolClient | null = null;
 
     // Initialize cost tracker with budget limits
     const qualityPreset = resolveQualityPreset(job.input_data, job.metadata);
@@ -178,15 +191,53 @@ export class JobExecutor {
 
     const costService = new CostControlService(this.supabase);
 
-    // Initialize progress tracker
+    // Initialize progress tracker (with optional Redis Streams for real-time SSE)
     const progress = new ProgressTracker({
       jobId: job.id,
       supabase: this.supabase,
       workerId: this.workerId,
       estimatedTotalActions: costTracker.getActionLimit(),
+      ...(this.redis && { redis: this.redis }),
     });
 
     try {
+      // 0a. Stamp execution_attempt_id to prevent duplicate execution (EC3)
+      if (this.pgPool) {
+        await this.pgPool.query(
+          'UPDATE gh_automation_jobs SET execution_attempt_id = $1 WHERE id = $2',
+          [this._executionAttemptId, job.id],
+        );
+        logger.info('Stamped execution attempt', { jobId: job.id, executionAttemptId: this._executionAttemptId });
+      }
+
+      // 0b. Subscribe to instant cancel channel (EC2 — LISTEN/NOTIFY)
+      if (this.pgPool) {
+        try {
+          cancelListenClient = await this.pgPool.connect();
+          const cancelChannel = `gh_job_cancel_${job.id}`;
+          await cancelListenClient.query(`LISTEN "${cancelChannel}"`);
+          cancelListenClient.on('notification', (msg: pg.Notification) => {
+            if (msg.channel === cancelChannel) {
+              logger.info('Received instant cancel NOTIFY', { jobId: job.id });
+              this._cancelled = true;
+              if (this._activeAdapter) {
+                this._activeAdapter.stop().catch(() => {});
+              }
+            }
+          });
+        } catch (err) {
+          logger.warn('Failed to set up cancel LISTEN channel', {
+            jobId: job.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          // Non-fatal — heartbeat polling still catches cancellation
+          if (cancelListenClient) {
+            try { cancelListenClient.release(); } catch { /* noop */ }
+            cancelListenClient = null;
+          }
+        }
+      }
+
       // 0. Pre-flight budget check (skip in development)
       const isDev = (process.env.NODE_ENV || 'development') === 'development';
       const preflight = isDev
@@ -194,10 +245,9 @@ export class JobExecutor {
         : await costService.preflightBudgetCheck(
             job.user_id,
             qualityPreset,
-            job.job_type,
           );
       if (isDev) {
-        console.log(`[JobExecutor] Skipping budget preflight (NODE_ENV=development)`);
+        getLogger().debug('Skipping budget preflight', { nodeEnv: 'development' });
       }
       if (!preflight.allowed) {
         await this.updateJobStatus(job.id, 'failed', preflight.reason);
@@ -233,7 +283,7 @@ export class JobExecutor {
             action_count: 0,
             total_tokens: 0,
           }).catch((err) => {
-            console.warn(`[JobExecutor] Preflight failure callback failed for job ${job.id}:`, err);
+            getLogger().warn('Preflight failure callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           });
         }
         return;
@@ -251,18 +301,25 @@ export class JobExecutor {
         action_limit: costTracker.getActionLimit(),
       });
 
-      // 1a. Notify VALET that the job is now running
+      // 1a. Notify VALET that the job is now running (include kasm_url if available)
+      const kasmUrl = process.env.KASM_SESSION_URL;
+      if (kasmUrl) {
+        progress.setKasmUrl(kasmUrl);
+      }
       if (job.callback_url) {
         callbackNotifier.notifyRunning(
           job.id,
           job.callback_url,
           job.valet_task_id,
-          undefined,
+          kasmUrl ? { kasm_url: kasmUrl } : undefined,
           this.workerId,
         ).catch((err) => {
-          console.warn(`[JobExecutor] Running callback failed for job ${job.id}:`, err);
+          getLogger().warn('Running callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });
       }
+
+      // 1b. Auto-populate user_data from VALET's resumes table if not provided
+      await this.enrichJobFromResumeProfile(job);
 
       // 2. Resolve task handler
       const handler = taskHandlerRegistry.getOrThrow(job.job_type);
@@ -300,7 +357,7 @@ export class JobExecutor {
               action_count: 0,
               total_tokens: 0,
             }).catch((err) => {
-              console.warn(`[JobExecutor] Validation failure callback failed for job ${job.id}:`, err);
+              getLogger().warn('Validation failure callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
             });
           }
           return;
@@ -329,7 +386,10 @@ export class JobExecutor {
           await this.logJobEvent(job.id, JOB_EVENT_TYPES.RESUME_DOWNLOAD_FAILED, {
             error: errMsg,
           });
-          throw new Error(`Resume download failed: ${errMsg}`);
+          logger.warn('Resume download failed, continuing without file', {
+            jobId: job.id,
+            error: errMsg,
+          });
         }
       }
 
@@ -347,19 +407,22 @@ export class JobExecutor {
             });
           }
         } catch (err) {
-          console.warn(`[JobExecutor] Session load failed for job ${job.id}:`, err);
+          getLogger().warn('Session load failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         }
       }
 
       // 7. Create and start adapter
       const adapterType = (process.env.GH_BROWSER_ENGINE || 'magnitude') as AdapterType;
       adapter = createAdapter(adapterType);
+      this._activeAdapter = adapter;
+      const headless = process.env.GH_HEADLESS !== 'false'; // default true
       await adapter.start({
         url: job.target_url,
         llm: llmSetup.llm,
         ...(llmSetup.imageLlm && { imageLlm: llmSetup.imageLlm }),
         ...(storedSession ? { storageState: storedSession } : {}),
         systemPrompt: 'You are a form-filling agent. RULES: (1) ONE action at a time. (2) TOP TO BOTTOM — start at the topmost unanswered field, never skip ahead. (3) DO NOT TOUCH any question that is even slightly cut off at the bottom of the screen. (4) Before reporting done, scan top to bottom and confirm every 100% visible question is answered. (5) When done with all fully visible fields, IMMEDIATELY report done. Do NOT use the wait action. Reporting done IS what triggers scrolling. (6) NEVER scroll or navigate.',
+        browserOptions: { headless },
       });
 
       console.log(`[JobExecutor] Adapter started for job ${job.id}`);
@@ -385,7 +448,7 @@ export class JobExecutor {
           }
         } catch (err) {
           // Observer is optional — don't fail the job if it can't attach
-          console.warn(`[JobExecutor] StagehandObserver init failed for job ${job.id}:`, err);
+          getLogger().warn('StagehandObserver init failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           observer = undefined;
         }
       }
@@ -408,7 +471,7 @@ export class JobExecutor {
             const cookies = (googleSession as any).cookies || [];
             if (cookies.length > 0) {
               await adapter.page.context().addCookies(cookies);
-              console.log(`[JobExecutor] Injected ${cookies.length} Google session cookies (from ${domain}) for user ${job.user_id}`);
+              getLogger().info('Injected Google session cookies', { count: cookies.length, domain, userId: job.user_id });
               googleSessionInjected = true;
             }
           }
@@ -421,18 +484,18 @@ export class JobExecutor {
           const cookies = (targetSession as any).cookies || [];
           if (cookies.length > 0) {
             await adapter.page.context().addCookies(cookies);
-            console.log(`[JobExecutor] Injected ${cookies.length} ${injTargetDomain} session cookies`);
+            getLogger().info('Injected target domain session cookies', { count: cookies.length, domain: injTargetDomain });
           }
         }
         // Reload page after cookie injection so Workday SSO picks up the Google session
         if (googleSessionInjected) {
-          console.log(`[JobExecutor] Reloading page after session injection...`);
+          getLogger().info('Reloading page after session injection');
           await adapter.page.reload({ waitUntil: 'networkidle' }).catch(() => {});
           await adapter.page.waitForTimeout(2000);
         }
       } catch (err) {
         // Session injection failure is non-fatal — worker can still try fresh login
-        console.warn(`[JobExecutor] Session injection failed (non-fatal):`, err);
+        getLogger().warn('Session injection failed (non-fatal)', { error: err instanceof Error ? err.message : String(err) });
       }
 
       // 8a. Auto-attach resume to file inputs via Playwright filechooser event.
@@ -515,7 +578,7 @@ export class JobExecutor {
           const screenshotUrl = await this.uploadScreenshot(job.id, 'final', screenshotBuffer);
           screenshotUrls.push(screenshotUrl);
         } catch (err) {
-          console.warn(`[JobExecutor] Screenshot failed for job ${job.id}:`, err);
+          getLogger().warn('Screenshot failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         }
 
         // Save browser session
@@ -527,7 +590,7 @@ export class JobExecutor {
               await this.sessionManager.saveSession(job.user_id, job.target_url, sessionState);
             }
           } catch (err) {
-            console.warn(`[JobExecutor] Session save failed for job ${job.id}:`, err);
+            getLogger().warn('Session save failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           }
         }
 
@@ -569,7 +632,9 @@ export class JobExecutor {
           cookbook_steps: engineResult.cookbookSteps,
         });
 
-        await costService.recordJobCost(job.user_id, job.id, finalCost);
+        await costService.recordJobCost(job.user_id, job.id, finalCost).catch((err) => {
+          getLogger().warn('Failed to record cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+        });
 
         if (job.callback_url) {
           callbackNotifier.notifyFromJob({
@@ -585,11 +650,11 @@ export class JobExecutor {
             action_count: finalCost.actionCount,
             total_tokens: finalCost.inputTokens + finalCost.outputTokens,
           }).catch((err) => {
-            console.warn(`[JobExecutor] Callback notification failed for job ${job.id}:`, err);
+            getLogger().warn('Callback notification failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           });
         }
 
-        console.log(`[JobExecutor] Job ${job.id} completed via cookbook (steps=${engineResult.cookbookSteps}, cost=$${finalCost.totalCost.toFixed(4)})`);
+        getLogger().info('Job completed via cookbook', { jobId: job.id, cookbookSteps: engineResult.cookbookSteps, costUsd: finalCost.totalCost });
         return;
       }
 
@@ -662,9 +727,9 @@ export class JobExecutor {
           }
 
           crashRecoveryAttempts++;
-          console.warn(
-            `[JobExecutor] Browser crash detected for job ${job.id}, recovery attempt ${crashRecoveryAttempts}/${MAX_CRASH_RECOVERIES}`,
-          );
+          getLogger().warn('Browser crash detected', {
+            jobId: job.id, attempt: crashRecoveryAttempts, maxAttempts: MAX_CRASH_RECOVERIES,
+          });
 
           await this.logJobEvent(job.id, 'browser_crash_detected', {
             attempt: crashRecoveryAttempts,
@@ -703,7 +768,7 @@ export class JobExecutor {
                 (adapter as MagnitudeAdapter).setObserver(observer);
               }
             } catch (err) {
-              console.warn(`[JobExecutor] StagehandObserver re-attach failed after crash recovery for job ${job.id}:`, err);
+              getLogger().warn('StagehandObserver re-attach failed after crash recovery', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
               observer = undefined;
             }
           }
@@ -754,7 +819,7 @@ export class JobExecutor {
               url_pattern: ManualStore.urlToPattern(job.target_url),
             });
           } catch (err) {
-            console.warn(`[JobExecutor] Manual save failed for job ${job.id}:`, err);
+            getLogger().warn('Manual save failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           }
         }
       }
@@ -800,7 +865,7 @@ export class JobExecutor {
         );
         screenshotUrls.push(screenshotUrl);
       } catch (err) {
-        console.warn(`[JobExecutor] Screenshot failed for job ${job.id}:`, err);
+        getLogger().warn('Screenshot failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       }
 
       // 11.5. Save browser session for future reuse
@@ -815,7 +880,7 @@ export class JobExecutor {
             });
           }
         } catch (err) {
-          console.warn(`[JobExecutor] Session save failed for job ${job.id}:`, err);
+          getLogger().warn('Session save failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         }
       }
 
@@ -838,9 +903,9 @@ export class JobExecutor {
           saveDomain,
           freshState as unknown as Record<string, unknown>,
         );
-        console.log(`[JobExecutor] Saved fresh session cookies for user ${job.user_id}`);
+        getLogger().info('Saved fresh session cookies', { userId: job.user_id });
       } catch (err) {
-        console.warn(`[JobExecutor] Session save failed (non-fatal):`, err);
+        getLogger().warn('Session save failed (non-fatal)', { error: err instanceof Error ? err.message : String(err) });
       }
 
       // 13. Handle awaiting_user_review vs completed
@@ -879,14 +944,16 @@ export class JobExecutor {
           cost_cents: Math.round(finalCost.totalCost * 100),
         });
 
-        await costService.recordJobCost(job.user_id, job.id, finalCost);
+        await costService.recordJobCost(job.user_id, job.id, finalCost).catch((err) => {
+          getLogger().warn('Failed to record cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+        });
 
-        console.log(`[JobExecutor] Job ${job.id} awaiting user review (actions=${finalCost.actionCount}, cost=$${finalCost.totalCost.toFixed(4)})`);
+        getLogger().info('Job awaiting user review', { jobId: job.id, actionCount: finalCost.actionCount, costUsd: finalCost.totalCost });
 
         // Keep heartbeat running and browser open — wait indefinitely
         // The worker process must stay alive for the browser to remain open
-        console.log(`[JobExecutor] Browser is open for manual review. Heartbeat continues.`);
-        console.log(`[JobExecutor] Press Ctrl+C to shut down the worker when done.`);
+        getLogger().info('Browser is open for manual review, heartbeat continues');
+        getLogger().info('Press Ctrl+C to shut down the worker when done');
 
         // Block indefinitely — the user will Ctrl+C when done
         await new Promise<void>(() => {
@@ -939,8 +1006,10 @@ export class JobExecutor {
         magnitude_steps: finalCost.actionCount,
       });
 
-      // 14. Record cost against user's monthly usage
-      await costService.recordJobCost(job.user_id, job.id, finalCost);
+      // 14. Record cost against user's monthly usage (best-effort, don't fail the job)
+      await costService.recordJobCost(job.user_id, job.id, finalCost).catch((err) => {
+        getLogger().warn('Failed to record cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+      });
 
       // 15. Fire VALET callback if configured
       if (job.callback_url) {
@@ -958,12 +1027,34 @@ export class JobExecutor {
           total_tokens: finalCost.inputTokens + finalCost.outputTokens,
         };
         callbackNotifier.notifyFromJob(jobRow).catch((err) => {
-          console.warn(`[JobExecutor] Callback notification failed for job ${job.id}:`, err);
+          getLogger().warn('Callback notification failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });
       }
 
-      console.log(`[JobExecutor] Job ${job.id} completed via ${handler.type} handler (actions=${finalCost.actionCount}, tokens=${finalCost.inputTokens + finalCost.outputTokens}, cost=$${finalCost.totalCost.toFixed(4)})`);
+      getLogger().info('Job completed via handler', { jobId: job.id, handler: handler.type, actionCount: finalCost.actionCount, totalTokens: finalCost.inputTokens + finalCost.outputTokens, costUsd: finalCost.totalCost });
     } catch (error: unknown) {
+      // Handle external cancellation (heartbeat detected cancelled status)
+      if (this._cancelled) {
+        getLogger().info('Job was cancelled by user', { jobId: job.id });
+        await progress.setStep(ProgressStep.FAILED);
+        await progress.flush();
+        const snapshot = costTracker.getSnapshot();
+        await costService.recordJobCost(job.user_id, job.id, snapshot).catch(() => {});
+        if (job.callback_url) {
+          callbackNotifier.notifyFromJob({
+            id: job.id,
+            valet_task_id: job.valet_task_id,
+            callback_url: job.callback_url,
+            status: 'cancelled',
+            worker_id: this.workerId,
+            llm_cost_cents: Math.round(snapshot.totalCost * 100),
+            action_count: snapshot.actionCount,
+            total_tokens: snapshot.inputTokens + snapshot.outputTokens,
+          }).catch(() => {});
+        }
+        return;
+      }
+
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorCode = this.classifyError(errorMessage);
 
@@ -984,17 +1075,17 @@ export class JobExecutor {
             if (resumed) {
               const hitlSnapshot = costTracker.getSnapshot();
               await costService.recordJobCost(job.user_id, job.id, hitlSnapshot).catch((err) => {
-                console.warn(`[JobExecutor] Failed to record HITL partial cost for job ${job.id}:`, err);
+                getLogger().warn('Failed to record HITL partial cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
               });
-              console.log(`[JobExecutor] Job ${job.id} resumed after HITL intervention`);
+              getLogger().info('Job resumed after HITL intervention', { jobId: job.id });
               return;
             }
           } else {
             // checkForBlockers handled the HITL flow but the blocker couldn't be resolved
-            console.warn(`[JobExecutor] Job ${job.id} blocked and HITL could not resolve`);
+            getLogger().warn('Job blocked and HITL could not resolve', { jobId: job.id });
           }
         } catch (hitlErr) {
-          console.warn(`[JobExecutor] HITL intervention failed for job ${job.id}:`, hitlErr);
+          getLogger().warn('HITL intervention failed', { jobId: job.id, error: hitlErr instanceof Error ? hitlErr.message : String(hitlErr) });
           // Fall through to normal error handling
         }
       }
@@ -1006,7 +1097,7 @@ export class JobExecutor {
 
       // Always record cost on failure (even zero cost for consistent accounting)
       await costService.recordJobCost(job.user_id, job.id, snapshot).catch((err) => {
-        console.warn(`[JobExecutor] Failed to record cost for job ${job.id}:`, err);
+        getLogger().warn('Failed to record cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       });
 
       // Fire VALET callback on failure too
@@ -1023,12 +1114,21 @@ export class JobExecutor {
           action_count: snapshot.actionCount,
           total_tokens: snapshot.inputTokens + snapshot.outputTokens,
         }).catch((err) => {
-          console.warn(`[JobExecutor] Callback notification failed for job ${job.id}:`, err);
+          getLogger().warn('Callback notification failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });
       }
     } finally {
       clearInterval(heartbeat);
+      this._activeAdapter = null;
+      this._executionAttemptId = null;
       if (blockerCheckInterval) clearInterval(blockerCheckInterval);
+      // Clean up cancel LISTEN subscription (EC2)
+      if (cancelListenClient) {
+        try {
+          await cancelListenClient.query(`UNLISTEN "gh_job_cancel_${job.id}"`);
+          cancelListenClient.release();
+        } catch { /* connection may already be closed */ }
+      }
       if (observer) {
         try { await observer.stop(); } catch { /* best-effort cleanup */ }
       }
@@ -1064,7 +1164,7 @@ export class JobExecutor {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorCode = this.classifyError(errorMessage);
 
-    console.error(`[JobExecutor] Job ${job.id} failed (code=${errorCode}): ${errorMessage}`);
+    getLogger().error('Job failed', { jobId: job.id, errorCode, errorMessage });
 
     await this.logJobEvent(job.id, 'job_failed', {
       error_code: errorCode,
@@ -1099,7 +1199,7 @@ export class JobExecutor {
         })
         .eq('id', job.id);
 
-      console.log(`[JobExecutor] Job ${job.id} re-queued for retry ${job.retry_count + 1}/${job.max_retries} (backoff=${backoffSeconds}s)`);
+      getLogger().info('Job re-queued for retry', { jobId: job.id, retryCount: job.retry_count + 1, maxRetries: job.max_retries, backoffSeconds });
     } else {
       await this.supabase
         .from('gh_automation_jobs')
@@ -1243,7 +1343,7 @@ export class JobExecutor {
       blockerResult = await this.blockerDetector.detectWithAdapter(adapter);
     } catch (err) {
       // Detection failure should not crash the job
-      console.warn(`[JobExecutor] Blocker detection failed for job ${job.id}:`, err);
+      getLogger().warn('Blocker detection failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       return false;
     }
 
@@ -1310,9 +1410,10 @@ export class JobExecutor {
           return false;
         }
 
-        console.warn(
-          `[JobExecutor] Job ${job.id} still blocked after resume (attempt ${attempt}/${MAX_POST_RESUME_CHECKS}): ${stillBlocked.type} (${stillBlocked.confidence})`,
-        );
+        getLogger().warn('Job still blocked after resume', {
+          jobId: job.id, attempt, maxAttempts: MAX_POST_RESUME_CHECKS,
+          blockerType: stillBlocked.type, confidence: stillBlocked.confidence,
+        });
 
         if (attempt < MAX_POST_RESUME_CHECKS) {
           // Re-pause and wait for another human intervention
@@ -1351,7 +1452,7 @@ export class JobExecutor {
       const screenshotBuffer = await adapter.screenshot();
       screenshotUrl = await this.uploadScreenshot(job.id, 'blocker', screenshotBuffer);
     } catch (err) {
-      console.warn(`[JobExecutor] HITL screenshot failed for job ${job.id}:`, err);
+      getLogger().warn('HITL screenshot failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
     }
 
     const pageUrl = await adapter.getCurrentUrl();
@@ -1419,7 +1520,7 @@ export class JobExecutor {
           total_tokens: costSnapshot.inputTokens + costSnapshot.outputTokens,
         } : undefined,
       ).catch((err) => {
-        console.warn(`[JobExecutor] HITL callback failed for job ${job.id}:`, err);
+        getLogger().warn('HITL callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       });
     }
 
@@ -1459,7 +1560,7 @@ export class JobExecutor {
 
       if (job.callback_url) {
         callbackNotifier.notifyResumed(job.id, job.callback_url, job.valet_task_id, this.workerId).catch((err) => {
-          console.warn(`[JobExecutor] Resume callback failed for job ${job.id}:`, err);
+          getLogger().warn('Resume callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });
       }
       return true;
@@ -1532,7 +1633,7 @@ export class JobExecutor {
       return this.readAndClearResolutionData(jobId);
     } catch (err) {
       client.release();
-      console.warn(`[JobExecutor] PG LISTEN failed for job ${jobId}, falling back to polling:`, err);
+      getLogger().warn('PG LISTEN failed, falling back to polling', { jobId, error: err instanceof Error ? err.message : String(err) });
       return this.waitForResumeViaPolling(jobId, timeoutSeconds);
     }
   }
@@ -1609,7 +1710,7 @@ export class JobExecutor {
 
       return { resumed: true, resolutionType, resolutionData };
     } catch (err) {
-      console.warn(`[JobExecutor] Failed to read resolution data for job ${jobId}:`, err);
+      getLogger().warn('Failed to read resolution data', { jobId, error: err instanceof Error ? err.message : String(err) });
       // Still resumed, just without resolution data
       return { resumed: true, resolutionType: 'manual' };
     }
@@ -1618,14 +1719,65 @@ export class JobExecutor {
   // --- Heartbeat ---
 
   private startHeartbeat(jobId: string): ReturnType<typeof setInterval> {
+    let consecutiveFailures = 0;
+
     return setInterval(async () => {
       try {
-        await this.supabase
+        const { data } = await this.supabase
           .from('gh_automation_jobs')
           .update({ last_heartbeat: new Date().toISOString() })
-          .eq('id', jobId);
+          .eq('id', jobId)
+          .select('status, execution_attempt_id')
+          .single();
+
+        // Heartbeat succeeded — reset failure counter (EC8)
+        consecutiveFailures = 0;
+
+        // Detect external cancellation (e.g. user clicked cancel in VALET)
+        if (data?.status === 'cancelled') {
+          getLogger().info('Job cancelled externally, stopping execution', { jobId });
+          this._cancelled = true;
+          if (this._activeAdapter) {
+            try { await this._activeAdapter.stop(); } catch { /* adapter may already be stopped */ }
+          }
+        }
+
+        // EC3: Verify execution_attempt_id — another worker may have taken over
+        if (
+          this._executionAttemptId &&
+          data?.execution_attempt_id &&
+          data.execution_attempt_id !== this._executionAttemptId
+        ) {
+          getLogger().warn('Execution attempt ID mismatch — another worker has claimed this job', {
+            jobId,
+            ours: this._executionAttemptId,
+            theirs: data.execution_attempt_id,
+          });
+          this._cancelled = true;
+          if (this._activeAdapter) {
+            try { await this._activeAdapter.stop(); } catch { /* adapter may already be stopped */ }
+          }
+        }
       } catch (err) {
-        console.warn(`[JobExecutor] Heartbeat failed for job ${jobId}:`, err);
+        // EC8: Track consecutive heartbeat failures
+        consecutiveFailures++;
+        getLogger().warn('Heartbeat failed', {
+          jobId,
+          consecutiveFailures,
+          error: err instanceof Error ? err.message : String(err),
+        });
+
+        if (consecutiveFailures >= MAX_HEARTBEAT_FAILURES) {
+          getLogger().error('Aborting job after consecutive heartbeat failures', {
+            jobId,
+            consecutiveFailures,
+            maxAllowed: MAX_HEARTBEAT_FAILURES,
+          });
+          this._cancelled = true;
+          if (this._activeAdapter) {
+            try { await this._activeAdapter.stop(); } catch { /* adapter may already be stopped */ }
+          }
+        }
       }
     }, HEARTBEAT_INTERVAL_MS);
   }
@@ -1665,7 +1817,50 @@ export class JobExecutor {
       });
     } catch (err) {
       // Event logging failures should not crash the job
-      console.warn(`[JobExecutor] Event log failed (${eventType}):`, err);
+      getLogger().warn('Event log failed', { eventType, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  // --- Resume profile enrichment ---
+
+  /**
+   * If the job has no user_data, attempt to load it from VALET's `resumes` table.
+   * Also sets up resume_ref from the resume's file_key if not already provided.
+   * This is backwards-compatible: if user_data is already present, this is a no-op.
+   */
+  private async enrichJobFromResumeProfile(job: AutomationJob): Promise<void> {
+    const hasUserData = job.input_data.user_data
+      && typeof job.input_data.user_data === 'object'
+      && Object.keys(job.input_data.user_data).length > 0;
+
+    if (hasUserData) return;
+
+    try {
+      const loader = new ResumeProfileLoader(this.supabase);
+      const result = await loader.loadForUser(job.user_id);
+
+      job.input_data.user_data = result.profile;
+
+      if (!job.resume_ref && result.fileKey) {
+        (job as any).resume_ref = { storage_path: result.fileKey };
+      }
+
+      await this.logJobEvent(job.id, 'resume_profile_loaded', {
+        resume_id: result.resumeId,
+        user_id: result.userId,
+        confidence: result.parsingConfidence,
+      });
+
+      getLogger().info('Auto-populated user_data from VALET resumes table', {
+        jobId: job.id,
+        resumeId: result.resumeId,
+      });
+    } catch (err) {
+      getLogger().warn('Failed to auto-populate user_data from resumes table', {
+        jobId: job.id,
+        userId: job.user_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -1837,7 +2032,7 @@ export class JobExecutor {
         const el = await page.$(selector);
         if (el && await el.isVisible()) {
           await el.fill(code);
-          console.log(`[JobExecutor] Injected 2FA code via selector: ${selector}`);
+          getLogger().debug('Injected 2FA code via selector', { selector });
           await this.logJobEvent(jobId, JOB_EVENT_TYPES.CREDENTIAL_INJECTION_SUCCEEDED, {
             injection_type: 'code_entry',
             selector,
@@ -1853,7 +2048,7 @@ export class JobExecutor {
         // Selector may not be valid on this page, try next
       }
     }
-    console.warn('[JobExecutor] Could not find 2FA code input field — resuming without injection');
+    getLogger().warn('Could not find 2FA code input field, resuming without injection');
     await this.logJobEvent(jobId, JOB_EVENT_TYPES.CREDENTIAL_INJECTION_FAILED, {
       injection_type: 'code_entry',
       reason: 'no_matching_input_field',
@@ -1905,7 +2100,7 @@ export class JobExecutor {
           const el = await page.$(sel);
           if (el && await el.isVisible()) {
             await el.fill(username);
-            console.log(`[JobExecutor] Injected username via selector: ${sel}`);
+            getLogger().debug('Injected username via selector', { selector: sel });
             usernameInjected = true;
             break;
           }
@@ -1925,7 +2120,7 @@ export class JobExecutor {
           const el = await page.$(sel);
           if (el && await el.isVisible()) {
             await el.fill(password);
-            console.log(`[JobExecutor] Injected password via selector: ${sel}`);
+            getLogger().debug('Injected password via selector', { selector: sel });
             passwordInjected = true;
             break;
           }
@@ -2015,7 +2210,7 @@ export class JobExecutor {
 
       return newAdapter;
     } catch (err) {
-      console.error(`[JobExecutor] Crash recovery failed for job ${job.id}:`, err);
+      getLogger().error('Crash recovery failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       return null;
     }
   }

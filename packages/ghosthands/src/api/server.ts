@@ -12,7 +12,7 @@ import { models } from './routes/models.js';
 import { createJobRoutes } from './routes/jobs.js';
 import { createValetRoutes } from './routes/valet.js';
 import { createUsageRoutes } from './routes/usage.js';
-import { requestLoggingMiddleware } from '../monitoring/logger.js';
+import { requestLoggingMiddleware, getLogger } from '../monitoring/logger.js';
 import { metricsMiddleware } from './middleware/metrics.js';
 import { createMonitoringRoutes } from './routes/monitoring.js';
 
@@ -69,7 +69,7 @@ export function createApp() {
   if (!poolUrl) {
     throw new Error('Missing DATABASE_URL, SUPABASE_DIRECT_URL, or DATABASE_DIRECT_URL environment variable');
   }
-  const pgPool = new Pool({ connectionString: poolUrl, max: 5 });
+  const pgPool = new Pool({ connectionString: poolUrl, max: 3, idleTimeoutMillis: 30_000 });
   const jobController = new JobController({ pool: pgPool });
 
   api.route('/jobs', createJobRoutes(jobController));
@@ -95,7 +95,7 @@ export function createApp() {
 export function startServer(port: number = 3100) {
   const app = createApp();
 
-  console.log(`GhostHands API starting on port ${port}`);
+  getLogger().info('GhostHands API starting', { port });
 
   // Bun-native serve
   if (typeof Bun !== 'undefined') {
@@ -109,7 +109,7 @@ export function startServer(port: number = 3100) {
   // Users should install @hono/node-server if not using Bun
   return import('@hono/node-server').then(({ serve }) => {
     serve({ fetch: app.fetch, port });
-    console.log(`GhostHands API listening on http://localhost:${port}`);
+    getLogger().info('GhostHands API listening', { url: `http://localhost:${port}` });
   });
 }
 

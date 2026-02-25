@@ -86,6 +86,7 @@ packages/ghosthands/src/
   detection/      # BlockerDetector (captcha/login detection)
   engine/         # ExecutionEngine, CookbookExecutor, ManualStore, TraceRecorder
   events/         # Job event type constants
+  lib/            # Shared utilities (Redis Streams helpers)
   monitoring/     # Logger (JSON structured, secret redaction), metrics, health, alerts
   scripts/        # Operational scripts (migration, job management, setup verification)
   security/       # Rate limiting, domain lockdown, input sanitization
@@ -135,6 +136,7 @@ Required:
 Optional:
 - `SUPABASE_PUBLISHABLE_KEY` -- Supabase publishable key (`sb_publishable_...`). Replaces legacy `anon` JWT.
 - `GH_MODEL` / `GH_IMAGE_MODEL` -- Default LLM model aliases
+- `REDIS_URL` -- Redis connection URL (enables real-time streaming via Redis Streams for SSE)
 - `GH_API_PORT` (default 3100), `GH_WORKER_PORT` (default 3101)
 - `GH_WORKER_ID` -- Worker identity for registry
 - `EC2_INSTANCE_ID`, `EC2_IP` -- EC2 metadata for monitoring

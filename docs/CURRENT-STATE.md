@@ -61,6 +61,7 @@ packages/ghosthands/src/
   detection/      BlockerDetector (captcha/login wall detection)
   engine/         ExecutionEngine, CookbookExecutor, ManualStore, TraceRecorder
   events/         Job event type constants (JOB_EVENT_TYPES)
+  lib/            Shared utilities (Redis Streams helpers)
   monitoring/     Structured JSON logger, Prometheus metrics, health checks, alerts
   scripts/        Operational scripts (run-migration, verify-setup, job management)
   security/       Rate limiting, domain lockdown, input sanitization
@@ -483,7 +484,7 @@ Monthly budgets by tier:
 | free | $0.50 |
 | starter | $2.00 |
 | pro | $10.00 |
-| premium | $10.00 |
+| premium | $25.00 |
 | enterprise | $100.00 |
 
 ### 4.5 Callback Notifier
@@ -877,7 +878,7 @@ Run in order:
 | Variable | Description |
 |----------|-------------|
 | `SUPABASE_URL` | Supabase project URL |
-| `SUPABASE_SERVICE_KEY` | Supabase service role key |
+| `SUPABASE_SECRET_KEY` | Supabase secret key (`sb_secret_...`). Legacy name `SUPABASE_SERVICE_KEY` accepted as fallback. |
 | `DATABASE_URL` | Postgres connection string (prefer transaction pooler for API) |
 | `GH_SERVICE_SECRET` | API authentication key (shared with VALET) |
 | `GH_CREDENTIAL_KEY` | 64 hex chars for AES-256-GCM encryption |
@@ -897,4 +898,5 @@ Run in order:
 | `DATABASE_DIRECT_URL` | -- | Alias for direct Postgres URL |
 | `EC2_INSTANCE_ID` | -- | EC2 metadata for worker registry |
 | `EC2_IP` | -- | EC2 IP for worker registry |
+| `REDIS_URL` | -- | Redis connection URL (optional, enables real-time streaming via Redis Streams for SSE) |
 | `CORS_ORIGIN` | `*` | Allowed CORS origins |

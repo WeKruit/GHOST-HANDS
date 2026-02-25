@@ -137,6 +137,7 @@ export function createJobRoutes(controller: JobController) {
         {
           error: 'job_not_cancellable',
           current_status: result.current_status,
+          reason: (result as any).reason || `Job with status '${result.current_status}' cannot be cancelled`,
         },
         409,
       );

@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, staging]
   pull_request:
-    branches: [main]
+    branches: [main, staging]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -59,7 +59,7 @@ jobs:
           GH_ENCRYPTION_KEY: ${{ secrets.GH_ENCRYPTION_KEY }}
 
   # ─── Docker build (main + staging branches) ────────────────────
-  # Staging: tags as staging-<sha>
+  # Staging: tags as staging-<sha> + mutable staging
   # Main:    tags as <sha> + latest
 
   docker:
@@ -80,10 +80,12 @@ jobs:
             echo "image_tag=staging-${{ github.sha }}" >> "$GITHUB_OUTPUT"
             echo "environment=staging" >> "$GITHUB_OUTPUT"
             echo "tag_latest=false" >> "$GITHUB_OUTPUT"
+            echo "tag_staging=true" >> "$GITHUB_OUTPUT"
           else
             echo "image_tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
             echo "environment=production" >> "$GITHUB_OUTPUT"
             echo "tag_latest=true" >> "$GITHUB_OUTPUT"
+            echo "tag_staging=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Configure AWS credentials
@@ -103,10 +105,14 @@ jobs:
           ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
           IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
           TAG_LATEST: ${{ steps.meta.outputs.tag_latest }}
+          TAG_STAGING: ${{ steps.meta.outputs.tag_staging }}
         run: |
           TAGS="-t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           if [ "$TAG_LATEST" = "true" ]; then
             TAGS="$TAGS -t $ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          fi
+          if [ "$TAG_STAGING" = "true" ]; then
+            TAGS="$TAGS -t $ECR_REGISTRY/$ECR_REPOSITORY:staging"
           fi
 
           docker build \
@@ -120,14 +126,16 @@ jobs:
           if [ "$TAG_LATEST" = "true" ]; then
             docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           fi
+          if [ "$TAG_STAGING" = "true" ]; then
+            docker push $ECR_REGISTRY/$ECR_REPOSITORY:staging
+          fi
 
-  # ─── Deploy: Staging ──────────────────────────────────────────
-  # Triggers on both staging branch (direct) and main branch (promotion)
+  # ─── Deploy: Staging (notify VALET after ASG is updated) ─────
 
   deploy-staging:
     name: Deploy Staging
     runs-on: ubuntu-latest
-    needs: [docker, test-integration]
+    needs: [docker, deploy-asg]
     if: github.event_name == 'push'
     environment: staging
     steps:
@@ -183,13 +191,112 @@ jobs:
             echo "::warning::VALET staging webhook returned HTTP ${HTTP_STATUS}."
           fi
 
+  # ─── Deploy to ASG instances (SSH) ────────────────────────────
+  # FIRST: SSH to each running ASG instance and pull/restart the
+  # new image. VALET notification happens after this succeeds.
+
+  deploy-asg:
+    name: Deploy to ASG Fleet
+    runs-on: ubuntu-latest
+    needs: [docker]
+    if: github.event_name == 'push'
+    environment: ${{ needs.docker.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Write SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SANDBOX_SSH_KEY }}" > ~/.ssh/valet-worker.pem
+          chmod 600 ~/.ssh/valet-worker.pem
+
+      - name: Deploy to ASG instances
+        env:
+          AWS_ASG_NAME: ghosthands-worker-asg
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          SSH_USER: ubuntu
+        run: |
+          chmod +x scripts/deploy-to-asg.sh
+          bash scripts/deploy-to-asg.sh "${{ needs.docker.outputs.image_tag }}"
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/valet-worker.pem
+
+  # ─── Rebuild Kasm image on Kasm server (SSH) ──────────────────
+  # Builds Dockerfile.kasm directly on the Kasm EC2 server.
+  # The image is ~8GB (full desktop + GH worker), so we build locally
+  # on the server rather than pushing through ECR.
+
+  deploy-kasm:
+    name: Rebuild Kasm Image
+    runs-on: ubuntu-latest
+    needs: [docker]
+    if: github.event_name == 'push'
+    environment: ${{ needs.docker.outputs.environment }}
+    steps:
+      - name: Write SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SANDBOX_SSH_KEY }}" > ~/.ssh/valet-worker.pem
+          chmod 600 ~/.ssh/valet-worker.pem
+
+      - name: Rebuild Kasm image on server
+        env:
+          KASM_SERVER_IP: ${{ secrets.KASM_SERVER_IP }}
+          SSH_USER: ubuntu
+        run: |
+          if [ -z "$KASM_SERVER_IP" ]; then
+            echo "::warning::KASM_SERVER_IP not configured. Skipping Kasm image rebuild."
+            exit 0
+          fi
+
+          SSH_OPTS="-i ~/.ssh/valet-worker.pem -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+
+          echo "Rebuilding Kasm image on ${KASM_SERVER_IP}..."
+
+          ssh $SSH_OPTS ${SSH_USER}@${KASM_SERVER_IP} bash -s << 'REMOTE_SCRIPT'
+          set -e
+          cd /opt/GHOST-HANDS
+
+          # Pull latest code
+          sudo git config --global --add safe.directory /opt/GHOST-HANDS
+          sudo git fetch origin staging
+          sudo git reset --hard origin/staging
+
+          # Build the Kasm image
+          echo "Building ghosthands-kasm:latest..."
+          sudo docker build -f Dockerfile.kasm -t ghosthands-kasm:latest . 2>&1 | tail -5
+
+          # Prune dangling images to save disk
+          sudo docker image prune -f > /dev/null 2>&1 || true
+
+          echo "Kasm image rebuilt successfully."
+          sudo docker images ghosthands-kasm --format '{{.ID}} {{.Tag}} {{.CreatedAt}}'
+          REMOTE_SCRIPT
+
+          echo "Kasm image rebuild complete on ${KASM_SERVER_IP}."
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/valet-worker.pem
+
   # ─── Deploy: Production ───────────────────────────────────────
-  # Only triggers on main branch pushes, after staging succeeds
+  # Only triggers on main branch pushes, after ASG is updated
 
   deploy-production:
     name: Deploy Production
     runs-on: ubuntu-latest
-    needs: [deploy-staging]
+    needs: [docker, deploy-asg]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     environment: production
     steps:
@@ -243,3 +350,4 @@ jobs:
           else
             echo "::warning::VALET production webhook returned HTTP ${HTTP_STATUS}."
           fi
+
