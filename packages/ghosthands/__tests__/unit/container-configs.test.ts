@@ -120,9 +120,25 @@ describe('Container Configs Module', () => {
   });
 
   describe('getServiceConfigs', () => {
+    const savedEnv: Record<string, string | undefined> = {};
+
     beforeEach(() => {
-      // Spy on getEnvVarsFromProcess to inject known env vars
-      vi.spyOn(containerConfigs, 'getEnvVarsFromProcess').mockReturnValue(SAMPLE_ENV_VARS);
+      // Set process.env directly so getEnvVarsFromProcess picks them up
+      // (vi.spyOn on named exports doesn't intercept internal calls in bun)
+      savedEnv.DATABASE_URL = process.env.DATABASE_URL;
+      savedEnv.SUPABASE_URL = process.env.SUPABASE_URL;
+      savedEnv.GH_SERVICE_SECRET = process.env.GH_SERVICE_SECRET;
+      process.env.DATABASE_URL = 'postgres://localhost/db';
+      process.env.SUPABASE_URL = 'https://example.supabase.co';
+      process.env.GH_SERVICE_SECRET = 'test-secret';
+    });
+
+    afterEach(() => {
+      // Restore original env
+      for (const [key, val] of Object.entries(savedEnv)) {
+        if (val === undefined) delete process.env[key];
+        else process.env[key] = val;
+      }
     });
 
     test('returns exactly 3 services', () => {
