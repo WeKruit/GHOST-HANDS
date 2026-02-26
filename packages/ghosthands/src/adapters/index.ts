@@ -16,10 +16,12 @@ export type {
   BrowserLaunchOptions,
 } from './types';
 export { MagnitudeAdapter } from './magnitude';
+export { StagehandAdapter } from './stagehand';
 export { MockAdapter, type MockAdapterConfig, type MockBlockerConfig } from './mock';
 
 import type { HitlCapableAdapter, AdapterType } from './types';
 import { MagnitudeAdapter } from './magnitude';
+import { StagehandAdapter } from './stagehand';
 import { MockAdapter } from './mock';
 
 const HITL_METHODS = ['observe', 'pause', 'resume', 'isPaused', 'screenshot', 'getCurrentUrl', 'observeWithBlockerDetection'] as const;
@@ -46,7 +48,8 @@ export function createAdapter(type: AdapterType = 'magnitude'): HitlCapableAdapt
       adapter = new MockAdapter();
       break;
     case 'stagehand':
-      throw new Error('Stagehand adapter not yet implemented. Install @browserbasehq/stagehand and create StagehandAdapter.');
+      adapter = new StagehandAdapter();
+      break;
     case 'actionbook':
       throw new Error('Actionbook adapter not yet implemented. Install @actionbookdev/js-sdk and create ActionbookAdapter.');
     case 'hybrid':

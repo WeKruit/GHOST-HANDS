@@ -4,7 +4,12 @@
       "Bash(find C:\\\\Users\\\\spenc\\\\Documents\\\\GitHub\\\\GHOST-HANDS\\\\packages\\\\ghosthands:*)",
       "Bash(find C:\\\\Users\\\\spenc\\\\Documents\\\\GitHub\\\\GHOST-HANDS\\\\packages\\\\ghosthands\\\\src:*)",
       "Bash(npx tsc:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(npm view:*)",
+      "Bash(bun pm:*)",
+      "Bash(bun add:*)",
+      "Bash(npx patch-package:*)",
+      "Bash(bun patch:*)"
     ]
   }
 }

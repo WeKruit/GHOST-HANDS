@@ -556,6 +556,13 @@ export class SmartApplyHandler implements TaskHandler {
   private async handleJobListing(adapter: BrowserAutomationAdapter): Promise<void> {
     console.log('[SmartApply] On job listing page, clicking Apply...');
 
+    // Remove target="_blank" from Apply links so navigation stays in the same tab
+    await adapter.page.evaluate(() => {
+      document.querySelectorAll('a[target="_blank"]').forEach(a => {
+        a.removeAttribute('target');
+      });
+    });
+
     const urlBefore = await adapter.getCurrentUrl();
     await this.throttleLlm(adapter);
     const result = await adapter.act(
