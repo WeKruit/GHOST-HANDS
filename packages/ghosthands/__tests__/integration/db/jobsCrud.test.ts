@@ -295,13 +295,23 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
   // ── DB-008: Filter jobs by status ────────────────────────────────────────
 
   test('DB-008: filter jobs by status — returns only matching', async () => {
-    const inserted = await insertTestJobs(supabase, [
-      { job_type: JOB_TYPE_FILTER, status: 'pending' },
-      { job_type: JOB_TYPE_FILTER, status: 'completed' },
-      { job_type: JOB_TYPE_FILTER, status: 'failed' },
-    ]);
+    // Insert one at a time to avoid batch issues, then update statuses
+    const [job1] = await insertTestJobs(supabase, { job_type: JOB_TYPE_FILTER, status: 'pending' });
+    const [job2] = await insertTestJobs(supabase, { job_type: JOB_TYPE_FILTER, status: 'pending' });
+    const [job3] = await insertTestJobs(supabase, { job_type: JOB_TYPE_FILTER, status: 'pending' });
 
-    const insertedIds = inserted.map((j) => j.id as string);
+    // Update statuses after insert to avoid any insert-time constraints
+    await supabase.from('gh_automation_jobs').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('id', job2.id as string);
+    await supabase.from('gh_automation_jobs').update({ status: 'failed', completed_at: new Date().toISOString(), error_code: 'test_error' }).eq('id', job3.id as string);
+
+    const insertedIds = [job1.id as string, job2.id as string, job3.id as string];
+
+    // Verify all 3 rows exist
+    const { data: allRows } = await supabase
+      .from('gh_automation_jobs')
+      .select('id, status')
+      .in('id', insertedIds);
+    expect(allRows).toHaveLength(3);
 
     // Query for pending jobs scoped to the rows we just inserted
     const { data: pending, error } = await supabase
@@ -313,8 +323,6 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     expect(error).toBeNull();
     expect(pending).not.toBeNull();
     expect(pending!.length).toBe(1);
-
-    // The single returned row should be the pending one
     expect(pending![0].status).toBe('pending');
   });
 
