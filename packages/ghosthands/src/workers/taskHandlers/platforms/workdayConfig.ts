@@ -1443,32 +1443,39 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
       const text = ((await options.nth(i).textContent()) || '').trim().toLowerCase();
       if (!text || text === 'no items.' || text === 'no results') continue;
 
+      // Exact match
       if (text === normSkill) { bestIdx = i; bestScore = 100; break; }
-      if (text.startsWith(normSkill) && 90 > bestScore) { bestScore = 90; bestIdx = i; }
-      if (normSkill.startsWith(text) && 85 > bestScore) { bestScore = 85; bestIdx = i; }
-      if (text.includes(normSkill) && text.length < normSkill.length * 3) {
+
+      // Option starts with skill — only accept if the option isn't way longer
+      // e.g. "Go" should NOT match "Go Carts", but "Python" matches "Python (Programming Language)"
+      if (text.startsWith(normSkill) && text.length <= normSkill.length * 2.5) {
+        const score = 90;
+        if (score > bestScore) { bestScore = score; bestIdx = i; }
+      }
+
+      // Skill starts with option text — only if option is nearly as long
+      if (normSkill.startsWith(text) && text.length >= normSkill.length * 0.7 && 85 > bestScore) {
+        bestScore = 85; bestIdx = i;
+      }
+
+      // Option contains skill name — must be a significant portion of the option text
+      if (text.includes(normSkill) && normSkill.length >= 3 && text.length <= normSkill.length * 3) {
         const score = 70 + (normSkill.length / text.length) * 20;
         if (score > bestScore) { bestScore = score; bestIdx = i; }
       }
-      if (normSkill.includes(text) && text.length >= 3 && 60 > bestScore) { bestScore = 60; bestIdx = i; }
     }
 
-    // If no fuzzy match, take the first valid option
-    if (bestIdx < 0) {
-      for (let i = 0; i < count; i++) {
-        const text = ((await options.nth(i).textContent()) || '').trim().toLowerCase();
-        if (text && text !== 'no items.' && text !== 'no results') {
-          bestIdx = i;
-          break;
-        }
-      }
+    // Require a minimum match quality — don't blindly pick a bad match
+    if (bestIdx >= 0 && bestScore >= 70) {
+      const chosen = await options.nth(bestIdx).textContent();
+      console.log(`[Workday] [Skills] Clicking option: "${chosen?.trim()}" (score: ${bestScore})`);
+      await options.nth(bestIdx).click();
+      return true;
     }
 
     if (bestIdx >= 0) {
       const chosen = await options.nth(bestIdx).textContent();
-      console.log(`[Workday] [Skills] Clicking option: "${chosen?.trim()}"`);
-      await options.nth(bestIdx).click();
-      return true;
+      console.log(`[Workday] [Skills] Best match "${chosen?.trim()}" too different (score: ${bestScore}) — skipping.`);
     }
 
     return false;

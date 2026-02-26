@@ -219,8 +219,73 @@ export class SmartApplyHandler implements TaskHandler {
             ) {
               await progress.setStep(ProgressStep.UPLOADING_RESUME);
               await config.handleExperiencePage(adapter, userProfile, dataPrompt);
-              // Custom handler already filled the page — skip generic fillPage
-              // to avoid wasting LLM calls re-scanning filled fields.
+
+              // Robust navigation after custom handler — mirrors fillPage()'s post-click logic
+              const urlBeforeExp = await adapter.getCurrentUrl();
+              const fpBeforeExp = await this.getPageFingerprint(adapter);
+
+              // Scroll to bottom to ensure Next button is visible
+              await adapter.page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+              await adapter.page.waitForTimeout(500);
+
+              let expClickResult = await config.clickNextButton(adapter);
+              console.log(`[SmartApply] [experience] After custom handler, clickNext: ${expClickResult}`);
+
+              if (expClickResult === 'clicked') {
+                await adapter.page.waitForTimeout(2000);
+
+                // Check for validation errors
+                const hasErrors = await config.detectValidationErrors(adapter);
+                if (hasErrors) {
+                  console.log(`[SmartApply] [experience] Validation errors after clicking Next — re-detecting page for recovery.`);
+                  // Don't break — let the main loop re-detect the page.
+                  // handleExperiencePage is idempotent (resume/skills already done, LLM sees filled fields).
+                } else {
+                  // Verify page actually changed
+                  const urlAfterExp = await adapter.getCurrentUrl();
+                  const fpAfterExp = await this.getPageFingerprint(adapter);
+                  if (urlAfterExp !== urlBeforeExp || fpAfterExp !== fpBeforeExp) {
+                    await this.waitForPageLoad(adapter);
+                    break;
+                  }
+                  // SPA delayed render — wait and check again
+                  await adapter.page.waitForTimeout(2000);
+                  const urlAfterWait = await adapter.getCurrentUrl();
+                  const fpAfterWait = await this.getPageFingerprint(adapter);
+                  if (urlAfterWait !== urlBeforeExp || fpAfterWait !== fpBeforeExp) {
+                    await this.waitForPageLoad(adapter);
+                    break;
+                  }
+                  console.log(`[SmartApply] [experience] Clicked Next but page unchanged — re-detecting.`);
+                }
+              }
+
+              if (expClickResult === 'review_detected') {
+                console.log(`[SmartApply] [experience] Review page detected.`);
+                break; // Main loop will re-detect as 'review' page type
+              }
+
+              if (expClickResult === 'not_found') {
+                // Scroll to content bottom and retry
+                const scrollMax = await this.getContentScrollMax(adapter);
+                await adapter.page.evaluate((target: number) =>
+                  window.scrollTo({ top: target, behavior: 'smooth' }),
+                scrollMax);
+                await adapter.page.waitForTimeout(800);
+
+                const retryClick = await config.clickNextButton(adapter);
+                if (retryClick === 'clicked') {
+                  await adapter.page.waitForTimeout(2000);
+                  await this.waitForPageLoad(adapter);
+                  break;
+                }
+                if (retryClick === 'review_detected') {
+                  console.log(`[SmartApply] [experience] Review page detected at bottom.`);
+                  break;
+                }
+                console.log(`[SmartApply] [experience] Next button not found even at bottom — re-detecting.`);
+              }
+              // Fall-through: re-detect page for recovery
               break;
             }
 
