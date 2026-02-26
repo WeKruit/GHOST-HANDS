@@ -10,7 +10,8 @@
       "Bash(bun add:*)",
       "Bash(npx patch-package:*)",
       "Bash(bun patch:*)",
-      "Bash(done)"
+      "Bash(done)",
+      "Bash(ls:*)"
     ]
   }
 }
