@@ -52,6 +52,13 @@ setup_vnc_password() {
 start_vnc() {
   echo "[entrypoint] $(date -u +%FT%TZ) Starting VNC services..." | tee -a "$VNC_LOG"
 
+  # Fix KasmVNC config: default ships with protocol: https which fails
+  # without TLS certs. Override to http for plain websocket access.
+  if [ -f /etc/kasmvnc/kasmvnc.yaml ]; then
+    sed -i 's/protocol: https/protocol: http/' /etc/kasmvnc/kasmvnc.yaml
+    echo "[entrypoint] Fixed KasmVNC protocol: https → http" | tee -a "$VNC_LOG"
+  fi
+
   # Preferred path: use Kasm's vnc_startup.sh (ships with the base image)
   if [ -x /dockerstartup/vnc_startup.sh ]; then
     echo "[entrypoint] Using Kasm vnc_startup.sh" | tee -a "$VNC_LOG"
