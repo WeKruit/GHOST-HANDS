@@ -1,6 +1,31 @@
 diff --git a/node_modules/@browserbasehq/stagehand/.bun-tag-1ab3947d876cb809 b/.bun-tag-1ab3947d876cb809
 new file mode 100644
 index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@browserbasehq/stagehand/.bun-tag-f2aca307f3134aec b/.bun-tag-f2aca307f3134aec
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/dist/cjs/lib/inference.js b/dist/cjs/lib/inference.js
+index d12bc5790bee7e8f4427d913af8341235ad6c3a5..65f62bebda48f0943c44008ae0b23db961e73728 100644
+--- a/dist/cjs/lib/inference.js
++++ b/dist/cjs/lib/inference.js
+@@ -155,7 +155,7 @@ async function observe({ instruction, domElements, llmClient, userProvidedInstru
+             .array(zod_1.z.object({
+             elementId: zod_1.z
+                 .string()
+-                .regex(/^\d+-\d+$/)
++                .regex(/^\d+(-\d+)?$/)
+                 .describe("the ID string associated with the element. Never include surrounding square brackets. This field must follow the format of 'number-number'."),
+             description: zod_1.z
+                 .string()
+@@ -249,7 +249,7 @@ async function act({ instruction, domElements, llmClient, userProvidedInstructio
+     const actSchema = zod_1.z.object({
+         elementId: zod_1.z
+             .string()
+-            .regex(/^\d+-\d+$/)
++            .regex(/^\d+(-\d+)?$/)
+             .describe("the ID string associated with the element. Never include surrounding square brackets. This field must follow the format of 'number-number'."),
+         description: zod_1.z
+             .string()
 diff --git a/dist/cjs/lib/prompt.js b/dist/cjs/lib/prompt.js
 index 4dd03ca3de9588fe138a68b33fb594c57e05fb04..fa3682177b2e900eb291d69f2b8a76c5c48345a7 100644
 --- a/dist/cjs/lib/prompt.js
@@ -52,6 +77,28 @@ index 5d2c5ea266069d607857bb4dc653e2528f0c1caa..d193dd0385ab124fdbfc19c79a50787e
      const trimmed = (0, utils_js_1.trimTrailingTextNode)(xp);
      if (!trimmed) {
          return undefined;
+diff --git a/dist/esm/lib/inference.js b/dist/esm/lib/inference.js
+index 19308c747d87740d7d03b0be0d4b52a2cef79d3e..799f6bcf6de734081b26a3329cb00d185bcee438 100644
+--- a/dist/esm/lib/inference.js
++++ b/dist/esm/lib/inference.js
+@@ -150,7 +150,7 @@ export async function observe({ instruction, domElements, llmClient, userProvide
+             .array(z.object({
+             elementId: z
+                 .string()
+-                .regex(/^\d+-\d+$/)
++                .regex(/^\d+(-\d+)?$/)
+                 .describe("the ID string associated with the element. Never include surrounding square brackets. This field must follow the format of 'number-number'."),
+             description: z
+                 .string()
+@@ -244,7 +244,7 @@ export async function act({ instruction, domElements, llmClient, userProvidedIns
+     const actSchema = z.object({
+         elementId: z
+             .string()
+-            .regex(/^\d+-\d+$/)
++            .regex(/^\d+(-\d+)?$/)
+             .describe("the ID string associated with the element. Never include surrounding square brackets. This field must follow the format of 'number-number'."),
+         description: z
+             .string()
 diff --git a/dist/esm/lib/prompt.js b/dist/esm/lib/prompt.js
 index 0280194da26b5f0d56cd666438e5a59c983ee25e..5ce34f67f1a5f71d684f24dedb04e6ae5b5106e6 100644
 --- a/dist/esm/lib/prompt.js

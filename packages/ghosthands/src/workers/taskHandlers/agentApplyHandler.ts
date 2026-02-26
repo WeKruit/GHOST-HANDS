@@ -17,7 +17,7 @@ import { detectPlatformFromUrl } from './platforms/index.js';
 
 // ── Constants ────────────────────────────────────────────────────────────
 
-const MAX_AGENT_STEPS = 75;
+const MAX_AGENT_STEPS = 1000;
 
 // ── Handler ──────────────────────────────────────────────────────────────
 
@@ -330,6 +330,7 @@ function buildSystemPrompt(
     lines.push('- Dropdowns are searchable — click field, type to filter, then select.');
     lines.push('- If "Create Account" page appears, check for "Already have an account? Sign In" link at the bottom.');
     lines.push('- Custom ARIA widgets: if fillForm fails on a field, use act instead.');
+    lines.push('- MULTISELECT PILLS: The × button on selected pills is hidden from the accessibility tree. To remove a selected value, click/focus the pill (the option element), then press Delete or Backspace. Do NOT try to click the × icon directly — it will always fail.');
   }
 
   return lines.join('\n');
