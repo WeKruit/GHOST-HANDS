@@ -3,7 +3,8 @@
     "allow": [
       "Bash(find C:\\\\Users\\\\spenc\\\\Documents\\\\GitHub\\\\GHOST-HANDS\\\\packages\\\\ghosthands:*)",
       "Bash(find C:\\\\Users\\\\spenc\\\\Documents\\\\GitHub\\\\GHOST-HANDS\\\\packages\\\\ghosthands\\\\src:*)",
-      "Bash(npx tsc:*)"
+      "Bash(npx tsc:*)",
+      "Bash(find:*)"
     ]
   }
 }
