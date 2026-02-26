@@ -694,7 +694,15 @@ export class JobExecutor {
       }, PERIODIC_BLOCKER_CHECK_MS);
 
       // 10. Build TaskContext and delegate to handler (with crash recovery)
-      const timeoutMs = job.timeout_seconds * 1000;
+      const rawTimeout = job.timeout_seconds;
+      const timeoutMs = (typeof rawTimeout === 'number' && rawTimeout > 0 ? rawTimeout : 1800) * 1000;
+      getLogger().info('Job execution timeout configured', {
+        jobId: job.id,
+        raw_timeout_seconds: rawTimeout,
+        effective_timeout_seconds: timeoutMs / 1000,
+        timeoutMs,
+        handler: handler.type,
+      });
       await this.updateJobStatus(job.id, 'running', `Executing ${handler.type} handler (Magnitude mode)`);
 
       let taskResult: TaskResult | undefined;
