@@ -1,7 +1,20 @@
 import { Hono } from 'hono';
 import * as os from 'os';
+import { readFileSync } from 'fs';
 
 const startedAt = Date.now();
+
+/** Read MemAvailable from /proc/meminfo (Linux only). Falls back to os.freemem(). */
+function getAvailableMemory(): number {
+  try {
+    const meminfo = readFileSync('/proc/meminfo', 'utf-8');
+    const match = meminfo.match(/MemAvailable:\s+(\d+)/);
+    if (match) return parseInt(match[1], 10) * 1024; // kB → bytes
+  } catch {
+    // Not Linux or /proc not available
+  }
+  return os.freemem();
+}
 
 // Cached DB health check — avoids hitting the DB on every /health request.
 // TTL: 30 seconds. Defaults to true if Supabase is not configured (e.g. tests).
@@ -57,8 +70,8 @@ health.get('/version', (c) => {
 
 health.get('/system', (c) => {
   const totalMem = os.totalmem();
-  const freeMem = os.freemem();
-  const usedMem = totalMem - freeMem;
+  const availableMem = getAvailableMemory();
+  const usedMem = totalMem - availableMem;
   const cpus = os.cpus();
   const loadAvg = os.loadavg();
 
