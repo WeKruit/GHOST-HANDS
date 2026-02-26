@@ -117,6 +117,14 @@ USER root
 COPY scripts/kasm-startup.sh /dockerstartup/custom_startup.sh
 RUN chmod +x /dockerstartup/custom_startup.sh
 
+# Copy VNC wrapper entrypoint (WEK-602)
+# When Kamal overrides ENTRYPOINT, the Kasm default entrypoint chain
+# (/dockerstartup/kasm_default_profile.sh → vnc_startup.sh → kasm_startup.sh)
+# is bypassed, leaving port 6901 without a listener. This wrapper starts
+# the VNC stack in the background, then exec's into the CMD (bun process).
+COPY scripts/entrypoint-with-vnc.sh /opt/ghosthands/scripts/entrypoint-with-vnc.sh
+RUN chmod +x /opt/ghosthands/scripts/entrypoint-with-vnc.sh
+
 # KasmVNC config
 COPY config/kasmvnc.yaml /etc/kasmvnc/kasmvnc.yaml
 
@@ -134,8 +142,13 @@ LABEL service="ghosthands"
 # Expose ports: GH API, Worker status, KasmVNC web
 EXPOSE 3100 3101 6901
 
-# Run as kasm-user (uid 1000) — Kasm handles the entrypoint
-# custom_startup.sh runs after desktop init
+# Run as kasm-user (uid 1000)
 USER 1000
 
 WORKDIR /opt/ghosthands
+
+# VNC wrapper entrypoint: starts Kasm VNC stack, then exec's CMD.
+# Orchestrators (Kamal, docker-compose, deploy-server) override CMD only;
+# the entrypoint ensures VNC always starts regardless of the target service.
+ENTRYPOINT ["/opt/ghosthands/scripts/entrypoint-with-vnc.sh"]
+CMD ["bun", "packages/ghosthands/src/workers/main.ts"]

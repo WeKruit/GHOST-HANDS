@@ -56,7 +56,7 @@ export interface ServiceDefinition {
 const PASSTHROUGH_PREFIXES = [
   'DATABASE_', 'SUPABASE_', 'REDIS_', 'GH_', 'ANTHROPIC_', 'DEEPSEEK_',
   'SILICONFLOW_', 'OPENAI_', 'AWS_', 'ECR_', 'CORS_', 'NODE_ENV',
-  'MAX_CONCURRENT_', 'JOB_DISPATCH_', 'GHOSTHANDS_', 'KASM_',
+  'MAX_CONCURRENT_', 'JOB_DISPATCH_', 'GHOSTHANDS_', 'KASM_', 'VNC_',
 ];
 
 /**

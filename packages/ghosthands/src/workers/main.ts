@@ -8,6 +8,8 @@ import { JobExecutor } from './JobExecutor.js';
 import { registerBuiltinHandlers } from './taskHandlers/index.js';
 import { getLogger } from '../monitoring/logger.js';
 import { fetchEc2InstanceId, fetchEc2Ip, completeLifecycleAction } from './asg-lifecycle.js';
+import { SessionManager } from '../sessions/SessionManager.js';
+import { createEncryptionFromEnv } from '../db/encryption.js';
 
 const logger = getLogger({ service: 'Worker' });
 
@@ -142,9 +144,27 @@ async function main(): Promise<void> {
     logger.warn('No DATABASE_DIRECT_URL or SUPABASE_DIRECT_URL — EC2/EC3 features disabled');
   }
 
+  // ── Session persistence — optional, requires GH_CREDENTIAL_KEY ──
+  let sessionManager: SessionManager | undefined;
+  const credKeyHex = process.env.GH_CREDENTIAL_KEY;
+  if (credKeyHex) {
+    try {
+      const encryption = createEncryptionFromEnv();
+      sessionManager = new SessionManager({ supabase, encryption });
+      logger.info('Session persistence enabled');
+    } catch (err) {
+      logger.warn('Session persistence disabled — encryption setup failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  } else {
+    logger.info('Session persistence disabled — GH_CREDENTIAL_KEY not set');
+  }
+
   const executor = new JobExecutor({
     supabase,
     workerId: WORKER_ID,
+    ...(sessionManager && { sessionManager }),
     ...(redis && { redis }),
     ...(pgPool && { pgPool }),
   });
