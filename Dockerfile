@@ -128,6 +128,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ssl-cert \
     && chmod 755 /etc/ssl/private \
     && chmod 644 /etc/ssl/private/ssl-cert-snakeoil.key
 
+# Kamal v2 requires a service label to match the deploy config
+LABEL service="ghosthands"
+
 # Expose ports: GH API, Worker status, KasmVNC web
 EXPOSE 3100 3101 6901
 
