@@ -196,10 +196,10 @@ jobs:
   # new image. VALET notification happens after this succeeds.
 
   deploy-asg:
-    name: Deploy to ASG Fleet
+    name: Deploy to ASG Fleet (disabled — using Kamal via ATM)
     runs-on: ubuntu-latest
     needs: [docker]
-    if: github.event_name == 'push'
+    if: false  # Disabled: Kamal deploys via ATM replace docker-compose ASG deploy
     environment: ${{ needs.docker.outputs.environment }}
     steps:
       - uses: actions/checkout@v4
@@ -238,7 +238,7 @@ jobs:
   deploy-production:
     name: Deploy Production
     runs-on: ubuntu-latest
-    needs: [docker, deploy-asg]
+    needs: [docker]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     environment: production
     steps:
