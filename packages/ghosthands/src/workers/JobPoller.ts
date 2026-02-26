@@ -82,6 +82,18 @@ export class JobPoller {
         // NOTE: If pgDirect connects through pgbouncer transaction mode,
         // LISTEN state is dropped between transactions. The poll timer
         // below compensates — NOTIFY is a best-effort optimization.
+        //
+        // TODO: pg_notify('gh_job_created', ...) is never called anywhere in the codebase.
+        // No trigger on gh_automation_jobs INSERT fires this notification.
+        // LISTEN is effectively a dead path — polling (5s interval) is the actual
+        // job discovery mechanism. To enable instant pickup, add a trigger:
+        //   CREATE OR REPLACE FUNCTION gh_notify_job_created() RETURNS trigger AS $$
+        //   BEGIN
+        //     PERFORM pg_notify('gh_job_created', NEW.id::text);
+        //     RETURN NEW;
+        //   END; $$ LANGUAGE plpgsql;
+        //   CREATE TRIGGER trg_gh_job_created AFTER INSERT ON gh_automation_jobs
+        //     FOR EACH ROW EXECUTE FUNCTION gh_notify_job_created();
         try {
             await this.pgDirect.query("LISTEN gh_job_created");
             this.pgDirect.on("notification", (_msg: Notification) => {

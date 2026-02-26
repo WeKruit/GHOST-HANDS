@@ -24,8 +24,14 @@ const logger = getLogger({ service: 'Worker' });
  *    so VALET/deploy.sh can check if it's safe to restart
  *
  * Job dispatch mode (JOB_DISPATCH_MODE env var):
- *   queue  → pg-boss consumer (new, requires VALET to enqueue via TaskQueueService)
- *   legacy → JobPoller with LISTEN/NOTIFY + polling (default)
+ *   queue  → pg-boss consumer. Requires VALET to have TASK_DISPATCH_MODE=queue and a
+ *            working pg-boss connection (session-mode Postgres). VALET enqueues via
+ *            TaskQueueService; pg-boss delivers to this consumer.
+ *   legacy → JobPoller with LISTEN/NOTIFY + polling (default). This is the correct
+ *            production mode. The poller picks up BOTH 'pending' and 'queued' statuses
+ *            (see migration 016 / PICKUP_SQL in JobPoller.ts), so it works regardless
+ *            of how VALET dispatched the job. Backward-compatible with any VALET
+ *            dispatch mode.
  */
 
 function parseWorkerId(): string {
@@ -55,6 +61,9 @@ function requireEnv(name: string): string {
 }
 
 async function main(): Promise<void> {
+  // GH uses JOB_DISPATCH_MODE; VALET uses TASK_DISPATCH_MODE — these are different env vars
+  // on different services. Legacy mode is backward-compatible and works regardless of
+  // VALET's dispatch mode because JobPoller picks up both 'pending' and 'queued' statuses.
   const dispatchMode = process.env.JOB_DISPATCH_MODE === 'queue' ? 'queue' : 'legacy';
   logger.info('Starting worker', { workerId: WORKER_ID, dispatchMode });
 
@@ -68,9 +77,14 @@ async function main(): Promise<void> {
   if (!supabaseServiceKey) {
     throw new Error('Missing required environment variable: SUPABASE_SECRET_KEY');
   }
-  // Prefer transaction-mode pooler (port 6543) to avoid session pool limits.
-  // LISTEN/NOTIFY won't work through transaction pooler, but fallback polling handles it.
-  const dbUrl = process.env.DATABASE_URL || process.env.SUPABASE_DIRECT_URL || requireEnv('DATABASE_DIRECT_URL');
+  // Prefer direct URL for pgDirect so LISTEN/NOTIFY works (pgbouncer transaction mode drops LISTEN state).
+  // Falls back to DATABASE_URL (pgbouncer) — LISTEN won't work but polling compensates.
+  const dbUrl = process.env.DATABASE_DIRECT_URL || process.env.SUPABASE_DIRECT_URL || process.env.DATABASE_URL;
+  if (!dbUrl) {
+    throw new Error('Missing required: DATABASE_DIRECT_URL, SUPABASE_DIRECT_URL, or DATABASE_URL');
+  }
+
+  const usingDirectUrl = !!(process.env.DATABASE_DIRECT_URL || process.env.SUPABASE_DIRECT_URL);
 
   // Pooled connection for normal queries (goes through pgbouncer)
   const supabase = createClient(supabaseUrl, supabaseServiceKey, {
@@ -84,7 +98,10 @@ async function main(): Promise<void> {
 
   logger.info('Connecting to Postgres');
   await pgDirect.connect();
-  logger.info('Postgres connection established');
+  logger.info('Postgres connection established', {
+    usingDirectUrl,
+    listenNotifyAvailable: usingDirectUrl,
+  });
 
   // CONVENTION: Single-task-per-worker. Each worker processes one job at a time.
   // This simplifies concurrency, avoids browser session conflicts, and makes
@@ -297,6 +314,34 @@ async function main(): Promise<void> {
         });
         process.exit(1);
       }
+    }
+  }
+
+  // Clean up stale registrations from previous container incarnations.
+  // When Kamal restarts a container, the old worker_id may still be 'active'
+  // with the same ec2_ip. Mark them offline so the fleet dashboard is accurate.
+  if (ec2Ip && ec2Ip !== 'unknown') {
+    try {
+      const staleResult = await pgDirect.query(`
+        UPDATE gh_worker_registry
+        SET status = 'offline', current_job_id = NULL
+        WHERE ec2_ip = $1
+          AND worker_id != $2
+          AND status IN ('active', 'draining')
+          AND last_heartbeat < NOW() - INTERVAL '2 minutes'
+        RETURNING worker_id
+      `, [ec2Ip, WORKER_ID]);
+      if (staleResult.rows && staleResult.rows.length > 0) {
+        logger.info('Cleaned up stale worker registrations', {
+          ec2Ip,
+          count: staleResult.rows.length,
+          staleWorkerIds: staleResult.rows.map((r: { worker_id: string }) => r.worker_id),
+        });
+      }
+    } catch (err) {
+      logger.warn('Stale worker cleanup failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err)
+      });
     }
   }
 

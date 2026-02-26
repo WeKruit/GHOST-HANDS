@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import * as os from 'os';
 
 const startedAt = Date.now();
 
@@ -51,6 +52,35 @@ health.get('/version', (c) => {
     build_time: process.env.BUILD_TIME || 'unknown',
     uptime_ms: Date.now() - startedAt,
     node_env: process.env.NODE_ENV || 'development',
+  });
+});
+
+health.get('/system', (c) => {
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const usedMem = totalMem - freeMem;
+  const cpus = os.cpus();
+  const loadAvg = os.loadavg();
+
+  return c.json({
+    cpu: {
+      usagePercent: Math.round(loadAvg[0] / cpus.length * 100 * 100) / 100, // 1-min load avg as % of cores
+      cores: cpus.length,
+      loadAvg1m: loadAvg[0],
+      loadAvg5m: loadAvg[1],
+      loadAvg15m: loadAvg[2],
+    },
+    memory: {
+      usedMb: Math.round(usedMem / 1024 / 1024),
+      totalMb: Math.round(totalMem / 1024 / 1024),
+      usagePercent: Math.round(usedMem / totalMem * 100 * 100) / 100,
+    },
+    disk: {
+      usedGb: 0,
+      totalGb: 0,
+      usagePercent: 0,
+    },
+    timestamp: new Date().toISOString(),
   });
 });
 
