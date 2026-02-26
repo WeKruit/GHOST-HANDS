@@ -15,6 +15,29 @@ import { ProgressStep } from '../progressTracker.js';
 import { getLogger } from '../../monitoring/logger.js';
 import { detectPlatformFromUrl } from './platforms/index.js';
 
+// ── Metrics Snapshot ──────────────────────────────────────────────────────
+
+interface AllMetricsSnapshot {
+  agentPrompt: number;
+  agentCompletion: number;
+  actPrompt: number;
+  actCompletion: number;
+  observePrompt: number;
+  observeCompletion: number;
+}
+
+function snapshotAllMetrics(stagehand: any): AllMetricsSnapshot {
+  const m = stagehand.stagehandMetrics;
+  return {
+    agentPrompt: m.agentPromptTokens || 0,
+    agentCompletion: m.agentCompletionTokens || 0,
+    actPrompt: m.actPromptTokens || 0,
+    actCompletion: m.actCompletionTokens || 0,
+    observePrompt: m.observePromptTokens || 0,
+    observeCompletion: m.observeCompletionTokens || 0,
+  };
+}
+
 // ── Constants ────────────────────────────────────────────────────────────
 
 const MAX_AGENT_STEPS = 1000;
@@ -53,6 +76,11 @@ export class AgentApplyHandler implements TaskHandler {
     }
     const stagehand = stagehandAdapter.getStagehand();
 
+    // Get model cost config for USD calculation
+    const resolvedModel = stagehandAdapter.getResolvedModel();
+    const costPerMInput = resolvedModel?.cost.input ?? 0;
+    const costPerMOutput = resolvedModel?.cost.output ?? 0;
+
     // 2. Detect platform for hints
     const platformConfig = detectPlatformFromUrl(job.target_url);
     logger.info('[AgentApply] Starting', {
@@ -89,6 +117,9 @@ export class AgentApplyHandler implements TaskHandler {
 
     let stepCount = 0;
 
+    // Snapshot metrics before agent run to compute delta for act/observe sub-calls
+    const metricsBefore = snapshotAllMetrics(stagehand);
+
     try {
       const result = await agent.execute({
         instruction: buildInstruction(job.target_url, userProfile, ctx.resumeFilePath),
@@ -97,14 +128,9 @@ export class AgentApplyHandler implements TaskHandler {
           onStepFinish: async (stepResult: any) => {
             stepCount++;
 
-            // Dump all top-level keys so we know the shape
-            const keys = Object.keys(stepResult || {});
-            logger.info('[Agent] step result keys', { step: stepCount, keys: keys.join(', ') });
-
             // Get reasoning — AI SDK puts it in `text`, but Stagehand may use `content`
             let text = stepResult.text || '';
             if (!text && stepResult.content) {
-              // content may be a string or array of content blocks
               if (typeof stepResult.content === 'string') {
                 text = stepResult.content;
               } else if (Array.isArray(stepResult.content)) {
@@ -119,14 +145,12 @@ export class AgentApplyHandler implements TaskHandler {
               progress.recordThought(String(text).slice(0, 300));
             }
 
-            // Dump tool calls — try to serialize the whole thing
+            // Dump tool calls
             const toolCalls = stepResult.toolCalls || [];
             for (const tc of toolCalls) {
-              const tcKeys = Object.keys(tc || {});
-              // Safely serialize args
               let argsStr = '(no args)';
               try { argsStr = JSON.stringify(tc.args ?? tc.input ?? tc, null, 0).slice(0, 800); } catch { argsStr = String(tc); }
-              logger.info('[Agent] CALL', { step: stepCount, tool: tc.toolName || tc.name || tc.type || 'unknown', tcKeys: tcKeys.join(','), args: argsStr });
+              logger.info('[Agent] CALL', { step: stepCount, tool: tc.toolName || tc.name || tc.type || 'unknown', args: argsStr });
             }
 
             // Dump tool results
@@ -137,14 +161,28 @@ export class AgentApplyHandler implements TaskHandler {
               logger.info('[Agent] RESULT', { step: stepCount, tool: tr.toolName || tr.name || 'unknown', result: resultStr });
             }
 
-            // Track token usage
-            if (stepResult.usage) {
-              const usage = stepResult.usage;
-              costTracker.recordTokenUsage({
-                inputTokens: usage.promptTokens || 0,
-                outputTokens: usage.completionTokens || 0,
-              });
-            }
+            // Log running metrics from stagehand (definitive source of truth)
+            const currentMetrics = snapshotAllMetrics(stagehand);
+            const deltaFromStart = {
+              agentIn: currentMetrics.agentPrompt - metricsBefore.agentPrompt,
+              agentOut: currentMetrics.agentCompletion - metricsBefore.agentCompletion,
+              actIn: currentMetrics.actPrompt - metricsBefore.actPrompt,
+              actOut: currentMetrics.actCompletion - metricsBefore.actCompletion,
+              observeIn: currentMetrics.observePrompt - metricsBefore.observePrompt,
+              observeOut: currentMetrics.observeCompletion - metricsBefore.observeCompletion,
+            };
+            const totalIn = deltaFromStart.agentIn + deltaFromStart.actIn + deltaFromStart.observeIn;
+            const totalOut = deltaFromStart.agentOut + deltaFromStart.actOut + deltaFromStart.observeOut;
+            const runningCost = totalIn * (costPerMInput / 1_000_000) + totalOut * (costPerMOutput / 1_000_000);
+            logger.info('[Agent] Running cost', {
+              step: stepCount,
+              agentIO: `${deltaFromStart.agentIn}/${deltaFromStart.agentOut}`,
+              actIO: `${deltaFromStart.actIn}/${deltaFromStart.actOut}`,
+              observeIO: `${deltaFromStart.observeIn}/${deltaFromStart.observeOut}`,
+              totalIn,
+              totalOut,
+              runningCostUsd: runningCost.toFixed(4),
+            });
 
             // Update progress based on step count
             if (stepCount <= 3) {
@@ -158,13 +196,45 @@ export class AgentApplyHandler implements TaskHandler {
         },
       });
 
+      // Use stagehand.stagehandMetrics for definitive totals (includes all LLM calls)
+      const metricsAfter = snapshotAllMetrics(stagehand);
+      const agentInDelta = metricsAfter.agentPrompt - metricsBefore.agentPrompt;
+      const agentOutDelta = metricsAfter.agentCompletion - metricsBefore.agentCompletion;
+      const actInDelta = metricsAfter.actPrompt - metricsBefore.actPrompt;
+      const actOutDelta = metricsAfter.actCompletion - metricsBefore.actCompletion;
+      const observeInDelta = metricsAfter.observePrompt - metricsBefore.observePrompt;
+      const observeOutDelta = metricsAfter.observeCompletion - metricsBefore.observeCompletion;
+      const totalIn = agentInDelta + actInDelta + observeInDelta;
+      const totalOut = agentOutDelta + actOutDelta + observeOutDelta;
+      const inputCost = totalIn * (costPerMInput / 1_000_000);
+      const outputCost = totalOut * (costPerMOutput / 1_000_000);
+      const totalCostUsd = inputCost + outputCost;
+
+      // Record to costTracker for budget enforcement and DB persistence
+      costTracker.recordTokenUsage({
+        inputTokens: totalIn,
+        outputTokens: totalOut,
+        inputCost,
+        outputCost,
+      });
+
+      // Also check for Stagehand's result.usage (snake_case from v3AgentHandler)
+      const resultUsage = result.usage;
+
       logger.info('[AgentApply] Agent finished', {
         success: result.success,
         completed: result.completed,
         message: result.message,
         steps: stepCount,
         actions: result.actions?.length || 0,
-        usage: result.usage,
+        agentIO: `${agentInDelta} in / ${agentOutDelta} out`,
+        actIO: `${actInDelta} in / ${actOutDelta} out`,
+        observeIO: `${observeInDelta} in / ${observeOutDelta} out`,
+        totalIn,
+        totalOut,
+        costUsd: totalCostUsd.toFixed(4),
+        model: resolvedModel?.alias || 'unknown',
+        ...(resultUsage ? { stagehandReportedUsage: resultUsage } : {}),
       });
 
       await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
@@ -179,13 +249,46 @@ export class AgentApplyHandler implements TaskHandler {
           steps: stepCount,
           actions: result.actions?.length || 0,
           completed: result.completed,
-          usage: result.usage,
+          cost: {
+            agentIn: agentInDelta,
+            agentOut: agentOutDelta,
+            actIn: actInDelta,
+            actOut: actOutDelta,
+            observeIn: observeInDelta,
+            observeOut: observeOutDelta,
+            totalIn,
+            totalOut,
+            costUsd: totalCostUsd,
+            model: resolvedModel?.alias || 'unknown',
+          },
         },
       };
     } catch (error) {
+      // Still capture cost even on failure
+      const metricsAfter = snapshotAllMetrics(stagehand);
+      const totalIn = (metricsAfter.agentPrompt - metricsBefore.agentPrompt) +
+        (metricsAfter.actPrompt - metricsBefore.actPrompt) +
+        (metricsAfter.observePrompt - metricsBefore.observePrompt);
+      const totalOut = (metricsAfter.agentCompletion - metricsBefore.agentCompletion) +
+        (metricsAfter.actCompletion - metricsBefore.actCompletion) +
+        (metricsAfter.observeCompletion - metricsBefore.observeCompletion);
+      const totalCostUsd = totalIn * (costPerMInput / 1_000_000) + totalOut * (costPerMOutput / 1_000_000);
+
+      if (totalIn > 0 || totalOut > 0) {
+        costTracker.recordTokenUsage({
+          inputTokens: totalIn,
+          outputTokens: totalOut,
+          inputCost: totalIn * (costPerMInput / 1_000_000),
+          outputCost: totalOut * (costPerMOutput / 1_000_000),
+        });
+      }
+
       logger.error('[AgentApply] Agent execution failed', {
         error: (error as Error).message,
         steps: stepCount,
+        totalIn,
+        totalOut,
+        costUsd: totalCostUsd.toFixed(4),
       });
 
       return {
@@ -195,6 +298,7 @@ export class AgentApplyHandler implements TaskHandler {
         data: {
           platform: platformConfig.platformId,
           steps: stepCount,
+          cost: { totalIn, totalOut, costUsd: totalCostUsd },
         },
       };
     }

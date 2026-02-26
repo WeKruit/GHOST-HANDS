@@ -101,7 +101,7 @@ export const CreateJobSchema = z.object({
   priority: z.number().int().min(1).max(10).default(5),
   scheduled_at: z.string().datetime().nullable().optional(),
   max_retries: z.number().int().min(0).max(10).default(3),
-  timeout_seconds: z.number().int().min(30).max(1800).default(300),
+  timeout_seconds: z.number().int().min(30).max(3600).default(1800),
   tags: z.array(z.string().max(50)).max(20).default([]),
   idempotency_key: z.string().max(255).optional(),
   metadata: z.record(z.unknown()).default({}),
