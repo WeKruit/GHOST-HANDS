@@ -75,7 +75,8 @@ describe('CallbackNotifier', () => {
         page_url: 'https://boards.greenhouse.io/company/jobs/1',
         timeout_seconds: 300,
       });
-      expect(body.completed_at).toBeTruthy();
+      // completed_at is only set for terminal statuses (completed/failed)
+      expect(body.completed_at).toBeUndefined();
     });
 
     test('sends needs_human with null valet_task_id when not provided', async () => {
