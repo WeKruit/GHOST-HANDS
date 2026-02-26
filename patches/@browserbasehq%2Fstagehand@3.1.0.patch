@@ -1,0 +1,58 @@
+diff --git a/dist/cjs/lib/v3/handlers/actHandler.js b/dist/cjs/lib/v3/handlers/actHandler.js
+index 5d2c5ea266069d607857bb4dc653e2528f0c1caa..d193dd0385ab124fdbfc19c79a50787e2e0f9560 100644
+--- a/dist/cjs/lib/v3/handlers/actHandler.js
++++ b/dist/cjs/lib/v3/handlers/actHandler.js
+@@ -276,10 +276,22 @@ function normalizeActInferenceElement(element, xpathMap, requireMethodAndArgumen
+         (!method || method === "not-supported" || !hasArgs)) {
+         return undefined;
+     }
+-    if (typeof elementId !== "string" || !elementId.includes("-")) {
++    if (typeof elementId !== "string") {
+         return undefined;
+     }
+-    const xp = xpathMap[elementId];
++    // Fix: LLM sometimes strips the frame prefix (returns "1079" instead of "0-1079").
++    // When this happens, search xpathMap for a matching key.
++    let resolvedElementId = elementId;
++    if (!elementId.includes("-")) {
++        const suffix = `-${elementId}`;
++        const match = Object.keys(xpathMap).find(k => k.endsWith(suffix));
++        if (match) {
++            resolvedElementId = match;
++        } else {
++            return undefined;
++        }
++    }
++    const xp = xpathMap[resolvedElementId];
+     const trimmed = (0, utils_js_1.trimTrailingTextNode)(xp);
+     if (!trimmed) {
+         return undefined;
+diff --git a/dist/esm/lib/v3/handlers/actHandler.js b/dist/esm/lib/v3/handlers/actHandler.js
+index 9c7b7d705c080e1a7adf7ae736781b7401ba5655..ae08fabb46340ee3d6254a931f954af7de390f58 100644
+--- a/dist/esm/lib/v3/handlers/actHandler.js
++++ b/dist/esm/lib/v3/handlers/actHandler.js
+@@ -272,10 +272,22 @@ function normalizeActInferenceElement(element, xpathMap, requireMethodAndArgumen
+         (!method || method === "not-supported" || !hasArgs)) {
+         return undefined;
+     }
+-    if (typeof elementId !== "string" || !elementId.includes("-")) {
++    if (typeof elementId !== "string") {
+         return undefined;
+     }
+-    const xp = xpathMap[elementId];
++    // Fix: LLM sometimes strips the frame prefix (returns "1079" instead of "0-1079").
++    // When this happens, search xpathMap for a matching key.
++    let resolvedElementId = elementId;
++    if (!elementId.includes("-")) {
++        const suffix = `-${elementId}`;
++        const match = Object.keys(xpathMap).find(k => k.endsWith(suffix));
++        if (match) {
++            resolvedElementId = match;
++        } else {
++            return undefined;
++        }
++    }
++    const xp = xpathMap[resolvedElementId];
+     const trimmed = trimTrailingTextNode(xp);
+     if (!trimmed) {
+         return undefined;
