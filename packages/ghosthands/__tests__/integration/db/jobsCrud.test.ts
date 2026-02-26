@@ -8,7 +8,7 @@
  *   bun run test:integration -- __tests__/integration/db/jobsCrud.test.ts
  */
 
-import { describe, test, expect, beforeAll, afterAll } from 'vitest';
+import { describe, test, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import {
   getTestSupabase,
   buildJobRow,
@@ -21,19 +21,34 @@ import {
 const hasSupabase = !!process.env.SUPABASE_URL;
 
 const JOB_TYPE = 'db_regression_test';
+const JOB_TYPE_FILTER = 'db_regression_test_filter';
+const JOB_TYPE_SCHEDULED = 'db_regression_test_scheduled';
+const ALL_JOB_TYPES = [JOB_TYPE, JOB_TYPE_FILTER, JOB_TYPE_SCHEDULED];
 
 describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
   const supabase = getTestSupabase();
 
   beforeAll(async () => {
-    await cleanupByJobType(supabase, JOB_TYPE);
+    for (const jt of ALL_JOB_TYPES) {
+      await cleanupByJobType(supabase, jt);
+    }
     // Clean up ancillary tables for test user
     await supabase.from('gh_user_usage').delete().eq('user_id', TEST_USER_ID);
     await supabase.from('gh_browser_sessions').delete().eq('user_id', TEST_USER_ID);
   });
 
+  beforeEach(async () => {
+    for (const jt of ALL_JOB_TYPES) {
+      await cleanupByJobType(supabase, jt);
+    }
+    await supabase.from('gh_user_usage').delete().eq('user_id', TEST_USER_ID);
+    await supabase.from('gh_browser_sessions').delete().eq('user_id', TEST_USER_ID);
+  });
+
   afterAll(async () => {
-    await cleanupByJobType(supabase, JOB_TYPE);
+    for (const jt of ALL_JOB_TYPES) {
+      await cleanupByJobType(supabase, jt);
+    }
     await supabase.from('gh_user_usage').delete().eq('user_id', TEST_USER_ID);
     await supabase.from('gh_browser_sessions').delete().eq('user_id', TEST_USER_ID);
   });
@@ -159,13 +174,9 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
   // ── DB-005: gh_user_usage cost accumulation ──────────────────────────────
 
   test('DB-005: gh_user_usage — cost accumulates on upsert', async () => {
-    const now = new Date();
-    const periodStart = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1),
-    ).toISOString();
-    const periodEnd = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1),
-    ).toISOString();
+    // Use fixed dates to avoid month-boundary flakiness
+    const periodStart = '2025-01-01T00:00:00.000Z';
+    const periodEnd = '2025-02-01T00:00:00.000Z';
 
     // First upsert — sets initial cost
     await supabase.from('gh_user_usage').upsert(
@@ -213,13 +224,9 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
   // ── DB-006: gh_user_usage upsert conflict ────────────────────────────────
 
   test('DB-006: gh_user_usage — upsert on (user_id, period_start) updates not duplicates', async () => {
-    const now = new Date();
-    const periodStart = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1),
-    ).toISOString();
-    const periodEnd = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1),
-    ).toISOString();
+    // Use fixed dates different from DB-005 to avoid cross-test interference
+    const periodStart = '2025-03-01T00:00:00.000Z';
+    const periodEnd = '2025-04-01T00:00:00.000Z';
 
     // Upsert twice with same user+period
     for (const cost of [1.0, 2.0]) {
@@ -302,9 +309,9 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
 
   test('DB-008: filter jobs by status — returns only matching', async () => {
     const inserted = await insertTestJobs(supabase, [
-      { job_type: JOB_TYPE, status: 'pending' },
-      { job_type: JOB_TYPE, status: 'completed' },
-      { job_type: JOB_TYPE, status: 'failed' },
+      { job_type: JOB_TYPE_FILTER, status: 'pending' },
+      { job_type: JOB_TYPE_FILTER, status: 'completed' },
+      { job_type: JOB_TYPE_FILTER, status: 'failed' },
     ]);
 
     const insertedIds = inserted.map((j) => j.id as string);
@@ -331,7 +338,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     const now = new Date().toISOString();
 
     const [futureJob] = await insertTestJobs(supabase, {
-      job_type: JOB_TYPE,
+      job_type: JOB_TYPE_SCHEDULED,
       scheduled_at: futureTime,
       status: 'pending',
     });
@@ -340,7 +347,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     const { data: ready } = await supabase
       .from('gh_automation_jobs')
       .select('id')
-      .eq('job_type', JOB_TYPE)
+      .eq('job_type', JOB_TYPE_SCHEDULED)
       .eq('status', 'pending')
       .or(`scheduled_at.is.null,scheduled_at.lte.${now}`);
 
