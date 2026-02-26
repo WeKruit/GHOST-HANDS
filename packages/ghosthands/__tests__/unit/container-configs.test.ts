@@ -6,26 +6,14 @@
  *
  * getEnvVarsFromProcess reads from process.env (populated by docker-compose env_file
  * and/or AWS Secrets Manager). Tests set process.env directly before calling.
- *
- * IMPORTANT: deploy-orchestration.test.ts uses vi.mock on this module, which in bun
- * leaks across test files. We must vi.unmock to get the real implementation.
  */
 
-import { describe, test, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
-
-// bun runs all test files in the same process. deploy-orchestration.test.ts
-// uses vi.mock on container-configs which leaks globally. We use dynamic
-// import to get the real module AFTER vi.mock's hoisting phase.
-let getEnvVarsFromProcess: typeof import('../../../../scripts/lib/container-configs').getEnvVarsFromProcess;
-let getServiceConfigs: typeof import('../../../../scripts/lib/container-configs').getServiceConfigs;
-type ServiceDefinition = import('../../../../scripts/lib/container-configs').ServiceDefinition;
-
-beforeAll(async () => {
-  // Dynamic import bypasses vi.mock hoisting — gets the real module
-  const mod = await import('../../../../scripts/lib/container-configs');
-  getEnvVarsFromProcess = mod.getEnvVarsFromProcess;
-  getServiceConfigs = mod.getServiceConfigs;
-});
+import { describe, test, expect, beforeEach, afterEach } from 'vitest';
+import {
+  getEnvVarsFromProcess,
+  getServiceConfigs,
+  type ServiceDefinition,
+} from '../../../../scripts/lib/container-configs';
 
 // -- Mock env vars for getServiceConfigs tests --
 
