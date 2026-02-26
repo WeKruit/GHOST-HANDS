@@ -52,11 +52,16 @@ setup_vnc_password() {
 start_vnc() {
   echo "[entrypoint] $(date -u +%FT%TZ) Starting VNC services..." | tee -a "$VNC_LOG"
 
-  # Fix KasmVNC config: default ships with protocol: https which fails
-  # without TLS certs. Override to http for plain websocket access.
-  if [ -f /etc/kasmvnc/kasmvnc.yaml ]; then
-    sed -i 's/protocol: https/protocol: http/' /etc/kasmvnc/kasmvnc.yaml
-    echo "[entrypoint] Fixed KasmVNC protocol: https → http" | tee -a "$VNC_LOG"
+  # Fix KasmVNC config: global config ships with protocol: https which
+  # fails without TLS certs. Override in user-level config (writable).
+  mkdir -p /home/kasm-user/.vnc
+  if ! grep -q 'protocol' /home/kasm-user/.vnc/kasmvnc.yaml 2>/dev/null; then
+    cat >> /home/kasm-user/.vnc/kasmvnc.yaml <<YAML
+
+network:
+  protocol: http
+YAML
+    echo "[entrypoint] Added network.protocol=http to user VNC config" | tee -a "$VNC_LOG"
   fi
 
   # Preferred path: use Kasm's vnc_startup.sh (ships with the base image)
