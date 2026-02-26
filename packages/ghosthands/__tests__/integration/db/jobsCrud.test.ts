@@ -13,12 +13,12 @@ import {
   getTestSupabase,
   buildJobRow,
   insertTestJobs,
-  cleanupByJobType,
-  TEST_USER_ID,
-  TEST_USER_ID_2,
 } from '../../e2e/helpers';
 
 const hasSupabase = !!process.env.SUPABASE_URL;
+
+// Unique user ID for this file — avoids cross-file interference when tests run in parallel
+const CRUD_TEST_USER_ID = '00000000-0000-0000-0000-000000000099';
 
 const JOB_TYPE = 'db_regression_test';
 const JOB_TYPE_FILTER = 'db_regression_test_filter';
@@ -28,30 +28,17 @@ const ALL_JOB_TYPES = [JOB_TYPE, JOB_TYPE_FILTER, JOB_TYPE_SCHEDULED];
 describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
   const supabase = getTestSupabase();
 
-  beforeAll(async () => {
-    for (const jt of ALL_JOB_TYPES) {
-      await cleanupByJobType(supabase, jt);
-    }
-    // Clean up ancillary tables for test user
-    await supabase.from('gh_user_usage').delete().eq('user_id', TEST_USER_ID);
-    await supabase.from('gh_browser_sessions').delete().eq('user_id', TEST_USER_ID);
-  });
+  // Batch cleanup: single DELETE per table using .in() instead of per-type loop.
+  // gh_job_events cascade-deletes when parent job is removed.
+  async function cleanAll() {
+    await supabase.from('gh_automation_jobs').delete().in('job_type', ALL_JOB_TYPES);
+    await supabase.from('gh_user_usage').delete().eq('user_id', CRUD_TEST_USER_ID);
+    await supabase.from('gh_browser_sessions').delete().eq('user_id', CRUD_TEST_USER_ID);
+  }
 
-  beforeEach(async () => {
-    for (const jt of ALL_JOB_TYPES) {
-      await cleanupByJobType(supabase, jt);
-    }
-    await supabase.from('gh_user_usage').delete().eq('user_id', TEST_USER_ID);
-    await supabase.from('gh_browser_sessions').delete().eq('user_id', TEST_USER_ID);
-  });
-
-  afterAll(async () => {
-    for (const jt of ALL_JOB_TYPES) {
-      await cleanupByJobType(supabase, jt);
-    }
-    await supabase.from('gh_user_usage').delete().eq('user_id', TEST_USER_ID);
-    await supabase.from('gh_browser_sessions').delete().eq('user_id', TEST_USER_ID);
-  });
+  beforeAll(cleanAll);
+  beforeEach(cleanAll);
+  afterAll(cleanAll);
 
   // ── DB-001: gh_automation_jobs CRUD ──────────────────────────────────────
 
@@ -181,7 +168,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     // First upsert — sets initial cost
     await supabase.from('gh_user_usage').upsert(
       {
-        user_id: TEST_USER_ID,
+        user_id: CRUD_TEST_USER_ID,
         tier: 'starter',
         period_start: periodStart,
         period_end: periodEnd,
@@ -196,7 +183,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     // Second upsert — accumulate cost
     await supabase.from('gh_user_usage').upsert(
       {
-        user_id: TEST_USER_ID,
+        user_id: CRUD_TEST_USER_ID,
         tier: 'starter',
         period_start: periodStart,
         period_end: periodEnd,
@@ -211,7 +198,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     const { data } = await supabase
       .from('gh_user_usage')
       .select('total_cost_usd, job_count')
-      .eq('user_id', TEST_USER_ID)
+      .eq('user_id', CRUD_TEST_USER_ID)
       .eq('period_start', periodStart)
       .single();
 
@@ -232,7 +219,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     for (const cost of [1.0, 2.0]) {
       await supabase.from('gh_user_usage').upsert(
         {
-          user_id: TEST_USER_ID,
+          user_id: CRUD_TEST_USER_ID,
           tier: 'starter',
           period_start: periodStart,
           period_end: periodEnd,
@@ -249,7 +236,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     const { data } = await supabase
       .from('gh_user_usage')
       .select('*')
-      .eq('user_id', TEST_USER_ID)
+      .eq('user_id', CRUD_TEST_USER_ID)
       .eq('period_start', periodStart);
 
     expect(data).toHaveLength(1);
@@ -264,7 +251,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     // First upsert
     const { error: err1 } = await supabase.from('gh_browser_sessions').upsert(
       {
-        user_id: TEST_USER_ID,
+        user_id: CRUD_TEST_USER_ID,
         domain,
         session_data: 'encrypted-v1',
         encryption_key_id: 'test-key-v1',
@@ -277,7 +264,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     // Second upsert — same user+domain
     const { error: err2 } = await supabase.from('gh_browser_sessions').upsert(
       {
-        user_id: TEST_USER_ID,
+        user_id: CRUD_TEST_USER_ID,
         domain,
         session_data: 'encrypted-v2',
         encryption_key_id: 'test-key-v1',
@@ -291,7 +278,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     const { data } = await supabase
       .from('gh_browser_sessions')
       .select('*')
-      .eq('user_id', TEST_USER_ID)
+      .eq('user_id', CRUD_TEST_USER_ID)
       .eq('domain', domain);
 
     expect(data).toHaveLength(1);
@@ -301,7 +288,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     await supabase
       .from('gh_browser_sessions')
       .delete()
-      .eq('user_id', TEST_USER_ID)
+      .eq('user_id', CRUD_TEST_USER_ID)
       .eq('domain', domain);
   });
 
