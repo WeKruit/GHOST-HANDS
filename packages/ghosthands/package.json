@@ -9,7 +9,7 @@
         "dev": "tsc --watch",
         "test": "vitest run",
         "test:unit": "vitest run __tests__/unit",
-        "test:integration": "vitest run __tests__/integration",
+        "test:integration": "vitest run __tests__/integration --fileParallelism=false",
         "test:e2e": "vitest run __tests__/e2e",
         "api": "bun src/api/server.ts",
         "api:dev": "bun --watch src/api/server.ts",
