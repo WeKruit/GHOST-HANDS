@@ -135,6 +135,7 @@ export class StagehandAdapter implements HitlCapableAdapter {
       experimental: true,
       disableAPI: true,
       logInferenceToFile: true,
+      cacheDir: 'action-cache',
       systemPrompt: options.systemPrompt,
       // Log ALL Stagehand events to see what the LLM sees and returns
       logger: (line) => {
