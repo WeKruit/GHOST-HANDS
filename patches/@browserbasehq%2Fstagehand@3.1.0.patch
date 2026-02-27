@@ -1,0 +1,373 @@
+diff --git a/dist/cjs/lib/inference.js b/dist/cjs/lib/inference.js
+index d12bc5790bee7e8f4427d913af8341235ad6c3a5..65f62bebda48f0943c44008ae0b23db961e73728 100644
+--- a/dist/cjs/lib/inference.js
++++ b/dist/cjs/lib/inference.js
+@@ -155,7 +155,7 @@ async function observe({ instruction, domElements, llmClient, userProvidedInstru
+             .array(zod_1.z.object({
+             elementId: zod_1.z
+                 .string()
+-                .regex(/^\d+-\d+$/)
++                .regex(/^\d+(-\d+)?$/)
+                 .describe("the ID string associated with the element. Never include surrounding square brackets. This field must follow the format of 'number-number'."),
+             description: zod_1.z
+                 .string()
+@@ -249,7 +249,7 @@ async function act({ instruction, domElements, llmClient, userProvidedInstructio
+     const actSchema = zod_1.z.object({
+         elementId: zod_1.z
+             .string()
+-            .regex(/^\d+-\d+$/)
++            .regex(/^\d+(-\d+)?$/)
+             .describe("the ID string associated with the element. Never include surrounding square brackets. This field must follow the format of 'number-number'."),
+         description: zod_1.z
+             .string()
+diff --git a/dist/cjs/lib/prompt.js b/dist/cjs/lib/prompt.js
+index 4dd03ca3de9588fe138a68b33fb594c57e05fb04..fa3682177b2e900eb291d69f2b8a76c5c48345a7 100644
+--- a/dist/cjs/lib/prompt.js
++++ b/dist/cjs/lib/prompt.js
+@@ -98,6 +98,8 @@ You will be given:
+ 1. a instruction of elements to observe
+ 2. a hierarchical accessibility tree showing the semantic structure of the page. The tree is a hybrid of the DOM and the accessibility tree.
+ 
++Each element in the tree has an ID shown as [frameIndex-nodeId], for example [0-1079] or [2-345]. When returning an elementId, you MUST include BOTH numbers separated by a hyphen, without the square brackets. For example, if the tree shows [0-1079], return elementId "0-1079". Never drop the leading number — "1079" alone is WRONG.
++
+ Return an array of elements that match the instruction if they exist, otherwise return an empty array.
+ When returning elements, include the appropriate method from the supported actions list.${actionsString}. When choosing non-left click actions, provide right or middle as the argument.`;
+     const content = observeSystemPrompt.replace(/\s+/g, " ");
+@@ -123,6 +125,8 @@ You will be given:
+ 1. a user defined instruction about what action to take
+ 2. a hierarchical accessibility tree showing the semantic structure of the page. The tree is a hybrid of the DOM and the accessibility tree.
+ 
++Each element in the tree has an ID shown as [frameIndex-nodeId], for example [0-1079] or [2-345]. When returning an elementId, you MUST include BOTH numbers separated by a hyphen, without the square brackets. For example, if the tree shows [0-1079], return elementId "0-1079". Never drop the leading number — "1079" alone is WRONG.
++
+ Return the element that matches the instruction if it exists. Otherwise, return an empty object.`;
+     const content = actSystemPrompt.replace(/\s+/g, " ");
+     return {
+diff --git a/dist/cjs/lib/v3/agent/tools/click.js b/dist/cjs/lib/v3/agent/tools/click.js
+index d7d2ba1af977a81708327eb93c5d1801f7f0ab06..48e8711b922d062da613a586c2700debb22a08a6 100644
+--- a/dist/cjs/lib/v3/agent/tools/click.js
++++ b/dist/cjs/lib/v3/agent/tools/click.js
+@@ -84,7 +84,7 @@ const clickTool = (v3, provider) => (0, ai_1.tool)({
+             if (result.screenshotBase64) {
+                 content.push({
+                     type: "media",
+-                    mediaType: "image/png",
++                    mediaType: "image/jpeg",
+                     data: result.screenshotBase64,
+                 });
+             }
+diff --git a/dist/cjs/lib/v3/agent/tools/dragAndDrop.js b/dist/cjs/lib/v3/agent/tools/dragAndDrop.js
+index b00da58cb4f9701af9d165a37e6b5588bca31950..09e678d874cbdac4699939e3693f1ca6640ab60e 100644
+--- a/dist/cjs/lib/v3/agent/tools/dragAndDrop.js
++++ b/dist/cjs/lib/v3/agent/tools/dragAndDrop.js
+@@ -85,7 +85,7 @@ const dragAndDropTool = (v3, provider) => (0, ai_1.tool)({
+             if (result.screenshotBase64) {
+                 content.push({
+                     type: "media",
+-                    mediaType: "image/png",
++                    mediaType: "image/jpeg",
+                     data: result.screenshotBase64,
+                 });
+             }
+diff --git a/dist/cjs/lib/v3/agent/tools/fillFormVision.js b/dist/cjs/lib/v3/agent/tools/fillFormVision.js
+index d9a52b67ee7e0febe05bd482c7a0d53f66dd37f1..e371c8dcd8df4f5f86af6b54fa2654849f8a541b 100644
+--- a/dist/cjs/lib/v3/agent/tools/fillFormVision.js
++++ b/dist/cjs/lib/v3/agent/tools/fillFormVision.js
+@@ -133,7 +133,7 @@ MANDATORY USE CASES (always use fillFormVision for these):
+                 if (result.screenshotBase64) {
+                     content.push({
+                         type: "media",
+-                        mediaType: "image/png",
++                        mediaType: "image/jpeg",
+                         data: result.screenshotBase64,
+                     });
+                 }
+diff --git a/dist/cjs/lib/v3/agent/tools/screenshot.js b/dist/cjs/lib/v3/agent/tools/screenshot.js
+index d3a46fbd98a6db99542c399fb75f38bad9ef2066..abd4f7e27b5be08916db6cfa15a269ba74cdb570 100644
+--- a/dist/cjs/lib/v3/agent/tools/screenshot.js
++++ b/dist/cjs/lib/v3/agent/tools/screenshot.js
+@@ -13,7 +13,7 @@ const screenshotTool = (v3) => (0, ai_1.tool)({
+             level: 1,
+         });
+         const page = await v3.context.awaitActivePage();
+-        const buffer = await page.screenshot({ fullPage: false });
++        const buffer = await page.screenshot({ fullPage: false, type: 'jpeg', quality: 50 });
+         const pageUrl = page.url();
+         return {
+             base64: buffer.toString("base64"),
+@@ -23,7 +23,7 @@ const screenshotTool = (v3) => (0, ai_1.tool)({
+     },
+     toModelOutput: (result) => ({
+         type: "content",
+-        value: [{ type: "media", mediaType: "image/png", data: result.base64 }],
++        value: [{ type: "media", mediaType: "image/jpeg", data: result.base64 }],
+     }),
+ });
+ exports.screenshotTool = screenshotTool;
+diff --git a/dist/cjs/lib/v3/agent/tools/scroll.js b/dist/cjs/lib/v3/agent/tools/scroll.js
+index 6d1dd543ee6ad55d1ac6a37c3e6253f9b14c17d6..69df22ed2eca357af44e2bb8c66533fa4303253f 100644
+--- a/dist/cjs/lib/v3/agent/tools/scroll.js
++++ b/dist/cjs/lib/v3/agent/tools/scroll.js
+@@ -136,7 +136,7 @@ const scrollVisionTool = (v3, provider) => (0, ai_1.tool)({
+         if (result.screenshotBase64) {
+             content.push({
+                 type: "media",
+-                mediaType: "image/png",
++                mediaType: "image/jpeg",
+                 data: result.screenshotBase64,
+             });
+         }
+diff --git a/dist/cjs/lib/v3/agent/tools/type.js b/dist/cjs/lib/v3/agent/tools/type.js
+index d6c59522e495a3986dc48cd558b8fbc4a325f4f1..def8b1f0e4cef2ddf14e00d9984442a41f31be34 100644
+--- a/dist/cjs/lib/v3/agent/tools/type.js
++++ b/dist/cjs/lib/v3/agent/tools/type.js
+@@ -94,7 +94,7 @@ const typeTool = (v3, provider, variables) => {
+                 if (result.screenshotBase64) {
+                     content.push({
+                         type: "media",
+-                        mediaType: "image/png",
++                        mediaType: "image/jpeg",
+                         data: result.screenshotBase64,
+                     });
+                 }
+diff --git a/dist/cjs/lib/v3/agent/tools/wait.js b/dist/cjs/lib/v3/agent/tools/wait.js
+index 91f09e1d863d0a37d2974482ef2c08226abc1469..05272c37dfe3c273636f671e11fd9f799c190d28 100644
+--- a/dist/cjs/lib/v3/agent/tools/wait.js
++++ b/dist/cjs/lib/v3/agent/tools/wait.js
+@@ -46,7 +46,7 @@ const waitTool = (v3, mode) => (0, ai_1.tool)({
+         if (result.screenshotBase64) {
+             content.push({
+                 type: "media",
+-                mediaType: "image/png",
++                mediaType: "image/jpeg",
+                 data: result.screenshotBase64,
+             });
+         }
+diff --git a/dist/cjs/lib/v3/agent/utils/screenshotHandler.js b/dist/cjs/lib/v3/agent/utils/screenshotHandler.js
+index ab5ff0f57d733efda31ecc68fbba9b1e0443ca1d..c0afd8297c85b2f4e197f218c2d325fa2020916e 100644
+--- a/dist/cjs/lib/v3/agent/utils/screenshotHandler.js
++++ b/dist/cjs/lib/v3/agent/utils/screenshotHandler.js
+@@ -19,7 +19,7 @@ async function waitAndCaptureScreenshot(page, delayMs = DEFAULT_DELAY_MS) {
+         await page.waitForTimeout(delayMs);
+     }
+     try {
+-        const buffer = await page.screenshot({ fullPage: false });
++        const buffer = await page.screenshot({ fullPage: false, type: 'jpeg', quality: 50 });
+         return buffer.toString("base64");
+     }
+     catch {
+diff --git a/dist/cjs/lib/v3/handlers/actHandler.js b/dist/cjs/lib/v3/handlers/actHandler.js
+index 5d2c5ea266069d607857bb4dc653e2528f0c1caa..d193dd0385ab124fdbfc19c79a50787e2e0f9560 100644
+--- a/dist/cjs/lib/v3/handlers/actHandler.js
++++ b/dist/cjs/lib/v3/handlers/actHandler.js
+@@ -276,10 +276,22 @@ function normalizeActInferenceElement(element, xpathMap, requireMethodAndArgumen
+         (!method || method === "not-supported" || !hasArgs)) {
+         return undefined;
+     }
+-    if (typeof elementId !== "string" || !elementId.includes("-")) {
++    if (typeof elementId !== "string") {
+         return undefined;
+     }
+-    const xp = xpathMap[elementId];
++    // Fix: LLM sometimes strips the frame prefix (returns "1079" instead of "0-1079").
++    // When this happens, search xpathMap for a matching key.
++    let resolvedElementId = elementId;
++    if (!elementId.includes("-")) {
++        const suffix = `-${elementId}`;
++        const match = Object.keys(xpathMap).find(k => k.endsWith(suffix));
++        if (match) {
++            resolvedElementId = match;
++        } else {
++            return undefined;
++        }
++    }
++    const xp = xpathMap[resolvedElementId];
+     const trimmed = (0, utils_js_1.trimTrailingTextNode)(xp);
+     if (!trimmed) {
+         return undefined;
+diff --git a/dist/esm/lib/inference.js b/dist/esm/lib/inference.js
+index 19308c747d87740d7d03b0be0d4b52a2cef79d3e..799f6bcf6de734081b26a3329cb00d185bcee438 100644
+--- a/dist/esm/lib/inference.js
++++ b/dist/esm/lib/inference.js
+@@ -150,7 +150,7 @@ export async function observe({ instruction, domElements, llmClient, userProvide
+             .array(z.object({
+             elementId: z
+                 .string()
+-                .regex(/^\d+-\d+$/)
++                .regex(/^\d+(-\d+)?$/)
+                 .describe("the ID string associated with the element. Never include surrounding square brackets. This field must follow the format of 'number-number'."),
+             description: z
+                 .string()
+@@ -244,7 +244,7 @@ export async function act({ instruction, domElements, llmClient, userProvidedIns
+     const actSchema = z.object({
+         elementId: z
+             .string()
+-            .regex(/^\d+-\d+$/)
++            .regex(/^\d+(-\d+)?$/)
+             .describe("the ID string associated with the element. Never include surrounding square brackets. This field must follow the format of 'number-number'."),
+         description: z
+             .string()
+diff --git a/dist/esm/lib/prompt.js b/dist/esm/lib/prompt.js
+index 0280194da26b5f0d56cd666438e5a59c983ee25e..5ce34f67f1a5f71d684f24dedb04e6ae5b5106e6 100644
+--- a/dist/esm/lib/prompt.js
++++ b/dist/esm/lib/prompt.js
+@@ -83,6 +83,8 @@ You will be given:
+ 1. a instruction of elements to observe
+ 2. a hierarchical accessibility tree showing the semantic structure of the page. The tree is a hybrid of the DOM and the accessibility tree.
+ 
++Each element in the tree has an ID shown as [frameIndex-nodeId], for example [0-1079] or [2-345]. When returning an elementId, you MUST include BOTH numbers separated by a hyphen, without the square brackets. For example, if the tree shows [0-1079], return elementId "0-1079". Never drop the leading number — "1079" alone is WRONG.
++
+ Return an array of elements that match the instruction if they exist, otherwise return an empty array.
+ When returning elements, include the appropriate method from the supported actions list.${actionsString}. When choosing non-left click actions, provide right or middle as the argument.`;
+     const content = observeSystemPrompt.replace(/\s+/g, " ");
+@@ -108,6 +110,8 @@ You will be given:
+ 1. a user defined instruction about what action to take
+ 2. a hierarchical accessibility tree showing the semantic structure of the page. The tree is a hybrid of the DOM and the accessibility tree.
+ 
++Each element in the tree has an ID shown as [frameIndex-nodeId], for example [0-1079] or [2-345]. When returning an elementId, you MUST include BOTH numbers separated by a hyphen, without the square brackets. For example, if the tree shows [0-1079], return elementId "0-1079". Never drop the leading number — "1079" alone is WRONG.
++
+ Return the element that matches the instruction if it exists. Otherwise, return an empty object.`;
+     const content = actSystemPrompt.replace(/\s+/g, " ");
+     return {
+diff --git a/dist/esm/lib/v3/agent/tools/click.js b/dist/esm/lib/v3/agent/tools/click.js
+index 0b741f96e8095b0eab486d75292fa2bd6dc4771d..a39cdc963288b5f2e65aef6dce86f76dec9285f3 100644
+--- a/dist/esm/lib/v3/agent/tools/click.js
++++ b/dist/esm/lib/v3/agent/tools/click.js
+@@ -81,7 +81,7 @@ export const clickTool = (v3, provider) => tool({
+             if (result.screenshotBase64) {
+                 content.push({
+                     type: "media",
+-                    mediaType: "image/png",
++                    mediaType: "image/jpeg",
+                     data: result.screenshotBase64,
+                 });
+             }
+diff --git a/dist/esm/lib/v3/agent/tools/dragAndDrop.js b/dist/esm/lib/v3/agent/tools/dragAndDrop.js
+index 3cc54211729391984eb1cc07eb133cd0058e870d..2e16853e95f1d8cde8203e4f72778b58f312def0 100644
+--- a/dist/esm/lib/v3/agent/tools/dragAndDrop.js
++++ b/dist/esm/lib/v3/agent/tools/dragAndDrop.js
+@@ -82,7 +82,7 @@ export const dragAndDropTool = (v3, provider) => tool({
+             if (result.screenshotBase64) {
+                 content.push({
+                     type: "media",
+-                    mediaType: "image/png",
++                    mediaType: "image/jpeg",
+                     data: result.screenshotBase64,
+                 });
+             }
+diff --git a/dist/esm/lib/v3/agent/tools/fillFormVision.js b/dist/esm/lib/v3/agent/tools/fillFormVision.js
+index 27d5f05b7246dcf5ec7aad8a674f0262cde48512..db534693006f9da1064b7a924c6b6bcce03ed19a 100644
+--- a/dist/esm/lib/v3/agent/tools/fillFormVision.js
++++ b/dist/esm/lib/v3/agent/tools/fillFormVision.js
+@@ -130,7 +130,7 @@ MANDATORY USE CASES (always use fillFormVision for these):
+                 if (result.screenshotBase64) {
+                     content.push({
+                         type: "media",
+-                        mediaType: "image/png",
++                        mediaType: "image/jpeg",
+                         data: result.screenshotBase64,
+                     });
+                 }
+diff --git a/dist/esm/lib/v3/agent/tools/screenshot.js b/dist/esm/lib/v3/agent/tools/screenshot.js
+index 33145854b9002f125996b9724e78e809221326d9..97330861f6ba69af7613111e9c9ddda648bcfa72 100644
+--- a/dist/esm/lib/v3/agent/tools/screenshot.js
++++ b/dist/esm/lib/v3/agent/tools/screenshot.js
+@@ -10,7 +10,7 @@ export const screenshotTool = (v3) => tool({
+             level: 1,
+         });
+         const page = await v3.context.awaitActivePage();
+-        const buffer = await page.screenshot({ fullPage: false });
++        const buffer = await page.screenshot({ fullPage: false, type: 'jpeg', quality: 50 });
+         const pageUrl = page.url();
+         return {
+             base64: buffer.toString("base64"),
+@@ -20,7 +20,7 @@ export const screenshotTool = (v3) => tool({
+     },
+     toModelOutput: (result) => ({
+         type: "content",
+-        value: [{ type: "media", mediaType: "image/png", data: result.base64 }],
++        value: [{ type: "media", mediaType: "image/jpeg", data: result.base64 }],
+     }),
+ });
+ //# sourceMappingURL=screenshot.js.map
+\ No newline at end of file
+diff --git a/dist/esm/lib/v3/agent/tools/scroll.js b/dist/esm/lib/v3/agent/tools/scroll.js
+index d4125a97de2da8ea92e97a23f43d35891a0b5ec7..6b21e2ceefda9d2034e50f93781d1094cbd37a64 100644
+--- a/dist/esm/lib/v3/agent/tools/scroll.js
++++ b/dist/esm/lib/v3/agent/tools/scroll.js
+@@ -132,7 +132,7 @@ export const scrollVisionTool = (v3, provider) => tool({
+         if (result.screenshotBase64) {
+             content.push({
+                 type: "media",
+-                mediaType: "image/png",
++                mediaType: "image/jpeg",
+                 data: result.screenshotBase64,
+             });
+         }
+diff --git a/dist/esm/lib/v3/agent/tools/type.js b/dist/esm/lib/v3/agent/tools/type.js
+index 275b1bea8c5a31a79a55f6b94f425ffa39c393e1..c6b86f08eb279aa33d49457e1180f7c194970f56 100644
+--- a/dist/esm/lib/v3/agent/tools/type.js
++++ b/dist/esm/lib/v3/agent/tools/type.js
+@@ -91,7 +91,7 @@ export const typeTool = (v3, provider, variables) => {
+                 if (result.screenshotBase64) {
+                     content.push({
+                         type: "media",
+-                        mediaType: "image/png",
++                        mediaType: "image/jpeg",
+                         data: result.screenshotBase64,
+                     });
+                 }
+diff --git a/dist/esm/lib/v3/agent/tools/wait.js b/dist/esm/lib/v3/agent/tools/wait.js
+index 1a49245a4e32af0b5cffaedd75dc0a3409e5315f..eebe845ec76b597cf001e3dd68e253da34401ca6 100644
+--- a/dist/esm/lib/v3/agent/tools/wait.js
++++ b/dist/esm/lib/v3/agent/tools/wait.js
+@@ -43,7 +43,7 @@ export const waitTool = (v3, mode) => tool({
+         if (result.screenshotBase64) {
+             content.push({
+                 type: "media",
+-                mediaType: "image/png",
++                mediaType: "image/jpeg",
+                 data: result.screenshotBase64,
+             });
+         }
+diff --git a/dist/esm/lib/v3/agent/utils/screenshotHandler.js b/dist/esm/lib/v3/agent/utils/screenshotHandler.js
+index 1762bfc3041bb9718cab9506933d4d2e06982833..51f52ceb2732ea6b07173afe478f32bd2e4aa0d1 100644
+--- a/dist/esm/lib/v3/agent/utils/screenshotHandler.js
++++ b/dist/esm/lib/v3/agent/utils/screenshotHandler.js
+@@ -16,7 +16,7 @@ export async function waitAndCaptureScreenshot(page, delayMs = DEFAULT_DELAY_MS)
+         await page.waitForTimeout(delayMs);
+     }
+     try {
+-        const buffer = await page.screenshot({ fullPage: false });
++        const buffer = await page.screenshot({ fullPage: false, type: 'jpeg', quality: 50 });
+         return buffer.toString("base64");
+     }
+     catch {
+diff --git a/dist/esm/lib/v3/handlers/actHandler.js b/dist/esm/lib/v3/handlers/actHandler.js
+index 9c7b7d705c080e1a7adf7ae736781b7401ba5655..ae08fabb46340ee3d6254a931f954af7de390f58 100644
+--- a/dist/esm/lib/v3/handlers/actHandler.js
++++ b/dist/esm/lib/v3/handlers/actHandler.js
+@@ -272,10 +272,22 @@ function normalizeActInferenceElement(element, xpathMap, requireMethodAndArgumen
+         (!method || method === "not-supported" || !hasArgs)) {
+         return undefined;
+     }
+-    if (typeof elementId !== "string" || !elementId.includes("-")) {
++    if (typeof elementId !== "string") {
+         return undefined;
+     }
+-    const xp = xpathMap[elementId];
++    // Fix: LLM sometimes strips the frame prefix (returns "1079" instead of "0-1079").
++    // When this happens, search xpathMap for a matching key.
++    let resolvedElementId = elementId;
++    if (!elementId.includes("-")) {
++        const suffix = `-${elementId}`;
++        const match = Object.keys(xpathMap).find(k => k.endsWith(suffix));
++        if (match) {
++            resolvedElementId = match;
++        } else {
++            return undefined;
++        }
++    }
++    const xp = xpathMap[resolvedElementId];
+     const trimmed = trimTrailingTextNode(xp);
+     if (!trimmed) {
+         return undefined;

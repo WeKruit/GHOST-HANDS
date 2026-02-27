@@ -97,8 +97,17 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
       llm: llmConfig,
       connectors: options.connectors,
       prompt: options.systemPrompt,
+      narrate: false,
       ...(browserConfig && { browser: browserConfig }),
     });
+
+    // Remove dangerous actions the LLM should never use.
+    // Scroll is handled by our orchestrator; navigation is handled by DOM code.
+    const blockedActions = new Set(['mouse:scroll', 'mouse:drag', 'keyboard:tab', 'browser:nav', 'browser:nav:back', 'browser:tab:new', 'browser:tab:switch']);
+    const agentAny = this.agent as any;
+    agentAny.actions = agentAny.actions.filter(
+      (a: { name: string }) => !blockedActions.has(a.name),
+    );
 
     // Wire Magnitude events to adapter events
     // Forward the full action payload (variant, x, y, content, etc.)
@@ -144,11 +153,17 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
 
   async act(instruction: string, context?: ActionContext): Promise<ActionResult> {
     const start = Date.now();
+    const ACT_TIMEOUT_MS = context?.timeoutMs ?? 60_000; // default 60s per act() call
     try {
-      await this.requireAgent().act(instruction, {
-        prompt: context?.prompt,
-        data: context?.data,
-      });
+      await Promise.race([
+        this.requireAgent().act(instruction, {
+          prompt: context?.prompt,
+          data: context?.data,
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`act() timed out after ${ACT_TIMEOUT_MS}ms`)), ACT_TIMEOUT_MS),
+        ),
+      ]);
       return {
         success: true,
         message: `Completed: ${instruction}`,

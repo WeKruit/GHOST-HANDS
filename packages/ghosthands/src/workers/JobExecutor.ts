@@ -111,6 +111,7 @@ function detectPlatform(url: string): string {
   if (url.includes('linkedin.com')) return 'linkedin';
   if (url.includes('lever.co')) return 'lever';
   if (url.includes('myworkdayjobs.com') || url.includes('workday.com')) return 'workday';
+  if (url.includes('amazon.jobs') || url.includes('www.amazon.jobs')) return 'amazon';
   if (url.includes('icims.com')) return 'icims';
   if (url.includes('taleo.net')) return 'taleo';
   if (url.includes('smartrecruiters.com')) return 'smartrecruiters';
@@ -420,8 +421,11 @@ export class JobExecutor {
         llm: llmSetup.llm,
         ...(llmSetup.imageLlm && { imageLlm: llmSetup.imageLlm }),
         ...(storedSession ? { storageState: storedSession } : {}),
+        systemPrompt: 'You are a form-filling agent. RULES: (1) ONE action at a time. (2) TOP TO BOTTOM — start at the topmost unanswered field, never skip ahead. (3) DO NOT TOUCH any question that is even slightly cut off at the bottom of the screen. (4) Before reporting done, scan top to bottom and confirm every 100% visible question is answered. (5) When done with all fully visible fields, IMMEDIATELY report done. Do NOT use the wait action. Reporting done IS what triggers scrolling. (6) NEVER scroll or navigate.',
         browserOptions: { headless },
       });
+
+      console.log(`[JobExecutor] Adapter started for job ${job.id}`);
 
       // 7a. Attach StagehandObserver for enriched blocker detection (optional)
       if (adapter.type === 'magnitude' && 'setObserver' in adapter) {
@@ -509,10 +513,12 @@ export class JobExecutor {
       }
 
       // 8.6. Check for blockers after initial page navigation
+      console.log(`[JobExecutor] Checking for blockers...`);
       const initiallyBlocked = await this.checkForBlockers(job, adapter, costTracker);
       if (initiallyBlocked) {
         throw new Error('Page blocked after initial navigation and HITL resolution failed');
       }
+      console.log(`[JobExecutor] Blocker check complete — clear`);
 
       // 9. Try ExecutionEngine (cookbook replay) before Magnitude handler
       await progress.setStep(ProgressStep.NAVIGATING);
@@ -527,6 +533,7 @@ export class JobExecutor {
         }),
       });
 
+      console.log(`[JobExecutor] Checking for cookbook...`);
       const engineResult = await executionEngine.execute({
         job,
         adapter,
@@ -687,7 +694,15 @@ export class JobExecutor {
       }, PERIODIC_BLOCKER_CHECK_MS);
 
       // 10. Build TaskContext and delegate to handler (with crash recovery)
-      const timeoutMs = job.timeout_seconds * 1000;
+      const rawTimeout = job.timeout_seconds;
+      const timeoutMs = (typeof rawTimeout === 'number' && rawTimeout > 0 ? rawTimeout : 1800) * 1000;
+      getLogger().info('Job execution timeout configured', {
+        jobId: job.id,
+        raw_timeout_seconds: rawTimeout,
+        effective_timeout_seconds: timeoutMs / 1000,
+        timeoutMs,
+        handler: handler.type,
+      });
       await this.updateJobStatus(job.id, 'running', `Executing ${handler.type} handler (Magnitude mode)`);
 
       let taskResult: TaskResult | undefined;
@@ -1341,6 +1356,7 @@ export class JobExecutor {
     }
 
     if (!blockerResult || blockerResult.confidence < BLOCKER_CONFIDENCE_THRESHOLD) {
+      console.log(`[JobExecutor] Blocker check result: ${blockerResult ? `type=${blockerResult.type} confidence=${blockerResult.confidence} (below threshold ${BLOCKER_CONFIDENCE_THRESHOLD})` : 'no blocker detected'}`);
       await this.logJobEvent(job.id, JOB_EVENT_TYPES.OBSERVATION_COMPLETED, {
         result: 'clear',
         url: currentUrl,
@@ -1348,7 +1364,34 @@ export class JobExecutor {
       return false;
     }
 
+    // SAFETY: If the blocker is a captcha but the page has form inputs, it's a
+    // form-level captcha (e.g. hCaptcha on Lever) — not blocking page access.
+    // These captchas activate at submission time, not during form filling.
+    if (blockerResult.type === 'captcha' || blockerResult.type === 'verification') {
+      try {
+        const formInputCount = await adapter.page.evaluate(() => {
+          return document.querySelectorAll(
+            'input[type="text"], input[type="email"], input[type="tel"], ' +
+            'input[type="url"], input[type="number"], textarea, select, ' +
+            'input[type="file"], [role="combobox"], [role="listbox"]'
+          ).length;
+        });
+        if (formInputCount >= 2) {
+          console.log(`[JobExecutor] Captcha detected (${blockerResult.selector}) but page has ${formInputCount} form inputs — treating as form-level captcha, not a blocker`);
+          await this.logJobEvent(job.id, JOB_EVENT_TYPES.OBSERVATION_COMPLETED, {
+            result: 'clear',
+            url: currentUrl,
+            note: `Captcha present but page has ${formInputCount} form inputs — form-level captcha, not access blocker`,
+          });
+          return false;
+        }
+      } catch {
+        // page.evaluate failed — fall through to normal blocker handling
+      }
+    }
+
     // Blocker detected — emit event and trigger HITL
+    console.log(`[JobExecutor] BLOCKER DETECTED: type=${blockerResult.type} confidence=${blockerResult.confidence} source=${blockerResult.source} details="${blockerResult.details}" selector="${blockerResult.selector || 'N/A'}"`);
     await this.logJobEvent(job.id, JOB_EVENT_TYPES.BLOCKER_DETECTED, {
       blocker_type: blockerResult.type,
       confidence: blockerResult.confidence,

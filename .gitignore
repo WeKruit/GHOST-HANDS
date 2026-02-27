@@ -42,6 +42,9 @@ tmp/
 playwright-report/
 test-results/
 
+#Stagehand output
+packages/ghosthands/inference_summary/
+
 # Bun
 .bun/
 

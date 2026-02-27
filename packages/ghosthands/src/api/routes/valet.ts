@@ -91,7 +91,7 @@ export function createValetRoutes(pool: pg.Pool) {
     `, [
       body.valet_user_id,
       'valet',
-      'apply',
+      'smart_apply',
       body.target_url,
       taskDescription,
       JSON.stringify({
