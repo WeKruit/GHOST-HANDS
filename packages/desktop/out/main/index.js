@@ -24,15 +24,15 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 const electron = require("electron");
 const path = require("path");
 const fs = require("fs");
-const crypto = require("crypto");
+const supabaseJs = require("@supabase/supabase-js");
+const http = require("http");
 const zod = require("zod");
+const crypto = require("crypto");
 const IPC = {
   APPLY: "apply",
   CANCEL_APPLY: "cancel-apply",
   SAVE_PROFILE: "save-profile",
   GET_PROFILE: "get-profile",
-  SAVE_SETTINGS: "save-settings",
-  GET_SETTINGS: "get-settings",
   GET_HISTORY: "get-history",
   CLEAR_HISTORY: "clear-history",
   SELECT_RESUME: "select-resume",
@@ -40,17 +40,16 @@ const IPC = {
   PROGRESS: "progress",
   IMPORT_COOKBOOK: "import-cookbook",
   GET_COOKBOOKS: "get-cookbooks",
-  DELETE_COOKBOOK: "delete-cookbook"
+  DELETE_COOKBOOK: "delete-cookbook",
+  SIGN_IN_GOOGLE: "sign-in-google",
+  SIGN_OUT: "sign-out",
+  GET_SESSION: "get-session"
 };
 const defaults = {
   profile: null,
-  settings: {
-    llmProvider: "openai",
-    llmApiKey: "",
-    llmModel: "gpt-4o"
-  },
   resumePath: null,
-  history: []
+  history: [],
+  refreshToken: null
 };
 let data = { ...defaults };
 let filePath = "";
@@ -90,15 +89,6 @@ function saveProfile(profile) {
   data.profile = profile;
   save();
 }
-function getSettings() {
-  ensureLoaded();
-  return data.settings;
-}
-function saveSettings(settings) {
-  ensureLoaded();
-  data.settings = settings;
-  save();
-}
 function getResumePath() {
   ensureLoaded();
   return data.resumePath;
@@ -131,6 +121,193 @@ function clearHistory() {
   data.history = [];
   save();
 }
+function getRefreshToken$1() {
+  ensureLoaded();
+  return data.refreshToken;
+}
+function setRefreshToken(token) {
+  ensureLoaded();
+  data.refreshToken = token;
+  save();
+}
+let supabase = null;
+let currentSession = null;
+let refreshTimer = null;
+function getSupabaseClient() {
+  if (!supabase) {
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY;
+    if (!url || !key) {
+      throw new Error("Missing SUPABASE_URL or SUPABASE_PUBLISHABLE_KEY environment variable");
+    }
+    supabase = supabaseJs.createClient(url, key, {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false,
+        detectSessionInUrl: false,
+        flowType: "pkce"
+      }
+    });
+  }
+  return supabase;
+}
+function toAuthSession(session) {
+  const user = session.user;
+  return {
+    accessToken: session.access_token,
+    user: {
+      id: user.id,
+      email: user.email ?? "",
+      name: user.user_metadata?.full_name || user.user_metadata?.name,
+      avatarUrl: user.user_metadata?.avatar_url
+    },
+    expiresAt: session.expires_at ?? 0
+  };
+}
+function scheduleRefresh() {
+  clearRefreshTimer();
+  if (!currentSession?.expires_at) return;
+  const expiresAtMs = currentSession.expires_at * 1e3;
+  const refreshInMs = expiresAtMs - Date.now() - 6e4;
+  if (refreshInMs <= 0) {
+    refreshAccessToken();
+    return;
+  }
+  refreshTimer = setTimeout(() => refreshAccessToken(), refreshInMs);
+}
+function clearRefreshTimer() {
+  if (refreshTimer) {
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
+}
+async function refreshAccessToken() {
+  if (!currentSession?.refresh_token) return;
+  try {
+    const client = getSupabaseClient();
+    const { data: data2, error } = await client.auth.refreshSession({
+      refresh_token: currentSession.refresh_token
+    });
+    if (error || !data2.session) {
+      currentSession = null;
+      return;
+    }
+    currentSession = data2.session;
+    scheduleRefresh();
+  } catch {
+    currentSession = null;
+  }
+}
+async function signInWithGoogle() {
+  return new Promise((resolve) => {
+    const client = getSupabaseClient();
+    const server = http.createServer(async (req, res) => {
+      const url = new URL(req.url ?? "/", `http://127.0.0.1`);
+      if (url.pathname !== "/callback") {
+        res.writeHead(404);
+        res.end("Not found");
+        return;
+      }
+      const code = url.searchParams.get("code");
+      const errorParam = url.searchParams.get("error");
+      if (errorParam) {
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end("<html><body><h2>Sign-in failed. You can close this tab.</h2></body></html>");
+        server.close();
+        resolve({ session: null, error: errorParam });
+        return;
+      }
+      if (!code) {
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end("<html><body><h2>No authorization code received. You can close this tab.</h2></body></html>");
+        server.close();
+        resolve({ session: null, error: "No authorization code received" });
+        return;
+      }
+      try {
+        const { data: data2, error } = await client.auth.exchangeCodeForSession(code);
+        if (error || !data2.session) {
+          res.writeHead(200, { "Content-Type": "text/html" });
+          res.end("<html><body><h2>Authentication failed. You can close this tab.</h2></body></html>");
+          server.close();
+          resolve({ session: null, error: error?.message ?? "Failed to exchange code" });
+          return;
+        }
+        currentSession = data2.session;
+        scheduleRefresh();
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end("<html><body><h2>Signed in successfully! You can close this tab and return to GhostHands.</h2></body></html>");
+        server.close();
+        resolve({ session: toAuthSession(data2.session) });
+      } catch (err) {
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end("<html><body><h2>Something went wrong. You can close this tab.</h2></body></html>");
+        server.close();
+        resolve({ session: null, error: err.message });
+      }
+    });
+    server.listen(0, "127.0.0.1", async () => {
+      const addr = server.address();
+      if (!addr || typeof addr === "string") {
+        server.close();
+        resolve({ session: null, error: "Failed to start local server" });
+        return;
+      }
+      const port = addr.port;
+      const redirectTo = `http://127.0.0.1:${port}/callback`;
+      const { data: data2, error } = await client.auth.signInWithOAuth({
+        provider: "google",
+        options: {
+          redirectTo,
+          skipBrowserRedirect: true
+        }
+      });
+      if (error || !data2.url) {
+        server.close();
+        resolve({ session: null, error: error?.message ?? "Failed to generate OAuth URL" });
+        return;
+      }
+      electron.shell.openExternal(data2.url);
+      setTimeout(() => {
+        server.close();
+        resolve({ session: null, error: "Sign-in timed out" });
+      }, 5 * 60 * 1e3);
+    });
+  });
+}
+async function signOut() {
+  clearRefreshTimer();
+  if (currentSession) {
+    try {
+      const client = getSupabaseClient();
+      await client.auth.signOut();
+    } catch {
+    }
+  }
+  currentSession = null;
+}
+function getSession() {
+  if (!currentSession) return null;
+  return toAuthSession(currentSession);
+}
+function getAccessToken() {
+  return currentSession?.access_token ?? null;
+}
+function getRefreshToken() {
+  return currentSession?.refresh_token ?? null;
+}
+async function tryRestoreSession(refreshToken) {
+  try {
+    const client = getSupabaseClient();
+    const { data: data2, error } = await client.auth.refreshSession({ refresh_token: refreshToken });
+    if (error || !data2.session) return null;
+    currentSession = data2.session;
+    scheduleRefresh();
+    return toAuthSession(data2.session);
+  } catch {
+    return null;
+  }
+}
 const STRATEGIES = [
   {
     name: "testId",
@@ -154,7 +331,7 @@ const STRATEGIES = [
   },
   {
     name: "text",
-    build: (page, d) => d.text ? page.getByText(d.text) : null
+    build: (page, d) => d.text ? page.getByText(d.text, { exact: true }) : null
   },
   {
     name: "css",
@@ -195,7 +372,7 @@ class LocatorResolver {
     while (true) {
       try {
         const count = await locator.count();
-        return count > 0;
+        return count === 1;
       } catch (err) {
         const isStale = err?.message?.includes("stale") || err?.message?.includes("detached") || err?.message?.includes("Element is not attached");
         if (isStale && retriesLeft > 0) {
@@ -420,7 +597,13 @@ class LocalManualStore {
    */
   lookup(url, taskType, platform) {
     const manuals = this.getAll();
-    const candidates = manuals.filter((m) => m.task_pattern === taskType).filter((m) => !platform || m.platform === platform || m.platform === "other").filter((m) => m.health_score > 0).filter((m) => LocalManualStore.urlMatchesPattern(url, m.url_pattern)).sort((a, b) => b.health_score - a.health_score);
+    const candidates = manuals.filter((m) => m.task_pattern === taskType).filter((m) => !platform || m.platform === platform || m.platform === "other").filter((m) => m.health_score > 0).filter(
+      (m) => (
+        // Template (seed) cookbooks rely on platform + task_pattern filtering only;
+        // recorded/actionbook manuals use exact URL pattern matching (staging parity).
+        m.source === "template" || LocalManualStore.urlMatchesPattern(url, m.url_pattern)
+      )
+    ).sort((a, b) => b.health_score - a.health_score);
     return candidates[0] ?? null;
   }
   /** Save an ActionManual to disk as {id}.json. */
@@ -517,6 +700,9 @@ class TraceRecorder {
       });
     };
     this.events.on("actionDone", this.boundHandler);
+    this.page.on("load", () => {
+      this.helperInjected = false;
+    });
     this.recording = true;
   }
   /** Stop subscribing to events. Recorded trace is preserved. */
@@ -538,20 +724,25 @@ class TraceRecorder {
   async recordAction(action) {
     const stepAction = mapVariantToAction(action.variant);
     if (!stepAction) return;
+    await this.ensureHelper();
     if (action.variant === "load") {
-      const loadAction = action;
+      const navAction = action;
       this.steps.push({
         order: this.steps.length,
         locator: { css: "body" },
         action: "navigate",
-        value: loadAction.url,
+        value: navAction.url,
         healthScore: 1
       });
       return;
     }
+    let elementInfo = null;
     const coordAction = action;
-    if (coordAction.x === void 0 || coordAction.y === void 0) return;
-    const elementInfo = await this.extractElementInfo(coordAction.x, coordAction.y);
+    if (coordAction.x !== void 0 && coordAction.y !== void 0) {
+      elementInfo = await this.extractElementInfo(coordAction.x, coordAction.y);
+    } else if (stepAction === "fill") {
+      elementInfo = await this.extractActiveElementInfo();
+    }
     if (!elementInfo) return;
     const locator = buildLocator(elementInfo);
     let value;
@@ -577,39 +768,72 @@ class TraceRecorder {
         ([px, py]) => {
           const el = document.elementFromPoint(px, py);
           if (!el) return null;
-          const tag = el.tagName.toLowerCase();
-          const elId = el.getAttribute("id") ?? "";
-          const name = el.getAttribute("name") ?? "";
-          const testId = el.getAttribute("data-testid") ?? "";
-          const role = el.getAttribute("role") ?? el.tagName.toLowerCase();
-          const ariaLabel = el.getAttribute("aria-label") ?? "";
-          const text = el.textContent?.trim().slice(0, 100) ?? "";
-          let css = tag;
-          if (elId) css += `#${elId}`;
-          if (name) css += `[name="${name}"]`;
-          const parts = [];
-          let current = el;
-          while (current && current !== document.documentElement) {
-            const parent = current.parentElement;
-            if (parent) {
-              const siblings = Array.from(parent.children).filter(
-                (c) => c.tagName === current.tagName
-              );
-              const index = siblings.indexOf(current) + 1;
-              parts.unshift(`${current.tagName.toLowerCase()}[${index}]`);
-            } else {
-              parts.unshift(current.tagName.toLowerCase());
-            }
-            current = parent;
-          }
-          const xpath = "/html/" + parts.join("/");
-          return { testId, role, name, ariaLabel, id: elId, text, css, xpath };
+          return window.__gh_extractLocator(el);
         },
         [x, y]
       );
     } catch {
       return null;
     }
+  }
+  /**
+   * Use document.activeElement for keyboard events that lack coordinates.
+   */
+  async extractActiveElementInfo() {
+    try {
+      return await this.page.evaluate(() => {
+        const el = document.activeElement;
+        if (!el || el === document.body || el === document.documentElement) return null;
+        return window.__gh_extractLocator(el);
+      });
+    } catch {
+      return null;
+    }
+  }
+  /**
+   * Inject the locator extraction helper into the page context once.
+   * Called automatically before first use.
+   */
+  helperInjected = false;
+  async ensureHelper() {
+    if (this.helperInjected) return;
+    await this.page.evaluate(() => {
+      window.__gh_extractLocator = (el) => {
+        const tag = el.tagName.toLowerCase();
+        const elId = el.getAttribute("id") ?? "";
+        const name = el.getAttribute("name") ?? "";
+        const testId = el.getAttribute("data-testid") ?? "";
+        const automationId = el.getAttribute("data-automation-id") ?? "";
+        const role = el.getAttribute("role") ?? tag;
+        const ariaLabel = el.getAttribute("aria-label") ?? "";
+        const text = el.textContent?.trim().slice(0, 100) ?? "";
+        let css = tag;
+        if (automationId) {
+          css = `${tag}[data-automation-id='${automationId}']`;
+        } else if (elId) {
+          css += `#${elId}`;
+        }
+        if (name) css += `[name="${name}"]`;
+        const parts = [];
+        let current = el;
+        while (current && current !== document.documentElement) {
+          const parent = current.parentElement;
+          if (parent) {
+            const siblings = Array.from(parent.children).filter(
+              (c) => c.tagName === current.tagName
+            );
+            const index = siblings.indexOf(current) + 1;
+            parts.unshift(`${current.tagName.toLowerCase()}[${index}]`);
+          } else {
+            parts.unshift(current.tagName.toLowerCase());
+          }
+          current = parent;
+        }
+        const xpath = "/html/" + parts.join("/");
+        return { testId, role, name, ariaLabel, id: elId, text, css, xpath };
+      };
+    });
+    this.helperInjected = true;
   }
   /**
    * If the value matches a userData field value, return {{field_name}}.
@@ -693,7 +917,7 @@ function buildFillPrompt(profile, resumePath) {
   if (profile.education.length > 0) {
     lines.push("", "Education:");
     for (const edu of profile.education) {
-      const years = edu.endYear ? `${edu.startYear}-${edu.endYear}` : `${edu.startYear}-present`;
+      const years = edu.endDate ? `${edu.startDate}-${edu.endDate}` : `${edu.startDate}-present`;
       lines.push(`- ${edu.degree} in ${edu.field} from ${edu.school} (${years})`);
     }
   }
@@ -766,20 +990,38 @@ function getManualStore() {
   return manualStore;
 }
 async function runApplication(params) {
-  const { targetUrl, profile, resumePath, settings, onProgress } = params;
+  const { targetUrl, profile, resumePath, onProgress } = params;
   const emit = (type, message, extra) => {
     onProgress({ type, message, timestamp: Date.now(), ...extra });
   };
+  const InputSchema = zod.z.object({
+    first_name: zod.z.string().min(1, "First name is required"),
+    last_name: zod.z.string().min(1, "Last name is required"),
+    email: zod.z.string().email("Valid email is required")
+  });
+  const validation = InputSchema.safeParse({
+    first_name: profile.firstName,
+    last_name: profile.lastName,
+    email: profile.email
+  });
+  if (!validation.success) {
+    const errors = validation.error.issues.map((i) => i.message).join(", ");
+    return { success: false, message: `Profile validation failed: ${errors}` };
+  }
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return { success: false, message: "ANTHROPIC_API_KEY environment variable is not set" };
+  }
   try {
     emit("status", "Starting automation engine...");
     const { startBrowserAgent } = await import("magnitude-core");
     const agent = await startBrowserAgent({
       url: targetUrl,
       llm: {
-        provider: settings.llmProvider,
+        provider: "anthropic",
         options: {
-          model: settings.llmModel,
-          apiKey: settings.llmApiKey
+          model: "claude-haiku-4-5-20251001",
+          apiKey
         }
       },
       browser: {
@@ -826,7 +1068,7 @@ async function runApplication(params) {
       emit("status", "Recording actions for future cookbook...");
       emit("status", "Filling out application form...");
       if (platform === "workday") {
-        const { runWorkdayPipeline } = await Promise.resolve().then(() => require("./chunks/workdayOrchestrator-pn6W7L79.js"));
+        const { runWorkdayPipeline } = await Promise.resolve().then(() => require("./chunks/workdayOrchestrator-Brj11oGW.js"));
         await runWorkdayPipeline(agent, profile, emit, resumePath);
       } else {
         await fillWithSmartScroll(agent, profile, emit, resumePath);
@@ -866,13 +1108,7 @@ async function runApplication(params) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     emit("error", `Failed: ${message}`);
-    if (activeAgent) {
-      try {
-        await activeAgent.stop();
-      } catch {
-      }
-    }
-    activeAgent = null;
+    emit("status", "Browser left open — you can fix the issue manually or cancel");
     return { success: false, message };
   }
 }
@@ -934,8 +1170,8 @@ function buildUserData(profile) {
     data2.school = edu.school;
     data2.degree = edu.degree;
     data2.field = edu.field;
-    data2.startYear = String(edu.startYear);
-    data2.endYear = edu.endYear ? String(edu.endYear) : "";
+    data2.startYear = edu.startDate;
+    data2.endYear = edu.endDate || "";
   }
   if (profile.experience.length > 0) {
     const exp = profile.experience[0];
@@ -987,14 +1223,82 @@ const ActionManualSchema = zod.z.object({
   created_at: zod.z.string().datetime(),
   updated_at: zod.z.string().datetime()
 });
+const GH_API_URL = process.env.GH_API_URL || "http://localhost:3100";
+async function fetchProfileFromApi() {
+  const token = getAccessToken();
+  if (!token) return null;
+  try {
+    const res = await fetch(`${GH_API_URL}/api/v1/gh/desktop/profile`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    return body.profile ?? null;
+  } catch {
+    return null;
+  }
+}
+async function syncProfileToApi(profile) {
+  const token = getAccessToken();
+  if (!token) return;
+  try {
+    await fetch(`${GH_API_URL}/api/v1/gh/desktop/profile`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify(profile)
+    });
+  } catch {
+  }
+}
 function registerIpcHandlers(getMainWindow) {
-  electron.ipcMain.handle(IPC.GET_PROFILE, () => getProfile());
-  electron.ipcMain.handle(IPC.SAVE_PROFILE, (_event, profile) => {
-    saveProfile(profile);
+  electron.ipcMain.handle(IPC.SIGN_IN_GOOGLE, async () => {
+    try {
+      const result = await signInWithGoogle();
+      if (result.session) {
+        const refreshToken = getRefreshToken();
+        if (refreshToken) setRefreshToken(refreshToken);
+        return { success: true, session: result.session };
+      }
+      return { success: false, error: result.error };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
   });
-  electron.ipcMain.handle(IPC.GET_SETTINGS, () => getSettings());
-  electron.ipcMain.handle(IPC.SAVE_SETTINGS, (_event, settings) => {
-    saveSettings(settings);
+  electron.ipcMain.handle(IPC.SIGN_OUT, async () => {
+    await signOut();
+    setRefreshToken(null);
+  });
+  electron.ipcMain.handle(IPC.GET_SESSION, async () => {
+    const session = getSession();
+    if (session) return session;
+    const refreshToken = getRefreshToken$1();
+    if (refreshToken) {
+      const restored = await tryRestoreSession(refreshToken);
+      if (restored) {
+        const newRefreshToken = getRefreshToken();
+        if (newRefreshToken) setRefreshToken(newRefreshToken);
+        return restored;
+      }
+      setRefreshToken(null);
+    }
+    return null;
+  });
+  electron.ipcMain.handle(IPC.GET_PROFILE, async () => {
+    if (getAccessToken()) {
+      const remote = await fetchProfileFromApi();
+      if (remote) {
+        saveProfile(remote);
+        return remote;
+      }
+    }
+    return getProfile();
+  });
+  electron.ipcMain.handle(IPC.SAVE_PROFILE, async (_event, profile) => {
+    saveProfile(profile);
+    await syncProfileToApi(profile);
   });
   electron.ipcMain.handle(IPC.SELECT_RESUME, async () => {
     const win = getMainWindow();
@@ -1013,10 +1317,8 @@ function registerIpcHandlers(getMainWindow) {
   electron.ipcMain.handle(IPC.APPLY, async (_event, url) => {
     const win = getMainWindow();
     const profile = getProfile();
-    const settings = getSettings();
     const resumePath = getResumePath();
     if (!profile) return { success: false, message: "Please set up your profile first" };
-    if (!settings.llmApiKey) return { success: false, message: "Please configure your LLM API key in settings" };
     const recordId = crypto.randomUUID();
     addHistory({
       id: recordId,
@@ -1033,7 +1335,6 @@ function registerIpcHandlers(getMainWindow) {
       targetUrl: url,
       profile,
       resumePath: resumePath ?? void 0,
-      settings,
       onProgress
     });
     updateHistory(recordId, {
@@ -1091,20 +1392,29 @@ if (electron.app.isPackaged) {
     process.env.PLAYWRIGHT_BROWSERS_PATH = bundledBrowsers;
   }
 }
-try {
-  const envPath = path.join(__dirname, "../../.env");
-  const envContent = fs.readFileSync(envPath, "utf-8");
-  for (const line of envContent.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const value = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
-    if (!process.env[key]) process.env[key] = value;
+function loadEnvFile(filePath2) {
+  try {
+    const content = fs.readFileSync(filePath2, "utf-8");
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eqIdx = trimmed.indexOf("=");
+      if (eqIdx === -1) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      const value = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
+      if (!process.env[key]) process.env[key] = value;
+    }
+    return true;
+  } catch {
+    return false;
   }
-} catch {
 }
+const packageRoot = path.join(__dirname, "../..");
+const ghEnv = process.env.GH_ENV;
+if (ghEnv) {
+  loadEnvFile(path.join(packageRoot, `.env.${ghEnv}`));
+}
+loadEnvFile(path.join(packageRoot, ".env"));
 let mainWindow = null;
 function createWindow() {
   mainWindow = new electron.BrowserWindow({

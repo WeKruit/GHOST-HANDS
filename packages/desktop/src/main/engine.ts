@@ -1,4 +1,5 @@
-import type { UserProfile, ProgressEvent, AppSettings } from '../shared/types';
+import type { UserProfile, ProgressEvent } from '../shared/types';
+import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { CookbookExecutor } from './engine/CookbookExecutor';
 import { LocalManualStore } from './engine/LocalManualStore';
@@ -24,7 +25,6 @@ export interface RunApplicationParams {
   targetUrl: string;
   profile: UserProfile;
   resumePath?: string;
-  settings: AppSettings;
   onProgress: (event: ProgressEvent) => void;
 }
 
@@ -34,11 +34,33 @@ export interface RunResult {
 }
 
 export async function runApplication(params: RunApplicationParams): Promise<RunResult> {
-  const { targetUrl, profile, resumePath, settings, onProgress } = params;
+  const { targetUrl, profile, resumePath, onProgress } = params;
 
   const emit = (type: ProgressEvent['type'], message?: string, extra?: Partial<ProgressEvent>) => {
     onProgress({ type, message, timestamp: Date.now(), ...extra });
   };
+
+  // Validate required profile fields (matches staging handler.validate())
+  const InputSchema = z.object({
+    first_name: z.string().min(1, 'First name is required'),
+    last_name: z.string().min(1, 'Last name is required'),
+    email: z.string().email('Valid email is required'),
+  });
+
+  const validation = InputSchema.safeParse({
+    first_name: profile.firstName,
+    last_name: profile.lastName,
+    email: profile.email,
+  });
+  if (!validation.success) {
+    const errors = validation.error.issues.map(i => i.message).join(', ');
+    return { success: false, message: `Profile validation failed: ${errors}` };
+  }
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return { success: false, message: 'ANTHROPIC_API_KEY environment variable is not set' };
+  }
 
   try {
     emit('status', 'Starting automation engine...');
@@ -49,12 +71,12 @@ export async function runApplication(params: RunApplicationParams): Promise<RunR
     const agent = await startBrowserAgent({
       url: targetUrl,
       llm: {
-        provider: settings.llmProvider,
+        provider: 'anthropic',
         options: {
-          model: settings.llmModel,
-          apiKey: settings.llmApiKey,
+          model: 'claude-haiku-4-5-20251001',
+          apiKey,
         },
-      },
+      } as any,
       browser: {
         launchOptions: { headless: false },
       },
@@ -165,10 +187,10 @@ export async function runApplication(params: RunApplicationParams): Promise<RunR
     const message = error instanceof Error ? error.message : String(error);
     emit('error', `Failed: ${message}`);
 
-    if (activeAgent) {
-      try { await activeAgent.stop(); } catch { /* best-effort */ }
-    }
-    activeAgent = null;
+    // Keep browser open for human intervention — do NOT call agent.stop().
+    // The user can manually fix the issue and resume, or use cancelApplication()
+    // to explicitly close the browser when they're done.
+    emit('status', 'Browser left open — you can fix the issue manually or cancel');
 
     return { success: false, message };
   }
@@ -247,8 +269,8 @@ function buildUserData(profile: UserProfile): Record<string, string> {
     data.school = edu.school;
     data.degree = edu.degree;
     data.field = edu.field;
-    data.startYear = String(edu.startYear);
-    data.endYear = edu.endYear ? String(edu.endYear) : '';
+    data.startYear = edu.startDate;
+    data.endYear = edu.endDate || '';
   }
 
   // Flatten first experience entry

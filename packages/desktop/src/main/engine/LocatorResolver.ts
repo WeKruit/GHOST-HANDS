@@ -54,7 +54,7 @@ const STRATEGIES: Strategy[] = [
   },
   {
     name: 'text',
-    build: (page, d) => d.text ? page.getByText(d.text) : null,
+    build: (page, d) => d.text ? page.getByText(d.text, { exact: true }) : null,
   },
   {
     name: 'css',
@@ -104,7 +104,7 @@ export class LocatorResolver {
     while (true) {
       try {
         const count = await locator.count();
-        return count > 0;
+        return count === 1;
       } catch (err: any) {
         const isStale =
           err?.message?.includes('stale') ||

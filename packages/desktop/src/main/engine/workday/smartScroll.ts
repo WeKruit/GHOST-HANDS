@@ -18,7 +18,6 @@
 import type { MinimalAdapter } from './DesktopAdapterShim.js';
 import { isActuallyReview } from './pageClassifier.js';
 import {
-  fillDropdownsProgrammatically,
   fillDateFieldsProgrammatically,
   checkRequiredCheckboxes,
   hasEmptyVisibleFields,
@@ -72,14 +71,8 @@ export async function fillWithSmartScroll(
   });
   await adapter.page.waitForTimeout(300);
 
-  // Round 1: DOM-first dropdown fill + date fill, then LLM for text fields
+  // Round 1: DOM-first date fill + checkbox fill, then LLM for everything else
   logger.debug('Round 1: DOM fill pass', { pageLabel });
-  if (Object.keys(fullQAMap).length > 0) {
-    const programmaticFilled = await fillDropdownsProgrammatically(adapter, fullQAMap);
-    if (programmaticFilled > 0) {
-      logger.debug('Programmatically filled dropdowns', { pageLabel, count: programmaticFilled });
-    }
-  }
   // DOM-first: fill date fields
   await fillDateFieldsProgrammatically(adapter);
   // DOM-first: check any required checkboxes (Terms & Conditions, Privacy, etc.)
@@ -127,15 +120,15 @@ export async function fillWithSmartScroll(
 
     logger.debug('Scrolled page', { pageLabel, scrollY: scrollAfter, round });
 
-    // DOM-first: fill dropdowns, date fields, and checkboxes programmatically
-    if (Object.keys(fullQAMap).length > 0) {
-      const programmaticFilled = await fillDropdownsProgrammatically(adapter, fullQAMap);
-      if (programmaticFilled > 0) {
-        logger.debug('Programmatically filled dropdowns', { pageLabel, count: programmaticFilled });
-      }
-    }
+    // DOM-first: fill date fields and checkboxes programmatically.
+    // Save scroll position first — DOM fills may scroll the page as a side effect.
+    const scrollBeforeDomFill = scrollAfter;
     await fillDateFieldsProgrammatically(adapter);
     await checkRequiredCheckboxes(adapter);
+
+    // Restore scroll position after DOM fills (DOM interactions may have shifted the viewport)
+    await adapter.page.evaluate((y: number) => window.scrollTo(0, y), scrollBeforeDomFill);
+    await adapter.page.waitForTimeout(200);
 
     // Only invoke the LLM if there are still empty fields visible AND we haven't hit the limit
     if (llmCallCount >= MAX_LLM_CALLS) {

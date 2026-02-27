@@ -1,23 +1,110 @@
 import { ipcMain, dialog, BrowserWindow } from 'electron';
 import { readFileSync } from 'fs';
 import { IPC } from '../shared/types';
-import type { UserProfile, AppSettings, ProgressEvent } from '../shared/types';
+import type { UserProfile, ProgressEvent, SignInResult } from '../shared/types';
 import * as store from './store';
+import * as auth from './auth';
 import { runApplication, cancelApplication, getManualStore } from './engine';
 import { ActionManualSchema } from './engine/types';
 import { randomUUID } from 'crypto';
 
-export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): void {
-  ipcMain.handle(IPC.GET_PROFILE, () => store.getProfile());
+const GH_API_URL = process.env.GH_API_URL || 'http://localhost:3100';
 
-  ipcMain.handle(IPC.SAVE_PROFILE, (_event, profile: UserProfile) => {
-    store.saveProfile(profile);
+/** Fetch profile from the API (best-effort, returns null on failure) */
+async function fetchProfileFromApi(): Promise<UserProfile | null> {
+  const token = auth.getAccessToken();
+  if (!token) return null;
+  try {
+    const res = await fetch(`${GH_API_URL}/api/v1/gh/desktop/profile`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    return body.profile ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Push profile to the API (best-effort, silent failure) */
+async function syncProfileToApi(profile: UserProfile): Promise<void> {
+  const token = auth.getAccessToken();
+  if (!token) return;
+  try {
+    await fetch(`${GH_API_URL}/api/v1/gh/desktop/profile`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(profile),
+    });
+  } catch {
+    // Silent failure on network error
+  }
+}
+
+export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): void {
+  // ── Auth handlers ─────────────────────────────────────────────────
+
+  ipcMain.handle(IPC.SIGN_IN_GOOGLE, async (): Promise<SignInResult> => {
+    try {
+      const result = await auth.signInWithGoogle();
+      if (result.session) {
+        const refreshToken = auth.getRefreshToken();
+        if (refreshToken) store.setRefreshToken(refreshToken);
+        return { success: true, session: result.session };
+      }
+      return { success: false, error: result.error };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
   });
 
-  ipcMain.handle(IPC.GET_SETTINGS, () => store.getSettings());
+  ipcMain.handle(IPC.SIGN_OUT, async () => {
+    await auth.signOut();
+    store.setRefreshToken(null);
+  });
 
-  ipcMain.handle(IPC.SAVE_SETTINGS, (_event, settings: AppSettings) => {
-    store.saveSettings(settings);
+  ipcMain.handle(IPC.GET_SESSION, async () => {
+    // Try in-memory session first
+    const session = auth.getSession();
+    if (session) return session;
+
+    // Fall back to stored refresh token
+    const refreshToken = store.getRefreshToken();
+    if (refreshToken) {
+      const restored = await auth.tryRestoreSession(refreshToken);
+      if (restored) {
+        // Update stored refresh token (may have changed)
+        const newRefreshToken = auth.getRefreshToken();
+        if (newRefreshToken) store.setRefreshToken(newRefreshToken);
+        return restored;
+      }
+      // Stored token is invalid — clear it
+      store.setRefreshToken(null);
+    }
+    return null;
+  });
+
+  // ── Profile handlers ──────────────────────────────────────────────
+
+  ipcMain.handle(IPC.GET_PROFILE, async () => {
+    // If signed in, try to fetch from API first
+    if (auth.getAccessToken()) {
+      const remote = await fetchProfileFromApi();
+      if (remote) {
+        store.saveProfile(remote); // Update local cache
+        return remote;
+      }
+    }
+    return store.getProfile();
+  });
+
+  ipcMain.handle(IPC.SAVE_PROFILE, async (_event, profile: UserProfile) => {
+    store.saveProfile(profile);
+    // Best-effort sync to API
+    await syncProfileToApi(profile);
   });
 
   ipcMain.handle(IPC.SELECT_RESUME, async () => {
@@ -42,11 +129,9 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
   ipcMain.handle(IPC.APPLY, async (_event, url: string) => {
     const win = getMainWindow();
     const profile = store.getProfile();
-    const settings = store.getSettings();
     const resumePath = store.getResumePath();
 
     if (!profile) return { success: false, message: 'Please set up your profile first' };
-    if (!settings.llmApiKey) return { success: false, message: 'Please configure your LLM API key in settings' };
 
     const recordId = randomUUID();
     store.addHistory({
@@ -66,7 +151,6 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
       targetUrl: url,
       profile,
       resumePath: resumePath ?? undefined,
-      settings,
       onProgress,
     });
 

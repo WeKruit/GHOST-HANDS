@@ -34,34 +34,39 @@ export function mapDesktopProfileToWorkday(
       school: edu.school,
       degree: edu.degree,
       field_of_study: edu.field,
-      start_date: String(edu.startYear),
-      end_date: edu.endYear ? String(edu.endYear) : '',
+      gpa: edu.gpa || undefined,
+      start_date: edu.startDate,
+      end_date: edu.endDate || '',
     })),
 
     // Experience
-    experience: profile.experience.map((exp) => ({
-      company: exp.company,
-      title: exp.title,
-      currently_work_here: !exp.endDate,
-      start_date: exp.startDate,
-      end_date: exp.endDate || '',
-      description: exp.description,
-    })),
+    experience: profile.experience.map((exp) => {
+      const isPresent = !exp.endDate || exp.endDate.toLowerCase().trim() === 'present';
+      return {
+        company: exp.company,
+        title: exp.title,
+        location: exp.location || '',
+        currently_work_here: isPresent,
+        start_date: exp.startDate,
+        end_date: isPresent ? '' : exp.endDate || '',
+        description: exp.description,
+      };
+    }),
 
     // Skills
-    skills: [],
+    skills: profile.skills || [],
 
     // Resume
     resume_path: resumePath,
 
     // Legal/compliance
-    work_authorization: 'Yes',
-    visa_sponsorship: 'No',
+    work_authorization: profile.workAuthorization || 'Yes',
+    visa_sponsorship: profile.visaSponsorship || 'No',
 
-    // Voluntary self-identification defaults
-    gender: 'Male',
-    race_ethnicity: 'Asian',
-    veteran_status: 'I am not a protected veteran',
-    disability_status: 'I do not wish to answer',
+    // Voluntary self-identification
+    gender: profile.gender || 'Male',
+    race_ethnicity: profile.raceEthnicity || 'Asian (Not Hispanic or Latino)',
+    veteran_status: profile.veteranStatus || 'I am not a protected veteran',
+    disability_status: profile.disabilityStatus || "No, I Don't Have A Disability",
   };
 }

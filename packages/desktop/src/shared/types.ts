@@ -11,29 +11,32 @@ export interface UserProfile {
   zipCode?: string;
   education: EducationEntry[];
   experience: ExperienceEntry[];
+  skills?: string[];
   qaAnswers?: Record<string, string>;
+  workAuthorization?: string;
+  visaSponsorship?: string;
+  gender?: string;
+  raceEthnicity?: string;
+  veteranStatus?: string;
+  disabilityStatus?: string;
 }
 
 export interface EducationEntry {
   school: string;
   degree: string;
   field: string;
-  startYear: number;
-  endYear?: number;
+  gpa?: string;
+  startDate: string;   // "YYYY-MM" or "YYYY"
+  endDate?: string;     // "YYYY-MM" or "YYYY"
 }
 
 export interface ExperienceEntry {
   company: string;
   title: string;
+  location?: string;
   startDate: string;
   endDate?: string;
   description: string;
-}
-
-export interface AppSettings {
-  llmProvider: 'openai' | 'anthropic' | 'deepseek';
-  llmApiKey: string;
-  llmModel: string;
 }
 
 export interface ApplicationRecord {
@@ -56,13 +59,33 @@ export interface ProgressEvent {
   timestamp: number;
 }
 
+/** Authenticated user info */
+export interface AuthUser {
+  id: string;
+  email: string;
+  name?: string;
+  avatarUrl?: string;
+}
+
+/** Session returned to the renderer */
+export interface AuthSession {
+  accessToken: string;
+  user: AuthUser;
+  expiresAt: number;
+}
+
+/** Result of a sign-in attempt */
+export interface SignInResult {
+  success: boolean;
+  session?: AuthSession;
+  error?: string;
+}
+
 export const IPC = {
   APPLY: 'apply',
   CANCEL_APPLY: 'cancel-apply',
   SAVE_PROFILE: 'save-profile',
   GET_PROFILE: 'get-profile',
-  SAVE_SETTINGS: 'save-settings',
-  GET_SETTINGS: 'get-settings',
   GET_HISTORY: 'get-history',
   CLEAR_HISTORY: 'clear-history',
   SELECT_RESUME: 'select-resume',
@@ -71,4 +94,7 @@ export const IPC = {
   IMPORT_COOKBOOK: 'import-cookbook',
   GET_COOKBOOKS: 'get-cookbooks',
   DELETE_COOKBOOK: 'delete-cookbook',
+  SIGN_IN_GOOGLE: 'sign-in-google',
+  SIGN_OUT: 'sign-out',
+  GET_SESSION: 'get-session',
 } as const;

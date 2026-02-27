@@ -12,21 +12,33 @@ if (app.isPackaged) {
   }
 }
 
-// Load .env file into process.env (for TEST_GMAIL_PASSWORD, etc.)
-try {
-  // __dirname = out/main/ in built app, so ../../.env = package root
-  const envPath = join(__dirname, '../../.env');
-  const envContent = readFileSync(envPath, 'utf-8');
-  for (const line of envContent.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const value = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '');
-    if (!process.env[key]) process.env[key] = value;
+// Load .env file into process.env
+// Priority: .env.{GH_ENV} > .env (GH_ENV is set by npm scripts: "staging" or "production")
+function loadEnvFile(filePath: string): boolean {
+  try {
+    const content = readFileSync(filePath, 'utf-8');
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx === -1) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      const value = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '');
+      if (!process.env[key]) process.env[key] = value;
+    }
+    return true;
+  } catch {
+    return false;
   }
-} catch { /* .env file is optional */ }
+}
+
+const packageRoot = join(__dirname, '../..');
+const ghEnv = process.env.GH_ENV;
+if (ghEnv) {
+  loadEnvFile(join(packageRoot, `.env.${ghEnv}`));
+}
+// Always load .env as fallback (fills in any keys not set by env-specific file)
+loadEnvFile(join(packageRoot, '.env'));
 
 let mainWindow: BrowserWindow | null = null;
 

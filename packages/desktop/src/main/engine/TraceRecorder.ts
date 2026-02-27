@@ -23,6 +23,7 @@ export interface TraceRecorderOptions {
 }
 
 // ── Magnitude action event shapes ──────────────────────────────────────
+// Variants match magnitude-core's WebAction types (click, type, scroll, load)
 
 interface ClickAction {
   variant: 'click';
@@ -45,12 +46,12 @@ interface ScrollAction {
   deltaY: number;
 }
 
-interface LoadAction {
+interface NavAction {
   variant: 'load';
   url: string;
 }
 
-type ActionEvent = ClickAction | TypeAction | ScrollAction | LoadAction | { variant: string; [key: string]: any };
+type ActionEvent = ClickAction | TypeAction | ScrollAction | NavAction | { variant: string; [key: string]: any };
 
 // ── Element info returned by page.evaluate ────────────────────────────
 
@@ -89,6 +90,10 @@ export class TraceRecorder {
       this.recordAction(action).catch(() => {});
     };
     this.events.on('actionDone', this.boundHandler);
+
+    // Re-inject helper after page navigation destroys it
+    this.page.on('load', () => { this.helperInjected = false; });
+
     this.recording = true;
   }
 
@@ -117,24 +122,33 @@ export class TraceRecorder {
     const stepAction = mapVariantToAction(action.variant);
     if (!stepAction) return;
 
-    // Navigation does not need elementFromPoint
+    // Ensure helper is injected before any DOM queries
+    await this.ensureHelper();
+
+    // Navigation does not need element lookup
     if (action.variant === 'load') {
-      const loadAction = action as LoadAction;
+      const navAction = action as NavAction;
       this.steps.push({
         order: this.steps.length,
         locator: { css: 'body' },
         action: 'navigate',
-        value: loadAction.url,
+        value: navAction.url,
         healthScore: 1.0,
       });
       return;
     }
 
-    // Actions with coordinates need elementFromPoint
-    const coordAction = action as { x: number; y: number; content?: string };
-    if (coordAction.x === undefined || coordAction.y === undefined) return;
+    // Resolve element — mouse actions use coordinates, keyboard uses activeElement
+    let elementInfo: ElementInfo | null = null;
+    const coordAction = action as { x?: number; y?: number };
 
-    const elementInfo = await this.extractElementInfo(coordAction.x, coordAction.y);
+    if (coordAction.x !== undefined && coordAction.y !== undefined) {
+      elementInfo = await this.extractElementInfo(coordAction.x, coordAction.y);
+    } else if (stepAction === 'fill') {
+      // keyboard:type has no coordinates — use the currently focused element
+      elementInfo = await this.extractActiveElementInfo();
+    }
+
     if (!elementInfo) return;
 
     const locator = buildLocator(elementInfo);
@@ -164,45 +178,79 @@ export class TraceRecorder {
         ([px, py]: [number, number]) => {
           const el = document.elementFromPoint(px, py);
           if (!el) return null;
-
-          const tag = el.tagName.toLowerCase();
-          const elId = el.getAttribute('id') ?? '';
-          const name = el.getAttribute('name') ?? '';
-          const testId = el.getAttribute('data-testid') ?? '';
-          const role = el.getAttribute('role') ?? el.tagName.toLowerCase();
-          const ariaLabel = el.getAttribute('aria-label') ?? '';
-          const text = el.textContent?.trim().slice(0, 100) ?? '';
-
-          // Build a basic CSS selector
-          let css = tag;
-          if (elId) css += `#${elId}`;
-          if (name) css += `[name="${name}"]`;
-
-          // Build basic XPath
-          const parts: string[] = [];
-          let current: Element | null = el;
-          while (current && current !== document.documentElement) {
-            const parent: Element | null = current.parentElement;
-            if (parent) {
-              const siblings = Array.from(parent.children).filter(
-                (c: Element) => c.tagName === current!.tagName,
-              );
-              const index = siblings.indexOf(current) + 1;
-              parts.unshift(`${current.tagName.toLowerCase()}[${index}]`);
-            } else {
-              parts.unshift(current.tagName.toLowerCase());
-            }
-            current = parent;
-          }
-          const xpath = '/html/' + parts.join('/');
-
-          return { testId, role, name, ariaLabel, id: elId, text, css, xpath };
+          return (window as any).__gh_extractLocator(el);
         },
         [x, y] as [number, number],
       );
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Use document.activeElement for keyboard events that lack coordinates.
+   */
+  private async extractActiveElementInfo(): Promise<ElementInfo | null> {
+    try {
+      return await this.page.evaluate(() => {
+        const el = document.activeElement;
+        if (!el || el === document.body || el === document.documentElement) return null;
+        return (window as any).__gh_extractLocator(el);
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Inject the locator extraction helper into the page context once.
+   * Called automatically before first use.
+   */
+  private helperInjected = false;
+  private async ensureHelper(): Promise<void> {
+    if (this.helperInjected) return;
+    await this.page.evaluate(() => {
+      (window as any).__gh_extractLocator = (el: Element) => {
+        const tag = el.tagName.toLowerCase();
+        const elId = el.getAttribute('id') ?? '';
+        const name = el.getAttribute('name') ?? '';
+        const testId = el.getAttribute('data-testid') ?? '';
+        const automationId = el.getAttribute('data-automation-id') ?? '';
+        const role = el.getAttribute('role') ?? tag;
+        const ariaLabel = el.getAttribute('aria-label') ?? '';
+        const text = el.textContent?.trim().slice(0, 100) ?? '';
+
+        // Build CSS selector — prefer data-automation-id for Workday
+        let css = tag;
+        if (automationId) {
+          css = `${tag}[data-automation-id='${automationId}']`;
+        } else if (elId) {
+          css += `#${elId}`;
+        }
+        if (name) css += `[name="${name}"]`;
+
+        // Build basic XPath
+        const parts: string[] = [];
+        let current: Element | null = el;
+        while (current && current !== document.documentElement) {
+          const parent: Element | null = current.parentElement;
+          if (parent) {
+            const siblings = Array.from(parent.children).filter(
+              (c: Element) => c.tagName === current!.tagName,
+            );
+            const index = siblings.indexOf(current) + 1;
+            parts.unshift(`${current.tagName.toLowerCase()}[${index}]`);
+          } else {
+            parts.unshift(current.tagName.toLowerCase());
+          }
+          current = parent;
+        }
+        const xpath = '/html/' + parts.join('/');
+
+        return { testId, role, name, ariaLabel, id: elId, text, css, xpath };
+      };
+    });
+    this.helperInjected = true;
   }
 
   /**
@@ -224,11 +272,16 @@ export class TraceRecorder {
 /** Map Magnitude action variant to ManualStep action. */
 function mapVariantToAction(variant: string): ManualStep['action'] | null {
   switch (variant) {
-    case 'click': return 'click';
-    case 'type': return 'fill';
-    case 'scroll': return 'scroll';
-    case 'load': return 'navigate';
-    default: return null;
+    case 'click':
+      return 'click';
+    case 'type':
+      return 'fill';
+    case 'scroll':
+      return 'scroll';
+    case 'load':
+      return 'navigate';
+    default:
+      return null;
   }
 }
 

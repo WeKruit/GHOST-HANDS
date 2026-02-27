@@ -48,7 +48,7 @@ export class DesktopAdapterShim implements MinimalAdapter {
   }
 
   async navigate(url: string): Promise<void> {
-    await this.agent.nav(url);
+    await this.agent.page.goto(url, { waitUntil: 'domcontentloaded' });
   }
 
   get page(): any {

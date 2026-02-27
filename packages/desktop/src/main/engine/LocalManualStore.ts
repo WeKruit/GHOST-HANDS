@@ -72,7 +72,11 @@ export class LocalManualStore {
       .filter((m) => m.task_pattern === taskType)
       .filter((m) => !platform || m.platform === platform || m.platform === 'other')
       .filter((m) => m.health_score > 0)
-      .filter((m) => LocalManualStore.urlMatchesPattern(url, m.url_pattern))
+      .filter((m) =>
+        // Template (seed) cookbooks rely on platform + task_pattern filtering only;
+        // recorded/actionbook manuals use exact URL pattern matching (staging parity).
+        m.source === 'template' || LocalManualStore.urlMatchesPattern(url, m.url_pattern),
+      )
       .sort((a, b) => b.health_score - a.health_score);
 
     return candidates[0] ?? null;

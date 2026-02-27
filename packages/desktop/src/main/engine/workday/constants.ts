@@ -5,7 +5,7 @@ import { z } from 'zod';
 export const PHONE_2FA_TIMEOUT_MS = 180_000; // 3 minutes
 export const PHONE_2FA_POLL_INTERVAL_MS = 5_000;
 export const PAGE_TRANSITION_WAIT_MS = 3_000;
-export const MAX_FORM_PAGES = 30; // safety limit to avoid infinite loops
+export const MAX_FORM_PAGES = 15; // safety limit to avoid infinite loops
 
 // --- Page type detection schema ---
 

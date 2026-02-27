@@ -63,7 +63,7 @@ function buildFillPrompt(profile: UserProfile, resumePath?: string): string {
   if (profile.education.length > 0) {
     lines.push('', 'Education:');
     for (const edu of profile.education) {
-      const years = edu.endYear ? `${edu.startYear}-${edu.endYear}` : `${edu.startYear}-present`;
+      const years = edu.endDate ? `${edu.startDate}-${edu.endDate}` : `${edu.startDate}-present`;
       lines.push(`- ${edu.degree} in ${edu.field} from ${edu.school} (${years})`);
     }
   }

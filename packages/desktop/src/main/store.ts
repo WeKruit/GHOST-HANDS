@@ -1,24 +1,20 @@
 import { app } from 'electron';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
-import type { UserProfile, AppSettings, ApplicationRecord } from '../shared/types';
+import type { UserProfile, ApplicationRecord } from '../shared/types';
 
 interface StoreSchema {
   profile: UserProfile | null;
-  settings: AppSettings;
   resumePath: string | null;
   history: ApplicationRecord[];
+  refreshToken: string | null;
 }
 
 const defaults: StoreSchema = {
   profile: null,
-  settings: {
-    llmProvider: 'openai',
-    llmApiKey: '',
-    llmModel: 'gpt-4o',
-  },
   resumePath: null,
   history: [],
+  refreshToken: null,
 };
 
 let data: StoreSchema = { ...defaults };
@@ -66,17 +62,6 @@ export function saveProfile(profile: UserProfile): void {
   save();
 }
 
-export function getSettings(): AppSettings {
-  ensureLoaded();
-  return data.settings;
-}
-
-export function saveSettings(settings: AppSettings): void {
-  ensureLoaded();
-  data.settings = settings;
-  save();
-}
-
 export function getResumePath(): string | null {
   ensureLoaded();
   return data.resumePath;
@@ -112,5 +97,16 @@ export function updateHistory(id: string, updates: Partial<ApplicationRecord>): 
 export function clearHistory(): void {
   ensureLoaded();
   data.history = [];
+  save();
+}
+
+export function getRefreshToken(): string | null {
+  ensureLoaded();
+  return data.refreshToken;
+}
+
+export function setRefreshToken(token: string | null): void {
+  ensureLoaded();
+  data.refreshToken = token;
   save();
 }

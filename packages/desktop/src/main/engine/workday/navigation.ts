@@ -8,7 +8,6 @@
 import type { MinimalAdapter } from './DesktopAdapterShim.js';
 import { PAGE_TRANSITION_WAIT_MS } from './constants.js';
 import {
-  fillDropdownsProgrammatically,
   fillDateFieldsProgrammatically,
   hasEmptyVisibleFields,
 } from './domFillers.js';
@@ -178,9 +177,6 @@ export async function clickNextWithErrorRecovery(
         await adapter.page.waitForTimeout(800);
 
         // Now fill any empty field that's visible after jumping
-        if (Object.keys(fullQAMap).length > 0) {
-          await fillDropdownsProgrammatically(adapter, fullQAMap);
-        }
         await fillDateFieldsProgrammatically(adapter);
       }
     }
@@ -208,11 +204,6 @@ ${fillPrompt}`,
 
       const after = await adapter.page.evaluate(() => window.scrollY);
       if (after <= before) break;
-
-      // DOM-first: fill any dropdowns programmatically
-      if (Object.keys(fullQAMap).length > 0) {
-        await fillDropdownsProgrammatically(adapter, fullQAMap);
-      }
 
       // Only invoke LLM if there are still empty fields
       const hasEmpty = await hasEmptyVisibleFields(adapter);

@@ -10,6 +10,7 @@ import type { UserProfile, ProgressEvent } from '../../../shared/types.js';
 import { DesktopAdapterShim } from './DesktopAdapterShim.js';
 import { mapDesktopProfileToWorkday } from './profileMapper.js';
 import type { WorkdayUserProfile } from './workdayTypes.js';
+import type { SelfIdFields } from './workdayPrompts.js';
 import { MAX_FORM_PAGES } from './constants.js';
 import type { PageState } from './constants.js';
 import { getLogger } from './desktopLogger.js';
@@ -54,105 +55,121 @@ export async function runWorkdayPipeline(
   const dataPrompt = buildDataPrompt(workdayProfile, qaOverrides);
   const fullQAMap = buildFullQAMap(workdayProfile, qaOverrides);
 
+  const selfId: SelfIdFields = {
+    gender: workdayProfile.gender || 'Male',
+    race_ethnicity: workdayProfile.race_ethnicity || 'Asian (Not Hispanic or Latino)',
+    veteran_status: workdayProfile.veteran_status || 'I am not a protected veteran',
+    disability_status: workdayProfile.disability_status || "No, I Don't Have A Disability",
+  };
+
   let pagesProcessed = 0;
 
   emit('status', 'Workday pipeline started — detecting page type...');
 
-  while (pagesProcessed < MAX_FORM_PAGES) {
-    pagesProcessed++;
+  try {
+    while (pagesProcessed < MAX_FORM_PAGES) {
+      pagesProcessed++;
 
-    await waitForPageLoad(adapter);
+      await waitForPageLoad(adapter);
 
-    let pageState = await detectPage(adapter);
-    logger.info('Processing page', { page: pagesProcessed, pageType: pageState.page_type, title: pageState.page_title || 'N/A' });
-    emit('status', `Page ${pagesProcessed}: ${pageState.page_type}`);
+      let pageState = await detectPage(adapter);
+      logger.info('Processing page', { page: pagesProcessed, pageType: pageState.page_type, title: pageState.page_title || 'N/A' });
+      emit('status', `Page ${pagesProcessed}: ${pageState.page_type}`);
 
-    switch (pageState.page_type) {
-      case 'job_listing':
-        await handleJobListing(adapter, pageState);
-        break;
+      switch (pageState.page_type) {
+        case 'job_listing':
+          await handleJobListing(adapter, pageState);
+          break;
 
-      case 'login':
-      case 'google_signin':
-        emit('status', 'Handling login...');
-        await handleLogin(adapter, pageState, workdayProfile);
-        break;
+        case 'login':
+        case 'google_signin':
+          emit('status', 'Handling login...');
+          await handleLogin(adapter, pageState, workdayProfile);
+          break;
 
-      case 'verification_code':
-        emit('status', 'Retrieving verification code...');
-        await handleVerificationCode(adapter);
-        break;
+        case 'verification_code':
+          emit('status', 'Retrieving verification code...');
+          await handleVerificationCode(adapter);
+          break;
 
-      case 'phone_2fa':
-        emit('status', 'Waiting for manual 2FA (up to 3 min)...');
-        await handlePhone2FA(adapter);
-        break;
+        case 'phone_2fa':
+          emit('status', 'Waiting for manual 2FA (up to 3 min)...');
+          await handlePhone2FA(adapter);
+          break;
 
-      case 'account_creation':
-        emit('status', 'Creating account...');
-        await handleAccountCreation(adapter, workdayProfile, dataPrompt);
-        break;
+        case 'account_creation':
+          emit('status', 'Creating account...');
+          await handleAccountCreation(adapter, workdayProfile, dataPrompt);
+          break;
 
-      case 'personal_info':
-        emit('status', 'Filling personal information...');
-        await handlePersonalInfoPage(adapter, workdayProfile, qaOverrides, fullQAMap);
-        break;
+        case 'personal_info':
+          emit('status', 'Filling personal information...');
+          await handlePersonalInfoPage(adapter, workdayProfile, qaOverrides, fullQAMap);
+          break;
 
-      case 'experience':
-      case 'resume_upload':
-        emit('status', 'Filling experience & uploading resume...');
-        await handleExperiencePage(adapter, workdayProfile, fullQAMap);
-        break;
+        case 'experience':
+        case 'resume_upload':
+          emit('status', 'Filling experience & uploading resume...');
+          await handleExperiencePage(adapter, workdayProfile, fullQAMap);
+          break;
 
-      case 'questions': {
-        emit('status', 'Answering application questions...');
-        const qResult = await handleFormPage(adapter, 'application questions', dataPrompt, fullQAMap);
-        if (qResult === 'review_detected') {
-          pageState = { page_type: 'review', page_title: 'Review' };
-          continue;
+        case 'questions': {
+          emit('status', 'Answering application questions...');
+          const qResult = await handleFormPage(adapter, 'application questions', dataPrompt, fullQAMap);
+          if (qResult === 'review_detected') {
+            pageState = { page_type: 'review', page_title: 'Review' };
+            continue;
+          }
+          break;
         }
-        break;
-      }
 
-      case 'voluntary_disclosure': {
-        emit('status', 'Filling voluntary disclosures...');
-        const vResult = await handleVoluntaryDisclosure(adapter, dataPrompt, fullQAMap);
-        if (vResult === 'review_detected') {
-          pageState = { page_type: 'review', page_title: 'Review' };
-          continue;
+        case 'voluntary_disclosure': {
+          emit('status', 'Filling voluntary disclosures...');
+          const vResult = await handleVoluntaryDisclosure(adapter, dataPrompt, fullQAMap, selfId);
+          if (vResult === 'review_detected') {
+            pageState = { page_type: 'review', page_title: 'Review' };
+            continue;
+          }
+          break;
         }
-        break;
-      }
 
-      case 'self_identify': {
-        emit('status', 'Filling self-identification...');
-        const sResult = await handleSelfIdentify(adapter, dataPrompt, fullQAMap);
-        if (sResult === 'review_detected') {
-          pageState = { page_type: 'review', page_title: 'Review' };
-          continue;
+        case 'self_identify': {
+          emit('status', 'Filling self-identification...');
+          const sResult = await handleSelfIdentify(adapter, dataPrompt, fullQAMap, selfId);
+          if (sResult === 'review_detected') {
+            pageState = { page_type: 'review', page_title: 'Review' };
+            continue;
+          }
+          break;
         }
-        break;
+
+        case 'review':
+          emit('status', 'Reached review page — stopping before submission');
+          logger.info('Application filled, stopped at review page', { pagesProcessed });
+          return;
+
+        case 'confirmation':
+          logger.warn('Unexpected: landed on confirmation page');
+          emit('status', 'Application appears to have been submitted (unexpected)');
+          return;
+
+        case 'error':
+          throw new Error(`Workday error page: ${pageState.error_message || 'Unknown error'}`);
+
+        case 'unknown':
+        default:
+          emit('status', 'Unknown page — attempting generic fill...');
+          await handleGenericPage(adapter, dataPrompt, fullQAMap);
+          break;
       }
-
-      case 'review':
-        emit('status', 'Reached review page — stopping before submission');
-        logger.info('Application filled, stopped at review page', { pagesProcessed });
-        return;
-
-      case 'confirmation':
-        logger.warn('Unexpected: landed on confirmation page');
-        emit('status', 'Application appears to have been submitted (unexpected)');
-        return;
-
-      case 'error':
-        throw new Error(`Workday error page: ${pageState.error_message || 'Unknown error'}`);
-
-      case 'unknown':
-      default:
-        emit('status', 'Unknown page — attempting generic fill...');
-        await handleGenericPage(adapter, dataPrompt, fullQAMap);
-        break;
     }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (pagesProcessed > 2) {
+      emit('status', `Error after ${pagesProcessed} pages — browser open for manual review`);
+      return; // Don't re-throw — match staging's keepBrowserOpen behavior
+    }
+    throw error;
   }
 
   logger.warn('Reached max page limit without finding review page', { maxPages: MAX_FORM_PAGES, pagesProcessed });
@@ -190,6 +207,10 @@ function buildFullQAMap(
     'Full name': `${profile.first_name} ${profile.last_name}`,
     'Signature': `${profile.first_name} ${profile.last_name}`,
     'Name': `${profile.first_name} ${profile.last_name}`,
+    'Are you legally authorized to work': profile.work_authorization || 'Yes',
+    'Are you legally authorized to work in the United States': profile.work_authorization || 'Yes',
+    'Will you now or in the future require sponsorship': profile.visa_sponsorship || 'No',
+    'Will you now, or in the future, require sponsorship': profile.visa_sponsorship || 'No',
     'What is your desired salary?': 'Open to discussion',
     'Desired salary': 'Open to discussion',
     ...qaOverrides,
@@ -252,7 +273,7 @@ function buildDataPrompt(
   parts.push('--- GENERAL RULES ---');
   parts.push(`Work Authorization → ${profile.work_authorization}`);
   parts.push(`Visa Sponsorship → ${profile.visa_sponsorship}`);
-  parts.push('For self-identification: Gender → select "Male". Race/Ethnicity → select "Asian (Not Hispanic or Latino)". Veteran Status → select "I am not a protected veteran". Disability → select "I do not wish to answer".');
+  parts.push(`For self-identification: Gender → select "${profile.gender || 'Male'}". Race/Ethnicity → select "${profile.race_ethnicity || 'Asian (Not Hispanic or Latino)'}". Veteran Status → select "${profile.veteran_status || 'I am not a protected veteran'}". Disability → select "${profile.disability_status || "No, I Don't Have A Disability"}".`);
   parts.push('For any question not listed above, select the most reasonable/common answer.');
   parts.push('DROPDOWN TECHNIQUE: After clicking a dropdown, ALWAYS TYPE your desired answer first (e.g. "No", "Yes", "Male", "Website") to filter the list. If a matching option appears, click it. If typing does not produce a match, click whitespace to close the dropdown, then re-click it and try typing a shorter keyword. The popup menu that appears after clicking a dropdown ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions. NEVER use arrow keys inside dropdowns. NEVER use mouse scroll inside dropdowns.');
   parts.push('NESTED DROPDOWNS: Some dropdowns have sub-menus. After selecting a category (e.g. "Website"), a second list appears with specific options (e.g. "workday.com"). Select the sub-option. Do NOT click any back arrow or "\u2190 Category" button — that navigates backwards.');

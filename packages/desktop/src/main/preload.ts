@@ -1,14 +1,10 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import { IPC } from '../shared/types';
-import type { UserProfile, AppSettings, ApplicationRecord, ProgressEvent } from '../shared/types';
+import type { UserProfile, ApplicationRecord, ProgressEvent, AuthSession, SignInResult } from '../shared/types';
 
 const api = {
   getProfile: (): Promise<UserProfile | null> => ipcRenderer.invoke(IPC.GET_PROFILE),
   saveProfile: (profile: UserProfile): Promise<void> => ipcRenderer.invoke(IPC.SAVE_PROFILE, profile),
-
-  getSettings: (): Promise<AppSettings> => ipcRenderer.invoke(IPC.GET_SETTINGS),
-  saveSettings: (settings: AppSettings): Promise<void> =>
-    ipcRenderer.invoke(IPC.SAVE_SETTINGS, settings),
 
   selectResume: (): Promise<string | null> => ipcRenderer.invoke(IPC.SELECT_RESUME),
   getResumePath: (): Promise<string | null> => ipcRenderer.invoke(IPC.GET_RESUME_PATH),
@@ -28,8 +24,12 @@ const api = {
   onProgress: (callback: (event: ProgressEvent) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, data: ProgressEvent) => callback(data);
     ipcRenderer.on(IPC.PROGRESS, handler);
-    return () => ipcRenderer.removeListener(IPC.PROGRESS, handler);
+    return () => { ipcRenderer.removeListener(IPC.PROGRESS, handler); };
   },
+
+  signInWithGoogle: (): Promise<SignInResult> => ipcRenderer.invoke(IPC.SIGN_IN_GOOGLE),
+  signOut: (): Promise<void> => ipcRenderer.invoke(IPC.SIGN_OUT),
+  getSession: (): Promise<AuthSession | null> => ipcRenderer.invoke(IPC.GET_SESSION),
 };
 
 contextBridge.exposeInMainWorld('ghosthands', api);
