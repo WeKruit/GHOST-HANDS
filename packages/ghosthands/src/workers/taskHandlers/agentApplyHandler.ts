@@ -161,27 +161,25 @@ export class AgentApplyHandler implements TaskHandler {
               logger.info('[Agent] RESULT', { step: stepCount, tool: tr.toolName || tr.name || 'unknown', result: resultStr });
             }
 
-            // Log running metrics from stagehand (definitive source of truth)
+            // Log running cost from act+observe sub-calls (stagehandMetrics).
+            // Agent planner tokens are NOT available mid-run — they only get
+            // reported after execute() returns via result.totalUsage.
+            // So the running cost shown here is a LOWER BOUND (sub-calls only).
             const currentMetrics = snapshotAllMetrics(stagehand);
-            const deltaFromStart = {
-              agentIn: currentMetrics.agentPrompt - metricsBefore.agentPrompt,
-              agentOut: currentMetrics.agentCompletion - metricsBefore.agentCompletion,
-              actIn: currentMetrics.actPrompt - metricsBefore.actPrompt,
-              actOut: currentMetrics.actCompletion - metricsBefore.actCompletion,
-              observeIn: currentMetrics.observePrompt - metricsBefore.observePrompt,
-              observeOut: currentMetrics.observeCompletion - metricsBefore.observeCompletion,
-            };
-            const totalIn = deltaFromStart.agentIn + deltaFromStart.actIn + deltaFromStart.observeIn;
-            const totalOut = deltaFromStart.agentOut + deltaFromStart.actOut + deltaFromStart.observeOut;
-            const runningCost = totalIn * (costPerMInput / 1_000_000) + totalOut * (costPerMOutput / 1_000_000);
-            logger.info('[Agent] Running cost', {
+            const actIn = currentMetrics.actPrompt - metricsBefore.actPrompt;
+            const actOut = currentMetrics.actCompletion - metricsBefore.actCompletion;
+            const obsIn = currentMetrics.observePrompt - metricsBefore.observePrompt;
+            const obsOut = currentMetrics.observeCompletion - metricsBefore.observeCompletion;
+            const subCallIn = actIn + obsIn;
+            const subCallOut = actOut + obsOut;
+            const subCallCost = subCallIn * (costPerMInput / 1_000_000) + subCallOut * (costPerMOutput / 1_000_000);
+            logger.info('[Agent] Running cost (sub-calls only, planner not yet available)', {
               step: stepCount,
-              agentIO: `${deltaFromStart.agentIn}/${deltaFromStart.agentOut}`,
-              actIO: `${deltaFromStart.actIn}/${deltaFromStart.actOut}`,
-              observeIO: `${deltaFromStart.observeIn}/${deltaFromStart.observeOut}`,
-              totalIn,
-              totalOut,
-              runningCostUsd: runningCost.toFixed(4),
+              actIO: `${actIn}/${actOut}`,
+              observeIO: `${obsIn}/${obsOut}`,
+              subCallIn,
+              subCallOut,
+              subCallCostUsd: subCallCost.toFixed(4),
             });
 
             // Update progress based on step count
@@ -196,16 +194,33 @@ export class AgentApplyHandler implements TaskHandler {
         },
       });
 
-      // Use stagehand.stagehandMetrics for definitive totals (includes all LLM calls)
+      // ── Token accounting ──────────────────────────────────────────────
+      // Agent planner tokens (from Vercel AI SDK's generateText totalUsage)
+      // come from result.usage — these are ONLY the planner's own LLM calls.
+      // Act/observe sub-call tokens are separate API calls tracked independently
+      // in stagehandMetrics. They do NOT overlap, so we SUM all three.
+      //
+      // stagehandMetrics.agentPromptTokens is also updated from result.totalUsage
+      // at the end of execute(), so it should match result.usage.input_tokens.
+
+      // 1. Agent planner tokens from result.usage (most reliable source)
+      const agentPlannerIn = result.usage?.input_tokens || 0;
+      const agentPlannerOut = result.usage?.output_tokens || 0;
+
+      // 2. Act/observe sub-call tokens from stagehandMetrics
       const metricsAfter = snapshotAllMetrics(stagehand);
-      const agentInDelta = metricsAfter.agentPrompt - metricsBefore.agentPrompt;
-      const agentOutDelta = metricsAfter.agentCompletion - metricsBefore.agentCompletion;
       const actInDelta = metricsAfter.actPrompt - metricsBefore.actPrompt;
       const actOutDelta = metricsAfter.actCompletion - metricsBefore.actCompletion;
       const observeInDelta = metricsAfter.observePrompt - metricsBefore.observePrompt;
       const observeOutDelta = metricsAfter.observeCompletion - metricsBefore.observeCompletion;
-      const totalIn = agentInDelta + actInDelta + observeInDelta;
-      const totalOut = agentOutDelta + actOutDelta + observeOutDelta;
+
+      // 3. Cross-check: stagehandMetrics.agent should match result.usage
+      const agentMetricsIn = metricsAfter.agentPrompt - metricsBefore.agentPrompt;
+      const agentMetricsOut = metricsAfter.agentCompletion - metricsBefore.agentCompletion;
+
+      // 4. Total = planner + act + observe (no overlap)
+      const totalIn = agentPlannerIn + actInDelta + observeInDelta;
+      const totalOut = agentPlannerOut + actOutDelta + observeOutDelta;
       const inputCost = totalIn * (costPerMInput / 1_000_000);
       const outputCost = totalOut * (costPerMOutput / 1_000_000);
       const totalCostUsd = inputCost + outputCost;
@@ -218,23 +233,20 @@ export class AgentApplyHandler implements TaskHandler {
         outputCost,
       });
 
-      // Also check for Stagehand's result.usage (snake_case from v3AgentHandler)
-      const resultUsage = result.usage;
-
       logger.info('[AgentApply] Agent finished', {
         success: result.success,
         completed: result.completed,
         message: result.message,
         steps: stepCount,
         actions: result.actions?.length || 0,
-        agentIO: `${agentInDelta} in / ${agentOutDelta} out`,
+        plannerIO: `${agentPlannerIn} in / ${agentPlannerOut} out`,
+        plannerMetricsIO: `${agentMetricsIn} in / ${agentMetricsOut} out`,
         actIO: `${actInDelta} in / ${actOutDelta} out`,
         observeIO: `${observeInDelta} in / ${observeOutDelta} out`,
         totalIn,
         totalOut,
         costUsd: totalCostUsd.toFixed(4),
         model: resolvedModel?.alias || 'unknown',
-        ...(resultUsage ? { stagehandReportedUsage: resultUsage } : {}),
       });
 
       await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
@@ -250,8 +262,8 @@ export class AgentApplyHandler implements TaskHandler {
           actions: result.actions?.length || 0,
           completed: result.completed,
           cost: {
-            agentIn: agentInDelta,
-            agentOut: agentOutDelta,
+            plannerIn: agentPlannerIn,
+            plannerOut: agentPlannerOut,
             actIn: actInDelta,
             actOut: actOutDelta,
             observeIn: observeInDelta,
@@ -264,14 +276,18 @@ export class AgentApplyHandler implements TaskHandler {
         },
       };
     } catch (error) {
-      // Still capture cost even on failure
+      // Still capture cost even on failure — on error, agent planner tokens
+      // may not be available (result.totalUsage not returned), so we use
+      // stagehandMetrics which may or may not have been updated.
       const metricsAfter = snapshotAllMetrics(stagehand);
-      const totalIn = (metricsAfter.agentPrompt - metricsBefore.agentPrompt) +
-        (metricsAfter.actPrompt - metricsBefore.actPrompt) +
-        (metricsAfter.observePrompt - metricsBefore.observePrompt);
-      const totalOut = (metricsAfter.agentCompletion - metricsBefore.agentCompletion) +
-        (metricsAfter.actCompletion - metricsBefore.actCompletion) +
-        (metricsAfter.observeCompletion - metricsBefore.observeCompletion);
+      const agentIn = metricsAfter.agentPrompt - metricsBefore.agentPrompt;
+      const agentOut = metricsAfter.agentCompletion - metricsBefore.agentCompletion;
+      const actIn = metricsAfter.actPrompt - metricsBefore.actPrompt;
+      const actOut = metricsAfter.actCompletion - metricsBefore.actCompletion;
+      const obsIn = metricsAfter.observePrompt - metricsBefore.observePrompt;
+      const obsOut = metricsAfter.observeCompletion - metricsBefore.observeCompletion;
+      const totalIn = agentIn + actIn + obsIn;
+      const totalOut = agentOut + actOut + obsOut;
       const totalCostUsd = totalIn * (costPerMInput / 1_000_000) + totalOut * (costPerMOutput / 1_000_000);
 
       if (totalIn > 0 || totalOut > 0) {
@@ -286,6 +302,9 @@ export class AgentApplyHandler implements TaskHandler {
       logger.error('[AgentApply] Agent execution failed', {
         error: (error as Error).message,
         steps: stepCount,
+        plannerIO: `${agentIn}/${agentOut}`,
+        actIO: `${actIn}/${actOut}`,
+        observeIO: `${obsIn}/${obsOut}`,
         totalIn,
         totalOut,
         costUsd: totalCostUsd.toFixed(4),
@@ -298,7 +317,7 @@ export class AgentApplyHandler implements TaskHandler {
         data: {
           platform: platformConfig.platformId,
           steps: stepCount,
-          cost: { totalIn, totalOut, costUsd: totalCostUsd },
+          cost: { plannerIn: agentIn, plannerOut: agentOut, actIn, actOut, observeIn: obsIn, observeOut: obsOut, totalIn, totalOut, costUsd: totalCostUsd },
         },
       };
     }
@@ -334,13 +353,24 @@ function buildSystemPrompt(
   lines.push(`  act("type \\"${profile.first_name}\\" into the First Name field")`);
   lines.push('');
   lines.push('fillForm: Use for filling multiple text fields at once. Each field needs {action, value}.');
-  lines.push('extract: Use to read the page and understand what fields/buttons are present.');
-  lines.push('screenshot: Take a screenshot to see the visual layout when confused.');
+  lines.push('observe: Use to identify interactive elements and understand page structure via the accessibility tree. This is your GO-TO tool for understanding the page. Use observe BEFORE act when you are unsure what elements exist.');
+  lines.push('extract: Use to read text content from the page.');
+  lines.push('screenshot: LAST RESORT ONLY. Screenshots cost 100x more tokens than observe/extract. NEVER use screenshot unless observe AND extract both failed to give you the information you need. The ONLY valid uses for screenshot are: visual-only elements with no accessibility labels, CAPTCHAs, or image-based layouts where the accessibility tree is empty.');
+  lines.push('');
+  lines.push('TOOL PRIORITY (always follow this order):');
+  lines.push('  1. observe / ariaTree — to understand page structure and find elements');
+  lines.push('  2. extract — to read text content');
+  lines.push('  3. act / fillForm — to interact with elements');
+  lines.push('  4. screenshot — ABSOLUTE LAST RESORT, only after observe+extract failed');
+  lines.push('');
+  lines.push('NEVER take a screenshot to "confirm" an action succeeded. Use observe instead.');
+  lines.push('NEVER take a screenshot to "see what the page looks like". Use observe instead.');
   lines.push('');
   lines.push('IF AN ACT CALL FAILS:');
-  lines.push('1. Take a screenshot to see what is on screen');
-  lines.push('2. Use extract or ariaTree to understand the page structure');
-  lines.push('3. Retry with a MORE SPECIFIC description referencing nearby text, heading, or section name');
+  lines.push('1. Use observe to get the accessibility tree and find the correct element');
+  lines.push('2. If observe returns nothing useful, try extract');
+  lines.push('3. ONLY if both observe and extract failed, take a screenshot as a last resort');
+  lines.push('4. Retry with a MORE SPECIFIC description referencing nearby text, heading, or section name');
   lines.push('');
 
   // ── Credentials (high priority — near the top) ──
@@ -417,7 +447,7 @@ function buildSystemPrompt(
 
   // ── Rules (concise) ──
   lines.push('RULES:');
-  lines.push('- Log in or create account using the exact credentials above.');
+  lines.push('- ALWAYS prefer "Sign in with Google" or "Continue with Google" when available. Only use email/password if Google sign-in is not an option.');
   lines.push('- Fill ALL fields with ACTUAL DATA values, never field labels.');
   lines.push('- For dropdowns, click to open, then select the closest match.');
   lines.push('- For "How did you hear?" → "LinkedIn" or "Online Job Board".');
@@ -431,10 +461,11 @@ function buildSystemPrompt(
     lines.push('');
     lines.push('WORKDAY TIPS:');
     lines.push('- Multi-step form with progress bar at top.');
-    lines.push('- Dropdowns are searchable — click field, type to filter, then select.');
+    lines.push('- DROPDOWNS: NEVER scroll through dropdown options. ALWAYS type your desired value into the dropdown search field to filter results, then select from the filtered list. Dropdowns use virtual rendering — only ~20 options are visible at a time, so scrolling will miss most options.');
     lines.push('- If "Create Account" page appears, check for "Already have an account? Sign In" link at the bottom.');
     lines.push('- Custom ARIA widgets: if fillForm fails on a field, use act instead.');
     lines.push('- MULTISELECT PILLS: The × button on selected pills is hidden from the accessibility tree. To remove a selected value, click/focus the pill (the option element), then press Delete or Backspace. Do NOT try to click the × icon directly — it will always fail.');
+    lines.push('- RADIO BUTTONS: Workday hides the actual <input> and uses custom styled elements. If clicking a radio button reports success but nothing changes, click the LABEL text next to it instead. For example: act("click the label text \\"No\\" next to the radio button") rather than act("click the No radio button").');
   }
 
   return lines.join('\n');

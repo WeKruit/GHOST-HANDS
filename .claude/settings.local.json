@@ -11,7 +11,8 @@
       "Bash(npx patch-package:*)",
       "Bash(bun patch:*)",
       "Bash(done)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(grep:*)"
     ]
   }
 }
