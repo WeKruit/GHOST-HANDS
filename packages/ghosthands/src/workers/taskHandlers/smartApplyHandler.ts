@@ -4,7 +4,6 @@ import { z } from 'zod';
 import type { TaskHandler, TaskContext, TaskResult, ValidationResult } from './types.js';
 import { detectPlatformFromUrl } from './platforms/index.js';
 import { LayeredOrchestrator } from './LayeredOrchestrator.js';
-import { BlockerDetector } from '../../detection/BlockerDetector.js';
 
 /**
  * Zod schema for SmartApplyHandler input validation.
@@ -77,7 +76,6 @@ export class SmartApplyHandler implements TaskHandler {
       config,
       costTracker,
       progress,
-      blockerDetector: new BlockerDetector(),
     });
 
     const result = await orchestrator.run({

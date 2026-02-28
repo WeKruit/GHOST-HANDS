@@ -50,20 +50,44 @@ export class ApplyHandler implements TaskHandler {
       return { success: false, error: `Action failed: ${actResult.message}` };
     }
 
-    // Attempt to extract final page state for confirmation
+    // Extract page state to determine actual submission outcome
+    const PageStateSchema = z.object({
+      page_type: z.enum(['confirmation', 'review', 'in_progress', 'unknown']),
+      evidence: z.string().optional(),
+    });
+
+    let pageState: z.infer<typeof PageStateSchema> | null = null;
     try {
-      const PageStateSchema = z.object({ page_type: z.string() });
-      const pageState = await adapter.extract(
-        'Is this a confirmation page showing the application was submitted? Or is the form still in progress? Return page_type as "confirmation", "review", or "in_progress".',
+      pageState = await adapter.extract(
+        'Look at the current page. Classify it as one of: "confirmation" (application was submitted — you see a thank you message, confirmation number, or success notice), "review" (application summary shown with a final Submit/Confirm button the user must click), "in_progress" (form fields still visible, application is not complete), "unknown" (cannot determine). Also provide brief evidence for your classification.',
         PageStateSchema,
       );
-      if (pageState?.page_type === 'confirmation') {
-        return { success: true, data: { message: 'Application submitted successfully', page_type: 'confirmation' } };
-      }
     } catch {
-      // Extraction is best-effort for one-shot handler
+      // Extraction failed — treat as unknown
     }
 
-    return { success: true, data: { message: 'Applied via single-shot agent' } };
+    const page_type = pageState?.page_type ?? 'unknown';
+
+    if (page_type === 'confirmation') {
+      return { success: true, data: { message: 'Application submitted successfully', page_type, evidence: pageState?.evidence } };
+    }
+
+    if (page_type === 'review') {
+      return {
+        success: false,
+        awaitingUserReview: true,
+        keepBrowserOpen: true,
+        data: { message: 'Application reached review page — awaiting user submission', page_type, evidence: pageState?.evidence },
+      };
+    }
+
+    // in_progress or unknown — the application was NOT submitted
+    return {
+      success: false,
+      error: page_type === 'in_progress'
+        ? 'Application form still in progress after agent execution'
+        : 'Could not confirm application was submitted',
+      data: { page_type, evidence: pageState?.evidence },
+    };
   }
 }
