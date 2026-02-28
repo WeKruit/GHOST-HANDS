@@ -12,7 +12,7 @@ import { ProgressTracker, ProgressStep } from './progressTracker.js';
 import { loadModelConfig } from '../config/models.js';
 import { taskHandlerRegistry } from './taskHandlers/registry.js';
 import { callbackNotifier } from './callbackNotifier.js';
-import type { TaskContext, TaskResult } from './taskHandlers/types.js';
+import type { TaskHandler, TaskContext, TaskResult } from './taskHandlers/types.js';
 import { SessionManager } from '../sessions/SessionManager.js';
 import { BlockerDetector, type BlockerResult, type BlockerType } from '../detection/BlockerDetector.js';
 import { ExecutionEngine } from '../engine/ExecutionEngine.js';
@@ -23,7 +23,9 @@ import { StagehandObserver } from '../engine/StagehandObserver.js';
 import type { MagnitudeAdapter } from '../adapters/magnitude.js';
 import { ThoughtThrottle, JOB_EVENT_TYPES } from '../events/JobEventTypes.js';
 import { ResumeDownloader, type ResumeRef } from './resumeDownloader.js';
+import { ResumeProfileLoader } from '../db/resumeProfileLoader.js';
 import { getLogger } from '../monitoring/logger.js';
+import { AgentApplyHandler } from './taskHandlers/agentApplyHandler.js';
 
 const logger = getLogger({ service: 'job-executor' });
 
@@ -86,6 +88,7 @@ const BLOCKER_CONFIDENCE_THRESHOLD = 0.6;
 const MAX_POST_RESUME_CHECKS = 3;
 const BLOCKER_CHECK_INTERVAL_MS = 15_000; // Minimum interval between action-triggered blocker checks
 const PERIODIC_BLOCKER_CHECK_MS = 30_000; // Periodic timer-based blocker check interval
+const BLOCKER_CHECK_TIMEOUT_MS = 20_000; // Timeout for any single blocker check call
 const CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK = 3; // Check for blockers after this many consecutive action failures
 
 /** Error codes that should trigger HITL instead of immediate retry */
@@ -316,8 +319,22 @@ export class JobExecutor {
         });
       }
 
-      // 2. Resolve task handler
-      const handler = taskHandlerRegistry.getOrThrow(job.job_type);
+      // 1b. Auto-populate user_data from VALET's resumes table if not provided
+      await this.enrichJobFromResumeProfile(job);
+
+      // 2. Resolve task handler — execution_mode can override the default handler
+      let handler: TaskHandler = taskHandlerRegistry.getOrThrow(job.job_type);
+      if (job.execution_mode === 'agent_apply') {
+        handler = new AgentApplyHandler();
+        logger.info('execution_mode override: using AgentApplyHandler', { jobId: job.id });
+      } else if (job.execution_mode === 'smart_apply') {
+        // SmartApplyHandler is already registered in the registry as 'smart_apply'.
+        // If the job_type doesn't match, override with SmartApplyHandler.
+        if (handler.type !== 'smart_apply') {
+          handler = taskHandlerRegistry.getOrThrow('smart_apply');
+          logger.info('execution_mode override: using SmartApplyHandler', { jobId: job.id });
+        }
+      }
 
       // 3. Validate input if handler supports it
       if (handler.validate) {
@@ -381,7 +398,10 @@ export class JobExecutor {
           await this.logJobEvent(job.id, JOB_EVENT_TYPES.RESUME_DOWNLOAD_FAILED, {
             error: errMsg,
           });
-          throw new Error(`Resume download failed: ${errMsg}`);
+          logger.warn('Resume download failed, continuing without file', {
+            jobId: job.id,
+            error: errMsg,
+          });
         }
       }
 
@@ -404,6 +424,7 @@ export class JobExecutor {
       }
 
       // 7. Create and start adapter
+      logger.debug('[exec] Step 7: Creating adapter', { jobId: job.id });
       const adapterType = (process.env.GH_BROWSER_ENGINE || 'magnitude') as AdapterType;
       adapter = createAdapter(adapterType);
       this._activeAdapter = adapter;
@@ -415,6 +436,32 @@ export class JobExecutor {
         ...(storedSession ? { storageState: storedSession } : {}),
         browserOptions: { headless },
       });
+
+      logger.debug('[exec] Step 7: Adapter started, waiting for page load', { jobId: job.id, adapterType });
+
+      // 7b. Wait for page to be ready before any interactions (SPA pages like Greenhouse need this)
+      try {
+        await Promise.race([
+          adapter.page.waitForLoadState('domcontentloaded'),
+          new Promise((resolve) => setTimeout(resolve, 10_000)),
+        ]);
+        logger.debug('[exec] Step 7: Page domcontentloaded', { jobId: job.id });
+      } catch {
+        logger.debug('[exec] Step 7: Page load wait skipped', { jobId: job.id });
+      }
+
+      // 7c. For SPA platforms (non-Workday), wait for networkidle to let React/JS finish rendering
+      if (platform !== 'workday') {
+        try {
+          await Promise.race([
+            adapter.page.waitForLoadState('networkidle'),
+            new Promise((resolve) => setTimeout(resolve, 15_000)),
+          ]);
+          logger.debug('[exec] Step 7c: Page networkidle (SPA ready)', { jobId: job.id });
+        } catch {
+          logger.debug('[exec] Step 7c: networkidle wait skipped (timeout ok)', { jobId: job.id });
+        }
+      }
 
       // 7a. Attach StagehandObserver for enriched blocker detection (optional)
       if (adapter.type === 'magnitude' && 'setObserver' in adapter) {
@@ -442,11 +489,13 @@ export class JobExecutor {
         }
       }
 
+      logger.debug('[exec] Step 8: Registering credentials', { jobId: job.id, hasCredentials: !!credentials });
       // 8. Register credentials if available
       if (credentials) {
         adapter.registerCredentials(credentials);
       }
 
+      logger.debug('[exec] Step 8.5: Injecting browser session', { jobId: job.id, hasSessionManager: !!this.sessionManager });
       // 8.5. Inject stored browser session (e.g. Google auth cookies)
       if (this.sessionManager) try {
         // Load Google session for Sign-in-with-Google flows
@@ -479,13 +528,17 @@ export class JobExecutor {
         // Reload page after cookie injection so Workday SSO picks up the Google session
         if (googleSessionInjected) {
           getLogger().info('Reloading page after session injection');
+          logger.debug('[exec] Step 8.5: Reloading page (networkidle)...', { jobId: job.id });
           await adapter.page.reload({ waitUntil: 'networkidle' }).catch(() => {});
           await adapter.page.waitForTimeout(2000);
+          logger.debug('[exec] Step 8.5: Page reload complete', { jobId: job.id });
         }
       } catch (err) {
         // Session injection failure is non-fatal — worker can still try fresh login
         getLogger().warn('Session injection failed (non-fatal)', { error: err instanceof Error ? err.message : String(err) });
       }
+
+      logger.debug('[exec] Step 8.5: Session injection done', { jobId: job.id });
 
       // 8a. Auto-attach resume to file inputs via Playwright filechooser event.
       // This covers ALL execution paths (handlers, cookbook, crash recovery).
@@ -501,13 +554,35 @@ export class JobExecutor {
         adapter.page.on('filechooser', fileChooserHandler);
       }
 
-      // 8.6. Check for blockers after initial page navigation
-      const initiallyBlocked = await this.checkForBlockers(job, adapter, costTracker);
-      if (initiallyBlocked) {
-        throw new Error('Page blocked after initial navigation and HITL resolution failed');
+      // 8.6. Check for blockers after initial page navigation (with timeout)
+      // Skip for non-Workday platforms — SPA pages (Greenhouse) cause page.evaluate() to hang
+      const skipInitialBlockerCheck = platform !== 'workday';
+      if (skipInitialBlockerCheck) {
+        logger.debug('[exec] Step 8.6: Skipping initial blocker check (non-workday platform)', { jobId: job.id, platform });
+      } else {
+        logger.debug('[exec] Step 8.6: Checking for blockers', { jobId: job.id });
+        let initiallyBlocked = false;
+        try {
+          initiallyBlocked = await Promise.race([
+            this.checkForBlockers(job, adapter, costTracker),
+            new Promise<false>((resolve) =>
+              setTimeout(() => {
+                logger.warn('[exec] Step 8.6: Blocker check timed out, skipping', { jobId: job.id });
+                resolve(false);
+              }, BLOCKER_CHECK_TIMEOUT_MS),
+            ),
+          ]);
+        } catch (err) {
+          logger.warn('[exec] Step 8.6: Blocker check error, skipping', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+        }
+        if (initiallyBlocked) {
+          throw new Error('Page blocked after initial navigation and HITL resolution failed');
+        }
+        logger.debug('[exec] Step 8.6: Blocker check passed', { jobId: job.id });
       }
 
       // 9. Try ExecutionEngine (cookbook replay) before Magnitude handler
+      logger.debug('[exec] Step 9: Trying cookbook engine', { jobId: job.id });
       await progress.setStep(ProgressStep.NAVIGATING);
 
       const logEventFn = (eventType: string, metadata: Record<string, any>) =>
@@ -528,6 +603,8 @@ export class JobExecutor {
         logEvent: logEventFn,
         resumeFilePath,
       });
+
+      logger.debug('[exec] Step 9: Engine result', { jobId: job.id, success: engineResult.success, mode: engineResult.mode });
 
       // Track TraceRecorder for Magnitude path (manual training)
       let traceRecorder: TraceRecorder | null = null;
@@ -667,19 +744,26 @@ export class JobExecutor {
       });
 
       // Start periodic blocker check timer (catches blockers even when adapter is stuck)
-      blockerCheckInterval = setInterval(async () => {
-        if (!adapter || adapter.isPaused?.()) return; // Don't check while paused
-        try {
-          const blocked = await this.checkForBlockers(job, adapter, costTracker);
-          if (blocked) {
-            // Already handled internally — the job will be paused
+      // Only for workday_apply — SPA platforms (Greenhouse) cause page.evaluate() to hang,
+      // creating contention with Magnitude's own evaluate calls
+      if (handler.type === 'workday_apply') {
+        blockerCheckInterval = setInterval(async () => {
+          if (!adapter || adapter.isPaused?.()) return; // Don't check while paused
+          try {
+            await Promise.race([
+              this.checkForBlockers(job, adapter, costTracker),
+              new Promise<false>((resolve) => setTimeout(() => resolve(false), BLOCKER_CHECK_TIMEOUT_MS)),
+            ]);
+          } catch {
+            // Non-fatal
           }
-        } catch {
-          // Non-fatal
-        }
-      }, PERIODIC_BLOCKER_CHECK_MS);
+        }, PERIODIC_BLOCKER_CHECK_MS);
+      } else {
+        logger.debug('[exec] Periodic blocker checks disabled for non-workday handler', { jobId: job.id, handler: handler.type });
+      }
 
       // 10. Build TaskContext and delegate to handler (with crash recovery)
+      logger.debug('[exec] Step 10: Delegating to handler', { jobId: job.id, handler: handler.type, timeoutSeconds: job.timeout_seconds });
       const timeoutMs = job.timeout_seconds * 1000;
       await this.updateJobStatus(job.id, 'running', `Executing ${handler.type} handler (Magnitude mode)`);
 
@@ -698,10 +782,12 @@ export class JobExecutor {
         };
 
         try {
+          logger.debug('[exec] Step 10: Calling handler.execute()', { jobId: job.id, handler: handler.type, attempt: crashRecoveryAttempts });
           taskResult = await Promise.race([
             handler.execute(ctx),
             this.createTimeout(timeoutMs),
           ]);
+          logger.debug('[exec] Step 10: Handler returned', { jobId: job.id, success: taskResult?.success });
           break; // Success -- exit retry loop
         } catch (execError) {
           const execMsg = execError instanceof Error ? execError.message : String(execError);
@@ -1230,7 +1316,8 @@ export class JobExecutor {
       }
     });
 
-    adapter.on('actionStarted', async (action: { variant: string }) => {
+    adapter.on('actionStarted', (action: { variant: string }) => {
+      logger.debug('[magnitude] actionStarted', { variant: action.variant, jobId: job.id });
       blockerState.consecutiveFailures++;
       costTracker.recordAction(); // throws ActionLimitExceededError if over limit
       costTracker.recordModeStep('magnitude');
@@ -1240,16 +1327,14 @@ export class JobExecutor {
         action_count: costTracker.getSnapshot().actionCount,
       });
 
+      // Fire-and-forget — never await in event handlers (blocks Magnitude's page.evaluate)
       if (blockerState.consecutiveFailures >= CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK && adapter) {
-        try {
-          await this.checkForBlockers(job, adapter, costTracker);
-        } catch {
-          // Non-fatal
-        }
+        this.checkForBlockers(job, adapter, costTracker).catch(() => {});
       }
     });
 
-    adapter.on('actionDone', async (action: { variant: string }) => {
+    adapter.on('actionDone', (action: { variant: string }) => {
+      logger.debug('[magnitude] actionDone', { variant: action.variant, jobId: job.id });
       progress.onActionDone(action.variant);
       blockerState.consecutiveFailures = 0;
       this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
@@ -1260,27 +1345,29 @@ export class JobExecutor {
       const now = Date.now();
       if (now - blockerState.lastCheckTime >= BLOCKER_CHECK_INTERVAL_MS) {
         blockerState.lastCheckTime = now;
-        try {
-          const currentUrl = await adapter.getCurrentUrl();
-          if (currentUrl !== blockerState.lastKnownUrl) {
-            blockerState.lastKnownUrl = currentUrl;
-            try {
-              const currentDomain = new URL(currentUrl).hostname;
-              if (currentDomain !== targetDomain) {
-                await this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
-                  from_domain: targetDomain,
-                  to_url: currentUrl,
-                });
+        // Fire-and-forget — never await in event handlers (blocks Magnitude's page.evaluate)
+        (async () => {
+          try {
+            const currentUrl = await adapter.getCurrentUrl();
+            if (currentUrl !== blockerState.lastKnownUrl) {
+              blockerState.lastKnownUrl = currentUrl;
+              try {
+                const currentDomain = new URL(currentUrl).hostname;
+                if (currentDomain !== targetDomain) {
+                  this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
+                    from_domain: targetDomain,
+                    to_url: currentUrl,
+                  });
+                }
+              } catch {
+                // Invalid URL — skip domain comparison
               }
-            } catch {
-              // Invalid URL — skip domain comparison
             }
+            this.checkForBlockers(job, adapter, costTracker).catch(() => {});
+          } catch {
+            // Detection errors are non-fatal
           }
-          await this.checkForBlockers(job, adapter, costTracker);
-        } catch (err) {
-          if ((err as Error).message?.includes('Blocker detected')) throw err;
-          // Detection errors are non-fatal
-        }
+        })();
       }
     });
 
@@ -1776,6 +1863,49 @@ export class JobExecutor {
     } catch (err) {
       // Event logging failures should not crash the job
       getLogger().warn('Event log failed', { eventType, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  // --- Resume profile enrichment ---
+
+  /**
+   * If the job has no user_data, attempt to load it from VALET's `resumes` table.
+   * Also sets up resume_ref from the resume's file_key if not already provided.
+   * This is backwards-compatible: if user_data is already present, this is a no-op.
+   */
+  private async enrichJobFromResumeProfile(job: AutomationJob): Promise<void> {
+    const hasUserData = job.input_data.user_data
+      && typeof job.input_data.user_data === 'object'
+      && Object.keys(job.input_data.user_data).length > 0;
+
+    if (hasUserData) return;
+
+    try {
+      const loader = new ResumeProfileLoader(this.supabase);
+      const result = await loader.loadForUser(job.user_id);
+
+      job.input_data.user_data = result.profile;
+
+      if (!job.resume_ref && result.fileKey) {
+        (job as any).resume_ref = { storage_path: result.fileKey };
+      }
+
+      await this.logJobEvent(job.id, 'resume_profile_loaded', {
+        resume_id: result.resumeId,
+        user_id: result.userId,
+        confidence: result.parsingConfidence,
+      });
+
+      getLogger().info('Auto-populated user_data from VALET resumes table', {
+        jobId: job.id,
+        resumeId: result.resumeId,
+      });
+    } catch (err) {
+      getLogger().warn('Failed to auto-populate user_data from resumes table', {
+        jobId: job.id,
+        userId: job.user_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 

@@ -289,21 +289,33 @@ export class BlockerDetector {
    * Run DOM-based detection (selector patterns + text patterns).
    */
   private async runDOMDetection(page: Page): Promise<BlockerResult[]> {
+    const DOM_EVAL_TIMEOUT_MS = 10_000;
     const matches: BlockerResult[] = [];
 
-    // 1. Check selector-based patterns via page.evaluate
-    const selectorResults = await page.evaluate((patterns: { selector: string; type: string; confidence: number }[]) => {
-      const found: { selector: string; type: string; confidence: number; visible: boolean }[] = [];
-      for (const p of patterns) {
-        const el = document.querySelector(p.selector);
-        if (el) {
-          const rect = el.getBoundingClientRect();
-          const visible = rect.width > 0 && rect.height > 0;
-          found.push({ ...p, visible });
-        }
-      }
-      return found;
-    }, SELECTOR_PATTERNS.map(p => ({ selector: p.selector, type: p.type, confidence: p.confidence })));
+    // 1. Check selector-based patterns via page.evaluate (with timeout)
+    let selectorResults: { selector: string; type: string; confidence: number; visible: boolean }[] = [];
+    try {
+      selectorResults = await Promise.race([
+        page.evaluate((patterns: { selector: string; type: string; confidence: number }[]) => {
+          const found: { selector: string; type: string; confidence: number; visible: boolean }[] = [];
+          for (const p of patterns) {
+            const el = document.querySelector(p.selector);
+            if (el) {
+              const rect = el.getBoundingClientRect();
+              const visible = rect.width > 0 && rect.height > 0;
+              found.push({ ...p, visible });
+            }
+          }
+          return found;
+        }, SELECTOR_PATTERNS.map(p => ({ selector: p.selector, type: p.type, confidence: p.confidence }))),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('DOM selector evaluate timed out')), DOM_EVAL_TIMEOUT_MS),
+        ),
+      ]);
+    } catch {
+      // page.evaluate timed out or failed — skip DOM selector check
+      return matches;
+    }
 
     for (const result of selectorResults) {
       // Visible elements get full confidence; hidden ones get reduced
@@ -317,10 +329,21 @@ export class BlockerDetector {
       });
     }
 
-    // 2. Check text patterns against page body text
-    const bodyText = await page.evaluate(() => {
-      return document.body?.innerText?.substring(0, 5000) || '';
-    });
+    // 2. Check text patterns against page body text (with timeout)
+    let bodyText = '';
+    try {
+      bodyText = await Promise.race([
+        page.evaluate(() => {
+          return document.body?.innerText?.substring(0, 5000) || '';
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('DOM text evaluate timed out')), DOM_EVAL_TIMEOUT_MS),
+        ),
+      ]);
+    } catch {
+      // page.evaluate timed out or failed — skip text pattern check
+      return matches;
+    }
 
     for (const { type, pattern, confidence } of TEXT_PATTERNS) {
       if (pattern.test(bodyText)) {
@@ -345,9 +368,15 @@ export class BlockerDetector {
 
     let elements: ObservedElement[] | undefined;
     try {
-      elements = await adapter.observe(OBSERVE_INSTRUCTION);
+      const OBSERVE_TIMEOUT_MS = 15_000;
+      elements = await Promise.race([
+        adapter.observe(OBSERVE_INSTRUCTION),
+        new Promise<undefined>((_, reject) =>
+          setTimeout(() => reject(new Error('observe() timed out')), OBSERVE_TIMEOUT_MS),
+        ),
+      ]);
     } catch {
-      // observe() may fail if the page is in an unusual state; fall through
+      // observe() may fail or time out if the page is in an unusual state; fall through
       return null;
     }
 

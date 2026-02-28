@@ -82,7 +82,7 @@ services:
   # GhostHands Worker (default instance, no target routing)
   worker:
     image: ${ECR_IMAGE:-ghosthands:latest}
-    command: ["bun", "packages/ghosthands/src/workers/main.ts"]
+    command: ["bun", "packages/ghosthands/src/workers/workerLauncher.ts"]
     network_mode: host
     env_file: .env
     environment:
@@ -90,11 +90,9 @@ services:
       - GH_ENVIRONMENT=staging
       - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-1}
       - GH_WORKER_PORT=3101
-      - DISPLAY=:99
+      - GH_HEADLESS=false
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
       - SSL_CERT_DIR=/etc/ssl/certs
-    volumes:
-      - /tmp/.X11-unix:/tmp/.X11-unix:rw
     depends_on:
       api:
         condition: service_healthy

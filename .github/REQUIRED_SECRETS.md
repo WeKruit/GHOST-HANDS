@@ -36,7 +36,7 @@ aws ecr create-repository \
 
 | Secret | Description | Notes |
 |--------|-------------|-------|
-| `SANDBOX_SSH_KEY` | Private SSH key (PEM format) for EC2 access | Contents of `valet-worker.pem` |
+| `SANDBOX_SSH_KEY` | Private SSH key (PEM format) for EC2 access | Contents of `wekruit-atm-server.pem` |
 
 The key must be authorized on all ASG instances (via Launch Template user-data or AMI).
 Default SSH user: `ubuntu`.
@@ -90,7 +90,7 @@ gh secret set AWS_ACCESS_KEY_ID --body "AKIA..."
 gh secret set AWS_SECRET_ACCESS_KEY --body "..."
 
 # For multi-line secrets (SSH key)
-gh secret set SANDBOX_SSH_KEY < ~/.ssh/valet-worker.pem
+gh secret set SANDBOX_SSH_KEY < ~/.ssh/wekruit-atm-server.pem
 ```
 
 Or via GitHub UI: **Settings > Secrets and variables > Actions > New repository secret**

@@ -8,6 +8,8 @@ import { JobExecutor } from './JobExecutor.js';
 import { registerBuiltinHandlers } from './taskHandlers/index.js';
 import { getLogger } from '../monitoring/logger.js';
 import { fetchEc2InstanceId, fetchEc2Ip, completeLifecycleAction } from './asg-lifecycle.js';
+import { SessionManager } from '../sessions/SessionManager.js';
+import { createEncryptionFromEnv } from '../db/encryption.js';
 
 const logger = getLogger({ service: 'Worker' });
 
@@ -24,8 +26,14 @@ const logger = getLogger({ service: 'Worker' });
  *    so VALET/deploy.sh can check if it's safe to restart
  *
  * Job dispatch mode (JOB_DISPATCH_MODE env var):
- *   queue  → pg-boss consumer (new, requires VALET to enqueue via TaskQueueService)
- *   legacy → JobPoller with LISTEN/NOTIFY + polling (default)
+ *   queue  → pg-boss consumer. Requires VALET to have TASK_DISPATCH_MODE=queue and a
+ *            working pg-boss connection (session-mode Postgres). VALET enqueues via
+ *            TaskQueueService; pg-boss delivers to this consumer.
+ *   legacy → JobPoller with LISTEN/NOTIFY + polling (default). This is the correct
+ *            production mode. The poller picks up BOTH 'pending' and 'queued' statuses
+ *            (see migration 016 / PICKUP_SQL in JobPoller.ts), so it works regardless
+ *            of how VALET dispatched the job. Backward-compatible with any VALET
+ *            dispatch mode.
  */
 
 function parseWorkerId(): string {
@@ -55,6 +63,9 @@ function requireEnv(name: string): string {
 }
 
 async function main(): Promise<void> {
+  // GH uses JOB_DISPATCH_MODE; VALET uses TASK_DISPATCH_MODE — these are different env vars
+  // on different services. Legacy mode is backward-compatible and works regardless of
+  // VALET's dispatch mode because JobPoller picks up both 'pending' and 'queued' statuses.
   const dispatchMode = process.env.JOB_DISPATCH_MODE === 'queue' ? 'queue' : 'legacy';
   logger.info('Starting worker', { workerId: WORKER_ID, dispatchMode });
 
@@ -68,9 +79,14 @@ async function main(): Promise<void> {
   if (!supabaseServiceKey) {
     throw new Error('Missing required environment variable: SUPABASE_SECRET_KEY');
   }
-  // Prefer transaction-mode pooler (port 6543) to avoid session pool limits.
-  // LISTEN/NOTIFY won't work through transaction pooler, but fallback polling handles it.
-  const dbUrl = process.env.DATABASE_URL || process.env.SUPABASE_DIRECT_URL || requireEnv('DATABASE_DIRECT_URL');
+  // Prefer direct URL for pgDirect so LISTEN/NOTIFY works (pgbouncer transaction mode drops LISTEN state).
+  // Falls back to DATABASE_URL (pgbouncer) — LISTEN won't work but polling compensates.
+  const dbUrl = process.env.DATABASE_DIRECT_URL || process.env.SUPABASE_DIRECT_URL || process.env.DATABASE_URL;
+  if (!dbUrl) {
+    throw new Error('Missing required: DATABASE_DIRECT_URL, SUPABASE_DIRECT_URL, or DATABASE_URL');
+  }
+
+  const usingDirectUrl = !!(process.env.DATABASE_DIRECT_URL || process.env.SUPABASE_DIRECT_URL);
 
   // Pooled connection for normal queries (goes through pgbouncer)
   const supabase = createClient(supabaseUrl, supabaseServiceKey, {
@@ -87,7 +103,10 @@ async function main(): Promise<void> {
 
   logger.info('Connecting to Postgres');
   await pgDirect.connect();
-  logger.info('Postgres connection established');
+  logger.info('Postgres connection established', {
+    usingDirectUrl,
+    listenNotifyAvailable: usingDirectUrl,
+  });
 
   // CONVENTION: Single-task-per-worker. Each worker processes one job at a time.
   // This simplifies concurrency, avoids browser session conflicts, and makes
@@ -128,9 +147,27 @@ async function main(): Promise<void> {
     logger.warn('No DATABASE_DIRECT_URL or SUPABASE_DIRECT_URL — EC2/EC3 features disabled');
   }
 
+  // ── Session persistence — optional, requires GH_CREDENTIAL_KEY ──
+  let sessionManager: SessionManager | undefined;
+  const credKeyHex = process.env.GH_CREDENTIAL_KEY;
+  if (credKeyHex) {
+    try {
+      const encryption = createEncryptionFromEnv();
+      sessionManager = new SessionManager({ supabase, encryption });
+      logger.info('Session persistence enabled');
+    } catch (err) {
+      logger.warn('Session persistence disabled — encryption setup failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  } else {
+    logger.info('Session persistence disabled — GH_CREDENTIAL_KEY not set');
+  }
+
   const executor = new JobExecutor({
     supabase,
     workerId: WORKER_ID,
+    ...(sessionManager && { sessionManager }),
     ...(redis && { redis }),
     ...(pgPool && { pgPool }),
   });
@@ -303,6 +340,34 @@ async function main(): Promise<void> {
     }
   }
 
+  // Clean up stale registrations from previous container incarnations.
+  // When Kamal restarts a container, the old worker_id may still be 'active'
+  // with the same ec2_ip. Mark them offline so the fleet dashboard is accurate.
+  if (ec2Ip && ec2Ip !== 'unknown') {
+    try {
+      const staleResult = await pgDirect.query(`
+        UPDATE gh_worker_registry
+        SET status = 'offline', current_job_id = NULL
+        WHERE ec2_ip = $1
+          AND worker_id != $2
+          AND status IN ('active', 'draining')
+          AND last_heartbeat < NOW() - INTERVAL '2 minutes'
+        RETURNING worker_id
+      `, [ec2Ip, WORKER_ID]);
+      if (staleResult.rows && staleResult.rows.length > 0) {
+        logger.info('Cleaned up stale worker registrations', {
+          ec2Ip,
+          count: staleResult.rows.length,
+          staleWorkerIds: staleResult.rows.map((r: { worker_id: string }) => r.worker_id),
+        });
+      }
+    } catch (err) {
+      logger.warn('Stale worker cleanup failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
+  }
+
   // Heartbeat every 30s — updates last_heartbeat and current_job_id.
   // Also marks stale workers (no heartbeat in 5 min) as offline.
   const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -367,9 +432,28 @@ async function main(): Promise<void> {
       logger.error('pg-boss error', { error: err.message });
     });
 
+    // Retry pg-boss startup with backoff — session-mode pool may be temporarily
+    // full during simultaneous container restarts (MaxClientsInSessionMode).
     logger.info('Starting pg-boss...');
-    await boss.start();
-    logger.info('pg-boss started');
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        await boss.start();
+        logger.info('pg-boss started', { attempt });
+        break;
+      } catch (err) {
+        const isPoolFull = err instanceof Error && err.message.includes('MaxClientsInSessionMode');
+        if (isPoolFull && attempt < 5) {
+          const delay = attempt * 2000; // 2s, 4s, 6s, 8s
+          logger.warn(`pg-boss startup failed (attempt ${attempt}/5, retrying in ${delay}ms)`, { error: (err as Error).message });
+          await new Promise(r => setTimeout(r, delay));
+          // Re-create boss instance (old one may have stale internal state)
+          boss = new PgBoss({ connectionString: directUrl, schema: 'pgboss', max: 2 });
+          boss.on('error', (e: Error) => logger.error('pg-boss error', { error: e.message }));
+        } else {
+          throw err; // Non-pool error or exhausted retries — crash worker
+        }
+      }
+    }
 
     consumer = new PgBossConsumer({
       boss,

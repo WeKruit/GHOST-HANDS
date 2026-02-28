@@ -2,8 +2,8 @@
  * WEK-83: ECR Authentication Module Tests
  *
  * Unit tests for the ECR auth module (scripts/lib/ecr-auth.ts).
- * Uses real temp files instead of vi.mock('fs') because Bun runs all test files
- * in the same process and vi.mock leaks across files (same pattern as container-configs.test.ts).
+ * Uses real temp files instead of vi.mock('fs') to avoid mock leaks in bun's
+ * single-process test runner.
  *
  * The module reads DOCKER_CONFIG_PATH at import time, so we must set the env var
  * BEFORE the module is first loaded. We use dynamic import() inside beforeAll to

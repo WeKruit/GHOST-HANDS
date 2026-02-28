@@ -207,7 +207,7 @@ describe('WEK-162: kasm_url in callback payloads', () => {
     expect(payload.status).toBe('running');
     expect(payload.worker_id).toBe(WORKER_ID);
     expect(payload.kasm_url).toBeUndefined();
-    // All existing fields should still be present
-    expect(payload.completed_at).toBeDefined();
+    // completed_at is only set for terminal statuses (completed/failed)
+    expect(payload.completed_at).toBeUndefined();
   });
 });

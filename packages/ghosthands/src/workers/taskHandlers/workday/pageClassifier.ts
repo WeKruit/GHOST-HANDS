@@ -59,6 +59,7 @@ export async function detectPage(adapter: BrowserAutomationAdapter): Promise<Pag
     const urlHints: string[] = [];
     if (currentUrl.includes('signin') || currentUrl.includes('login')) urlHints.push('This appears to be a login page.');
     if (currentUrl.includes('myworkdayjobs.com') && currentUrl.includes('/job/')) urlHints.push('This appears to be a Workday job listing.');
+    //if (currentUrl.includes('greenhouse.io') && currentUrl.includes('/job/')) urlHints.push('This appears to be a Workday job listing.');
 
     const urlContext = urlHints.length > 0 ? `URL context: ${urlHints.join(' ')} ` : '';
 
