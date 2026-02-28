@@ -68,7 +68,7 @@ const MAX_AGENT_STEPS = 1000;
 // ── Handler ──────────────────────────────────────────────────────────────
 
 export class AgentApplyHandler implements TaskHandler {
-  readonly type = 'smart_apply';
+  readonly type = 'agent_apply';
   readonly description = 'LLM agent fills out job application autonomously via Stagehand agent mode';
 
   validate(inputData: Record<string, any>): ValidationResult {
