@@ -440,3 +440,289 @@ index 9c7b7d705c080e1a7adf7ae736781b7401ba5655..ae08fabb46340ee3d6254a931f954af7
      const trimmed = trimTrailingTextNode(xp);
      if (!trimmed) {
          return undefined;
+diff --git a/dist/cjs/lib/v3/agent/AnthropicCUAClient.js b/dist/cjs/lib/v3/agent/AnthropicCUAClient.js
+index f28f596..64b7ad6 100644
+--- a/dist/cjs/lib/v3/agent/AnthropicCUAClient.js
++++ b/dist/cjs/lib/v3/agent/AnthropicCUAClient.js
+@@ -11,6 +11,125 @@ const imageCompression_js_1 = require("./utils/imageCompression.js");
+ const zodCompat_js_1 = require("../zodCompat.js");
+ const flowLogger_js_1 = require("../flowLogger.js");
+ const uuid_1 = require("uuid");
++/**
++ * Prune old results for a given tool name from conversation history.
++ * Keeps only the most recent result; replaces older ones with a short stub
++ * to prevent quadratic token accumulation from large tool outputs (e.g. ariaTree).
++ */
++function pruneOldToolResults(items, toolName) {
++    // 1. Collect all tool_use IDs for the target tool, in order
++    const toolUseIds = [];
++    for (const msg of items) {
++        if (msg.role === "assistant" && Array.isArray(msg.content)) {
++            for (const block of msg.content) {
++                if (block.type === "tool_use" && block.name === toolName) {
++                    toolUseIds.push(block.id);
++                }
++            }
++        }
++    }
++    // Nothing to prune if there are 0 or 1 results
++    if (toolUseIds.length <= 1) return;
++    // 2. All IDs except the last one should be pruned
++    const idsToReplace = new Set(toolUseIds.slice(0, -1));
++    // 3. Replace matching tool_result content with a stub
++    for (const msg of items) {
++        if (msg.role === "user" && Array.isArray(msg.content)) {
++            for (let i = 0; i < msg.content.length; i++) {
++                const block = msg.content[i];
++                if (block.type === "tool_result" && idsToReplace.has(block.tool_use_id)) {
++                    msg.content[i] = {
++                        ...block,
++                        content: [{ type: "text", text: `[${toolName} result pruned — see latest ${toolName} call for current page state]` }],
++                    };
++                }
++            }
++        }
++    }
++}
++/**
++ * Compress old conversation steps to reduce quadratic token accumulation.
++ * Keeps the last `keepRecentN` assistant+user step pairs in full detail.
++ * For older steps:
++ *   - Truncates assistant thinking/text to ~100 chars
++ *   - Replaces tool_result content with minimal stubs
++ *   - Preserves tool_use blocks and tool_use_ids (required by Anthropic API)
++ */
++function compressOldSteps(items, keepRecentN = 6) {
++    // Count assistant messages from the end to find the cutoff index
++    let assistantCount = 0;
++    let cutoffIndex = items.length; // everything before this index gets compressed
++    for (let i = items.length - 1; i >= 0; i--) {
++        if (items[i].role === "assistant") {
++            assistantCount++;
++            if (assistantCount >= keepRecentN) {
++                cutoffIndex = i;
++                break;
++            }
++        }
++    }
++    // Nothing to compress if fewer steps than the window
++    if (assistantCount < keepRecentN) return;
++    // Build a set of tool_use_ids that belong to already-pruned ariaTree stubs
++    // so we don't double-stub them
++    const alreadyPrunedIds = new Set();
++    for (let i = 0; i < cutoffIndex; i++) {
++        const msg = items[i];
++        if (msg.role === "user" && Array.isArray(msg.content)) {
++            for (const block of msg.content) {
++                if (block.type === "tool_result" &&
++                    Array.isArray(block.content) &&
++                    block.content.length === 1 &&
++                    block.content[0].type === "text" &&
++                    block.content[0].text.includes("pruned")) {
++                    alreadyPrunedIds.add(block.tool_use_id);
++                }
++            }
++        }
++    }
++    // Compress messages before the cutoff
++    for (let i = 0; i < cutoffIndex; i++) {
++        const msg = items[i];
++        if (msg.role === "assistant" && Array.isArray(msg.content)) {
++            // Compress assistant content blocks
++            for (let j = 0; j < msg.content.length; j++) {
++                const block = msg.content[j];
++                if (block.type === "text" && typeof block.text === "string" && block.text.length > 120) {
++                    // Truncate thinking/text to ~100 chars
++                    msg.content[j] = {
++                        ...block,
++                        text: block.text.slice(0, 100) + "…[truncated]",
++                    };
++                }
++                if (block.type === "thinking" && typeof block.thinking === "string" && block.thinking.length > 120) {
++                    msg.content[j] = {
++                        ...block,
++                        thinking: block.thinking.slice(0, 100) + "…[truncated]",
++                    };
++                }
++                // tool_use blocks are preserved as-is (API requires them to match tool_results)
++            }
++        }
++        else if (msg.role === "user" && Array.isArray(msg.content)) {
++            // Compress tool_result content blocks
++            for (let j = 0; j < msg.content.length; j++) {
++                const block = msg.content[j];
++                if (block.type === "tool_result" && !alreadyPrunedIds.has(block.tool_use_id)) {
++                    // Check if this result has substantial content worth compressing
++                    const contentStr = JSON.stringify(block.content);
++                    if (contentStr && contentStr.length > 200) {
++                        const isError = block.is_error ||
++                            (typeof contentStr === "string" && contentStr.toLowerCase().includes("error"));
++                        msg.content[j] = {
++                            ...block,
++                            content: [{ type: "text", text: isError ? '{"success":false}' : '{"success":true}' }],
++                        };
++                    }
++                }
++            }
++        }
++    }
++}
+ /**
+  * Client for Anthropic's Computer Use API
+  * This implementation uses the official Anthropic Messages API for Computer Use
+@@ -284,6 +403,12 @@ class AnthropicCUAClient extends AgentClient_js_1.AgentClient {
+                     nextInputItems.push(userToolResultsMessage);
+                 }
+             }
++            // Prune old ariaTree results to prevent quadratic token accumulation.
++            // Keep only the most recent ariaTree result; replace older ones with a stub.
++            pruneOldToolResults(nextInputItems, "ariaTree");
++            // Compress old conversation steps: keep last 6 steps in full,
++            // truncate assistant text and replace tool results with stubs for older steps.
++            compressOldSteps(nextInputItems, 6);
+             // The step is completed only if there were no tool_use items
+             const completed = toolUseItems.length === 0;
+             logger({
+diff --git a/dist/esm/lib/v3/agent/AnthropicCUAClient.js b/dist/esm/lib/v3/agent/AnthropicCUAClient.js
+index c49ed47..d07a473 100644
+--- a/dist/esm/lib/v3/agent/AnthropicCUAClient.js
++++ b/dist/esm/lib/v3/agent/AnthropicCUAClient.js
+@@ -5,6 +5,125 @@ import { compressConversationImages } from "./utils/imageCompression.js";
+ import { toJsonSchema } from "../zodCompat.js";
+ import { SessionFileLogger, formatCuaPromptPreview, formatCuaResponsePreview, } from "../flowLogger.js";
+ import { v7 as uuidv7 } from "uuid";
++/**
++ * Prune old results for a given tool name from conversation history.
++ * Keeps only the most recent result; replaces older ones with a short stub
++ * to prevent quadratic token accumulation from large tool outputs (e.g. ariaTree).
++ */
++function pruneOldToolResults(items, toolName) {
++    // 1. Collect all tool_use IDs for the target tool, in order
++    const toolUseIds = [];
++    for (const msg of items) {
++        if (msg.role === "assistant" && Array.isArray(msg.content)) {
++            for (const block of msg.content) {
++                if (block.type === "tool_use" && block.name === toolName) {
++                    toolUseIds.push(block.id);
++                }
++            }
++        }
++    }
++    // Nothing to prune if there are 0 or 1 results
++    if (toolUseIds.length <= 1) return;
++    // 2. All IDs except the last one should be pruned
++    const idsToReplace = new Set(toolUseIds.slice(0, -1));
++    // 3. Replace matching tool_result content with a stub
++    for (const msg of items) {
++        if (msg.role === "user" && Array.isArray(msg.content)) {
++            for (let i = 0; i < msg.content.length; i++) {
++                const block = msg.content[i];
++                if (block.type === "tool_result" && idsToReplace.has(block.tool_use_id)) {
++                    msg.content[i] = {
++                        ...block,
++                        content: [{ type: "text", text: `[${toolName} result pruned — see latest ${toolName} call for current page state]` }],
++                    };
++                }
++            }
++        }
++    }
++}
++/**
++ * Compress old conversation steps to reduce quadratic token accumulation.
++ * Keeps the last `keepRecentN` assistant+user step pairs in full detail.
++ * For older steps:
++ *   - Truncates assistant thinking/text to ~100 chars
++ *   - Replaces tool_result content with minimal stubs
++ *   - Preserves tool_use blocks and tool_use_ids (required by Anthropic API)
++ */
++function compressOldSteps(items, keepRecentN = 6) {
++    // Count assistant messages from the end to find the cutoff index
++    let assistantCount = 0;
++    let cutoffIndex = items.length; // everything before this index gets compressed
++    for (let i = items.length - 1; i >= 0; i--) {
++        if (items[i].role === "assistant") {
++            assistantCount++;
++            if (assistantCount >= keepRecentN) {
++                cutoffIndex = i;
++                break;
++            }
++        }
++    }
++    // Nothing to compress if fewer steps than the window
++    if (assistantCount < keepRecentN) return;
++    // Build a set of tool_use_ids that belong to already-pruned ariaTree stubs
++    // so we don't double-stub them
++    const alreadyPrunedIds = new Set();
++    for (let i = 0; i < cutoffIndex; i++) {
++        const msg = items[i];
++        if (msg.role === "user" && Array.isArray(msg.content)) {
++            for (const block of msg.content) {
++                if (block.type === "tool_result" &&
++                    Array.isArray(block.content) &&
++                    block.content.length === 1 &&
++                    block.content[0].type === "text" &&
++                    block.content[0].text.includes("pruned")) {
++                    alreadyPrunedIds.add(block.tool_use_id);
++                }
++            }
++        }
++    }
++    // Compress messages before the cutoff
++    for (let i = 0; i < cutoffIndex; i++) {
++        const msg = items[i];
++        if (msg.role === "assistant" && Array.isArray(msg.content)) {
++            // Compress assistant content blocks
++            for (let j = 0; j < msg.content.length; j++) {
++                const block = msg.content[j];
++                if (block.type === "text" && typeof block.text === "string" && block.text.length > 120) {
++                    // Truncate thinking/text to ~100 chars
++                    msg.content[j] = {
++                        ...block,
++                        text: block.text.slice(0, 100) + "…[truncated]",
++                    };
++                }
++                if (block.type === "thinking" && typeof block.thinking === "string" && block.thinking.length > 120) {
++                    msg.content[j] = {
++                        ...block,
++                        thinking: block.thinking.slice(0, 100) + "…[truncated]",
++                    };
++                }
++                // tool_use blocks are preserved as-is (API requires them to match tool_results)
++            }
++        }
++        else if (msg.role === "user" && Array.isArray(msg.content)) {
++            // Compress tool_result content blocks
++            for (let j = 0; j < msg.content.length; j++) {
++                const block = msg.content[j];
++                if (block.type === "tool_result" && !alreadyPrunedIds.has(block.tool_use_id)) {
++                    // Check if this result has substantial content worth compressing
++                    const contentStr = JSON.stringify(block.content);
++                    if (contentStr && contentStr.length > 200) {
++                        const isError = block.is_error ||
++                            (typeof contentStr === "string" && contentStr.toLowerCase().includes("error"));
++                        msg.content[j] = {
++                            ...block,
++                            content: [{ type: "text", text: isError ? '{"success":false}' : '{"success":true}' }],
++                        };
++                    }
++                }
++            }
++        }
++    }
++}
+ /**
+  * Client for Anthropic's Computer Use API
+  * This implementation uses the official Anthropic Messages API for Computer Use
+@@ -278,6 +397,12 @@ export class AnthropicCUAClient extends AgentClient {
+                     nextInputItems.push(userToolResultsMessage);
+                 }
+             }
++            // Prune old ariaTree results to prevent quadratic token accumulation.
++            // Keep only the most recent ariaTree result; replace older ones with a stub.
++            pruneOldToolResults(nextInputItems, "ariaTree");
++            // Compress old conversation steps: keep last 6 steps in full,
++            // truncate assistant text and replace tool results with stubs for older steps.
++            compressOldSteps(nextInputItems, 6);
+             // The step is completed only if there were no tool_use items
+             const completed = toolUseItems.length === 0;
+             logger({

@@ -116,14 +116,88 @@ export class AgentApplyHandler implements TaskHandler {
     // 3. Build system prompt (includes credentials directly — agent needs them for login)
     const systemPrompt = buildSystemPrompt(userProfile, qaOverrides, ctx.resumeFilePath, platformConfig.platformId);
 
-    // 4. Set up resume file chooser handler
-    if (ctx.resumeFilePath) {
-      const resumePath = ctx.resumeFilePath;
-      adapter.page.on('filechooser', async (chooser: any) => {
-        logger.info('[AgentApply] File chooser opened — attaching resume', { path: resumePath });
-        await chooser.setFiles(resumePath);
-      });
+    // 4. Resume upload — two mechanisms:
+    //   A) CDP file chooser interception: when agent clicks "Attach", the native
+    //      OS file picker is suppressed and we handle it via Page.handleFileChooser.
+    //   B) Proactive setInputFiles: on each step, check for <input type="file">
+    //      elements and set the file directly (handles remote browsers too).
+    let resumeUploaded = false;
+    const resumePath = ctx.resumeFilePath;
+
+    // Track which CDP sessions have file chooser interception to avoid duplicate handlers
+    const interceptedSessionIds = new Set<string | null>();
+
+    async function tryUploadResume(): Promise<boolean> {
+      if (!resumePath || resumeUploaded) return false;
+      try {
+        const activePage = stagehand.context.activePage();
+        if (!activePage) return false;
+        const count = await activePage.evaluate(() =>
+          document.querySelectorAll('input[type="file"]').length
+        );
+        if (count > 0) {
+          await activePage.locator('input[type="file"]').setInputFiles(resumePath);
+          resumeUploaded = true;
+          logger.info('[AgentApply] Resume auto-uploaded via setInputFiles', { path: resumePath });
+          return true;
+        }
+      } catch (err) {
+        logger.warn('[AgentApply] Resume auto-upload attempt failed (non-fatal)', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return false;
     }
+
+    // Set up CDP file chooser interception on the current active page.
+    // Called initially and on each agent step (to handle page navigations/new tabs).
+    async function ensureFileChooserInterception(): Promise<void> {
+      if (!resumePath) return;
+      try {
+        const activePage = stagehand.context.activePage();
+        if (!activePage) return;
+
+        const frame = activePage.mainFrame();
+        const session = frame?.session;
+        if (!session?.on || !session?.send) return;
+
+        const sessionId = session.id ?? 'root';
+        if (interceptedSessionIds.has(sessionId)) return;
+
+        await activePage.sendCDP('Page.setInterceptFileChooserDialog', { enabled: true });
+
+        session.on('Page.fileChooserOpened', async () => {
+          logger.info('[AgentApply] File chooser dialog intercepted via CDP');
+          try {
+            // Accept with local file path (works for local browsers)
+            await session.send('Page.handleFileChooser', {
+              action: 'accept',
+              files: [resumePath],
+            });
+            resumeUploaded = true;
+            logger.info('[AgentApply] Resume uploaded via Page.handleFileChooser');
+          } catch (acceptErr) {
+            // Remote browsers can't access local paths — cancel dialog, use setInputFiles
+            logger.warn('[AgentApply] handleFileChooser accept failed, falling back to setInputFiles', {
+              error: acceptErr instanceof Error ? acceptErr.message : String(acceptErr),
+            });
+            try {
+              await session.send('Page.handleFileChooser', { action: 'cancel' });
+            } catch { /* ignore cancel failure */ }
+            await tryUploadResume();
+          }
+        });
+
+        interceptedSessionIds.add(sessionId);
+        logger.info('[AgentApply] File chooser interception active', { sessionId });
+      } catch (err) {
+        logger.warn('[AgentApply] File chooser interception setup failed (non-fatal)', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    await ensureFileChooserInterception();
 
     await progress.setStep(ProgressStep.NAVIGATING);
 
@@ -184,6 +258,13 @@ export class AgentApplyHandler implements TaskHandler {
               let resultStr = '(no result)';
               try { resultStr = JSON.stringify(tr.result ?? tr.output ?? tr, null, 0).slice(0, 800); } catch { resultStr = String(tr); }
               logger.info('[Agent] RESULT', { step: stepCount, tool: tr.toolName || tr.name || 'unknown', result: resultStr });
+            }
+
+            // Ensure file chooser interception on current page (re-applies after navigations)
+            // and proactively upload resume if a file input already exists on the page.
+            if (resumePath && !resumeUploaded) {
+              await ensureFileChooserInterception();
+              await tryUploadResume();
             }
 
             // Log running cost from act+observe sub-calls (stagehandMetrics).
@@ -365,7 +446,7 @@ function buildSystemPrompt(
   const lines: string[] = [];
 
   // ── Role & Tool Usage (MOST IMPORTANT — goes first) ──
-  lines.push(`You are filling out a job application for ${profile.first_name} ${profile.last_name}. Fill every field, then STOP at the review page.`);
+  lines.push(`You are filling out a job application for ${profile.first_name} ${profile.last_name}. Fill every field on every page, then call done. Do NOT submit.`);
   lines.push('');
   lines.push('HOW TO USE YOUR TOOLS:');
   lines.push('');
@@ -472,7 +553,7 @@ function buildSystemPrompt(
 
   // Resume
   if (resumePath) {
-    lines.push('RESUME: Always try clicking the "Attach" or "Upload" button FIRST for resume/CV fields — the file will be uploaded automatically. Only fall back to "Enter manually" if the upload button fails or does not exist.');
+    lines.push('RESUME: A resume file is being uploaded automatically by the system. Do NOT click any upload/attach/select-file buttons — the file input is filled directly. If you see a resume upload section, just wait a moment and then continue to the next page. If the page requires a resume to proceed and it hasn\'t appeared yet, call the wait tool for 3 seconds and try again.');
     lines.push('');
   }
 
@@ -492,8 +573,8 @@ function buildSystemPrompt(
   lines.push('- For dropdowns: (1) click the dropdown button to OPEN it, (2) then in a SEPARATE act call, click the option you want. Never try to select an option and open the dropdown in the same act call.');
   lines.push('- For "How did you hear?" → "LinkedIn" or "Online Job Board".');
   lines.push('- Click Next/Continue to advance through pages.');
-  lines.push('- NEVER click Submit/Submit Application.');
-  lines.push('- STOP at the Review/Summary page and call done.');
+  lines.push('- NEVER click Submit / Submit Application. When all fields are filled and only a Submit button remains, call done.');
+  lines.push('- If you reach a Review/Summary page, call done immediately. But not all applications have one — if all fields are filled and there is nothing left but Submit, call done.');
   lines.push('- If you hit a CAPTCHA or 2FA, call done and explain the blocker.');
 
   // Platform-specific
@@ -528,11 +609,11 @@ function buildInstruction(
   ];
 
   if (resumePath) {
-    parts.push('For resume/CV fields, try clicking the "Attach" or "Upload" button first — the file uploads automatically. Fall back to "Enter manually" only if upload fails.');
+    parts.push('Resume uploads are handled automatically — do NOT click upload/attach buttons for resume. Just continue filling other fields.');
   }
 
   parts.push('Navigate through all pages by clicking Next/Continue.');
-  parts.push('STOP at the Review/Summary page — do NOT submit the application. Call done when you reach the review page.');
+  parts.push('NEVER click Submit. When all fields are filled and only a Submit button remains, call done.');
 
   return parts.join(' ');
 }

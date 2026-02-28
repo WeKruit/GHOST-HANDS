@@ -12,7 +12,8 @@
       "Bash(bun patch:*)",
       "Bash(done)",
       "Bash(ls:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(bun install:*)"
     ]
   }
 }
