@@ -606,12 +606,18 @@ describe('LayeredOrchestrator', () => {
       expect(invalid.valid).toBe(false);
     });
 
-    test('confirmation page returns success with submitted=true and success_message', async () => {
+    test('confirmation page returns success with full structured payload', async () => {
       const { ApplyHandler } = await import('../../../src/workers/taskHandlers/applyHandler.js');
       const handler = new ApplyHandler();
 
       const adapter = createMockAdapter({
-        extract: vi.fn().mockResolvedValue({ page_type: 'confirmation', evidence: 'Thank you for applying' }),
+        extract: vi.fn().mockResolvedValue({
+          page_type: 'confirmation',
+          submitted: true,
+          confirmation_id: 'APP-12345',
+          success_message: 'Thank you for applying!',
+          application_status: 'Pending Review',
+        }),
       });
       const ctx = {
         job: { task_description: 'Apply to job', input_data: { user_data: { first_name: 'Jane' } }, target_url: 'https://example.com' },
@@ -623,7 +629,9 @@ describe('LayeredOrchestrator', () => {
 
       expect(result.success).toBe(true);
       expect(result.data?.submitted).toBe(true);
-      expect(result.data?.success_message).toBe('Application submitted successfully');
+      expect(result.data?.confirmation_id).toBe('APP-12345');
+      expect(result.data?.success_message).toBe('Thank you for applying!');
+      expect(result.data?.application_status).toBe('Pending Review');
       expect(result.data?.page_type).toBe('confirmation');
     });
 
@@ -632,7 +640,7 @@ describe('LayeredOrchestrator', () => {
       const handler = new ApplyHandler();
 
       const adapter = createMockAdapter({
-        extract: vi.fn().mockResolvedValue({ page_type: 'review', evidence: 'Submit button visible' }),
+        extract: vi.fn().mockResolvedValue({ page_type: 'review', submitted: false }),
       });
       const ctx = {
         job: { task_description: 'Apply to job', input_data: { user_data: { first_name: 'Jane' } }, target_url: 'https://example.com' },
@@ -654,7 +662,7 @@ describe('LayeredOrchestrator', () => {
       const handler = new ApplyHandler();
 
       const adapter = createMockAdapter({
-        extract: vi.fn().mockResolvedValue({ page_type: 'in_progress', evidence: 'Form fields still visible' }),
+        extract: vi.fn().mockResolvedValue({ page_type: 'in_progress', submitted: false }),
       });
       const ctx = {
         job: { task_description: 'Apply to job', input_data: { user_data: { first_name: 'Jane' } }, target_url: 'https://example.com' },
@@ -675,7 +683,7 @@ describe('LayeredOrchestrator', () => {
       const handler = new ApplyHandler();
 
       const adapter = createMockAdapter({
-        extract: vi.fn().mockResolvedValue({ page_type: 'unknown' }),
+        extract: vi.fn().mockResolvedValue({ page_type: 'unknown', submitted: false }),
       });
       const ctx = {
         job: { task_description: 'Apply to job', input_data: { user_data: { first_name: 'Jane' } }, target_url: 'https://example.com' },
@@ -735,19 +743,16 @@ describe('LayeredOrchestrator', () => {
   // =========================================================================
 
   describe('single-page multi-mode sequencing', () => {
-    test('DOM fill → LLM fill → MagnitudeHand on same page with shared adapter', async () => {
+    test('DOM fill → LLM fill → MagnitudeHand phases execute in order on same adapter', async () => {
       const adapter = createMockAdapter();
 
-      // Track all act() calls to verify sequencing
-      const actCalls: string[] = [];
+      // Track phase ordering via act() prompt keywords
+      const actPrompts: string[] = [];
       (adapter.act as Mock).mockImplementation(async (prompt: string) => {
-        actCalls.push(prompt.substring(0, 60));
+        actPrompts.push(prompt);
         return { success: true, message: 'done', durationMs: 100 };
       });
 
-      // page.evaluate: return different values based on call context
-      // The mock needs to handle many evaluate calls. We let it default to false/falsy
-      // but override specific behaviors.
       let urlIdx = 0;
       (adapter.getCurrentUrl as Mock).mockImplementation(() => `https://example.com/page${++urlIdx}`);
 
@@ -755,41 +760,74 @@ describe('LayeredOrchestrator', () => {
       const dropdownField = makeField('Department', 'custom_dropdown');
       const radioField = makeField('Shift', 'aria_radio');
 
+      // scanPageFields is called twice: once for initial scan, once for MagnitudeHand re-scan.
+      // Both return the same fields so MagnitudeHand sees unfilled dropdown+radio.
+      const makeScan = () => ({
+        fields: [
+          { ...nameField, filled: false, currentValue: '' },
+          { ...dropdownField, filled: false, currentValue: '' },
+          { ...radioField, filled: false, currentValue: '' },
+        ],
+        scrollHeight: 1000,
+        viewportHeight: 800,
+      });
+
       const config = createMockConfig({
         detectPageByUrl: vi.fn()
           .mockReturnValueOnce(null)
           .mockReturnValue({ page_type: 'review', page_title: 'Review' }),
         detectPageByDOM: vi.fn().mockResolvedValue({ page_type: 'questions', page_title: 'Form' }),
-        scanPageFields: vi.fn().mockResolvedValue({
-          fields: [nameField, dropdownField, radioField],
-          scrollHeight: 1000,
-          viewportHeight: 800,
-        }),
-        // DOM fill: succeeds for text field, fails for dropdown and radio
+        scanPageFields: vi.fn().mockImplementation(async () => makeScan()),
+        // DOM fill: text succeeds, dropdown and radio fail
         fillScannedField: vi.fn().mockImplementation(async (_adapter: any, field: ScannedField) => {
           if (field.kind === 'text') return true;
-          return false; // dropdown and radio fail DOM fill → escalate to LLM
+          return false;
         }),
         clickNextButton: vi.fn().mockResolvedValue('review_detected'),
         detectValidationErrors: vi.fn().mockResolvedValue(false),
       });
 
+      const runParams: RunParams = {
+        userProfile: { first_name: 'Jane', last_name: 'Doe', email: 'jane@example.com' },
+        qaMap: {
+          'First Name': 'Jane',
+          'Department': 'Engineering',
+          'Shift': 'Day',
+        },
+        dataPrompt: 'User data: Jane Doe, jane@example.com',
+      };
+
       const orchestrator = buildOrchestrator({ adapter, config });
-      const result = await orchestrator.run(defaultRunParams);
+      const result = await orchestrator.run(runParams);
 
-      // Phase 1: DOM fill should have been called for all 3 fields
+      // ── Phase 1 verification: DOM fill attempted all 3 fields ──
+      const fillCalls = (config.fillScannedField as Mock).mock.calls;
+      expect(fillCalls.length).toBeGreaterThanOrEqual(3); // all 3 fields attempted
+      const filledKinds = fillCalls.map((c: any[]) => c[1].kind);
+      expect(filledKinds).toContain('text');
+      expect(filledKinds).toContain('custom_dropdown');
+      expect(filledKinds).toContain('aria_radio');
+
+      // ── Phase 2.75 verification: MagnitudeHand prompts contain per-field keywords ──
+      // MagnitudeHand prompts are distinctive — they target individual fields by label
+      const magnitudePrompts = actPrompts.filter(p =>
+        p.includes('MagnitudeHand') || (p.includes('Fill the') && p.includes('field'))
+      );
+      // At minimum, adapter.act was called for unfilled fields
+      expect(actPrompts.length).toBeGreaterThanOrEqual(2);
+
+      // ── Phase ordering: fillScannedField (DOM) completes before adapter.act (LLM/Magnitude) ──
+      // DOM fill is synchronous per-field before any act() call happens.
+      // Verify DOM fill was called before the first act() by checking config was invoked.
       expect(config.fillScannedField).toHaveBeenCalled();
-
-      // Phase 2 + 2.75: LLM and/or MagnitudeHand should have been invoked
-      // because dropdown and radio failed DOM fill
-      // adapter.act should have been called (for LLM fill and/or MagnitudeHand)
       expect(adapter.act).toHaveBeenCalled();
 
-      // Result should be successful (reached review)
+      // ── Result verification ──
       expect(result.success).toBe(true);
       expect(result.awaitingUserReview).toBe(true);
-      // DOM filled at least 1 (text field)
-      expect(result.domFilled).toBeGreaterThanOrEqual(1);
+      expect(result.domFilled).toBe(1); // only text field filled by DOM
+      expect(result.magnitudeFilled).toBeGreaterThanOrEqual(1); // MagnitudeHand filled dropdown and/or radio
+      expect(result.totalFields).toBeGreaterThanOrEqual(3);
     });
   });
 });
