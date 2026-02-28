@@ -26,7 +26,6 @@ import type {
   ReviewResult,
   CookbookAction,
   EscalationPolicy,
-  DEFAULT_ESCALATION_POLICY,
 } from './types';
 
 const MAX_PAGES = 15;
@@ -113,6 +112,7 @@ export class SectionOrchestrator {
         result.actionsFailed += pageResult.actionsFailed;
         result.totalCost += pageResult.cost;
         this.totalCost += pageResult.cost;
+        ctx.budgetRemaining -= pageResult.cost;
 
         if (pageResult.isLastPage) {
           result.success = true;
@@ -235,9 +235,14 @@ export class SectionOrchestrator {
     const domLayer = this.layers.get('dom')!;
     const matches = await domLayer.process(sectionObs, ctx);
 
-    // If we got matches for most fields, use them
+    // If we matched all fields, use DOM results
     const unmatchedCount = section.fields.length - matches.length;
-    if (unmatchedCount === 0 || matches.length > 0) {
+    if (unmatchedCount === 0) {
+      return matches;
+    }
+
+    // If DOM matched most fields (>70%), use DOM results
+    if (matches.length >= section.fields.length * 0.7) {
       return matches;
     }
 
@@ -385,9 +390,25 @@ export class SectionOrchestrator {
     const magLayer = this.layers.get('magnitude');
     if (magLayer) {
       try {
-        const result = await (magLayer as any).adapter.act(
-          'Click the "Next", "Continue", or "Save & Continue" button to proceed to the next page. Do NOT click "Submit" unless this is the final review page.',
-        );
+        const navAction: PlannedAction = {
+          field: {
+            id: 'nav-next',
+            selector: 'button',
+            fieldType: 'unknown',
+            label: 'Next/Continue button',
+            required: false,
+            visible: true,
+            disabled: false,
+          },
+          actionType: 'click',
+          value: 'Next',
+          layer: 'magnitude',
+          attemptCount: 0,
+          layerHistory: [],
+          confidence: 0.9,
+          matchMethod: 'default',
+        };
+        const [result] = await magLayer.execute([navAction], ctx);
         if (result.success) {
           await ctx.page.waitForTimeout(1000);
           return true;
@@ -450,7 +471,7 @@ export class SectionOrchestrator {
       },
       domAction: {
         selector: action.field.selector,
-        valueTemplate: `{{${action.matchMethod === 'automation_id' ? action.value : action.field.label}}}`,
+        valueTemplate: `{{${action.field.label}}}`,
         action: action.actionType,
       },
       guiAction: result.boundingBoxAtExecution

@@ -14,15 +14,13 @@
 
 import { SectionOrchestrator, type OrchestratorResult } from './SectionOrchestrator';
 import { CookbookExecutorV3, type CookbookV3Result } from './CookbookExecutorV3';
+import { LayerHand } from './LayerHand';
 import { DOMHand } from './layers/DOMHand';
 import { StagehandHand } from './layers/StagehandHand';
 import { MagnitudeHand } from './layers/MagnitudeHand';
-import { LayerHand } from './LayerHand';
 import type {
   LayerContext,
   CookbookPageEntry,
-  EscalationPolicy,
-  DEFAULT_ESCALATION_POLICY,
 } from './types';
 import type { BrowserAutomationAdapter } from '../../adapters/types';
 import type { AutomationJob } from '../../workers/taskHandlers/types';

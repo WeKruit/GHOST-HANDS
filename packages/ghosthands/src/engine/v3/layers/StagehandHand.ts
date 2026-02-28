@@ -66,7 +66,7 @@ export class StagehandHand extends LayerHand {
       return Array.from(btns).map((b) => {
         const rect = b.getBoundingClientRect();
         return {
-          selector: b.id ? `#${b.id}` : `button:has-text("${(b.textContent || '').trim().slice(0, 30)}")`,
+          selector: b.id ? `#${b.id}` : `button:has-text("${(b.textContent || '').trim().slice(0, 30).replace(/"/g, '\\"')}")`,
           text: (b.textContent || '').trim(),
           disabled: (b as HTMLButtonElement).disabled || false,
           boundingBox: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
@@ -252,13 +252,14 @@ export class StagehandHand extends LayerHand {
     let costIncurred = 0;
 
     try {
+      const { z } = await import('zod');
       const extracted = await this.adapter.extract(
         'List all form fields on this page that are not yet filled, including their labels and types',
-        require('zod').z.array(
-          require('zod').z.object({
-            label: require('zod').z.string(),
-            type: require('zod').z.string(),
-            selector: require('zod').z.string().optional(),
+        z.array(
+          z.object({
+            label: z.string(),
+            type: z.string(),
+            selector: z.string().optional(),
           }),
         ),
       ) as Array<{ label: string; type: string; selector?: string }>;
