@@ -608,6 +608,67 @@
     }
     .toast.show { transform: translateX(-50%) translateY(0); }
 
+    /* ── Workday-style selectinput (hierarchical dropdown) ── */
+    .wd-selectinput {
+      position: relative;
+      width: 100%;
+      display: flex;
+      align-items: center;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      background: #fafafa;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .wd-selectinput:focus-within {
+      border-color: #4361ee;
+      box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.15);
+      background: white;
+    }
+    .wd-selectinput-search {
+      flex: 1;
+      border: none;
+      background: transparent;
+      padding: 0.6rem 0.75rem;
+      font-size: 0.925rem;
+      font-family: inherit;
+      outline: none;
+    }
+    .wd-selectinput-trigger {
+      padding: 0 0.75rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+    }
+    /* Portal — rendered at body level like Workday */
+    .wd-active-list-container {
+      display: none;
+      position: absolute;
+      background: white;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+      z-index: 200;
+      max-height: 280px;
+      overflow-y: auto;
+      min-width: 250px;
+    }
+    .wd-active-list-container.open { display: block; }
+    .wd-active-list-container .wd-option {
+      padding: 0.5rem 0.75rem;
+      cursor: pointer;
+      font-size: 0.9rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      transition: background 0.1s;
+    }
+    .wd-active-list-container .wd-option:hover { background: #eef1ff; }
+    .wd-active-list-container .wd-option[aria-selected="true"] { background: #e0e7ff; }
+    .wd-active-list-container .wd-option .wd-chevron {
+      margin-left: 0.5rem;
+      opacity: 0.5;
+    }
+
     @media (max-width: 600px) {
       .form-row { grid-template-columns: 1fr; }
       .card { padding: 1.25rem; }
@@ -1022,18 +1083,19 @@
             <input type="date" id="startDate" name="startDate">
           </div>
 
-          <!-- Custom dropdown: Referral source -->
+          <!-- Workday-style hierarchical dropdown: Referral source -->
           <div class="form-group">
-            <label for="referralSource">How did you hear about us?</label>
-            <div class="custom-select" id="referralSource" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="How did you hear about us?" tabindex="0">
-              <div class="custom-select-trigger"><span class="placeholder">Select…</span></div>
-              <div class="custom-select-dropdown" role="listbox">
-                <div class="custom-select-option" role="option" data-value="linkedin">LinkedIn</div>
-                <div class="custom-select-option" role="option" data-value="indeed">Indeed</div>
-                <div class="custom-select-option" role="option" data-value="referral">Employee Referral</div>
-                <div class="custom-select-option" role="option" data-value="website">Company Website</div>
-                <div class="custom-select-option" role="option" data-value="event">Career Fair / Event</div>
-                <div class="custom-select-option" role="option" data-value="other">Other</div>
+            <label for="referralSource">How did you hear about us? <span class="required">*</span></label>
+            <div class="wd-selectinput" id="referralSource"
+                 data-uxi-widget-type="selectinput"
+                 role="combobox" aria-expanded="false" aria-haspopup="listbox"
+                 aria-label="How did you hear about us?" tabindex="0" data-required="true">
+              <input type="text" class="wd-selectinput-search"
+                     role="combobox" data-automation-id="searchBox"
+                     autocomplete="off" aria-controls="referralPortal"
+                     placeholder="Select…">
+              <div class="wd-selectinput-trigger">
+                <svg class="wd-icon-caret" width="12" height="12" viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" stroke="#666" stroke-width="1.5" fill="none"/></svg>
               </div>
             </div>
           </div>
@@ -1470,6 +1532,12 @@
 
 <div class="toast" id="toast">Application submitted successfully!</div>
 
+<!-- Workday-style portal for hierarchical dropdown (rendered at body level) -->
+<div class="wd-active-list-container" id="referralPortal"
+     data-automation-id="activeListContainer">
+  <!-- Options injected dynamically by JS -->
+</div>
+
 <script>
   // ═══════════════════════════════════════════════════════════
   // Stepper navigation
@@ -1800,18 +1868,147 @@
     toggle(document.getElementById('sponsorshipFields'), val === 'needSponsorship');
   });
 
-  // Referral Source
+  // Referral Source (hierarchical — value is "Category > SubOption")
   const refSelect = document.getElementById('referralSource');
   refSelect.addEventListener('change', () => {
-    const val = refSelect.dataset.value;
-    toggle(document.getElementById('referralNameField'), val === 'referral');
-    toggle(document.getElementById('otherReferralField'), val === 'other');
+    const val = refSelect.dataset.value || '';
+    toggle(document.getElementById('referralNameField'), val.startsWith('Referral >'));
+    toggle(document.getElementById('otherReferralField'), val === 'Other > Other');
   });
 
   // Willing to relocate toggle → relocation city
   document.getElementById('willingToRelocate').closest('.toggle-switch').addEventListener('change', () => {
     toggle(document.getElementById('relocateFields'), document.getElementById('willingToRelocate').checked);
   });
+
+  // ═══════════════════════════════════════════════════════════
+  // Workday-style hierarchical dropdown (referral source)
+  // ═══════════════════════════════════════════════════════════
+  (function() {
+    const REFERRAL_DATA = {
+      'Job Board':     ['Indeed', 'Glassdoor', 'Agefiph', 'Monster', 'ZipRecruiter'],
+      'Social Media':  ['LinkedIn', 'Twitter/X', 'Facebook', 'Instagram'],
+      'Event':         ['Careers Fair', 'Tech Conference', 'University Event', 'Meetup'],
+      'Website':       ['Company Website', 'Blog Post', 'Press Article'],
+      'Referral':      ['Employee Referral', 'Recruiter', 'Friend/Family'],
+      'Other':         ['Other'],
+    };
+
+    const widget = document.getElementById('referralSource');
+    const searchInput = widget.querySelector('.wd-selectinput-search');
+    const trigger = widget.querySelector('.wd-selectinput-trigger');
+    const portal = document.getElementById('referralPortal');
+    let currentLevel = 'top'; // 'top' or a category name
+    let selectedValue = '';
+
+    function positionPortal() {
+      const rect = widget.getBoundingClientRect();
+      portal.style.left = rect.left + 'px';
+      portal.style.top = (rect.bottom + 4) + 'px';
+      portal.style.width = rect.width + 'px';
+    }
+
+    function renderTopLevel() {
+      currentLevel = 'top';
+      const categories = Object.keys(REFERRAL_DATA);
+      portal.innerHTML = categories.map((cat, i) =>
+        `<div class="wd-option" role="option"
+              aria-setsize="${categories.length}" aria-posinset="${i + 1}"
+              data-uxi-multiselectlistitem-hassidecharm="true"
+              data-category="${cat}">
+          <span>${cat}</span>
+          <svg class="wd-chevron wd-icon-chevron-right-small" width="12" height="12" viewBox="0 0 12 12">
+            <path d="M4 2l4 4-4 4" stroke="#666" stroke-width="1.5" fill="none"/>
+          </svg>
+        </div>`
+      ).join('');
+      attachCategoryListeners();
+    }
+
+    function renderSubOptions(category) {
+      currentLevel = category;
+      const subs = REFERRAL_DATA[category] || [];
+      portal.innerHTML = subs.map((sub, i) =>
+        `<div class="wd-option" role="option"
+              aria-setsize="${subs.length}" aria-posinset="${i + 1}"
+              data-value="${category} > ${sub}">
+          <span>${sub}</span>
+        </div>`
+      ).join('');
+      attachSubListeners();
+      portal.scrollTop = 0;
+    }
+
+    function attachCategoryListeners() {
+      portal.querySelectorAll('.wd-option').forEach(opt => {
+        opt.addEventListener('click', (e) => {
+          e.stopPropagation();
+          renderSubOptions(opt.dataset.category);
+        });
+      });
+    }
+
+    function attachSubListeners() {
+      portal.querySelectorAll('.wd-option').forEach(opt => {
+        opt.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const val = opt.dataset.value; // "Category > SubOption"
+          selectedValue = val;
+          const displayText = val.split(' > ')[1] || val;
+          searchInput.value = displayText;
+          widget.dataset.value = val;
+          closePortal();
+          widget.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+      });
+    }
+
+    function openPortal() {
+      positionPortal();
+      renderTopLevel();
+      portal.classList.add('open');
+      widget.setAttribute('aria-expanded', 'true');
+    }
+
+    function closePortal() {
+      portal.classList.remove('open');
+      widget.setAttribute('aria-expanded', 'false');
+    }
+
+    function isPortalOpen() {
+      return portal.classList.contains('open');
+    }
+
+    // Open on click
+    trigger.addEventListener('click', (e) => {
+      e.stopPropagation();
+      isPortalOpen() ? closePortal() : openPortal();
+    });
+    searchInput.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!isPortalOpen()) openPortal();
+    });
+    searchInput.addEventListener('focus', () => {
+      if (!isPortalOpen()) openPortal();
+    });
+
+    // Keyboard
+    widget.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closePortal();
+      if (e.key === 'Enter' && !isPortalOpen()) openPortal();
+    });
+
+    // Close on outside click
+    document.addEventListener('click', (e) => {
+      if (!widget.contains(e.target) && !portal.contains(e.target)) {
+        closePortal();
+      }
+    });
+
+    // Reposition on scroll/resize
+    window.addEventListener('scroll', () => { if (isPortalOpen()) positionPortal(); });
+    window.addEventListener('resize', () => { if (isPortalOpen()) positionPortal(); });
+  })();
 
   // ═══════════════════════════════════════════════════════════
   // Repeater: Work Experience
