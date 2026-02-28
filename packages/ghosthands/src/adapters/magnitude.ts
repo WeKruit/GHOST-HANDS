@@ -167,6 +167,15 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
     return this.requireAgent().extract(instruction, schema);
   }
 
+  /**
+   * Execute a low-level action directly, bypassing the LLM planning loop.
+   * Used by v3 MagnitudeHand for individual click/type/scroll at known targets.
+   * This is dramatically cheaper than act() since it skips screenshot→LLM cycles.
+   */
+  async exec(action: { variant: string; [key: string]: unknown }): Promise<void> {
+    await this.requireAgent().exec(action);
+  }
+
   /** Attach a StagehandObserver to enable observe() support. */
   setObserver(observer: StagehandObserver): void {
     this._observer = observer;
