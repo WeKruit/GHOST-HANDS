@@ -50,6 +50,20 @@ export class ApplyHandler implements TaskHandler {
       return { success: false, error: `Action failed: ${actResult.message}` };
     }
 
+    // Attempt to extract final page state for confirmation
+    try {
+      const PageStateSchema = z.object({ page_type: z.string() });
+      const pageState = await adapter.extract(
+        'Is this a confirmation page showing the application was submitted? Or is the form still in progress? Return page_type as "confirmation", "review", or "in_progress".',
+        PageStateSchema,
+      );
+      if (pageState?.page_type === 'confirmation') {
+        return { success: true, data: { message: 'Application submitted successfully', page_type: 'confirmation' } };
+      }
+    } catch {
+      // Extraction is best-effort for one-shot handler
+    }
+
     return { success: true, data: { message: 'Applied via single-shot agent' } };
   }
 }

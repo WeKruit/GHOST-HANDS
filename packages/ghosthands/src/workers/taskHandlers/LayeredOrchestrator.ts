@@ -109,13 +109,15 @@ export class LayeredOrchestrator {
     const adapter = this.adapter;
     const config = this.config;
 
-    // Auto-attach resume to any file dialog
+    // Auto-attach resume to any file dialog (use named handler for cleanup)
+    let filechooserHandler: ((chooser: any) => Promise<void>) | null = null;
     if (resumePath) {
       const rp = resumePath;
-      adapter.page.on('filechooser', async (chooser) => {
-        console.log(`[Orchestrator] File chooser opened — attaching resume: ${rp}`);
+      filechooserHandler = async (chooser: any) => {
+        console.log('[Orchestrator] File chooser opened — attaching resume');
         await chooser.setFiles(rp);
-      });
+      };
+      adapter.page.on('filechooser', filechooserHandler);
     }
 
     let pagesProcessed = 0;
@@ -249,6 +251,11 @@ export class LayeredOrchestrator {
         keepBrowserOpen: pagesProcessed > 2,
         error: msg,
       };
+    } finally {
+      // Clean up filechooser listener to avoid duplicates
+      if (filechooserHandler) {
+        try { adapter.page.off('filechooser', filechooserHandler); } catch {}
+      }
     }
   }
 
@@ -482,7 +489,6 @@ export class LayeredOrchestrator {
 
     // Native email/password login
     console.log('[Orchestrator] No Google SSO — trying email/password login...');
-    const PASSWORD_SUFFIX = 'aA1!';
 
     const formState = await adapter.page.evaluate(() => {
       const hasEmail = !!document.querySelector(
@@ -625,13 +631,6 @@ export class LayeredOrchestrator {
       if (formState.hasPassword) {
         loginError = await checkLoginError();
 
-        // Retry with suffix
-        if (loginError && password) {
-          console.log(`[Orchestrator] Login failed: "${loginError}" — retrying with strengthened password...`);
-          await fillAndSubmit(password + PASSWORD_SUFFIX);
-          loginError = await checkLoginError();
-        }
-
         if (loginError) {
           console.log(`[Orchestrator] Login failed: "${loginError}" — navigating to account creation...`);
           const clickedCreate = await adapter.page.evaluate(() => {
@@ -666,8 +665,11 @@ export class LayeredOrchestrator {
   private async handleGoogleSignIn(email: string, userPassword?: string): Promise<void> {
     const adapter = this.adapter;
     const password = userPassword || process.env.TEST_GMAIL_PASSWORD || '';
+    if (!password) {
+      console.warn('[Orchestrator] No password available for Google sign-in — password entry will be skipped.');
+    }
 
-    console.log(`[Orchestrator] On Google sign-in page for ${email}...`);
+    console.log('[Orchestrator] On Google sign-in page...');
 
     const googlePageType = await adapter.page.evaluate(`
       (() => {
@@ -761,6 +763,10 @@ export class LayeredOrchestrator {
     }
 
     if (googlePageType.type === 'password_entry') {
+      if (!password) {
+        console.warn('[Orchestrator] Google password page but no password available — cannot proceed.');
+        throw new Error('Google sign-in requires a password in user_data.password or TEST_GMAIL_PASSWORD env var');
+      }
       const passwordInput = adapter.page.locator('input[type="password"]:visible').first();
       await passwordInput.fill(password);
       await adapter.page.waitForTimeout(300);
@@ -770,12 +776,15 @@ export class LayeredOrchestrator {
     }
 
     // Unknown Google page — LLM fallback
+    const passwordHint = password
+      ? `- If you see a "Password" field, type the password and click "Next".`
+      : `- If you see a "Password" field, report the task as done (no password available).`;
     await adapter.act(
       `This is a Google sign-in page. Move through the sign-in flow for "${email}":
 - If you see a "Continue", "Confirm", or "Allow" button, click it to proceed.
 - If you see the account "${email}" listed, click on it to select it.
 - If you see an "Email or phone" field, type "${email}" and click "Next".
-- If you see a "Password" field, do NOT type anything — just report the task as done.
+${passwordHint}
 - If you see a CAPTCHA or image challenge, report the task as done.
 Click only ONE button, then report the task as done.`,
     );
@@ -834,12 +843,11 @@ Click only ONE button, then report the task as done.`,
     console.log('[Orchestrator] Account creation page detected, filling in details...');
 
     const email = profile.email || '';
-    const basePassword = profile.password || process.env.TEST_GMAIL_PASSWORD || '';
-    if (!basePassword) {
+    const password = profile.password || process.env.TEST_GMAIL_PASSWORD || '';
+    if (!password) {
       console.warn('[Orchestrator] No password available for account creation — cannot proceed.');
       throw new Error('Account creation requires a password in user_data.password or TEST_GMAIL_PASSWORD env var');
     }
-    const password = basePassword + 'aA1!';
 
     // DOM-fill email
     await adapter.page.evaluate((e: string) => {
@@ -1013,7 +1021,7 @@ ${dataPrompt}`,
             field.filled = true;
             domFills++;
             this.totalDomFilled++;
-            console.log(`[Orchestrator] [${pageLabel}] DOM-filled "${field.label}" → "${answer.substring(0, 30)}${answer.length > 30 ? '...' : ''}" (${field.kind})`);
+            console.log(`[Orchestrator] [${pageLabel}] DOM-filled "${field.label}" (${field.kind})`);
           }
         } catch (err) {
           console.warn(`[Orchestrator] [${pageLabel}] DOM fill failed for "${field.label}": ${err}`);
@@ -1042,7 +1050,8 @@ ${dataPrompt}`,
 
       if (postWalkUnfilled.length > 0) {
         console.log(`[Orchestrator] [${pageLabel}] Post-walk cleanup: ${postWalkUnfilled.length} field(s) still unfilled`);
-        await this.postWalkCleanup(postWalkUnfilled, scan, config, qaMap, fillPrompt, pageLabel, llmCalls, MAX_LLM_CALLS);
+        const cleanupCalls = await this.postWalkCleanup(postWalkUnfilled, scan, config, qaMap, fillPrompt, pageLabel, llmCalls, MAX_LLM_CALLS);
+        llmCalls += cleanupCalls;
       }
 
       // ── PHASE 2.75: MAGNITUDE HAND ──
@@ -1125,9 +1134,10 @@ ${dataPrompt}`,
         const perFieldBefore = await this.getPerFieldValues(visibleFields);
         const checkedBefore = await this.getCheckedCheckboxes();
 
-        console.log(`[Orchestrator] [${pageLabel}] LLM call ${currentLlmCalls + callsMade + 1}/${maxLlmCalls} for ${visibleFields.length} visible field(s): ${visibleFields.map(f => `"${f.label}"`).join(', ')}`);
+        console.log(`[Orchestrator] [${pageLabel}] LLM call ${currentLlmCalls + callsMade + 1}/${maxLlmCalls} for ${visibleFields.length} visible field(s)`);
+        let actSucceeded = false;
         try {
-          await this.safeAct(enrichedPrompt, pageLabel);
+          actSucceeded = await this.safeAct(enrichedPrompt, pageLabel);
         } catch (actError) {
           console.warn(`[Orchestrator] [${pageLabel}] LLM act() failed: ${actError instanceof Error ? actError.message : actError}`);
         }
@@ -1179,7 +1189,7 @@ ${dataPrompt}`,
     pageLabel: string,
     llmCalls: number,
     maxLlmCalls: number,
-  ): Promise<void> {
+  ): Promise<number> {
     const adapter = this.adapter;
 
     for (const field of postWalkUnfilled) {
@@ -1201,7 +1211,7 @@ ${dataPrompt}`,
         if (ok) {
           field.filled = true;
           this.totalDomFilled++;
-          console.log(`[Orchestrator] [${pageLabel}] Post-walk filled "${field.label}" → "${answer.substring(0, 30)}${answer.length > 30 ? '...' : ''}" (${field.kind})`);
+          console.log(`[Orchestrator] [${pageLabel}] Post-walk filled "${field.label}" (${field.kind})`);
         }
       } catch (err) {
         console.warn(`[Orchestrator] [${pageLabel}] Post-walk DOM fill failed for "${field.label}": ${err}`);
@@ -1219,7 +1229,9 @@ ${dataPrompt}`,
             target.selector,
           );
           await adapter.page.waitForTimeout(300);
-        } catch {}
+        } catch (scrollErr) {
+          console.warn(`[Orchestrator] [${pageLabel}] Scroll to field failed: ${scrollErr}`);
+        }
       }
 
       const visibleFields = await this.scanVisibleUnfilledFields(qaMap);
@@ -1227,14 +1239,19 @@ ${dataPrompt}`,
         const groupContext = this.buildScanContextForLLM(visibleFields);
         const cleanupPrompt = `${fillPrompt}\n\nFIELDS VISIBLE IN CURRENT VIEWPORT (${visibleFields.length} field(s) detected by scan):\n${groupContext}\n\nFill the fields listed above. They are currently visible and empty. Use the expected values shown where provided.\n\nCRITICAL: NEVER skip a [REQUIRED] field (marked with * or [REQUIRED]). If no exact data is available, use your best judgment to pick the most reasonable answer.\n\nDo NOT scroll the page or click Next.`;
 
-        console.log(`[Orchestrator] [${pageLabel}] Post-walk LLM cleanup for ${visibleFields.length} remaining field(s): ${visibleFields.map(f => `"${f.label}"`).join(', ')}`);
+        console.log(`[Orchestrator] [${pageLabel}] Post-walk LLM cleanup for ${visibleFields.length} remaining field(s)`);
         try {
-          await this.safeAct(cleanupPrompt, pageLabel);
+          const ok = await this.safeAct(cleanupPrompt, pageLabel);
+          if (!ok) {
+            console.warn(`[Orchestrator] [${pageLabel}] Post-walk LLM call reported failure`);
+          }
         } catch (err) {
           console.warn(`[Orchestrator] [${pageLabel}] Post-walk LLM call failed: ${err instanceof Error ? err.message : err}`);
         }
+        return 1;
       }
     }
+    return 0;
   }
 
   // ==========================================================================
@@ -1510,7 +1527,9 @@ ${dataPrompt}`,
     try {
       await this.adapter.page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
       await this.adapter.page.waitForTimeout(PAGE_TRANSITION_WAIT_MS);
-    } catch {}
+    } catch (err) {
+      console.warn(`[Orchestrator] waitForPageSettled failed: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   private async dismissCookieBanner(): Promise<void> {
@@ -1564,7 +1583,9 @@ ${dataPrompt}`,
         console.log('[Orchestrator] Dismissed cookie consent banner');
         await this.adapter.page.waitForTimeout(500);
       }
-    } catch {}
+    } catch (err) {
+      console.warn(`[Orchestrator] dismissCookieBanner failed: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   private async dismissOpenOverlays(): Promise<void> {
@@ -1577,7 +1598,9 @@ ${dataPrompt}`,
         }
       });
       await this.adapter.page.waitForTimeout(300);
-    } catch {}
+    } catch (err) {
+      console.warn(`[Orchestrator] dismissOpenOverlays failed: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   private async getPageFingerprint(): Promise<string> {
@@ -1791,7 +1814,7 @@ Set is_final_review to true ONLY if this is genuinely the last page before submi
     try {
       const fileInput = this.adapter.page.locator('input[type="file"]').first();
       await fileInput.setInputFiles(resumePath);
-      console.log(`[Orchestrator] Resume uploaded via DOM file input: ${resumePath}`);
+      console.log('[Orchestrator] Resume uploaded via DOM file input');
       await this.adapter.page.waitForTimeout(2000);
       return true;
     } catch (err) {
@@ -2073,30 +2096,51 @@ ${dataPrompt}`;
   /**
    * Returns the current value for each field by selector, in order.
    * Used for per-field before/after comparison in llmFillPhase.
+   * Handles native inputs (.value), custom dropdowns (inner input or selected text),
+   * and aria radio groups (aria-checked radio text).
    */
-  private async getPerFieldValues(fields: { selector: string }[]): Promise<string[]> {
-    const selectors = fields.map(f => f.selector);
-    return this.adapter.page.evaluate((sels: string[]) => {
-      return sels.map(sel => {
-        const el = document.querySelector<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(sel);
-        return el?.value ?? '';
-      });
-    }, selectors);
-  }
+  private async getPerFieldValues(fields: { selector: string; kind?: string }[]): Promise<string[]> {
+    const fieldInfo = fields.map(f => ({ selector: f.selector, kind: f.kind || 'text' }));
+    return this.adapter.page.evaluate((info: { selector: string; kind: string }[]) => {
+      return info.map(({ selector, kind }) => {
+        if (!selector) return '';
+        let el: Element | null;
+        try {
+          el = document.querySelector(selector);
+        } catch {
+          return '';
+        }
+        if (!el) return '';
 
-  private async getVisibleFieldValues(): Promise<string> {
-    return this.adapter.page.evaluate(() => {
-      const vh = window.innerHeight;
-      const vals: string[] = [];
-      document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(
-        'input, textarea, select'
-      ).forEach(el => {
-        const rect = el.getBoundingClientRect();
-        if (rect.bottom < 0 || rect.top > vh || rect.width === 0 || rect.height === 0) return;
-        vals.push(el.value || '');
+        // Native inputs: read .value
+        if ('value' in el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT')) {
+          return (el as HTMLInputElement).value ?? '';
+        }
+
+        // Custom dropdown: check inner input, then selected option text
+        if (kind === 'custom_dropdown') {
+          const inner = el.querySelector('input') as HTMLInputElement | null;
+          if (inner?.value?.trim()) return inner.value;
+          const selected = el.querySelector('[aria-selected="true"], [data-selected="true"], .selected');
+          if (selected) return (selected.textContent || '').trim();
+          return (el.textContent || '').trim().substring(0, 100);
+        }
+
+        // Aria radio: return checked radio's text
+        if (kind === 'aria_radio') {
+          const checked = el.querySelector('[role="radio"][aria-checked="true"]');
+          if (checked) return (checked.getAttribute('aria-label') || checked.textContent || '').trim();
+          if (el.getAttribute('aria-checked') === 'true') {
+            return (el.getAttribute('aria-label') || el.textContent || '').trim();
+          }
+          return '';
+        }
+
+        // Fallback: try .value then textContent
+        if ('value' in el) return (el as HTMLInputElement).value ?? '';
+        return '';
       });
-      return vals.join('|');
-    });
+    }, fieldInfo);
   }
 
   private async getCheckedCheckboxes(): Promise<number[]> {
