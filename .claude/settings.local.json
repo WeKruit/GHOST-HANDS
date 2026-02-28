@@ -13,7 +13,10 @@
       "Bash(done)",
       "Bash(ls:*)",
       "Bash(grep:*)",
-      "Bash(bun install:*)"
+      "Bash(bun install:*)",
+      "Bash(bun run:*)",
+      "Bash(bun -e:*)",
+      "Bash(bun:*)"
     ]
   }
 }
