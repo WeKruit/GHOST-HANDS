@@ -1,6 +1,10 @@
+import path from 'node:path';
+import fs from 'node:fs';
 import { z } from 'zod';
 import type { TaskHandler, TaskContext, TaskResult, ValidationResult } from './types.js';
-import { ProgressStep } from '../progressTracker.js';
+import { detectPlatformFromUrl } from './platforms/index.js';
+import { LayeredOrchestrator } from './LayeredOrchestrator.js';
+import { BlockerDetector } from '../../detection/BlockerDetector.js';
 
 /**
  * Zod schema for ApplyHandler input validation.
@@ -30,36 +34,75 @@ export class ApplyHandler implements TaskHandler {
   }
 
   async execute(ctx: TaskContext): Promise<TaskResult> {
-    const { job, adapter, progress } = ctx;
+    const { job, adapter, progress, costTracker } = ctx;
+    const userProfile = job.input_data.user_data as Record<string, any> | undefined;
 
-    // Execute the browser automation.
-    // Resume upload is handled automatically by JobExecutor's filechooser listener
-    // which intercepts any file input dialog and attaches the downloaded resume.
-    const actResult = await adapter.act(job.task_description, {
-      prompt: ctx.resumeFilePath
-        ? `${ctx.dataPrompt}\n\nA resume file is available for upload. When you encounter a file upload field for resume/CV, click it to trigger the file dialog — the file will be attached automatically.`
-        : ctx.dataPrompt,
-      data: job.input_data.user_data,
-    });
+    // If no user_data, fall back to simple one-shot adapter.act()
+    if (!userProfile || !userProfile.first_name) {
+      const actResult = await adapter.act(job.task_description, {
+        prompt: ctx.resumeFilePath
+          ? `${ctx.dataPrompt}\n\nA resume file is available for upload. When you encounter a file upload field for resume/CV, click it to trigger the file dialog — the file will be attached automatically.`
+          : ctx.dataPrompt,
+        data: job.input_data.user_data,
+      });
 
-    if (!actResult.success) {
-      return { success: false, error: `Action failed: ${actResult.message}` };
+      if (!actResult.success) {
+        return { success: false, error: `Action failed: ${actResult.message}` };
+      }
+
+      return { success: true, data: { message: 'Applied via single-shot agent' } };
     }
 
-    // Extract results
-    await progress.setStep(ProgressStep.EXTRACTING_RESULTS);
-    const result = await adapter.extract(
-      'Extract any confirmation number, success message, or application ID visible on the page',
-      z.object({
-        confirmation_id: z.string().optional(),
-        success_message: z.string().optional(),
-        submitted: z.boolean(),
-      })
-    );
+    // Route through LayeredOrchestrator for structured multi-page apply
+    const qaOverrides = job.input_data.qa_overrides || {};
+    const config = detectPlatformFromUrl(job.target_url);
+    const dataPrompt = config.buildDataPrompt(userProfile, qaOverrides);
+    const qaMap = config.buildQAMap(userProfile, qaOverrides);
+
+    let resumePath: string | null = null;
+    if (userProfile.resume_path) {
+      const resolved = path.isAbsolute(userProfile.resume_path)
+        ? userProfile.resume_path
+        : path.resolve(process.cwd(), userProfile.resume_path);
+      if (fs.existsSync(resolved)) resumePath = resolved;
+    }
+    // Also check ctx.resumeFilePath (downloaded by JobExecutor)
+    if (!resumePath && ctx.resumeFilePath) {
+      resumePath = ctx.resumeFilePath;
+    }
+
+    const orchestrator = new LayeredOrchestrator({
+      adapter,
+      config,
+      costTracker,
+      progress,
+      blockerDetector: new BlockerDetector(),
+    });
+
+    const result = await orchestrator.run({
+      userProfile,
+      qaMap,
+      dataPrompt,
+      resumePath,
+    });
 
     return {
-      success: result.submitted ?? true,
-      data: result,
+      success: result.success,
+      keepBrowserOpen: result.keepBrowserOpen,
+      awaitingUserReview: result.awaitingUserReview,
+      error: result.error,
+      data: {
+        platform: result.platform,
+        pages_processed: result.pagesProcessed,
+        final_page: result.finalPage,
+        dom_filled: result.domFilled,
+        llm_filled: result.llmFilled,
+        magnitude_filled: result.magnitudeFilled,
+        total_fields: result.totalFields,
+        message: result.awaitingUserReview
+          ? 'Application filled. Waiting for user to review and submit.'
+          : result.error || `Processed ${result.pagesProcessed} pages.`,
+      },
     };
   }
 }
