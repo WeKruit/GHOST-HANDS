@@ -226,7 +226,7 @@ export class PageScanner {
         var buttons = [];
         var scrollY = ${scrollY};
         var startIdx = ${startIdx};
-        var platform = "${platform}";
+        var platform = ${JSON.stringify(platform)};
         var viewportHeight = window.innerHeight;
         var viewportWidth = window.innerWidth;
         var idx = startIdx;
