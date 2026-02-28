@@ -61,3 +61,4 @@ test-*-data*
 
 # Magnitude source (backup of upstream monorepo)
 magnitude-source/
+.env.backup
