@@ -5,7 +5,6 @@ import type { CostTracker } from '../costControl.js';
 import type { ProgressTracker } from '../progressTracker.js';
 import { ProgressStep } from '../progressTracker.js';
 import { findBestAnswer } from './platforms/genericConfig.js';
-import type { BlockerDetector, BlockerResult } from '../../detection/BlockerDetector.js';
 
 // ============================================================================
 // Constants
@@ -29,9 +28,7 @@ export interface OrchestratorParams {
   config: PlatformConfig;
   costTracker: CostTracker;
   progress: ProgressTracker;
-  blockerDetector?: BlockerDetector;
   maxPages?: number;
-  hitlCallback?: (blocker: BlockerResult) => Promise<boolean>;
 }
 
 export interface RunParams {
@@ -77,9 +74,7 @@ export class LayeredOrchestrator {
   private readonly config: PlatformConfig;
   private readonly costTracker: CostTracker;
   private readonly progress: ProgressTracker;
-  private readonly blockerDetector?: BlockerDetector;
   private readonly maxPages: number;
-  private readonly hitlCallback?: (blocker: BlockerResult) => Promise<boolean>;
 
   private lastLlmCallTime = 0;
   private loginAttempted = false;
@@ -95,9 +90,7 @@ export class LayeredOrchestrator {
     this.config = params.config;
     this.costTracker = params.costTracker;
     this.progress = params.progress;
-    this.blockerDetector = params.blockerDetector;
     this.maxPages = params.maxPages ?? 15;
-    this.hitlCallback = params.hitlCallback;
   }
 
   // ==========================================================================
@@ -114,8 +107,12 @@ export class LayeredOrchestrator {
     if (resumePath) {
       const rp = resumePath;
       filechooserHandler = async (chooser: any) => {
-        console.log('[Orchestrator] File chooser opened — attaching resume');
-        await chooser.setFiles(rp);
+        try {
+          console.log('[Orchestrator] File chooser opened — attaching resume');
+          await chooser.setFiles(rp);
+        } catch (err) {
+          console.warn(`[Orchestrator] Failed to attach resume: ${err instanceof Error ? err.message : err}`);
+        }
       };
       adapter.page.on('filechooser', filechooserHandler);
     }
@@ -254,7 +251,9 @@ export class LayeredOrchestrator {
     } finally {
       // Clean up filechooser listener to avoid duplicates
       if (filechooserHandler) {
-        try { adapter.page.off('filechooser', filechooserHandler); } catch {}
+        try { adapter.page.off('filechooser', filechooserHandler); } catch (err) {
+          console.warn(`[Orchestrator] Failed to remove filechooser listener: ${err instanceof Error ? err.message : err}`);
+        }
       }
     }
   }
@@ -666,7 +665,7 @@ export class LayeredOrchestrator {
     const adapter = this.adapter;
     const password = userPassword || process.env.TEST_GMAIL_PASSWORD || '';
     if (!password) {
-      console.warn('[Orchestrator] No password available for Google sign-in — password entry will be skipped.');
+      console.warn('[Orchestrator] No password available for Google sign-in — password entry will fail if required.');
     }
 
     console.log('[Orchestrator] On Google sign-in page...');
@@ -1164,6 +1163,11 @@ ${dataPrompt}`,
         if (anyChanged) {
           continue; // re-scan same viewport
         }
+
+        // safeAct failed AND no DOM changes — stop retrying this viewport
+        if (!actSucceeded) {
+          break;
+        }
       }
 
       if (currentScrollPos >= maxScrollPos) break;
@@ -1203,7 +1207,9 @@ ${dataPrompt}`,
             field.selector,
           );
           await adapter.page.waitForTimeout(300);
-        } catch {}
+        } catch (err) {
+          console.warn(`[Orchestrator] [${pageLabel}] Scroll to field failed: ${err instanceof Error ? err.message : err}`);
+        }
       }
 
       try {
@@ -1307,13 +1313,14 @@ ${dataPrompt}`,
             field.selector,
           );
           await adapter.page.waitForTimeout(300);
-        } catch {}
+        } catch (err) {
+          console.warn(`[Orchestrator] [${pageLabel}] MagnitudeHand scroll to field failed: ${err instanceof Error ? err.message : err}`);
+        }
       }
 
       const answer = field.matchedAnswer || findBestAnswer(field.label, qaMap);
       const prompt = this.buildMagnitudeHandPrompt(field, answer || undefined, dataPrompt);
-      const answerPreview = answer ? `"${answer.substring(0, 30)}${answer.length > 30 ? '...' : ''}"` : 'best judgment';
-      console.log(`[Orchestrator] [${pageLabel}] MagnitudeHand: Filling "${field.label}" (${field.kind}) → ${answerPreview}`);
+      console.log(`[Orchestrator] [${pageLabel}] MagnitudeHand: Filling "${field.label}" (${field.kind})`);
 
       try {
         await this.throttleLlm();

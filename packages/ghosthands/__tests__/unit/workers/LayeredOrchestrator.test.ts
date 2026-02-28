@@ -22,6 +22,7 @@ function createMockPage() {
       }),
     }),
     on: vi.fn(),
+    off: vi.fn(),
     context: vi.fn().mockReturnValue({
       newPage: vi.fn().mockResolvedValue({
         goto: vi.fn().mockResolvedValue(undefined),
@@ -516,7 +517,7 @@ describe('LayeredOrchestrator', () => {
   // =========================================================================
 
   describe('filechooser listener', () => {
-    test('registers filechooser handler when resumePath provided', async () => {
+    test('registers and cleans up filechooser handler when resumePath provided', async () => {
       const adapter = createMockAdapter();
       const config = createMockConfig({
         detectPageByUrl: vi.fn().mockReturnValue({ page_type: 'review', page_title: 'Review' }),
@@ -526,6 +527,12 @@ describe('LayeredOrchestrator', () => {
       await orchestrator.run({ ...defaultRunParams, resumePath: '/tmp/resume.pdf' });
 
       expect(adapter.page.on).toHaveBeenCalledWith('filechooser', expect.any(Function));
+      // Verify cleanup: page.off called with same event name and handler
+      expect((adapter.page as any).off).toHaveBeenCalledWith('filechooser', expect.any(Function));
+      // Verify the same handler reference was used for on() and off()
+      const onHandler = (adapter.page.on as Mock).mock.calls[0][1];
+      const offHandler = ((adapter.page as any).off as Mock).mock.calls[0][1];
+      expect(onHandler).toBe(offHandler);
     });
 
     test('does not register filechooser handler when no resumePath', async () => {
@@ -538,6 +545,22 @@ describe('LayeredOrchestrator', () => {
       await orchestrator.run({ ...defaultRunParams, resumePath: null });
 
       expect(adapter.page.on).not.toHaveBeenCalled();
+      expect((adapter.page as any).off).not.toHaveBeenCalled();
+    });
+
+    test('cleans up filechooser handler even on error', async () => {
+      const adapter = createMockAdapter();
+      (adapter.act as Mock).mockRejectedValue(new Error('Browser crashed'));
+      const config = createMockConfig({
+        detectPageByUrl: vi.fn().mockReturnValue({ page_type: 'job_listing', page_title: 'Job' }),
+      });
+
+      const orchestrator = buildOrchestrator({ adapter, config });
+      const result = await orchestrator.run({ ...defaultRunParams, resumePath: '/tmp/resume.pdf' });
+
+      expect(result.success).toBe(false);
+      // Even after error, cleanup should have happened
+      expect((adapter.page as any).off).toHaveBeenCalledWith('filechooser', expect.any(Function));
     });
   });
 
