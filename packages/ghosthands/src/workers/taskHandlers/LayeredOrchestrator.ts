@@ -219,7 +219,7 @@ export class LayeredOrchestrator {
             const step = (pageState.page_type === 'experience' || pageState.page_type === 'resume_upload')
               ? ProgressStep.UPLOADING_RESUME
               : ProgressStep.FILLING_FORM;
-            await this.progress.setStep(step as any);
+            await this.progress.setStep(step);
 
             const fillPrompt = config.buildPagePrompt(pageState.page_type, dataPrompt);
             const result = await this.fillPage(fillPrompt, qaMap, pageState.page_type, resumePath, 0, 0, dataPrompt);
@@ -453,7 +453,7 @@ export class LayeredOrchestrator {
 
     // Google SSO path
     if (currentUrl.includes('accounts.google.com')) {
-      await this.handleGoogleSignIn(email);
+      await this.handleGoogleSignIn(email, profile.password);
       return;
     }
 
@@ -663,9 +663,9 @@ export class LayeredOrchestrator {
     await this.waitForPageSettled();
   }
 
-  private async handleGoogleSignIn(email: string): Promise<void> {
+  private async handleGoogleSignIn(email: string, userPassword?: string): Promise<void> {
     const adapter = this.adapter;
-    const password = process.env.TEST_GMAIL_PASSWORD || '';
+    const password = userPassword || process.env.TEST_GMAIL_PASSWORD || '';
 
     console.log(`[Orchestrator] On Google sign-in page for ${email}...`);
 
@@ -807,7 +807,7 @@ Click only ONE button, then report the task as done.`,
 
     if (!code) throw new Error('Could not find verification code in Gmail');
 
-    console.log(`[Orchestrator] Found verification code: ${code}`);
+    console.log(`[Orchestrator] Found verification code (${code.length} digits)`);
     const enterResult = await adapter.act(
       `Enter the verification code "${code}" into the verification code input field, then click the "Next", "Verify", "Continue", or "Submit" button. Report the task as done after clicking.`,
     );
@@ -835,7 +835,11 @@ Click only ONE button, then report the task as done.`,
 
     const email = profile.email || '';
     const basePassword = profile.password || process.env.TEST_GMAIL_PASSWORD || '';
-    const password = basePassword ? basePassword + 'aA1!' : 'GhApp2026!x';
+    if (!basePassword) {
+      console.warn('[Orchestrator] No password available for account creation — cannot proceed.');
+      throw new Error('Account creation requires a password in user_data.password or TEST_GMAIL_PASSWORD env var');
+    }
+    const password = basePassword + 'aA1!';
 
     // DOM-fill email
     await adapter.page.evaluate((e: string) => {
@@ -971,15 +975,19 @@ ${dataPrompt}`,
                 uploadBtn.selector,
               );
               await adapter.page.waitForTimeout(300);
-              await this.safeAct(
+              const uploadClicked = await this.safeAct(
                 'Click the resume/CV upload button or drag-and-drop area to open the file picker. ' +
                 'Look for text like "Upload", "Attach", "Choose File", "Browse", "Add Resume", or a drag-and-drop zone. ' +
                 'Click it ONCE, then report done immediately. Do NOT fill any other fields.',
                 pageLabel);
               llmCalls++;
-              await adapter.page.waitForTimeout(3000);
-              resumeUploaded = true;
-              uploadBtn.filled = true;
+              if (uploadClicked) {
+                await adapter.page.waitForTimeout(3000);
+                resumeUploaded = true;
+                uploadBtn.filled = true;
+              } else {
+                console.warn(`[Orchestrator] [${pageLabel}] Resume upload click reported failure — will retry on next cycle.`);
+              }
             } catch (err) {
               console.warn(`[Orchestrator] [${pageLabel}] LLM resume upload click failed: ${err}`);
             }
@@ -1114,7 +1122,7 @@ ${dataPrompt}`,
         const groupContext = this.buildScanContextForLLM(visibleFields);
         const enrichedPrompt = `${fillPrompt}\n\nFIELDS VISIBLE IN CURRENT VIEWPORT (${visibleFields.length} field(s) detected by scan):\n${groupContext}\n\nFill the fields listed above. They are currently visible and empty. Use the expected values shown where provided.\n\nADDITIONALLY: If you see any other visible empty required fields on screen (marked with * or "required") that are NOT listed above, fill those too. Some custom dropdowns or non-standard UI components may not appear in the scan. For dropdowns that don't have a text input, click them to open, then select the correct option.\n\nCRITICAL: NEVER skip a [REQUIRED] field (marked with * or [REQUIRED]). If no exact data is available, use your best judgment to pick the most reasonable answer. For example, "Degree Status" → "Completed" or "Graduated", "Visa Status" → "Authorized to work", etc. Required fields MUST be filled.\n\nIMPORTANT — STUCK FIELD RULE: If you type a value into a dropdown/autocomplete field and NO matching options appear in the dropdown list, the value is NOT available. Do NOT retry the same field or retype the same value. Instead: select all text in the field, delete it to clear it, click somewhere else to close any popups, then move on to the next field. You get ONE attempt per field — if it doesn't match, clear it and move on.\n\nDROPDOWN NAVIGATION: For click-to-open dropdowns (not search/type fields) showing a long list of options where the option you need is not visible, you MAY press ArrowDown repeatedly to scroll through options within the dropdown, then press Enter or click to select. This scrolls within the dropdown only, not the page.\n\nDo NOT scroll the page or click Next.`;
 
-        const fieldsBefore = await this.getVisibleFieldValues();
+        const perFieldBefore = await this.getPerFieldValues(visibleFields);
         const checkedBefore = await this.getCheckedCheckboxes();
 
         console.log(`[Orchestrator] [${pageLabel}] LLM call ${currentLlmCalls + callsMade + 1}/${maxLlmCalls} for ${visibleFields.length} visible field(s): ${visibleFields.map(f => `"${f.label}"`).join(', ')}`);
@@ -1128,15 +1136,22 @@ ${dataPrompt}`,
         await this.dismissOpenOverlays();
         await this.restoreUncheckedCheckboxes(checkedBefore);
 
-        const fieldsAfter = await this.getVisibleFieldValues();
-        if (fieldsAfter !== fieldsBefore) {
-          for (const vf of visibleFields) {
-            const match = scan.fields.find(sf => sf.selector === vf.selector);
+        // Per-field comparison: only mark fields whose values actually changed
+        const perFieldAfter = await this.getPerFieldValues(visibleFields);
+        let anyChanged = false;
+        for (let i = 0; i < visibleFields.length; i++) {
+          const before = perFieldBefore[i] ?? '';
+          const after = perFieldAfter[i] ?? '';
+          if (after !== before && after.trim() !== '') {
+            const match = scan.fields.find(sf => sf.selector === visibleFields[i].selector);
             if (match) {
               match.filled = true;
               fieldsFilled++;
             }
+            anyChanged = true;
           }
+        }
+        if (anyChanged) {
           continue; // re-scan same viewport
         }
       }
@@ -1193,9 +1208,9 @@ ${dataPrompt}`,
       }
     }
 
-    // Targeted LLM call for remaining unfilled fields
+    // Targeted LLM call for remaining unfilled fields (strict cap)
     const stillUnfilled = postWalkUnfilled.filter(f => !f.filled);
-    if (stillUnfilled.length > 0 && llmCalls < maxLlmCalls + 2) {
+    if (stillUnfilled.length > 0 && llmCalls < maxLlmCalls) {
       const target = stillUnfilled[0];
       if (target.selector) {
         try {
@@ -1671,25 +1686,35 @@ Set is_final_review to true ONLY if this is genuinely the last page before submi
     }
   }
 
-  private async safeAct(prompt: string, label: string): Promise<void> {
+  /**
+   * Calls adapter.act() and checks the ActionResult.success flag.
+   * Returns true if the action succeeded, false if it reported failure.
+   * Throws only on budget/action-limit errors and unrecoverable exceptions.
+   */
+  private async safeAct(prompt: string, label: string): Promise<boolean> {
     const healthy = await this.isPageHealthy();
     if (!healthy) {
       console.warn(`[Orchestrator] [${label}] Page appears broken — skipping LLM call.`);
-      return;
+      return false;
     }
 
     await this.throttleLlm();
 
     try {
-      await this.adapter.act(prompt);
+      const result = await this.adapter.act(prompt);
+      if (!result.success) {
+        console.warn(`[Orchestrator] [${label}] act() reported failure: ${result.message}`);
+        return false;
+      }
+      return true;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       if (msg.includes('429') || msg.includes('rate_limit') || msg.includes('Too Many Requests')) {
         console.warn(`[Orchestrator] [${label}] Rate limited (429) — waiting 30s before retry...`);
         await this.adapter.page.waitForTimeout(30_000);
         this.lastLlmCallTime = Date.now();
-        await this.adapter.act(prompt);
-        return;
+        const retryResult = await this.adapter.act(prompt);
+        return retryResult.success;
       }
       throw error;
     }
@@ -1951,6 +1976,7 @@ Set is_final_review to true ONLY if this is genuinely the last page before submi
     });
 
     // Deduplicate and match answers
+    if (!Array.isArray(visibleEmpty)) return [];
     const seen = new Set<string>();
     const fields: ScannedField[] = [];
     for (const raw of visibleEmpty) {
@@ -2042,6 +2068,20 @@ RULES:
 
 APPLICANT DATA:
 ${dataPrompt}`;
+  }
+
+  /**
+   * Returns the current value for each field by selector, in order.
+   * Used for per-field before/after comparison in llmFillPhase.
+   */
+  private async getPerFieldValues(fields: { selector: string }[]): Promise<string[]> {
+    const selectors = fields.map(f => f.selector);
+    return this.adapter.page.evaluate((sels: string[]) => {
+      return sels.map(sel => {
+        const el = document.querySelector<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(sel);
+        return el?.value ?? '';
+      });
+    }, selectors);
   }
 
   private async getVisibleFieldValues(): Promise<string> {

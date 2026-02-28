@@ -1,9 +1,22 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import { z } from 'zod';
 import type { TaskHandler, TaskContext, TaskResult, ValidationResult } from './types.js';
 import { detectPlatformFromUrl } from './platforms/index.js';
 import { LayeredOrchestrator } from './LayeredOrchestrator.js';
 import { BlockerDetector } from '../../detection/BlockerDetector.js';
+
+/**
+ * Zod schema for SmartApplyHandler input validation.
+ * user_data is required and must contain first_name, last_name, and a valid email.
+ */
+const SmartApplyInputSchema = z.object({
+  user_data: z.object({
+    first_name: z.string({ required_error: 'is required' }).min(1, 'is required'),
+    last_name: z.string({ required_error: 'is required' }).min(1, 'is required'),
+    email: z.string({ required_error: 'is required' }).email('must be a valid email'),
+  }).passthrough(),
+}).passthrough();
 
 /**
  * SmartApplyHandler — Thin wrapper that delegates to LayeredOrchestrator.
@@ -16,18 +29,14 @@ export class SmartApplyHandler implements TaskHandler {
   readonly description = 'Fill out a job application on any ATS platform (multi-step), stopping before submission';
 
   validate(inputData: Record<string, any>): ValidationResult {
-    const errors: string[] = [];
-    const userData = inputData.user_data;
-
-    if (!userData) {
-      errors.push('user_data is required');
-    } else {
-      if (!userData.first_name) errors.push('user_data.first_name is required');
-      if (!userData.last_name) errors.push('user_data.last_name is required');
-      if (!userData.email) errors.push('user_data.email is required');
+    const result = SmartApplyInputSchema.safeParse(inputData);
+    if (result.success) {
+      return { valid: true };
     }
-
-    return { valid: errors.length === 0, errors: errors.length > 0 ? errors : undefined };
+    const errors = result.error.issues.map((issue) =>
+      issue.path.length > 0 ? `${issue.path.join('.')} ${issue.message}` : issue.message
+    );
+    return { valid: false, errors: errors.length > 0 ? errors : undefined };
   }
 
   async execute(ctx: TaskContext): Promise<TaskResult> {
@@ -45,7 +54,7 @@ export class SmartApplyHandler implements TaskHandler {
     const dataPrompt = config.buildDataPrompt(userProfile, qaOverrides);
     const qaMap = config.buildQAMap(userProfile, qaOverrides);
 
-    // Resolve resume file path
+    // Resolve resume file path (check user_data.resume_path, then ctx.resumeFilePath from JobExecutor)
     let resumePath: string | null = null;
     if (userProfile.resume_path) {
       const resolved = path.isAbsolute(userProfile.resume_path)
@@ -57,6 +66,10 @@ export class SmartApplyHandler implements TaskHandler {
       } else {
         console.warn(`[SmartApply] Resume not found at ${resolved} — skipping upload.`);
       }
+    }
+    if (!resumePath && ctx.resumeFilePath) {
+      resumePath = ctx.resumeFilePath;
+      console.log(`[SmartApply] Using JobExecutor resume: ${resumePath}`);
     }
 
     // Create orchestrator and run
