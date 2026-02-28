@@ -59,6 +59,8 @@ export const INTERACTIVE_SELECTOR = [
   '[role="spinbutton"]',
   '[role="slider"]',
   '[role="searchbox"]',
+  '[data-uxi-widget-type="selectinput"]',
+  '[aria-haspopup="listbox"]',
 ].join(", ");
 
 export const PLACEHOLDER_RE = /^(select|choose|pick|--|—)/i;
@@ -81,8 +83,6 @@ export function resolveUrl(input: string): string {
 export async function injectHelpers(page: Page) {
   const selectorStr = JSON.stringify(INTERACTIVE_SELECTOR);
   await page.evaluate(`
-    // Shim for tsx/esbuild __name helper (not available in browser context)
-    if (typeof __name === 'undefined') var __name = function(fn) { return fn; };
     window.__ff = {
       SELECTOR: ${selectorStr},
 
@@ -167,7 +167,7 @@ export async function extractFields(page: Page): Promise<FormField[]> {
     const seen = new Set();
     const out: any[] = [];
 
-    const shouldSkip = (el: any): boolean => {
+    function shouldSkip(el: any): boolean {
       // Skip elements inside dropdown panels (search inputs, listbox internals)
       if (el.closest('[class*="select-dropdown"], [class*="select-option"]'))
         return true;
@@ -205,7 +205,7 @@ export async function extractFields(page: Page): Promise<FormField[]> {
     }
 
     // Get only the "main" text of an option, ignoring description sub-elements
-    const getOptionMainText = (opt: any): string => {
+    function getOptionMainText(opt: any): string {
       // If it has child elements with description class, exclude them
       const clone = opt.cloneNode(true) as HTMLElement;
       clone
@@ -214,7 +214,7 @@ export async function extractFields(page: Page): Promise<FormField[]> {
         )
         .forEach((x: any) => x.remove());
       return clone.textContent?.trim() || "";
-    };
+    }
 
     document.querySelectorAll(ff.SELECTOR).forEach((el: any) => {
       if (seen.has(el)) return;
@@ -230,6 +230,9 @@ export async function extractFields(page: Page): Promise<FormField[]> {
         if (role === "textbox") return "text";
         if (role === "combobox") return "select";
         if (role === "listbox") return "select";
+        // Workday-style searchable dropdowns
+        if (el.getAttribute("data-uxi-widget-type") === "selectinput") return "select";
+        if (el.getAttribute("aria-haspopup") === "listbox") return "select";
         if (role === "radio") return "radio";
         if (role === "checkbox") return "checkbox";
         if (role === "spinbutton") return "number";
@@ -478,17 +481,20 @@ export interface ComboboxInfo {
   id: string;
   label: string;
   isNative: boolean;
-  kind: "select" | "radio-group" | "toggle"; // what type of control
+  kind: "select" | "radio-group" | "toggle" | "checkbox"; // what type of control
   options: string[];
 }
 
-export async function findVisibleProbeTargets(page: Page): Promise<ComboboxInfo[]> {
+export async function findVisibleProbeTargets(
+  page: Page,
+  skipDiscoveryIds?: Set<string>,
+): Promise<ComboboxInfo[]> {
   const raw: any[] = await page.evaluate(() => {
     const ff = (window as any).__ff;
     const result: any[] = [];
     const seen = new Set();
 
-    const getOptionMainText = (opt: any): string => {
+    function getOptionMainText(opt: any): string {
       const clone = opt.cloneNode(true) as HTMLElement;
       clone
         .querySelectorAll(
@@ -496,7 +502,7 @@ export async function findVisibleProbeTargets(page: Page): Promise<ComboboxInfo[
         )
         .forEach((x: any) => x.remove());
       return clone.textContent?.trim() || "";
-    };
+    }
 
     // Native selects
     document.querySelectorAll("select").forEach((el: any) => {
@@ -552,6 +558,21 @@ export async function findVisibleProbeTargets(page: Page): Promise<ComboboxInfo[
           isNative: false,
           kind: "select",
           options: opts,
+        });
+      });
+
+    // Workday-style searchable dropdowns (data-uxi-widget-type="selectinput")
+    document
+      .querySelectorAll('[data-uxi-widget-type="selectinput"], [aria-haspopup="listbox"]')
+      .forEach((el: any) => {
+        if (seen.has(el) || !ff.isVisible(el)) return;
+        seen.add(el);
+        result.push({
+          id: el.getAttribute("data-ff-id") || ff.tag(el),
+          label: ff.getAccessibleName(el),
+          isNative: false,
+          kind: "select",
+          options: [], // will be discovered by clicking
         });
       });
 
@@ -613,74 +634,246 @@ export async function findVisibleProbeTargets(page: Page): Promise<ComboboxInfo[
         });
       });
 
+    // Standalone checkboxes (may reveal conditional fields when checked)
+    document
+      .querySelectorAll('input[type="checkbox"], [role="checkbox"]')
+      .forEach((el: any) => {
+        if (seen.has(el) || !ff.isVisible(el)) return;
+        // Skip checkboxes inside multi-checkbox groups
+        const inGroup = el.closest('.checkbox-group, [role="group"]');
+        if (inGroup) {
+          const otherCheckboxes = inGroup.querySelectorAll('input[type="checkbox"], [role="checkbox"]');
+          if (otherCheckboxes.length > 1) return; // actual group, skip
+        }
+        seen.add(el);
+        const id = el.getAttribute("data-ff-id") || ff.tag(el);
+        const label = ff.getAccessibleName(el) || el.getAttribute("aria-label") || "";
+        if (!label) return; // skip unlabeled checkboxes
+        result.push({
+          id,
+          label,
+          isNative: false,
+          kind: "checkbox",
+          options: ["checked"],
+        });
+      });
+
     return result;
   });
 
+  // Helper: read de-duplicated option texts from activeListContainer
+  async function readActiveListOptions(page: Page): Promise<string[]> {
+    const raw = await page.evaluate(() => {
+      const container = document.querySelector('[data-automation-id="activeListContainer"]');
+      if (!container) return [];
+      // Use [role="option"] first; these are the leaf interactive items in Workday
+      let items = Array.from(container.querySelectorAll('[role="option"]'));
+      if (items.length === 0) {
+        items = Array.from(container.querySelectorAll(
+          '[data-automation-id="promptOption"], [data-automation-id="menuItem"]'
+        ));
+      }
+      return items
+        .filter((o: any) => {
+          const r = o.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        })
+        .map((o: any) => (o.textContent || "").trim())
+        .filter(Boolean);
+    });
+    // De-duplicate while preserving order
+    return [...new Set(raw)];
+  }
+
+  // Helper: click an option inside activeListContainer using Playwright locator
+  // (page.evaluate el.click() doesn't fire Workday's React handlers)
+  async function clickActiveListOption(page: Page, text: string): Promise<boolean> {
+    try {
+      const container = page.locator('[data-automation-id="activeListContainer"]');
+      // Try role="option" first
+      let option = container.locator(`[role="option"]`).filter({ hasText: text }).first();
+      if (await option.count() === 0) {
+        option = container.locator(`[data-automation-id="promptOption"], [data-automation-id="menuItem"]`)
+          .filter({ hasText: text }).first();
+      }
+      if (await option.count() > 0) {
+        await option.click({ timeout: 2000 });
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
   // For custom comboboxes with no options found, click to discover
   for (const cb of raw) {
+    if (skipDiscoveryIds?.has(cb.id)) continue;
     if (cb.kind === "select" && !cb.isNative && cb.options.length === 0 && cb.id) {
       try {
+        // Dismiss any lingering dropdown portals (Workday reuses them)
+        await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
+        await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
+        await page.waitForTimeout(300);
+
         await clickComboboxTrigger(page, cb.id);
+        await page.waitForTimeout(500);
 
-        cb.options = await page.evaluate((ffId) => {
-          const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-          if (!el) return [];
-          const ff = (window as any).__ff;
+        const topLevel = await readActiveListOptions(page);
+        if (topLevel.length > 0) {
+          // Detect if items have chevrons (side charms) indicating sub-categories
+          const hasChevrons = await page.evaluate(() => {
+            const container = document.querySelector('[data-automation-id="activeListContainer"]');
+            if (!container) return false;
+            return container.querySelector('svg.wd-icon-chevron-right-small') !== null ||
+              container.querySelector('[data-uxi-multiselectlistitem-hassidecharm="true"]') !== null;
+          });
 
-          const extractOpts = (container: Element): string[] => {
+          if (hasChevrons) {
+            // Hierarchical dropdown — drill into each category
+            const allOptions: string[] = [];
+
+            for (let i = 0; i < topLevel.length; i++) {
+              const category = topLevel[i];
+
+              if (i > 0) {
+                // Reopen dropdown for each category after the first
+                await clickComboboxTrigger(page, cb.id);
+                await page.waitForTimeout(500);
+              }
+
+              // Click the category to drill into its sub-options
+              await clickActiveListOption(page, category);
+              await page.waitForTimeout(800);
+
+              // Read what's now showing — use aria-setsize to know total count
+              const info = await page.evaluate(() => {
+                const c = document.querySelector('[data-automation-id="activeListContainer"]');
+                if (!c) return { count: 0, setsize: 0, texts: [] as string[] };
+                const items = c.querySelectorAll('[role="option"]');
+                const setsize = parseInt(items[0]?.getAttribute("aria-setsize") || "0", 10);
+                const texts = Array.from(items)
+                  .filter((o: any) => o.getBoundingClientRect().height > 0)
+                  .map((o: any) => (o.textContent || "").trim())
+                  .filter(Boolean);
+                return { count: items.length, setsize, texts: [...new Set(texts)] };
+              });
+
+              // When chevrons are present, clicking a category ALWAYS drills into sub-options.
+              // Even if setsize=1 or the sub-option name matches the category name
+              // (e.g., "Careers Fair" has one sub-option also called "Careers Fair").
+              const allSubs: string[] = [...info.texts];
+
+              // If virtualized, scroll to load more items
+              if (info.setsize > info.texts.length) {
+                for (let scrollAttempt = 0; scrollAttempt < 20; scrollAttempt++) {
+                  await page.evaluate(() => {
+                    const c = document.querySelector('[data-automation-id="activeListContainer"]') as HTMLElement;
+                    if (c) c.scrollTop += 300;
+                  });
+                  await page.waitForTimeout(200);
+
+                  const moreTexts = await page.evaluate(() => {
+                    const c = document.querySelector('[data-automation-id="activeListContainer"]');
+                    if (!c) return [];
+                    return Array.from(c.querySelectorAll('[role="option"]'))
+                      .filter((o: any) => o.getBoundingClientRect().height > 0)
+                      .map((o: any) => (o.textContent || "").trim())
+                      .filter(Boolean);
+                  });
+
+                  let newCount = 0;
+                  for (const t of moreTexts) {
+                    if (!allSubs.includes(t)) {
+                      allSubs.push(t);
+                      newCount++;
+                    }
+                  }
+                  if (newCount === 0) break; // no more new items
+                }
+              }
+
+              for (const sub of allSubs) {
+                allOptions.push(`${category} > ${sub}`);
+              }
+
+              // Close and dismiss
+              await page.keyboard.press("Escape");
+              await page.waitForTimeout(200);
+              await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
+              await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
+              await page.waitForTimeout(200);
+            }
+
+            cb.options = allOptions;
+            console.error(`  discovered ${allOptions.length} hierarchical options for "${cb.label}"`);
+          } else {
+            // Flat dropdown — no chevrons, just use top-level options
+            cb.options = topLevel;
+            console.error(`  discovered ${topLevel.length} flat options for "${cb.label}"`);
+          }
+        } else {
+          // No activeListContainer — fall back to standard option extraction
+          cb.options = await page.evaluate((ffId) => {
+            const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+            if (!el) return [];
+            const ff = (window as any).__ff;
+
+            function extractOpts(container: Element): string[] {
+              return Array.from(
+                container.querySelectorAll('[role="option"], [role="menuitem"]')
+              )
+                .filter((o: any) => ff.isVisible(o))
+                .map((o: any) => {
+                  const clone = o.cloneNode(true) as HTMLElement;
+                  clone
+                    .querySelectorAll('[class*="desc"], .option-desc, small')
+                    .forEach((x: any) => x.remove());
+                  return clone.textContent?.trim() || "";
+                })
+                .filter(Boolean);
+            }
+
+            let opts = extractOpts(el);
+            if (opts.length > 0) return opts;
+
+            const ctrlId =
+              el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
+            if (ctrlId) {
+              const popup = document.getElementById(ctrlId);
+              if (popup) {
+                opts = extractOpts(popup);
+                if (opts.length > 0) return opts;
+              }
+            }
+
+            if (el.tagName === "INPUT") {
+              const container = el.closest(
+                '[class*="select"], [class*="combobox"], .form-group'
+              );
+              if (container) {
+                opts = extractOpts(container);
+                if (opts.length > 0) return opts;
+              }
+            }
+
             return Array.from(
-              container.querySelectorAll('[role="option"], [role="menuitem"]')
+              document.querySelectorAll('[role="option"], [role="menuitem"]')
             )
               .filter((o: any) => ff.isVisible(o))
-              .map((o: any) => {
-                const clone = o.cloneNode(true) as HTMLElement;
-                clone
-                  .querySelectorAll('[class*="desc"], .option-desc, small')
-                  .forEach((x: any) => x.remove());
-                return clone.textContent?.trim() || "";
-              })
+              .map((o: any) => o.textContent?.trim() || "")
               .filter(Boolean);
-          };
-
-          // 1. Look inside this combobox's dropdown first
-          let opts = extractOpts(el);
-          if (opts.length > 0) return opts;
-
-          // 2. Check aria-controls (might be set dynamically after opening)
-          const ctrlId =
-            el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
-          if (ctrlId) {
-            const popup = document.getElementById(ctrlId);
-            if (popup) {
-              opts = extractOpts(popup);
-              if (opts.length > 0) return opts;
-            }
+          }, cb.id);
+          if (cb.options.length > 0) {
+            console.error(`  discovered ${cb.options.length} options for "${cb.label}" (fallback)`);
           }
+        }
 
-          // 3. For <input role="combobox">, look in ancestor container
-          if (el.tagName === "INPUT") {
-            const container = el.closest(
-              '[class*="select"], [class*="combobox"], .form-group'
-            );
-            if (container) {
-              opts = extractOpts(container);
-              if (opts.length > 0) return opts;
-            }
-          }
-
-          // 4. Fallback: globally visible options
-          return Array.from(
-            document.querySelectorAll(
-              '[role="option"], [role="menuitem"], [role="treeitem"]'
-            )
-          )
-            .filter((o: any) => ff.isVisible(o))
-            .map((o: any) => o.textContent?.trim() || "")
-            .filter(Boolean);
-        }, cb.id);
-
+        // Ensure dropdown is fully closed
         await page.keyboard.press("Escape");
-        await page.waitForTimeout(200);
+        await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
+        await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
+        await page.waitForTimeout(300);
       } catch {
         // ignore — might not be an openable combobox
       }
@@ -745,13 +938,13 @@ export async function selectOption(
   cb: ComboboxInfo,
   optionText: string
 ): Promise<void> {
-  if (cb.kind === "toggle") {
-    // Toggle: just click it to turn it on
+  if (cb.kind === "toggle" || cb.kind === "checkbox") {
+    // Toggle/checkbox: just click it
     await page.evaluate((ffId) => {
       const el = document.querySelector(`[data-ff-id="${ffId}"]`) as any;
       if (el) el.click();
     }, cb.id);
-    await page.waitForTimeout(200);
+    await page.waitForTimeout(600); // Workday etc. need time to render conditional fields
     return;
   }
 
@@ -802,7 +995,7 @@ export async function selectOption(
         const el = document.querySelector(`[data-ff-id="${ffId}"]`);
         if (!el) return false;
 
-        const matchOpt = (opt: Element): boolean => {
+        function matchOpt(opt: Element): boolean {
           const clone = opt.cloneNode(true) as HTMLElement;
           clone
             .querySelectorAll(
@@ -811,7 +1004,7 @@ export async function selectOption(
             .forEach((x: any) => x.remove());
           const mainText = clone.textContent?.trim();
           return mainText === text;
-        };
+        }
 
         // Look for options within this combobox's dropdown
         const opts = el.querySelectorAll('[role="option"], [role="menuitem"]');
@@ -861,13 +1054,13 @@ export async function selectOption(
 }
 
 export async function resetProbeTarget(page: Page, cb: ComboboxInfo): Promise<void> {
-  if (cb.kind === "toggle") {
-    // Toggle: click again to turn off
+  if (cb.kind === "toggle" || cb.kind === "checkbox") {
+    // Toggle/checkbox: click again to revert
     await page.evaluate((ffId) => {
       const el = document.querySelector(`[data-ff-id="${ffId}"]`) as any;
       if (el) el.click();
     }, cb.id);
-    await page.waitForTimeout(200);
+    await page.waitForTimeout(300);
     return;
   }
 
@@ -923,7 +1116,7 @@ export async function discoverConditionals(page: Page) {
   const discoveredOptions = new Map<string, string[]>(); // id → options found by probing
 
   async function probe(parentChain: ConditionChain) {
-    const comboboxes = await findVisibleProbeTargets(page);
+    const comboboxes = await findVisibleProbeTargets(page, probed);
 
     // Mark all as probed upfront
     const toProbe: ComboboxInfo[] = [];
@@ -934,9 +1127,10 @@ export async function discoverConditionals(page: Page) {
         if (cb.options.length > 0) {
           discoveredOptions.set(cb.id, cb.options);
         }
-        // Only probe comboboxes with a manageable number of options
+        // Only probe comboboxes with a label and manageable number of options
         // (country pickers etc. with 200+ options are data-entry, not conditional triggers)
-        if (cb.options.length <= MAX_PROBE_OPTIONS) {
+        // Skip unnamed comboboxes — they're usually language switchers or other chrome
+        if (cb.label && cb.options.length <= MAX_PROBE_OPTIONS) {
           toProbe.push(cb);
         }
       }
@@ -946,8 +1140,14 @@ export async function discoverConditionals(page: Page) {
       for (const optionText of cb.options) {
         if (PLACEHOLDER_RE.test(optionText)) continue;
 
+        // Re-inject helpers if lost (e.g., page reload from language switch)
+        const hasHelpers = await page.evaluate(() => !!(window as any).__ff).catch(() => false);
+        if (!hasHelpers) await injectHelpers(page);
+
         const before = await tagAndSnapshot(page);
         await selectOption(page, cb, optionText);
+        // Extra settle time for slow frameworks (Workday, React)
+        await page.waitForTimeout(300);
         const after = await tagAndSnapshot(page);
 
         // Fields that went from hidden/absent → visible

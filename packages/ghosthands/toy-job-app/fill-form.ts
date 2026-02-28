@@ -9,26 +9,12 @@
  * any newly revealed conditional fields until the form stabilizes.
  *
  * Usage:
- *   npx tsx toy-job-app/fill-form.ts [url-or-file]
- *   npx tsx toy-job-app/fill-form.ts --user-id=<uuid> [--url=<url>]
- *
- * Flags:
- *   --user-id=<uuid>  Load profile from VALET's parsed resume in Supabase
- *   --url=<url>       Override the target URL (default: local index.html)
+ *   bun toy-job-app/fill-form.ts [url-or-file]
  */
 
-import type { Page } from "playwright";
-import { startBrowserAgent, type BrowserAgent } from "magnitude-core";
+import { chromium, type Page } from "playwright";
 import * as path from "path";
 import Anthropic from "@anthropic-ai/sdk";
-
-// Load .env from packages/ghosthands/
-process.loadEnvFile(path.resolve(__dirname, "..", ".env"));
-
-import { createClient } from "@supabase/supabase-js";
-import { ResumeProfileLoader } from "../src/db/resumeProfileLoader";
-import { ResumeDownloader } from "../src/workers/resumeDownloader";
-import type { WorkdayUserProfile } from "../src/workers/taskHandlers/workday/workdayTypes";
 
 import {
   type FormField,
@@ -44,82 +30,7 @@ import {
 /** Map of field name → desired value. Checked case-insensitively. */
 export type AnswerMap = Record<string, string>;
 
-let RESUME_PATH = path.resolve(__dirname, "..", "resumeTemp.pdf");
-
-// ── CLI arg parsing (matches staging apply-workday.ts) ──────
-
-function parseArg(flag: string): string | null {
-  const arg = process.argv.find((a) => a.startsWith(`--${flag}=`));
-  if (!arg) return null;
-  const value = arg.split("=").slice(1).join("=");
-  return value || null;
-}
-
-// ── Profile text builder ────────────────────────────────────
-
-/** Convert a WorkdayUserProfile into a human-readable profile string for LLM prompts. */
-function buildProfileText(p: WorkdayUserProfile): string {
-  const lines: string[] = [];
-
-  lines.push(`Name: ${p.first_name} ${p.last_name}`);
-  lines.push(`Email: ${p.email}`);
-  if (p.phone) lines.push(`Phone: ${p.phone}`);
-  if (p.address?.city || p.address?.state) {
-    const loc = [p.address.city, p.address.state].filter(Boolean).join(", ");
-    if (p.address.zip) lines.push(`Location: ${loc} ${p.address.zip}`);
-    else lines.push(`Location: ${loc}`);
-  }
-  if (p.linkedin_url) lines.push(`LinkedIn: ${p.linkedin_url}`);
-  if (p.website_url) lines.push(`Portfolio: ${p.website_url}`);
-
-  // Work experience
-  if (p.experience?.length) {
-    lines.push("");
-    const current = p.experience.find((e) => e.currently_work_here);
-    if (current) {
-      lines.push(`Current Role: ${current.title} at ${current.company}`);
-    }
-    for (const job of p.experience) {
-      if (job === current) continue;
-      const dates = [job.start_date, job.end_date].filter(Boolean).join(" – ");
-      lines.push(`Previous: ${job.title} at ${job.company}${dates ? ` (${dates})` : ""}`);
-    }
-  }
-
-  // Education
-  if (p.education?.length) {
-    lines.push("");
-    for (const edu of p.education) {
-      let edLine = `Education: ${edu.degree}`;
-      if (edu.field_of_study) edLine += ` in ${edu.field_of_study}`;
-      edLine += `, ${edu.school}`;
-      if (edu.end_date) edLine += `, ${edu.end_date}`;
-      if (edu.gpa) edLine += ` (GPA: ${edu.gpa})`;
-      lines.push(edLine);
-    }
-  }
-
-  // Skills
-  if (p.skills?.length) {
-    lines.push("");
-    lines.push(`Skills: ${p.skills.join(", ")}`);
-  }
-
-  // Legal/compliance
-  lines.push("");
-  lines.push(`Work authorization: ${p.work_authorization || "Yes"}`);
-  lines.push(`Visa sponsorship needed: ${p.visa_sponsorship || "No"}`);
-
-  // Demographics
-  lines.push("");
-  lines.push("Demographics:");
-  if (p.gender) lines.push(`Gender: ${p.gender}`);
-  if (p.race_ethnicity) lines.push(`Race/Ethnicity: ${p.race_ethnicity}`);
-  if (p.veteran_status) lines.push(`Veteran status: ${p.veteran_status}`);
-  if (p.disability_status) lines.push(`Disability: ${p.disability_status}`);
-
-  return lines.join("\n");
-}
+const RESUME_PATH = path.resolve(__dirname, "..", "resumeTemp.pdf");
 
 function defaultValue(field: FormField): string {
   switch (field.type) {
@@ -133,21 +44,24 @@ function defaultValue(field: FormField): string {
       return "1";
     case "date":
       return "2025-01-01";
-    case "textarea":
-      return "I am excited about this opportunity and believe my skills and experience make me a strong candidate for this position.";
     default:
       return "A";
   }
 }
 
-/** Look up an answer for a field, case-insensitive on field name. */
+/** Normalize a field name for matching: strip trailing *, trim whitespace. */
+function normalizeName(s: string): string {
+  return s.replace(/\s*\*+\s*$/, "").trim().toLowerCase();
+}
+
+/** Look up an answer for a field, case-insensitive, ignoring trailing * markers. */
 function getAnswer(answers: AnswerMap, field: FormField): string | undefined {
   // Try exact match first
   if (field.name in answers) return answers[field.name];
-  // Case-insensitive match
-  const lower = field.name.toLowerCase();
+  // Normalized match (case-insensitive, strip trailing *)
+  const norm = normalizeName(field.name);
   for (const [key, val] of Object.entries(answers)) {
-    if (key.toLowerCase() === lower) return val;
+    if (normalizeName(key) === norm) return val;
   }
   return undefined;
 }
@@ -189,23 +103,31 @@ Languages spoken: English (native), Mandarin Chinese (conversational)
 async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise<void> {
   for (const f of fields) {
     if (f.type !== "select" || f.isNative || (f.options && f.options.length > 0)) continue;
+    if (!f.name) continue; // skip unnamed fields (language switchers, etc.)
 
     try {
+      // Dismiss any lingering dropdown portal before opening next
+      await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
+      await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
+      await page.waitForTimeout(200);
+
       await clickComboboxTrigger(page, f.id);
-      await page.waitForTimeout(300);
+      await page.waitForTimeout(400);
 
       const options = await page.evaluate((ffId) => {
         const el = document.querySelector(`[data-ff-id="${ffId}"]`);
         if (!el) return [];
         const results: string[] = [];
 
-        const collect = (container: Element) => {
+        function collect(container: Element) {
           const opts = container.querySelectorAll('[role="option"], [role="menuitem"], li');
           for (const o of opts) {
+            const r = o.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
             const t = o.textContent?.trim();
             if (t && t.length < 200) results.push(t);
           }
-        };
+        }
 
         collect(el);
         const ctrlId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
@@ -217,7 +139,13 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
           const container = el.closest('[class*="select"], [class*="combobox"], .form-group');
           if (container) collect(container);
         }
-        return results;
+        // Workday: options in portal at body level
+        if (results.length === 0) {
+          const portal = document.querySelector('[data-automation-id="activeListContainer"]');
+          if (portal) collect(portal);
+        }
+        // De-duplicate
+        return [...new Set(results)];
       }, f.id);
 
       if (options.length > 0) {
@@ -233,21 +161,12 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
   }
 }
 
-/** Usage stats returned alongside answers from generateAnswers(). */
-interface GenerateResult {
-  answers: AnswerMap;
-  inputTokens: number;
-  outputTokens: number;
-}
-
-async function generateAnswers(fields: FormField[], profileText: string): Promise<GenerateResult> {
+async function generateAnswers(fields: FormField[]): Promise<AnswerMap> {
   const client = new Anthropic();
 
   // Build a compact description of each field for the prompt
   const fieldDescriptions = fields.map((f) => {
-    let desc = `- "${f.name}" (type: ${f.type}`;
-    if ((f as any).isMultiSelect) desc += `, multi-select`;
-    desc += `)`;
+    let desc = `- "${f.name}" (type: ${f.type})`;
     if (f.options?.length) desc += ` options: [${f.options.join(", ")}]`;
     if (f.choices?.length) desc += ` choices: [${f.choices.join(", ")}]`;
     if (f.section) desc += ` [section: ${f.section}]`;
@@ -256,12 +175,12 @@ async function generateAnswers(fields: FormField[], profileText: string): Promis
 
   const response = await client.messages.create({
     model: "claude-haiku-4-5-20251001",
-    max_tokens: 4096,
+    max_tokens: 2048,
     messages: [{
       role: "user",
       content: `You are filling out a job application form on behalf of an applicant. Here is their profile:
 
-${profileText}
+${SAMPLE_PROFILE}
 
 Here are the form fields to fill:
 
@@ -272,26 +191,17 @@ Rules:
 - If the profile doesn't have enough info, make up a plausible value.
 - For dropdowns/radio groups with listed options, you MUST pick the EXACT text of one of the available options.
 - For dropdowns WITHOUT listed options, provide your best guess for the value.
-- For multi-select fields, return a JSON array of ALL matching options from the available list (e.g., ["Python", "Java", "Go"]). Select every option that matches the applicant's skills/background.
 - For checkboxes/toggles, respond with "checked"/"unchecked" or "on"/"off".
 - For file upload fields, skip them (don't include in output).
-- For textarea fields (cover letters, open-ended questions), write 2-4 thoughtful sentences using the applicant's real background. NEVER return a single letter or placeholder — write a genuine response.
-- For conditional "Please specify" or "Other (please explain)" fields, answer in context of what triggered them (e.g., if "How did you hear about us?" was "Other", specify the referral source, not the job title).
 - For demographic/EEO fields (gender, race, ethnicity, veteran, disability), use the applicant's actual demographic info from their profile. Pick the option that best matches.
-- For salary fields, provide a realistic number based on the role and experience level (e.g., 120000 for a mid-level engineer).
 - You MUST respond with ONLY a valid JSON object. No explanation, no commentary, no markdown fences.
 
 Example response:
-{"First Name": "Alexander", "Last Name": "Chen", "Programming Languages": ["Python", "JavaScript / TypeScript", "Go"], "Cover Letter / Why do you want to work here?": "I am excited to apply because..."}`,
+{"First Name": "Alexander", "Last Name": "Chen", "Email": "alex.chen@gmail.com"}`,
     }],
   });
 
   const text = response.content[0].type === "text" ? response.content[0].text : "";
-  const inputTokens = response.usage?.input_tokens ?? 0;
-  const outputTokens = response.usage?.output_tokens ?? 0;
-  if (response.stop_reason === "max_tokens") {
-    console.error("\nWARNING: LLM response was truncated (hit max_tokens limit). Some fields may be missing answers.\n");
-  }
   console.error("\nLLM response:\n" + text + "\n");
 
   try {
@@ -303,10 +213,10 @@ Example response:
       if (Array.isArray(v)) (parsed as any)[k] = v.join(",");
       else if (typeof v === "number") (parsed as any)[k] = String(v);
     }
-    return { answers: parsed, inputTokens, outputTokens };
+    return parsed;
   } catch (e) {
     console.error("Failed to parse LLM response as JSON, using empty answers");
-    return { answers: {}, inputTokens, outputTokens };
+    return {};
   }
 }
 
@@ -339,12 +249,95 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
     case "number":
     case "password":
     case "search": {
-      // Skip combobox inputs — they look like text but are actually dropdown triggers
-      const isCombobox = await page.evaluate((ffId) => {
+      // Detect searchable dropdowns (Workday selectinput, comboboxes, etc.)
+      const searchDropdown = await page.evaluate((ffId) => {
         const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-        return el?.getAttribute("role") === "combobox";
+        if (!el) return false;
+        return (
+          el.getAttribute("role") === "combobox" ||
+          el.getAttribute("data-uxi-widget-type") === "selectinput" ||
+          el.getAttribute("data-automation-id") === "searchBox" ||
+          (el.getAttribute("autocomplete") === "off" && el.getAttribute("aria-controls"))
+        );
       }, field.id);
-      if (isCombobox) return false;
+
+      if (searchDropdown) {
+        const val = getAnswer(answers, field);
+        if (!val) {
+          console.error(`  skip ${tag} (searchable dropdown, no answer)`);
+          return false;
+        }
+        try {
+          // Click to open the dropdown
+          await page.click(sel, { timeout: 2000 });
+          await page.waitForTimeout(400);
+
+          // Type to search — this filters the cascading dropdown
+          await page.fill(sel, "", { timeout: 1000 }).catch(() => {});
+          await page.type(sel, val, { delay: 30 });
+          await page.waitForTimeout(1500);
+
+          // Try to click a matching element — scan broadly
+          const clicked = await page.evaluate((text) => {
+            const lowerText = text.toLowerCase();
+
+            // Strategy 1: ARIA/role-based elements
+            const roleEls = document.querySelectorAll(
+              '[role="option"], [role="menuitem"], [role="treeitem"], ' +
+              '[data-automation-id*="promptOption"], [data-automation-id*="menuItem"]'
+            );
+            for (const o of roleEls) {
+              const rect = o.getBoundingClientRect();
+              if (rect.width === 0 || rect.height === 0) continue;
+              const t = (o.textContent || "").trim().toLowerCase();
+              if (t === lowerText || t.includes(lowerText)) {
+                (o as HTMLElement).click();
+                return (o.textContent || "").trim();
+              }
+            }
+
+            // Strategy 2: Any visible element whose DIRECT text matches (not just textContent of children)
+            // This catches Workday's custom divs/spans that serve as clickable items
+            const allVisible = document.querySelectorAll(
+              'div[tabindex], div[data-automation-id], span[data-automation-id], ' +
+              'li, a, button, [role="button"]'
+            );
+            for (const o of allVisible) {
+              const rect = o.getBoundingClientRect();
+              if (rect.width === 0 || rect.height === 0) continue;
+              // Use direct childNodes text to avoid matching parent containers
+              let directText = "";
+              for (const n of o.childNodes) {
+                if (n.nodeType === Node.TEXT_NODE) directText += n.textContent;
+                else if (n.nodeType === Node.ELEMENT_NODE) directText += (n as Element).textContent;
+              }
+              directText = directText.trim().toLowerCase();
+              if (directText && (directText === lowerText || directText.includes(lowerText))) {
+                (o as HTMLElement).click();
+                return directText;
+              }
+            }
+            return null;
+          }, val);
+
+          if (clicked) {
+            console.error(`  search-select ${tag} → "${clicked}"`);
+            await page.waitForTimeout(300);
+            return true;
+          }
+
+          // Last resort: press down arrow + enter to select first search result
+          await page.keyboard.press("ArrowDown");
+          await page.waitForTimeout(200);
+          await page.keyboard.press("Enter");
+          console.error(`  search-select ${tag} → first result (keyboard)`);
+          await page.waitForTimeout(300);
+          return true;
+        } catch (e: any) {
+          console.error(`  skip ${tag} (searchable dropdown failed: ${e.message?.slice(0, 60)})`);
+          return false;
+        }
+      }
 
       const val = getAnswer(answers, field) ?? defaultValue(field);
       try {
@@ -364,48 +357,20 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
         console.error(`  fill ${tag} = "${val}"`);
         return true;
       } catch {
-        // page.fill() can be unreliable for HTML5 date inputs — set value directly
-        try {
-          await page.evaluate(({ sel, val }) => {
-            const el = document.querySelector(sel) as HTMLInputElement;
-            if (!el) return;
-            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-            if (setter) setter.call(el, val);
-            else el.value = val;
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-            el.dispatchEvent(new Event("change", { bubbles: true }));
-          }, { sel, val });
-          console.error(`  fill ${tag} = "${val}" (direct)`);
-          return true;
-        } catch {
-          console.error(`  skip ${tag} (not fillable)`);
-          return false;
-        }
+        console.error(`  skip ${tag} (not fillable)`);
+        return false;
       }
     }
 
     case "textarea": {
-      const val = getAnswer(answers, field) ?? defaultValue(field);
+      const val = getAnswer(answers, field) ?? "A";
       try {
         await page.fill(sel, val, { timeout: 2000 });
-        console.error(`  fill ${tag} = "${val.slice(0, 80)}${val.length > 80 ? "…" : ""}"`);
+        console.error(`  fill ${tag} = "${val}"`);
         return true;
       } catch {
-        // page.fill() fails on contenteditable divs — set innerHTML directly
-        try {
-          await page.evaluate(({ sel, val }) => {
-            const el = document.querySelector(sel) as HTMLElement;
-            if (!el) return;
-            el.textContent = val;
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-            el.dispatchEvent(new Event("change", { bubbles: true }));
-          }, { sel, val });
-          console.error(`  fill ${tag} = "${val.slice(0, 80)}${val.length > 80 ? "…" : ""}" (contenteditable)`);
-          return true;
-        } catch {
-          console.error(`  skip ${tag} (not fillable)`);
-          return false;
-        }
+        console.error(`  skip ${tag} (not fillable)`);
+        return false;
       }
     }
 
@@ -454,43 +419,66 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
         }
       }
 
-      // Multi-select: click multiple options
-      if ((field as any).isMultiSelect && answer) {
-        const valuesToSelect = answer.split(",").map((v: string) => v.trim()).filter(Boolean);
+      // Hierarchical dropdown: "Category > SubOption" path
+      if (answer && answer.includes(" > ")) {
+        const [category, value] = answer.split(" > ", 2);
         try {
-          await clickComboboxTrigger(page, field.id);
+          // Dismiss any open dropdowns first
+          await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
+          await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
           await page.waitForTimeout(200);
-          const clickedCount = await page.evaluate(
-            ({ ffId, values }) => {
-              const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-              if (!el) return 0;
-              let count = 0;
-              // Find all options in the dropdown
-              const allOpts = el.querySelectorAll('[role="option"], .multi-select-option');
-              for (const val of values) {
-                const lowerVal = val.toLowerCase();
-                for (const opt of allOpts) {
-                  const optText = opt.textContent?.trim().toLowerCase() || "";
-                  if (optText === lowerVal || optText.includes(lowerVal) || lowerVal.includes(optText)) {
-                    if (opt.getAttribute("aria-selected") !== "true") {
-                      (opt as HTMLElement).click();
-                    }
-                    count++;
-                    break;
-                  }
-                }
+
+          // Open the dropdown
+          await page.click(sel, { timeout: 2000 }).catch(async () => {
+            await clickComboboxTrigger(page, field.id);
+          });
+          await page.waitForTimeout(500);
+
+          // Click the category
+          const catClicked = await page.evaluate((text) => {
+            const container = document.querySelector('[data-automation-id="activeListContainer"]') || document;
+            const opts = container.querySelectorAll('[role="option"]');
+            for (const o of opts) {
+              const t = (o.textContent || "").trim();
+              if (t === text || t.toLowerCase().includes(text.toLowerCase())) {
+                (o as HTMLElement).click();
+                return true;
               }
-              return count;
-            },
-            { ffId: field.id, values: valuesToSelect }
-          );
-          console.error(`  multi-select ${tag} → ${clickedCount}/${valuesToSelect.length} [${valuesToSelect.join(", ")}]`);
-          // Close the dropdown after selecting
+            }
+            return false;
+          }, category);
+
+          if (!catClicked) {
+            console.error(`  skip ${tag} (category "${category}" not found)`);
+            await page.keyboard.press("Escape");
+            return false;
+          }
+          await page.waitForTimeout(600);
+
+          // Click the sub-option
+          const subClicked = await page.evaluate((text) => {
+            const container = document.querySelector('[data-automation-id="activeListContainer"]') || document;
+            const opts = container.querySelectorAll('[role="option"]');
+            const lower = text.toLowerCase();
+            for (const o of opts) {
+              const t = (o.textContent || "").trim();
+              if (t === text || t.toLowerCase() === lower || t.toLowerCase().includes(lower)) {
+                (o as HTMLElement).click();
+                return t;
+              }
+            }
+            return null;
+          }, value);
+
+          if (subClicked) {
+            console.error(`  select ${tag} → "${category} > ${subClicked}"`);
+            return true;
+          }
+          console.error(`  skip ${tag} (sub-option "${value}" not found in "${category}")`);
           await page.keyboard.press("Escape");
-          await page.waitForTimeout(150);
-          return clickedCount > 0;
+          return false;
         } catch (e: any) {
-          console.error(`  skip ${tag} (multi-select failed: ${e.message?.slice(0, 50)})`);
+          console.error(`  skip ${tag} (hierarchical select failed: ${e.message?.slice(0, 50)})`);
           return false;
         }
       }
@@ -509,7 +497,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
             if (!el) return false;
             const ff = (window as any).__ff;
             // Find first visible option anywhere inside or in aria-controls
-            const tryClick = (container: Element): boolean => {
+            function tryClick(container: Element): boolean {
               const opts = container.querySelectorAll('[role="option"], [role="menuitem"]');
               for (const o of opts) {
                 if (ff.isVisible(o)) {
@@ -518,7 +506,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
                 }
               }
               return false;
-            };
+            }
             if (tryClick(el)) return true;
             const ctrlId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
             if (ctrlId) {
@@ -530,6 +518,9 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
               const container = el.closest('[class*="select"], [class*="combobox"], .form-group');
               if (container && tryClick(container)) return true;
             }
+            // Workday: options in portal
+            const portal = document.querySelector('[data-automation-id="activeListContainer"]');
+            if (portal && tryClick(portal)) return true;
             return false;
           }, field.id);
           if (clicked) {
@@ -554,14 +545,14 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
             if (!el) return false;
             const lowerText = text.toLowerCase();
 
-            const getOptionText = (o: Element): string => {
+            function getOptionText(o: Element): string {
               const clone = o.cloneNode(true) as HTMLElement;
               clone.querySelectorAll('[class*="desc"], [class*="sub"], .option-desc, small')
                 .forEach((x: any) => x.remove());
               return clone.textContent?.trim() || "";
-            };
+            }
 
-            const findAndClick = (container: Element): boolean => {
+            function findAndClick(container: Element): boolean {
               const opts = container.querySelectorAll('[role="option"], [role="menuitem"]');
               // Try exact match first
               for (const o of opts) {
@@ -597,7 +588,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
                 }
               }
               return false;
-            };
+            }
 
             if (findAndClick(el)) return true;
             const ctrlId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
@@ -608,6 +599,9 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
             // For multi-selects
             const dropdown = el.querySelector('[class*="dropdown"], [role="listbox"]');
             if (dropdown && findAndClick(dropdown)) return true;
+            // Workday: options appear in a portal (activeListContainer) at body level
+            const portal = document.querySelector('[data-automation-id="activeListContainer"]');
+            if (portal && findAndClick(portal)) return true;
             return false;
           },
           { ffId: field.id, text: opt, strict: hasAnswer }
@@ -730,388 +724,276 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
   }
 }
 
-// ── Main ─────────────────────────────────────────────────────
+// ── Multi-page navigation ────────────────────────────────────
 
-async function main() {
-  // ── Parse CLI args ──────────────────────────────────────────
-  const userId = parseArg("user-id");
-  const urlArg = parseArg("url");
-  // Positional arg (first non-flag) as URL fallback
-  const positionalArg = process.argv.slice(2).find((a) => !a.startsWith("--"));
-  const input = urlArg || positionalArg || path.join(__dirname, "index.html");
-  const url = resolveUrl(input);
-  console.error(`Loading: ${url}\n`);
+const MAX_PAGES = 20;
 
-  // ── Load user profile ───────────────────────────────────────
-  let profileText = SAMPLE_PROFILE;
+interface NavigationState {
+  hasNextButton: boolean;
+  hasSubmitButton: boolean;
+  nextButtonSelector: string | null;
+}
 
-  if (userId) {
-    const supabaseUrl = process.env.SUPABASE_URL;
-    const supabaseKey = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
-    if (!supabaseUrl || !supabaseKey) {
-      console.error("Error: SUPABASE_URL and SUPABASE_SECRET_KEY must be set when using --user-id");
-      process.exit(1);
-    }
+async function detectNavigationButtons(page: Page): Promise<NavigationState> {
+  return page.evaluate(() => {
+    // Clear stale nav markers from previous pages
+    document.querySelectorAll('[data-ff-nav]').forEach(el => el.removeAttribute('data-ff-nav'));
 
-    const supabase = createClient(supabaseUrl, supabaseKey);
-    const loader = new ResumeProfileLoader(supabase);
+    const NEXT_RE = /^(next|continue|proceed|save and continue|save & continue)/i;
+    const NEXT_PREFIX_RE = /^next:/i;
+    const SUBMIT_RE = /^(submit|apply|apply now|send application|submit application)/i;
+    const SUBMIT_INCLUDES_RE = /submit|apply now|send application/i;
 
-    console.error(`Loading resume profile for user ${userId}…`);
-    let result;
-    try {
-      result = await loader.loadForUser(userId);
-    } catch (err) {
-      console.error(`Failed to load resume profile: ${err instanceof Error ? err.message : err}`);
-      console.error("Ensure a resume has been uploaded and parsed in VALET.");
-      process.exit(1);
-    }
+    const buttons = Array.from(document.querySelectorAll<HTMLElement>(
+      'button, [role="button"], input[type="submit"], a.btn, a[class*="btn"]'
+    ));
 
-    const { profile, fileKey, resumeId, parsingConfidence } = result;
-    profileText = buildProfileText(profile);
+    let hasNextButton = false;
+    let hasSubmitButton = false;
+    let nextButtonSelector: string | null = null;
 
-    console.error(`Resume loaded successfully:`);
-    console.error(`   Resume ID:    ${resumeId}`);
-    console.error(`   Name:         ${profile.first_name} ${profile.last_name}`);
-    console.error(`   Email:        ${profile.email}`);
-    console.error(`   Education:    ${profile.education.length} entries`);
-    console.error(`   Experience:   ${profile.experience.length} entries`);
-    console.error(`   Skills:       ${profile.skills.length} skills`);
-    console.error(`   Resume file:  ${fileKey || "(none)"}`);
-    console.error(`   Confidence:   ${parsingConfidence != null ? `${(parsingConfidence * 100).toFixed(0)}%` : "N/A"}`);
+    for (const btn of buttons) {
+      const rect = btn.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      const style = window.getComputedStyle(btn);
+      if (style.display === "none" || style.visibility === "hidden") continue;
 
-    // Download the resume file from Supabase Storage
-    if (fileKey) {
-      try {
-        const downloader = new ResumeDownloader(supabase);
-        RESUME_PATH = await downloader.download({ storage_path: fileKey }, "toy-fill-form");
-        console.error(`   Downloaded:   ${RESUME_PATH}`);
-      } catch (err) {
-        console.error(`   Resume download failed: ${err instanceof Error ? err.message : err}`);
-        console.error("   Falling back to local resumeTemp.pdf");
+      const text = (btn.textContent || (btn as HTMLInputElement).value || "").trim();
+
+      // Check submit first
+      if (btn.getAttribute("type") === "submit" || SUBMIT_RE.test(text) || SUBMIT_INCLUDES_RE.test(text)) {
+        hasSubmitButton = true;
+        continue;
+      }
+
+      // Check next
+      if (NEXT_RE.test(text) || NEXT_PREFIX_RE.test(text)) {
+        hasNextButton = true;
+        btn.setAttribute("data-ff-nav", "next");
+        nextButtonSelector = '[data-ff-nav="next"]';
       }
     }
 
-    console.error("");
-  } else {
-    console.error("No --user-id provided — using built-in sample profile (Alexander Chen).\n");
+    return { hasNextButton, hasSubmitButton, nextButtonSelector };
+  });
+}
+
+async function waitForPageTransition(page: Page, urlBefore: string): Promise<"same_page" | "new_page" | "new_url"> {
+  await page.waitForTimeout(500);
+  const urlAfter = page.url();
+
+  if (urlAfter !== urlBefore) {
+    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+    return "new_url";
   }
 
-  // ── Cost tracking ───────────────────────────────────────────
-  // Claude Haiku 4.5 pricing: $1.00/M input, $5.00/M output
-  const HAIKU_INPUT_COST_PER_TOKEN = 1.00 / 1_000_000;
-  const HAIKU_OUTPUT_COST_PER_TOKEN = 5.00 / 1_000_000;
+  await page.waitForTimeout(300);
+  return "new_page"; // assume in-page JS navigation worked
+}
 
-  const cost = {
-    // Anthropic SDK (generateAnswers) totals
-    llmInputTokens: 0,
-    llmOutputTokens: 0,
-    llmCalls: 0,
-    // Magnitude agent.act() totals
-    actInputTokens: 0,
-    actOutputTokens: 0,
-    actInputCost: 0,
-    actOutputCost: 0,
-    actCalls: 0,
-  };
+async function isMultiPageForm(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const sections = document.querySelectorAll(
+      ".form-section, .form-step, [data-section], .step-content"
+    );
+    if (sections.length <= 1) return false;
 
-  // Launch Magnitude agent — gives us a Playwright Page for DOM filling
-  // AND agent.act() for real visual agent fallback (blue cursor).
-  console.error("Starting Magnitude browser agent…");
-  const agent = await startBrowserAgent({
-    url,
-    llm: {
-      provider: "anthropic" as any,
-      options: {
-        model: "claude-haiku-4-5-20251001",
-        apiKey: process.env.ANTHROPIC_API_KEY!,
-      },
-    },
-    narrate: false,
+    let hiddenCount = 0;
+    for (const s of sections) {
+      const style = window.getComputedStyle(s as HTMLElement);
+      if (style.display === "none" || s.getAttribute("aria-hidden") === "true") {
+        hiddenCount++;
+      }
+    }
+    return hiddenCount >= 1;
   });
+}
 
-  // Wire up Magnitude cost tracking — accumulate every tokensUsed event
-  agent.events.on('tokensUsed', (usage: any) => {
-    cost.actInputTokens += usage.inputTokens ?? 0;
-    cost.actOutputTokens += usage.outputTokens ?? 0;
-    cost.actInputCost += usage.inputCost ?? (usage.inputTokens ?? 0) * HAIKU_INPUT_COST_PER_TOKEN;
-    cost.actOutputCost += usage.outputCost ?? (usage.outputTokens ?? 0) * HAIKU_OUTPUT_COST_PER_TOKEN;
-  });
+// ── Fill current page ────────────────────────────────────────
 
-  const page = agent.page;
-  await page.waitForLoadState("networkidle");
-  await injectHelpers(page);
+async function fillCurrentPage(page: Page, existingAnswers: AnswerMap = {}): Promise<AnswerMap> {
+  // Re-inject helpers if page navigated to a new URL
+  const hasHelpers = await page.evaluate(() => !!(window as any).__ff).catch(() => false);
+  if (!hasHelpers) {
+    await injectHelpers(page);
+  }
 
-  // Reveal all multi-step/accordion sections
-  await page.evaluate(() => {
-    document
-      .querySelectorAll(
-        '[data-section], .form-section, .form-step, .step-content, ' +
-          '.tab-pane, .accordion-content, .panel-body, [role="tabpanel"]'
-      )
-      .forEach((el: any) => {
-        el.style.display = "";
-        el.classList.add("active");
-        el.removeAttribute("hidden");
-        el.setAttribute("aria-hidden", "false");
-      });
-  });
-
-  // ── Extract fields and ask LLM for answers ─────────────────
   console.error("Extracting form fields…");
   const allFields = await extractFields(page);
   const visibleFields = allFields.filter((f) => f.visibleByDefault);
   console.error(`Found ${visibleFields.length} visible fields.`);
 
-  // Open custom dropdowns briefly to discover their options
+  if (visibleFields.length === 0) {
+    console.error("No visible fields on this page.");
+    return existingAnswers;
+  }
+
+  // Discover dropdown options (only for visible fields — skip hidden conditionals)
   console.error("Discovering dropdown options…");
-  await discoverDropdownOptions(page, allFields);
+  await discoverDropdownOptions(page, visibleFields);
 
-  console.error("\nAsking LLM for answers…\n");
+  // Only ask LLM about visible, named fields it hasn't answered yet
+  const unanswered = visibleFields.filter(
+    (f) => f.name && getAnswer(existingAnswers, f) === undefined && f.type !== "file"
+  );
 
-  // Send ALL fields (including hidden conditional ones) so the LLM can
-  // answer them if they appear later
-  const genResult = await generateAnswers(allFields, profileText);
-  const answers = genResult.answers;
-  cost.llmCalls++;
-  cost.llmInputTokens += genResult.inputTokens;
-  cost.llmOutputTokens += genResult.outputTokens;
-  console.error(`LLM provided ${Object.keys(answers).length} answers.\n`);
+  const answers = { ...existingAnswers };
+  if (unanswered.length > 0) {
+    console.error(`\nAsking LLM for ${unanswered.length} new fields…\n`);
+    const newAnswers = await generateAnswers(unanswered);
+    Object.assign(answers, newAnswers);
+    console.error(`LLM provided ${Object.keys(newAnswers).length} answers.\n`);
+  } else {
+    console.error("All fields already answered from previous pages.\n");
+  }
 
-  // ── Iterative fill loop ───────────────────────────────────
+  // Iterative fill loop
   const filled = new Set<string>();
   let round = 0;
 
   while (round < 10) {
     round++;
     const fields = await extractFields(page);
-    const visible = fields.filter((f) => f.visibleByDefault);
-
-    // Find fields we haven't filled yet
+    const visible = fields.filter((f) => f.visibleByDefault && f.name);
     const toFill = visible.filter((f) => !filled.has(f.id));
     if (toFill.length === 0) break;
 
-    // If new fields appeared that the LLM hasn't seen, ask again
     const unseen = toFill.filter(
       (f) => getAnswer(answers, f) === undefined && f.type !== "file"
     );
     if (unseen.length > 0 && round > 1) {
       console.error(`\n${unseen.length} new fields discovered — asking LLM…`);
-      const extraResult = await generateAnswers(unseen, profileText);
-      Object.assign(answers, extraResult.answers);
-      cost.llmCalls++;
-      cost.llmInputTokens += extraResult.inputTokens;
-      cost.llmOutputTokens += extraResult.outputTokens;
+      const extra = await generateAnswers(unseen);
+      Object.assign(answers, extra);
     }
 
     console.error(`\nRound ${round}: ${toFill.length} new fields to fill…`);
-
     for (const field of toFill) {
       filled.add(field.id);
       await fillField(page, field, answers);
     }
-
-    // Wait for conditional logic to react
     await page.waitForTimeout(400);
   }
 
-  console.error(`\nDone! Filled ${filled.size} fields in ${round} round(s).`);
+  console.error(`\nPage fill complete. ${filled.size} fields in ${round} round(s).`);
+  return answers;
+}
 
-  // ── MagnitudeHand Fallback (real Magnitude visual agent) ────
-  // Re-extract fields and identify truly unfilled ones. Then use Magnitude's
-  // agent.act() with micro-scoped prompts — this shows the real blue cursor
-  // and does autonomous screenshot-based interaction for each field.
-  {
-    await page.waitForTimeout(500); // let conditional UI settle
-    const postFields = await extractFields(page);
-    const postVisible = postFields.filter((f) => f.visibleByDefault);
+// ── Multi-page orchestration ─────────────────────────────────
 
-    // Robust unfilled detection — handles radio, checkbox, range, contenteditable
-    const unfilledFields: FormField[] = [];
-    for (const f of postVisible) {
-      const isFilled = await page.evaluate((ffId) => {
-        const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-        if (!el) return true; // element gone → skip
-        const tag = el.tagName;
-        const type = (el as HTMLInputElement).type || "";
-        const role = el.getAttribute("role") || "";
+async function fillMultiPageForm(page: Page): Promise<void> {
+  let answers: AnswerMap = {};
+  let pageNum = 0;
 
-        // Radio groups: check if any radio in the group is checked
-        if (type === "radio") {
-          const name = (el as HTMLInputElement).name;
-          if (name) {
-            const form = el.closest("form") || document;
-            const checked = form.querySelector(`input[type="radio"][name="${name}"]:checked`);
-            return !!checked;
-          }
-          return (el as HTMLInputElement).checked;
-        }
-        if (role === "radiogroup") {
-          return !!el.querySelector('input[type="radio"]:checked');
-        }
+  while (pageNum < MAX_PAGES) {
+    pageNum++;
+    console.error(`\n${"=".repeat(60)}`);
+    console.error(`PAGE ${pageNum}`);
+    console.error(`${"=".repeat(60)}\n`);
 
-        // Toggle switches (role="switch" on label — data-ff-id is on the label, not the hidden checkbox)
-        if (role === "switch") {
-          // Check the inner checkbox's checked state
-          const cb = el.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
-          if (cb) return true; // toggle exists and has a state — consider filled
-          // Fallback: check aria-checked
-          return el.getAttribute("aria-checked") === "true";
-        }
+    answers = await fillCurrentPage(page, answers);
 
-        // Checkboxes: always have a state, consider filled
-        if (type === "checkbox") return true;
+    const navState = await detectNavigationButtons(page);
 
-        // Range sliders: always have a default value, consider filled
-        if (type === "range") return true;
-
-        // File inputs: skip (handled separately)
-        if (type === "file") return true;
-
-        // Contenteditable rich text
-        if (el.getAttribute("contenteditable") === "true") {
-          const text = el.textContent?.trim() || "";
-          return text.length > 0;
-        }
-
-        // Standard inputs and textareas
-        if (tag === "INPUT" || tag === "TEXTAREA") {
-          const val = (el as HTMLInputElement).value?.trim() || "";
-          return val.length > 0;
-        }
-
-        // Native selects
-        if (tag === "SELECT") {
-          const sel = el as HTMLSelectElement;
-          const val = sel.value;
-          // Check if a non-placeholder option is selected
-          const selectedOpt = sel.options[sel.selectedIndex];
-          if (!selectedOpt) return false;
-          const text = selectedOpt.textContent?.trim() || "";
-          return val !== "" && !/^(select|choose|pick|--|—)/i.test(text);
-        }
-
-        // Custom combobox (role="combobox" on a div)
-        if (role === "combobox" && tag !== "INPUT" && tag !== "SELECT") {
-          // Check trigger text
-          const trigger = el.querySelector(".custom-select-trigger span");
-          const text = trigger?.textContent?.trim() || "";
-          if (text && !/^(select|choose|pick|--|—|start typing)/i.test(text)) return true;
-          // Check for selected option
-          const selected = el.querySelector(".custom-select-option.selected, [aria-selected='true']");
-          return !!selected;
-        }
-
-        // Autocomplete/typeahead inputs (role="combobox" on INPUT)
-        if (role === "combobox" && tag === "INPUT") {
-          return ((el as HTMLInputElement).value?.trim() || "").length > 0;
-        }
-
-        // Other elements — check textContent
-        const text = el.textContent?.trim() || "";
-        return text.length > 0;
-      }, f.id);
-
-      if (!isFilled) {
-        // If the LLM deliberately returned "" for this field, it's intentionally empty — skip
-        const answer = getAnswer(answers, f);
-        if (answer !== undefined && answer.trim() === "") {
-          // LLM saw this field and chose to leave it empty (e.g., no portfolio URL)
-          continue;
-        }
-        unfilledFields.push(f);
-      }
+    if (navState.hasSubmitButton && !navState.hasNextButton) {
+      console.error(`\n${"=".repeat(60)}`);
+      console.error("FINAL PAGE — Submit button detected.");
+      console.error("NOT clicking Submit. Review and submit manually.");
+      console.error(`${"=".repeat(60)}\n`);
+      console.error(`Done! Processed ${pageNum} page(s).`);
+      return;
     }
 
-    if (unfilledFields.length > 0) {
-      console.error(`\n[MagnitudeHand] ${unfilledFields.length} unfilled field(s) — using REAL Magnitude visual agent (blue cursor)…`);
-
-      let filledCount = 0;
-
-      for (const field of unfilledFields) {
-        // Scroll field into view so Magnitude can see it in screenshots
-        await page.evaluate((ffId) => {
-          const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-          el?.scrollIntoView({ block: "center", behavior: "auto" });
-        }, field.id);
-        await page.waitForTimeout(300);
-
-        // Build a micro-scoped prompt for this single field
-        const answer = getAnswer(answers, field);
-        let prompt = `You are filling out a job application for this person:\n${profileText.trim()}\n\n`;
-        prompt += `Fill the form field labeled "${field.name}"`;
-        if (answer) {
-          prompt += ` with the value "${answer}"`;
-        } else {
-          prompt += ` using the applicant's profile above to choose the best value`;
-        }
-
-        // Add type-specific hints
-        if (field.type === "select") {
-          if (field.options?.length) {
-            prompt += `. This is a dropdown with options: [${field.options.slice(0, 15).join(", ")}]. Click the dropdown to open it, then click the correct option. If the exact answer is not available, pick the closest matching option.`;
-          } else {
-            prompt += `. This is a dropdown — click it to open, then select the most appropriate option available.`;
-          }
-        } else if (field.type === "search" || field.type === "text") {
-          const role = await page.evaluate((ffId) => {
-            return document.querySelector(`[data-ff-id="${ffId}"]`)?.getAttribute("role") || "";
-          }, field.id);
-          if (role === "combobox") {
-            prompt += `. This is an autocomplete/typeahead field. Type the value, wait for suggestions to appear, then click the matching suggestion from the dropdown.`;
-          }
-        } else if (field.type === "textarea") {
-          prompt += `. This is a text area. Click on it and type the value.`;
-        } else if (field.type === "range") {
-          prompt += `. This is a slider. Drag it to the desired value.`;
-        }
-
-        prompt += ` Focus ONLY on this single field. Do NOT interact with any other fields or buttons.`;
-
-        console.error(`[MagnitudeHand] act() → "${field.name}"…`);
+    if (navState.hasNextButton && navState.nextButtonSelector) {
+      const urlBefore = page.url();
+      try {
+        // Try Playwright click first, fall back to JS .click() if it fails
         try {
-          cost.actCalls++;
-          await agent.act(prompt);
-          console.error(`[MagnitudeHand] Filled "${field.name}" OK`);
-          filledCount++;
-        } catch (e: any) {
-          console.error(`[MagnitudeHand] ERROR on "${field.name}": ${e.message?.slice(0, 120)}`);
+          await page.click(navState.nextButtonSelector, { timeout: 3000 });
+        } catch {
+          // Playwright click failed (overlay, scroll, etc.) — force via JS
+          const clicked = await page.evaluate((sel) => {
+            const btn = document.querySelector<HTMLElement>(sel);
+            if (!btn) return false;
+            btn.click();
+            return true;
+          }, navState.nextButtonSelector);
+          if (!clicked) throw new Error("Button not found");
         }
-
-        // Brief pause between fields
-        await page.waitForTimeout(200);
+        console.error("\n  Clicked Next button.");
+      } catch {
+        console.error("\n  Could not click Next button. Stopping.");
+        return;
       }
 
-      console.error(`\n[MagnitudeHand] Done! Filled ${filledCount}/${unfilledFields.length} field(s) via visual agent.`);
-    } else {
-      console.error("\n[MagnitudeHand] No unfilled fields — DOM filler handled everything.");
+      const transition = await waitForPageTransition(page, urlBefore);
+      console.error(`  Page transition: ${transition}`);
+
+      if (transition === "new_url") {
+        await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+      }
+      continue;
     }
+
+    // No navigation buttons — form is done or single-page
+    console.error("\nNo navigation buttons found. Form may be complete.");
+    console.error(`Done! Processed ${pageNum} page(s).`);
+    return;
   }
 
-  // ── Cost Summary ──────────────────────────────────────────
-  const llmCostUsd =
-    cost.llmInputTokens * HAIKU_INPUT_COST_PER_TOKEN +
-    cost.llmOutputTokens * HAIKU_OUTPUT_COST_PER_TOKEN;
-  const actCostUsd = cost.actInputCost + cost.actOutputCost;
-  const totalCostUsd = llmCostUsd + actCostUsd;
+  console.error(`Reached max page limit (${MAX_PAGES}). Stopping.`);
+}
 
-  console.error(`\n── Cost Summary ──────────────────────`);
-  console.error(
-    `LLM calls (generateAnswers):  ${cost.llmCalls} call(s), ` +
-    `${cost.llmInputTokens} in / ${cost.llmOutputTokens} out tokens, ` +
-    `$${llmCostUsd.toFixed(4)}`
-  );
-  console.error(
-    `Magnitude act() calls:        ${cost.actCalls} call(s), ` +
-    `${cost.actInputTokens} in / ${cost.actOutputTokens} out tokens, ` +
-    `$${actCostUsd.toFixed(4)}`
-  );
-  console.error(
-    `Total:                        $${totalCostUsd.toFixed(4)}`
-  );
-  console.error(`──────────────────────────────────────\n`);
+// ── Main ─────────────────────────────────────────────────────
 
-  console.error("Browser left open for inspection. Press Ctrl+C to close.");
-  await new Promise(() => {});
+async function main() {
+  const input = process.argv[2] || path.join(__dirname, "index.html");
+  const url = resolveUrl(input);
+  console.error(`Loading: ${url}\n`);
+
+  const browser = await chromium.launch({ headless: false, slowMo: 50 });
+  const page = await browser.newPage();
+  await page.goto(url, { waitUntil: "networkidle" });
+  // Wait for form fields to render (Workday/React SPAs need extra time)
+  await page.waitForSelector(
+    'input, select, textarea, [role="textbox"], [role="combobox"], [data-uxi-widget-type]',
+    { timeout: 15000 }
+  ).catch(() => {});
+  await page.waitForTimeout(1000); // Extra settle for React hydration
+  await injectHelpers(page);
+
+  const multiPage = await isMultiPageForm(page);
+  console.error(`Form type: ${multiPage ? "multi-page" : "single-page"}\n`);
+
+  if (multiPage) {
+    await fillMultiPageForm(page);
+  } else {
+    // Single-page: reveal all accordion/tab sections
+    await page.evaluate(() => {
+      document
+        .querySelectorAll(
+          '[data-section], .form-section, .form-step, .step-content, ' +
+            '.tab-pane, .accordion-content, .panel-body, [role="tabpanel"]'
+        )
+        .forEach((el: any) => {
+          el.style.display = "";
+          el.classList.add("active");
+          el.removeAttribute("hidden");
+          el.setAttribute("aria-hidden", "false");
+        });
+    });
+
+    await fillCurrentPage(page);
+  }
+
+  console.error("\nDone! Browser left open for inspection. Close the tab or press Ctrl+C to exit.");
+
+  // Exit when the user closes the page/tab or after 5 minutes
+  await Promise.race([
+    page.waitForEvent("close").catch(() => {}),
+    new Promise((resolve) => setTimeout(resolve, 300_000)),
+  ]);
+  await browser.close().catch(() => {});
 }
 
 main().catch((err) => {
