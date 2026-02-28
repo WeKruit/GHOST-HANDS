@@ -8,7 +8,7 @@
   "scripts": {
     "build": "turbo run build",
     "dev:api": "bun --watch packages/ghosthands/src/api/server.ts",
-    "dev:worker": "bun --watch packages/ghosthands/src/workers/main.ts",
+    "dev:worker": "bun --watch packages/ghosthands/src/workers/workerLauncher.ts",
     "test": "bun test packages/ghosthands/__tests__",
     "test:unit": "bun test packages/ghosthands/__tests__/unit",
     "test:integration": "bun test packages/ghosthands/__tests__/integration",
@@ -27,5 +27,8 @@
     "@aws-sdk/client-auto-scaling": "^3.750.0",
     "@aws-sdk/client-secrets-manager": "^3.995.0",
     "patchright": "^1.52.5"
+  },
+  "patchedDependencies": {
+    "@browserbasehq/stagehand@3.1.0": "patches/@browserbasehq%2Fstagehand@3.1.0.patch"
   }
 }

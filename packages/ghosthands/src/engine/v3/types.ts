@@ -71,10 +71,13 @@ export interface FormField {
   required: boolean;
   currentValue?: string;
   options?: string[];
+  /** For radio groups: the HTML `name` attribute shared by the group's inputs */
+  groupKey?: string;
   boundingBox?: BoundingBox;
   visible: boolean;
   disabled: boolean;
   domDepth?: number;
+  domOrdinal?: number;
   parentContainer?: string;
   stagehandDescription?: string;
 }
@@ -155,6 +158,8 @@ export interface PlannedAction {
   layerHistory: Array<{ layer: LayerId; error?: string }>;
   confidence: number;
   matchMethod: MatchMethod;
+  /** User data key from FieldMatch — used for cookbook template resolution */
+  userDataKey?: string;
 }
 
 // ── Execution Result ────────────────────────────────────────────────────
@@ -181,14 +186,6 @@ export interface ReviewResult {
   reviewedBy: LayerId;
 }
 
-// ── Analysis Result ─────────────────────────────────────────────────────
-
-export interface AnalysisResult {
-  discoveredFields: FormField[];
-  suggestedValues: FieldMatch[];
-  costIncurred: number;
-}
-
 // ── Layer Error ─────────────────────────────────────────────────────────
 
 export type ErrorCategory =
@@ -208,7 +205,6 @@ export interface LayerError {
   message: string;
   layer: LayerId;
   recoverable: boolean;
-  shouldEscalate: boolean;
   originalError?: unknown;
 }
 

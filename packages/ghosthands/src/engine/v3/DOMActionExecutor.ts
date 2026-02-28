@@ -20,18 +20,28 @@ export class DOMActionExecutor {
   ) {}
 
   /**
+   * Detect fatal browser errors that should abort the run, not be swallowed
+   * as fast-escalation misses. These indicate the browser/page is gone.
+   */
+  private isFatalBrowserError(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return /target closed|browser has been closed|execution context was destroyed|page closed/i.test(msg);
+  }
+
+  /**
    * Execute a single action item. Tries Tier 0 first (if action.tier === 0),
    * then escalates to Tier 3 on failure. If action.tier === 3, goes directly
    * to the LLM.
    */
   async execute(action: ActionItem): Promise<{ success: boolean; error?: string }> {
     const { field, value, tier } = action;
+    let tier0Error: string | undefined;
 
     // Tier 0 — try direct DOM manipulation first
     if (tier === 0) {
       try {
-        const tier0Success = await this.executeTier0(field, value);
-        if (tier0Success) {
+        const tier0Result = await this.executeTier0(field, value);
+        if (tier0Result === true) {
           this.logger.debug('Tier 0 fill succeeded', {
             label: field.label,
             fieldType: field.fieldType,
@@ -39,15 +49,43 @@ export class DOMActionExecutor {
           });
           return { success: true };
         }
+        // 'already_filled' means the field has a value — that's success, not a failure.
+        // Escalating to Magnitude for already-filled fields wastes LLM budget.
+        if (tier0Result === 'already_filled') {
+          this.logger.debug('Tier 0 field already filled, treating as success', {
+            label: field.label,
+            fieldType: field.fieldType,
+          });
+          return { success: true };
+        }
+        // Only 'not_found' and 'no_handler' should trigger fast escalation.
+        if (tier0Result === 'not_found' || tier0Result === 'no_handler') {
+          tier0Error = `element_not_found: "${field.label}" (${field.fieldType})`;
+        } else {
+          // 'no_match' — dropdown option not found, worth escalating
+          tier0Error = `${tier0Result}: "${field.label}" (${field.fieldType})`;
+        }
       } catch (err) {
+        if (this.isFatalBrowserError(err)) throw err;
+        tier0Error = err instanceof Error ? err.message : String(err);
         this.logger.debug('Tier 0 fill threw, escalating to Tier 3', {
           label: field.label,
           fieldType: field.fieldType,
-          error: err instanceof Error ? err.message : String(err),
+          error: tier0Error,
         });
       }
 
-      // Tier 0 failed — escalate to Tier 3
+      // When the adapter is a stub (DOMHand), skip Tier 3 entirely.
+      // The stub adapter always fails with a generic error that masks the
+      // original Tier 0 failure reason needed for fast escalation.
+      if ((this.adapter as any).type === 'stub') {
+        this.logger.debug('Skipping Tier 3 (stub adapter), returning Tier 0 error', {
+          label: field.label,
+          error: tier0Error,
+        });
+        return { success: false, error: tier0Error };
+      }
+
       this.logger.debug('Tier 0 fill failed, escalating to Tier 3', {
         label: field.label,
         fieldType: field.fieldType,
@@ -66,15 +104,18 @@ export class DOMActionExecutor {
       if (llmSuccess) {
         return { success: true };
       }
-      return { success: false, error: `LLM fill returned failure for "${field.label}"` };
+      // If Tier 3 also fails and we had a Tier 0 error, preserve it
+      // so the orchestrator can use it for fast escalation classification.
+      return { success: false, error: tier0Error ?? `LLM fill returned failure for "${field.label}"` };
     } catch (err) {
+      if (this.isFatalBrowserError(err)) throw err;
       const errorMsg = err instanceof Error ? err.message : String(err);
       this.logger.warn('Tier 3 LLM fill threw', {
         label: field.label,
         fieldType: field.fieldType,
         error: errorMsg,
       });
-      return { success: false, error: errorMsg };
+      return { success: false, error: tier0Error ?? errorMsg };
     }
   }
 
@@ -82,9 +123,13 @@ export class DOMActionExecutor {
 
   /**
    * Route to the appropriate Tier 0 method based on field type.
-   * Returns true on success, false on failure.
+   * Returns true on success, or a typed failure reason string:
+   *   - 'not_found': element not in DOM (should trigger fast escalation)
+   *   - 'already_filled': element exists but already has a value (should NOT escalate)
+   *   - 'no_match': element found but value matching failed (e.g. no option in dropdown)
+   *   - 'no_handler': no Tier 0 handler for this field type (should trigger fast escalation)
    */
-  private async executeTier0(field: FieldModel, value: string): Promise<boolean> {
+  private async executeTier0(field: FieldModel, value: string): Promise<true | 'not_found' | 'already_filled' | 'no_match' | 'no_handler'> {
     switch (field.fieldType) {
       case 'text':
       case 'email':
@@ -92,34 +137,46 @@ export class DOMActionExecutor {
       case 'number':
       case 'password':
       case 'textarea':
-      case 'contenteditable':
-        return this.fillText(field, value);
+      case 'contenteditable': {
+        const result = await this.fillText(field, value);
+        if (result === true) return true;
+        if (result === 'already_filled') return 'already_filled';
+        return 'not_found';
+      }
 
-      case 'select':
-        return this.fillSelect(field, value);
+      case 'select': {
+        return await this.fillSelect(field, value);
+      }
 
       case 'custom_dropdown':
-      case 'typeahead':
-        return this.fillCustomDropdown(field, value);
+      case 'typeahead': {
+        return await this.fillCustomDropdown(field, value);
+      }
 
-      case 'radio':
-        return this.fillRadio(field, value);
+      case 'radio': {
+        return await this.fillRadio(field, value);
+      }
 
-      case 'aria_radio':
-        return this.fillAriaRadio(field, value);
+      case 'aria_radio': {
+        return await this.fillAriaRadio(field, value);
+      }
 
-      case 'checkbox':
-        return this.checkCheckbox(field);
+      case 'checkbox': {
+        const result = await this.checkCheckbox(field);
+        return result || 'not_found';
+      }
 
-      case 'date':
-        return this.fillDate(field, value);
+      case 'date': {
+        const result = await this.fillDate(field, value);
+        return result || 'not_found';
+      }
 
       default:
         this.logger.debug('No Tier 0 handler for field type', {
           label: field.label,
           fieldType: field.fieldType,
         });
-        return false;
+        return 'no_handler';
     }
   }
 
@@ -130,16 +187,20 @@ export class DOMActionExecutor {
    * React-compatible: dispatches input, change, and blur events so React
    * picks up the new value.
    */
-  private async fillText(field: FieldModel, value: string): Promise<boolean> {
+  private async fillText(field: FieldModel, value: string): Promise<boolean | 'already_filled'> {
     try {
       await this.scrollFieldIntoView(field);
 
       const filled = await this.page.evaluate(({ sel, val }) => {
         const el = document.querySelector(sel) as HTMLInputElement | HTMLTextAreaElement | null;
-        if (!el) return false;
+        if (!el) return 'not_found';
 
-        // Skip if already filled
-        if (el.value && el.value.trim() !== '') return false;
+        // Skip if already filled WITH THE CORRECT value — not worth re-filling.
+        // If the existing value is WRONG (stale from a previous session), overwrite it.
+        const existing = (el.value || '').trim();
+        if (existing !== '' && existing.toLowerCase() === val.trim().toLowerCase()) {
+          return 'already_filled';
+        }
 
         const proto =
           el.tagName === 'TEXTAREA'
@@ -159,9 +220,15 @@ export class DOMActionExecutor {
         return true;
       }, { sel: field.selector, val: value });
 
-      this.logger.debug('fillText result', { label: field.label, success: filled });
-      return filled;
+      if (filled === 'already_filled') {
+        this.logger.debug('fillText skipped (already filled)', { label: field.label });
+        return 'already_filled';
+      }
+      const success = filled === true;
+      this.logger.debug('fillText result', { label: field.label, success });
+      return success;
     } catch (err) {
+      if (this.isFatalBrowserError(err)) throw err;
       this.logger.debug('fillText error', {
         label: field.label,
         error: err instanceof Error ? err.message : String(err),
@@ -174,13 +241,13 @@ export class DOMActionExecutor {
    * Fill a native <select> element by finding the best matching <option>
    * via normalized text comparison, then setting the value with native setter.
    */
-  private async fillSelect(field: FieldModel, value: string): Promise<boolean> {
+  private async fillSelect(field: FieldModel, value: string): Promise<true | 'not_found' | 'no_match'> {
     try {
       await this.scrollFieldIntoView(field);
 
       const filled = await this.page.evaluate(({ sel, val }) => {
         const el = document.querySelector(sel) as HTMLSelectElement | null;
-        if (!el) return false;
+        if (!el) return 'not_found';
 
         const valLower = val.toLowerCase().trim();
 
@@ -216,7 +283,7 @@ export class DOMActionExecutor {
           }
         }
 
-        if (!bestOption) return false;
+        if (!bestOption) return 'no_match';
 
         // Use native setter for React compatibility
         const nativeSetter = Object.getOwnPropertyDescriptor(
@@ -235,14 +302,15 @@ export class DOMActionExecutor {
         return true;
       }, { sel: field.selector, val: value });
 
-      this.logger.debug('fillSelect result', { label: field.label, success: filled });
+      this.logger.debug('fillSelect result', { label: field.label, success: filled === true });
       return filled;
     } catch (err) {
+      if (this.isFatalBrowserError(err)) throw err;
       this.logger.debug('fillSelect error', {
         label: field.label,
         error: err instanceof Error ? err.message : String(err),
       });
-      return false;
+      return 'not_found';
     }
   }
 
@@ -251,7 +319,7 @@ export class DOMActionExecutor {
    * Opens the dropdown, optionally types to filter, finds and clicks the
    * matching option, then closes any stray popup.
    */
-  private async fillCustomDropdown(field: FieldModel, value: string): Promise<boolean> {
+  private async fillCustomDropdown(field: FieldModel, value: string): Promise<true | 'not_found' | 'no_match'> {
     try {
       await this.scrollFieldIntoView(field);
 
@@ -302,18 +370,22 @@ export class DOMActionExecutor {
         }
       }
 
-      // Step 5: Wait and close any stray popup
+      // Close any stray popup — only click empty space if dropdown was successfully opened.
+      // Clicking at (10,10) on failure can interact with unrelated page elements.
       if (clicked) {
         await this.page.waitForTimeout(300);
+        await this.page.mouse.click(10, 10);
+        await this.page.waitForTimeout(200);
+      } else {
+        // Close popup without clicking arbitrary coordinates
+        await this.page.keyboard.press('Escape').catch(() => {});
+        await this.page.waitForTimeout(200);
       }
 
-      // Click empty space to close popup (coordinates well outside typical popups)
-      await this.page.mouse.click(10, 10);
-      await this.page.waitForTimeout(200);
-
       this.logger.debug('fillCustomDropdown result', { label: field.label, success: clicked });
-      return clicked;
+      return clicked ? true : 'no_match';
     } catch (err) {
+      if (this.isFatalBrowserError(err)) throw err;
       // Try to close any open popup before returning
       await this.page.keyboard.press('Escape').catch(() => {});
       await this.page.waitForTimeout(200);
@@ -322,7 +394,8 @@ export class DOMActionExecutor {
         label: field.label,
         error: err instanceof Error ? err.message : String(err),
       });
-      return false;
+      // Catch block = element interaction failed entirely → not_found
+      return 'not_found';
     }
   }
 
@@ -330,17 +403,17 @@ export class DOMActionExecutor {
    * Fill a native radio button group by matching the value to option labels.
    * Uses the field's groupKey (the `name` attribute) to find all radios in the group.
    */
-  private async fillRadio(field: FieldModel, value: string): Promise<boolean> {
+  private async fillRadio(field: FieldModel, value: string): Promise<true | 'not_found' | 'no_match'> {
     try {
       await this.scrollFieldIntoView(field);
 
       const clicked = await this.page.evaluate(({ groupKey, val }) => {
-        if (!groupKey) return false;
+        if (!groupKey) return 'not_found';
 
         const radios = document.querySelectorAll<HTMLInputElement>(
           `input[type="radio"][name="${groupKey}"]`,
         );
-        if (radios.length === 0) return false;
+        if (radios.length === 0) return 'not_found';
 
         const valLower = val.toLowerCase().trim();
 
@@ -400,21 +473,22 @@ export class DOMActionExecutor {
           }
         }
 
-        if (!bestMatch) return false;
+        if (!bestMatch) return 'no_match';
 
         bestMatch.click();
         bestMatch.dispatchEvent(new Event('change', { bubbles: true }));
         return true;
       }, { groupKey: field.groupKey || '', val: value });
 
-      this.logger.debug('fillRadio result', { label: field.label, success: clicked });
+      this.logger.debug('fillRadio result', { label: field.label, success: clicked === true });
       return clicked;
     } catch (err) {
+      if (this.isFatalBrowserError(err)) throw err;
       this.logger.debug('fillRadio error', {
         label: field.label,
         error: err instanceof Error ? err.message : String(err),
       });
-      return false;
+      return 'not_found';
     }
   }
 
@@ -422,16 +496,16 @@ export class DOMActionExecutor {
    * Fill an ARIA radiogroup (role="radio" children inside a role="radiogroup" container).
    * Used for custom radio implementations that don't use native <input type="radio">.
    */
-  private async fillAriaRadio(field: FieldModel, value: string): Promise<boolean> {
+  private async fillAriaRadio(field: FieldModel, value: string): Promise<true | 'not_found' | 'no_match'> {
     try {
       await this.scrollFieldIntoView(field);
 
       const clicked = await this.page.evaluate(({ sel, val }) => {
         const group = document.querySelector(sel);
-        if (!group) return false;
+        if (!group) return 'not_found';
 
         const radios = group.querySelectorAll('[role="radio"]');
-        if (radios.length === 0) return false;
+        if (radios.length === 0) return 'not_found';
 
         const valLower = val.toLowerCase().trim();
 
@@ -468,17 +542,18 @@ export class DOMActionExecutor {
           }
         }
 
-        return false;
+        return 'no_match';
       }, { sel: field.selector, val: value });
 
-      this.logger.debug('fillAriaRadio result', { label: field.label, success: clicked });
+      this.logger.debug('fillAriaRadio result', { label: field.label, success: clicked === true });
       return clicked;
     } catch (err) {
+      if (this.isFatalBrowserError(err)) throw err;
       this.logger.debug('fillAriaRadio error', {
         label: field.label,
         error: err instanceof Error ? err.message : String(err),
       });
-      return false;
+      return 'not_found';
     }
   }
 
@@ -517,6 +592,7 @@ export class DOMActionExecutor {
       this.logger.debug('checkCheckbox result', { label: field.label, success: checked });
       return checked;
     } catch (err) {
+      if (this.isFatalBrowserError(err)) throw err;
       this.logger.debug('checkCheckbox error', {
         label: field.label,
         error: err instanceof Error ? err.message : String(err),
@@ -562,6 +638,7 @@ export class DOMActionExecutor {
       this.logger.debug('fillDate result', { label: field.label, success: true });
       return true;
     } catch (err) {
+      if (this.isFatalBrowserError(err)) throw err;
       this.logger.debug('fillDate error', {
         label: field.label,
         error: err instanceof Error ? err.message : String(err),

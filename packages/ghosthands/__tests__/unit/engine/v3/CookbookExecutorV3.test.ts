@@ -96,6 +96,63 @@ describe('CookbookExecutorV3', () => {
     });
   });
 
+  describe('success criteria', () => {
+    it('marks failure when most actions are skipped (low health)', async () => {
+      const executor = new CookbookExecutorV3();
+
+      // 10 actions, 9 with very low health (will be skipped), 1 normal
+      const actions = Array.from({ length: 10 }, (_, i) =>
+        makeAction({
+          fieldSnapshot: {
+            ...makeAction().fieldSnapshot,
+            id: `f${i}`,
+            selector: `#field${i}`,
+            label: `Field ${i}`,
+          },
+        }),
+      );
+      // Health: first 9 are low (skipped), last one is fine but will fail (no real page)
+      const healthOverrides = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.9];
+      const entry = makeEntry(actions, healthOverrides);
+
+      const mockPage = {
+        evaluate: mock(() => Promise.resolve(null)),
+        $: mock(() => Promise.resolve(null)),
+        waitForSelector: mock(() => Promise.reject(new Error('not found'))),
+      } as any;
+
+      const result = await executor.execute(mockPage, entry, { firstName: 'John' });
+
+      // 9 skipped + 1 attempted = only 10% attempted, should NOT be success
+      expect(result.actionsSkipped).toBe(9);
+      expect(result.success).toBe(false);
+    });
+
+    it('tracks actionsTotal and actionsSkipped', async () => {
+      const executor = new CookbookExecutorV3();
+
+      const actions = [
+        makeAction(),
+        makeAction({
+          domAction: { ...makeAction().domAction, valueTemplate: '{{unknownField}}' },
+          fieldSnapshot: { ...makeAction().fieldSnapshot, id: 'f2', selector: '#f2' },
+        }),
+      ];
+      const entry = makeEntry(actions);
+
+      const mockPage = {
+        evaluate: mock(() => Promise.resolve(null)),
+        $: mock(() => Promise.resolve(null)),
+        waitForSelector: mock(() => Promise.reject(new Error('not found'))),
+      } as any;
+
+      const result = await executor.execute(mockPage, entry, { firstName: 'John' });
+
+      expect(result.actionsTotal).toBe(2);
+      expect(result.actionsSkipped).toBe(1); // unresolvable template
+    });
+  });
+
   describe('consecutive failure abort', () => {
     it('aborts after maxConsecutiveFailures', async () => {
       const executor = new CookbookExecutorV3({

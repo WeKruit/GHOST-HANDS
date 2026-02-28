@@ -13,7 +13,6 @@ import type {
   PlannedAction,
   ExecutionResult,
   ReviewResult,
-  AnalysisResult,
   LayerError,
 } from '../../../../src/engine/v3/types';
 
@@ -25,7 +24,7 @@ class TestLayerHand extends LayerHand {
   readonly requiresLLM = false;
 
   async observe(_ctx: LayerContext): Promise<V3ObservationResult> {
-    return {} as any;
+    return {} as V3ObservationResult;
   }
   async process(_obs: V3ObservationResult, _ctx: LayerContext): Promise<FieldMatch[]> {
     return [];
@@ -36,16 +35,12 @@ class TestLayerHand extends LayerHand {
   async review(_actions: PlannedAction[], _results: ExecutionResult[], _ctx: LayerContext): Promise<ReviewResult[]> {
     return [];
   }
-  async analyze(_obs: V3ObservationResult, _history: V3ObservationResult[], _ctx: LayerContext): Promise<AnalysisResult> {
-    return { discoveredFields: [], suggestedValues: [], costIncurred: 0 };
-  }
   throwError(error: unknown, _ctx: LayerContext): LayerError {
     return {
       category: this.classifyError(error),
       message: String(error),
       layer: 'dom',
       recoverable: true,
-      shouldEscalate: true,
     };
   }
 

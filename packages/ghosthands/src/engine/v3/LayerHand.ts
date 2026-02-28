@@ -1,12 +1,11 @@
 /**
  * LayerHand — Abstract base class for the three-layer execution engine.
  *
- * Each layer implements the same 6-method contract:
- *   observe()   — Discover fields on the page
- *   process()   — Match fields to user data
- *   execute()   — Fill/click/interact with fields
- *   review()    — Verify actions were applied correctly
- *   analyze()   — Deep analysis for edge cases
+ * Each layer implements the same 5-method contract:
+ *   observe()    — Discover fields on the page
+ *   process()    — Match fields to user data
+ *   execute()    — Fill/click/interact with fields
+ *   review()     — Verify actions were applied correctly
  *   throwError() — Classify and wrap errors
  *
  * Concrete implementations:
@@ -24,7 +23,6 @@ import type {
   PlannedAction,
   ExecutionResult,
   ReviewResult,
-  AnalysisResult,
   LayerError,
   ErrorCategory,
   BlockerInfo,
@@ -86,19 +84,6 @@ export abstract class LayerHand {
     results: ExecutionResult[],
     ctx: LayerContext,
   ): Promise<ReviewResult[]>;
-
-  /**
-   * Deep analysis for edge cases — discover hidden fields, conditional sections.
-   *
-   * - DOMHand: Extended DOM traversal (parent/sibling)
-   * - StagehandHand: Stagehand extract() + targeted observe()
-   * - MagnitudeHand: Vision LLM full page analysis
-   */
-  abstract analyze(
-    observation: V3ObservationResult,
-    history: V3ObservationResult[],
-    ctx: LayerContext,
-  ): Promise<AnalysisResult>;
 
   /**
    * Classify and wrap errors into LayerError.

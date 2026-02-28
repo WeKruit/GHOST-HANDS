@@ -72,7 +72,7 @@ export const ValetApplySchema = z.object({
   worker_affinity: z.enum(['strict', 'preferred', 'any']).default('preferred'),
   model: z.string().max(100).optional().describe('LLM model alias (e.g. "qwen-72b", "deepseek-chat", "claude-sonnet")'),
   image_model: z.string().max(100).optional().describe('Separate model for vision/screenshot analysis'),
-  execution_mode: z.enum(['auto', 'ai_only', 'cookbook_only']).default('auto'),
+  execution_mode: z.enum(['auto', 'ai_only', 'cookbook_only', 'hybrid', 'smart_apply', 'agent_apply']).default('auto'),
 });
 
 export type ValetApplyInput = z.infer<typeof ValetApplySchema>;
@@ -96,7 +96,7 @@ export const ValetTaskSchema = z.object({
   worker_affinity: z.enum(['strict', 'preferred', 'any']).default('preferred'),
   model: z.string().max(100).optional().describe('LLM model alias (e.g. "qwen-72b", "deepseek-chat", "claude-sonnet")'),
   image_model: z.string().max(100).optional().describe('Separate model for vision/screenshot analysis'),
-  execution_mode: z.enum(['auto', 'ai_only', 'cookbook_only']).default('auto'),
+  execution_mode: z.enum(['auto', 'ai_only', 'cookbook_only', 'hybrid', 'smart_apply', 'agent_apply']).default('auto'),
 });
 
 export type ValetTaskInput = z.infer<typeof ValetTaskSchema>;

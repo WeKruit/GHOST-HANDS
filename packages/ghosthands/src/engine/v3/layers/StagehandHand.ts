@@ -12,6 +12,7 @@ import { DOMActionExecutor } from '../DOMActionExecutor';
 import { FieldMatcher } from '../FieldMatcher';
 import { VerificationEngine } from '../VerificationEngine';
 import { getPlatformHandler } from '../platforms';
+import { toV2FieldModel, toV2PageModel } from '../v2compat';
 import type {
   LayerContext,
   V3ObservationResult,
@@ -19,10 +20,8 @@ import type {
   PlannedAction,
   ExecutionResult,
   ReviewResult,
-  AnalysisResult,
   LayerError,
   FormField,
-  BoundingBox,
 } from '../types';
 import type { BrowserAutomationAdapter, ObservedElement } from '../../../adapters/types';
 
@@ -37,7 +36,6 @@ export class StagehandHand extends LayerHand {
   }
 
   async observe(ctx: LayerContext): Promise<V3ObservationResult> {
-    const start = Date.now();
     const url = await ctx.page.url();
 
     // Use Stagehand observe() via adapter to get interactive elements
@@ -60,13 +58,13 @@ export class StagehandHand extends LayerHand {
       }
     }
 
-    // Also scan for buttons
+    // P2-1: Scan for buttons with CSS.escape for dynamic IDs
     const buttons = await ctx.page.evaluate(() => {
       const btns = document.querySelectorAll('button, input[type="submit"], [role="button"]');
       return Array.from(btns).map((b) => {
         const rect = b.getBoundingClientRect();
         return {
-          selector: b.id ? `#${b.id}` : `button:has-text("${(b.textContent || '').trim().slice(0, 30).replace(/"/g, '\\"')}")`,
+          selector: b.id ? `#${CSS.escape(b.id)}` : '',
           text: (b.textContent || '').trim(),
           disabled: (b as HTMLButtonElement).disabled || false,
           boundingBox: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
@@ -93,61 +91,52 @@ export class StagehandHand extends LayerHand {
 
   async process(observation: V3ObservationResult, ctx: LayerContext): Promise<FieldMatch[]> {
     const userData = ctx.userProfile as Record<string, string>;
-    const qaAnswers = (ctx.userProfile as any)?.qaAnswers ?? {};
+    const qaAnswers = (ctx.userProfile as Record<string, unknown>)?.qaAnswers as Record<string, string> ?? {};
     const matcher = new FieldMatcher(userData, qaAnswers, getPlatformHandler(observation.platform));
 
-    // Build a v2 PageModel for the FieldMatcher
-    const pageModel = {
-      url: observation.url,
-      platform: observation.platform,
-      pageType: observation.pageType,
-      fields: observation.fields.map((f) => ({
-        id: f.id,
-        selector: f.selector,
-        automationId: f.automationId,
-        name: f.name,
-        fieldType: f.fieldType as any,
-        fillStrategy: 'tier0' as any,
-        isRequired: f.required,
-        isVisible: f.visible,
-        isDisabled: f.disabled,
-        label: f.label || f.stagehandDescription || '',
-        placeholder: f.placeholder,
-        ariaLabel: f.ariaLabel,
-        currentValue: f.currentValue ?? '',
-        isEmpty: !f.currentValue || f.currentValue.trim() === '',
-        boundingBox: f.boundingBox ?? { x: 0, y: 0, width: 0, height: 0 },
-        absoluteY: f.boundingBox?.y ?? 0,
-      })),
-      buttons: [],
-      timestamp: observation.timestamp,
-    };
+    // Use stagehand descriptions as label fallback in the v2 page model
+    const pageModel = toV2PageModel(observation);
+    for (let i = 0; i < pageModel.fields.length; i++) {
+      const v3Field = observation.fields[i];
+      if ((!pageModel.fields[i].label || pageModel.fields[i].label.trim() === '') && v3Field?.stagehandDescription) {
+        pageModel.fields[i].label = v3Field.stagehandDescription;
+      }
+    }
 
-    const { matches } = matcher.match(pageModel as any);
+    const { matches } = matcher.match(pageModel);
 
-    return matches.map((m) => ({
-      field: observation.fields.find((f) => f.id === m.field.id) ?? observation.fields[0],
-      userDataKey: m.userDataKey,
-      value: m.value,
-      confidence: m.confidence,
-      matchMethod: m.matchMethod as FieldMatch['matchMethod'],
-    }));
+    // Filter out matches where the v3 field can't be found — falling back to fields[0]
+    // would silently map the wrong value to the wrong field.
+    return matches
+      .map((m) => {
+        const v3Field = observation.fields.find((f) => f.id === m.field.id);
+        if (!v3Field) return null;
+        return {
+          field: v3Field,
+          userDataKey: m.userDataKey,
+          value: m.value,
+          confidence: m.confidence,
+          matchMethod: m.matchMethod as FieldMatch['matchMethod'],
+        };
+      })
+      .filter((m): m is FieldMatch => m !== null);
   }
 
   async execute(actions: PlannedAction[], ctx: LayerContext): Promise<ExecutionResult[]> {
-    const domExecutor = new DOMActionExecutor(ctx.page, { type: 'mock' } as any);
+    const stubAdapter = { type: 'stub', act: () => Promise.resolve({ success: false }) } as unknown as BrowserAutomationAdapter;
+    const domExecutor = new DOMActionExecutor(ctx.page, stubAdapter);
     const results: ExecutionResult[] = [];
 
     for (const action of actions) {
       const start = Date.now();
 
       // Try DOM injection first (free)
-      const v2Field = this.toV2Field(action.field);
+      const v2Field = toV2FieldModel(action.field);
       const domResult = await domExecutor.execute({
         field: v2Field,
         value: action.value,
         tier: 0,
-        action: action.actionType as any,
+        action: action.actionType as import('../v2types').ActionType,
         retryCount: 0,
         maxRetries: 2,
       });
@@ -227,7 +216,7 @@ export class StagehandHand extends LayerHand {
         continue;
       }
 
-      const v2Field = this.toV2Field(action.field);
+      const v2Field = toV2FieldModel(action.field);
       const verification = await verifier.verify(v2Field, action.value);
       reviews.push({
         verified: verification.passed,
@@ -242,48 +231,6 @@ export class StagehandHand extends LayerHand {
     return reviews;
   }
 
-  async analyze(
-    observation: V3ObservationResult,
-    _history: V3ObservationResult[],
-    ctx: LayerContext,
-  ): Promise<AnalysisResult> {
-    // Use Stagehand extract() for deeper analysis if adapter supports it
-    let discoveredFields: FormField[] = [];
-    let costIncurred = 0;
-
-    try {
-      const { z } = await import('zod');
-      const extracted = await this.adapter.extract(
-        'List all form fields on this page that are not yet filled, including their labels and types',
-        z.array(
-          z.object({
-            label: z.string(),
-            type: z.string(),
-            selector: z.string().optional(),
-          }),
-        ),
-      ) as Array<{ label: string; type: string; selector?: string }>;
-
-      costIncurred = 0.001;
-      const knownSelectors = new Set(observation.fields.map((f) => f.selector));
-      discoveredFields = extracted
-        .filter((e) => e.selector && !knownSelectors.has(e.selector))
-        .map((e: any, i: number) => ({
-          id: `analyze-${i}`,
-          selector: e.selector || '',
-          fieldType: 'unknown' as const,
-          label: e.label,
-          required: false,
-          visible: true,
-          disabled: false,
-        }));
-    } catch {
-      // Extract failed — return empty analysis
-    }
-
-    return { discoveredFields, suggestedValues: [], costIncurred };
-  }
-
   throwError(error: unknown, _ctx: LayerContext): LayerError {
     const category = this.classifyError(error);
     return {
@@ -291,7 +238,6 @@ export class StagehandHand extends LayerHand {
       message: error instanceof Error ? error.message : String(error),
       layer: 'stagehand',
       recoverable: category !== 'browser_disconnected',
-      shouldEscalate: true, // Stagehand failures should try Magnitude next
     };
   }
 
@@ -302,7 +248,7 @@ export class StagehandHand extends LayerHand {
     el: ObservedElement,
   ): Promise<Omit<FormField, 'id' | 'stagehandDescription'> | null> {
     try {
-      const info = await page.evaluate((selector) => {
+      const info = await page.evaluate((selector: string) => {
         const element = document.querySelector(selector);
         if (!element) return null;
 
@@ -361,26 +307,5 @@ export class StagehandHand extends LayerHand {
       date: 'date', file: 'file', hidden: 'hidden',
     };
     return map[type.toLowerCase()] ?? 'unknown';
-  }
-
-  private toV2Field(field: FormField): any {
-    return {
-      id: field.id,
-      selector: field.selector,
-      automationId: field.automationId,
-      name: field.name,
-      fieldType: field.fieldType,
-      fillStrategy: 'tier0',
-      isRequired: field.required,
-      isVisible: field.visible,
-      isDisabled: field.disabled,
-      label: field.label,
-      placeholder: field.placeholder,
-      ariaLabel: field.ariaLabel,
-      currentValue: field.currentValue ?? '',
-      isEmpty: true,
-      boundingBox: field.boundingBox ?? { x: 0, y: 0, width: 0, height: 0 },
-      absoluteY: field.boundingBox?.y ?? 0,
-    };
   }
 }

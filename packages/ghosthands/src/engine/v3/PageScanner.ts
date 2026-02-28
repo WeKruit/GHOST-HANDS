@@ -105,6 +105,7 @@ export class PageScanner {
     const seenSelectors = new Set<string>();
     const seenButtonSelectors = new Set<string>();
     let globalFieldIdx = 0;
+    let globalButtonIdx = 0;
     let scrollY = 0;
     let round = 0;
 
@@ -116,7 +117,7 @@ export class PageScanner {
     while (round < MAX_SCROLL_ROUNDS) {
       round++;
 
-      const result = await this.extractVisibleElements(scrollY, globalFieldIdx);
+      const result = await this.extractVisibleElements(scrollY, globalFieldIdx, globalButtonIdx);
 
       // Deduplicate fields by selector
       for (const field of result.fields) {
@@ -127,8 +128,9 @@ export class PageScanner {
         }
       }
 
-      // Deduplicate buttons by selector
+      // Deduplicate buttons by selector + advance global button counter
       for (const button of result.buttons) {
+        globalButtonIdx++;
         if (!seenButtonSelectors.has(button.selector)) {
           seenButtonSelectors.add(button.selector);
           allButtons.push(button);
@@ -144,7 +146,7 @@ export class PageScanner {
           await this.page.evaluate(`window.scrollTo(0, ${scrollY})`);
           await this.page.waitForTimeout(200);
 
-          const bottomResult = await this.extractVisibleElements(scrollY, globalFieldIdx);
+          const bottomResult = await this.extractVisibleElements(scrollY, globalFieldIdx, globalButtonIdx);
           for (const field of bottomResult.fields) {
             if (!seenSelectors.has(field.selector)) {
               seenSelectors.add(field.selector);
@@ -153,6 +155,7 @@ export class PageScanner {
             }
           }
           for (const button of bottomResult.buttons) {
+            globalButtonIdx++;
             if (!seenButtonSelectors.has(button.selector)) {
               seenButtonSelectors.add(button.selector);
               allButtons.push(button);
@@ -217,6 +220,7 @@ export class PageScanner {
   private async extractVisibleElements(
     scrollY: number,
     startIdx: number,
+    startBtnIdx: number = 0,
   ): Promise<{ fields: RawFieldData[]; buttons: RawButtonData[] }> {
     const platform = this.platform;
 
@@ -226,6 +230,7 @@ export class PageScanner {
         var buttons = [];
         var scrollY = ${scrollY};
         var startIdx = ${startIdx};
+        var startBtnIdx = ${startBtnIdx};
         var platform = ${JSON.stringify(platform)};
         var viewportHeight = window.innerHeight;
         var viewportWidth = window.innerWidth;
@@ -557,9 +562,6 @@ export class PageScanner {
 
           var ft = getFieldType(el);
 
-          // Skip password fields (handled separately for security)
-          if (ft === 'password') continue;
-
           // Handle radio groups: only process each group once
           if (ft === 'radio') {
             var groupName = el.getAttribute('name') || '';
@@ -830,17 +832,14 @@ export class PageScanner {
           if (bEl.id) {
             bSelector = '#' + CSS.escape(bEl.id);
           } else if (bEl.getAttribute('data-testid')) {
-            bSelector = '[data-testid="' + bEl.getAttribute('data-testid') + '"]';
+            bSelector = '[data-testid="' + CSS.escape(bEl.getAttribute('data-testid')) + '"]';
           } else if (bAutoId) {
-            bSelector = '[data-automation-id="' + bAutoId + '"]';
+            bSelector = '[data-automation-id="' + CSS.escape(bAutoId) + '"]';
           } else {
-            // Use text-based selector as fallback for buttons
-            var bTag = bEl.tagName.toLowerCase();
-            if (bTag === 'input') {
-              bSelector = 'input[type="submit"][value="' + bText.replace(/"/g, '\\\\"') + '"]';
-            } else {
-              bSelector = bTag + ':has-text("' + bText.replace(/"/g, '\\\\"') + '")';
-            }
+            // Tag scan index to the button with global counter for stable unique selector
+            var globalBtnIdx = startBtnIdx + bi;
+            bEl.setAttribute('data-gh-scan-idx', 'btn-' + globalBtnIdx);
+            bSelector = '[data-gh-scan-idx="btn-' + globalBtnIdx + '"]';
           }
 
           buttons.push({

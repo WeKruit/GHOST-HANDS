@@ -12,7 +12,7 @@ import { ProgressTracker, ProgressStep } from './progressTracker.js';
 import { loadModelConfig } from '../config/models.js';
 import { taskHandlerRegistry } from './taskHandlers/registry.js';
 import { callbackNotifier } from './callbackNotifier.js';
-import type { TaskContext, TaskResult } from './taskHandlers/types.js';
+import type { TaskHandler, TaskContext, TaskResult } from './taskHandlers/types.js';
 import { SessionManager } from '../sessions/SessionManager.js';
 import { BlockerDetector, type BlockerResult, type BlockerType } from '../detection/BlockerDetector.js';
 import { ExecutionEngine } from '../engine/ExecutionEngine.js';
@@ -25,6 +25,7 @@ import { ThoughtThrottle, JOB_EVENT_TYPES } from '../events/JobEventTypes.js';
 import { ResumeDownloader, type ResumeRef } from './resumeDownloader.js';
 import { ResumeProfileLoader } from '../db/resumeProfileLoader.js';
 import { getLogger } from '../monitoring/logger.js';
+import { AgentApplyHandler } from './taskHandlers/agentApplyHandler.js';
 
 const logger = getLogger({ service: 'job-executor' });
 
@@ -321,8 +322,19 @@ export class JobExecutor {
       // 1b. Auto-populate user_data from VALET's resumes table if not provided
       await this.enrichJobFromResumeProfile(job);
 
-      // 2. Resolve task handler
-      const handler = taskHandlerRegistry.getOrThrow(job.job_type);
+      // 2. Resolve task handler — execution_mode can override the default handler
+      let handler: TaskHandler = taskHandlerRegistry.getOrThrow(job.job_type);
+      if (job.execution_mode === 'agent_apply') {
+        handler = new AgentApplyHandler();
+        logger.info('execution_mode override: using AgentApplyHandler', { jobId: job.id });
+      } else if (job.execution_mode === 'smart_apply') {
+        // SmartApplyHandler is already registered in the registry as 'smart_apply'.
+        // If the job_type doesn't match, override with SmartApplyHandler.
+        if (handler.type !== 'smart_apply') {
+          handler = taskHandlerRegistry.getOrThrow('smart_apply');
+          logger.info('execution_mode override: using SmartApplyHandler', { jobId: job.id });
+        }
+      }
 
       // 3. Validate input if handler supports it
       if (handler.validate) {

@@ -139,6 +139,8 @@ export interface ActionContext {
   prompt?: string;
   /** Data to substitute into the instruction */
   data?: Record<string, any>;
+  /** Timeout in milliseconds for this action (default: 60 000) */
+  timeoutMs?: number;
 }
 
 export interface ActionResult {

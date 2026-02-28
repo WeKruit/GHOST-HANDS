@@ -151,4 +151,4 @@ WORKDIR /opt/ghosthands
 # Orchestrators (Kamal, docker-compose, deploy-server) override CMD only;
 # the entrypoint ensures VNC always starts regardless of the target service.
 ENTRYPOINT ["/opt/ghosthands/scripts/entrypoint-with-vnc.sh"]
-CMD ["bun", "packages/ghosthands/src/workers/main.ts"]
+CMD ["bun", "packages/ghosthands/src/workers/workerLauncher.ts"]

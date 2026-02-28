@@ -155,6 +155,17 @@ export class ResumeProfileLoader {
 
     const profile = mapToWorkdayProfile(parsedData);
 
+    // Minimal usability check — reject only if the profile is truly unusable.
+    // Do NOT validate against the full WorkdayUserProfileSchema here: it requires
+    // .email() and education.min(1), which rejects partially parsed but still
+    // usable resumes (name + phone + experience). The strict Workday schema
+    // validation belongs at the handler level, not at enrichment time.
+    if (!profile.first_name && !profile.last_name) {
+      throw new Error(
+        `Resume ${data.id} mapped to unusable profile: missing both first_name and last_name`,
+      );
+    }
+
     logger.info('Loaded resume profile from database', {
       resumeId: data.id,
       userId: data.user_id,
