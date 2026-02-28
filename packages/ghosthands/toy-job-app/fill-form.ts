@@ -14,7 +14,22 @@
 
 import { chromium, type Page } from "playwright";
 import * as path from "path";
+import * as fs from "fs";
 import Anthropic from "@anthropic-ai/sdk";
+
+// Load ANTHROPIC_API_KEY from packages/ghosthands/.env if not already set
+if (!process.env.ANTHROPIC_API_KEY) {
+  const envPath = path.resolve(__dirname, "../.env");
+  if (fs.existsSync(envPath)) {
+    for (const line of fs.readFileSync(envPath, "utf-8").split("\n")) {
+      const match = line.match(/^([^#=]+)=(.*)$/);
+      if (match) {
+        const [, key, val] = match;
+        if (!process.env[key.trim()]) process.env[key.trim()] = val.trim();
+      }
+    }
+  }
+}
 
 import {
   type FormField,
@@ -324,6 +339,17 @@ Example response:
 
 // ── Fill a single field ─────────────────────────────────────
 
+/** Dismiss any open Workday dropdown/popup after a successful selection.
+ *  Clicks far away from the dropdown to avoid the Workday UXI re-open bug
+ *  (clicking near the combobox trigger closes then immediately re-opens it). */
+async function dismissDropdown(page: Page): Promise<void> {
+  await page.waitForTimeout(200);
+  await page.keyboard.press("Escape").catch(() => {});
+  // Click the page title / top of page — far from any dropdown trigger
+  await page.click("body", { position: { x: 1, y: 1 }, force: true }).catch(() => {});
+  await page.waitForTimeout(150);
+}
+
 async function fillField(page: Page, field: FormField, answers: AnswerMap = {}): Promise<boolean> {
   const sel = `[data-ff-id="${field.id}"]`;
   const tag = `[${field.name || field.type}]`;
@@ -479,6 +505,25 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
     case "select": {
       const answer = getAnswer(answers, field);
 
+      // Skip if the dropdown already displays the correct value
+      if (answer && !field.isNative) {
+        const currentDisplay = await page.evaluate((ffId) => {
+          const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+          if (!el) return "";
+          // Workday combobox: check the input value or the pill/selected text
+          if (el.tagName === "INPUT") return (el as HTMLInputElement).value.trim();
+          // Multi-select pill area: check text content
+          const pills = el.closest('[data-automation-id]')
+            ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
+          if (pills) return pills.textContent?.trim() || "";
+          return el.textContent?.trim() || "";
+        }, field.id);
+        if (currentDisplay && currentDisplay.toLowerCase().includes(answer.toLowerCase())) {
+          console.error(`  skip ${tag} (already has "${currentDisplay}")`);
+          return true;
+        }
+      }
+
       if (field.isNative) {
         try {
           if (answer) {
@@ -522,6 +567,9 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
       }
 
       // Hierarchical dropdown: "Category > SubOption" path
+      // IMPORTANT: Must use Playwright locator clicks (clickActiveListOption),
+      // not raw DOM el.click(). Workday's UXI framework requires proper
+      // mousedown/mouseup/click events.
       if (answer && answer.includes(" > ")) {
         const [category, value] = answer.split(" > ", 2);
         try {
@@ -531,56 +579,57 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
           await page.waitForTimeout(200);
 
           // Open the dropdown
-          await page.click(sel, { timeout: 2000 }).catch(async () => {
-            await clickComboboxTrigger(page, field.id);
-          });
+          await clickComboboxTrigger(page, field.id);
           await page.waitForTimeout(500);
 
-          // Click the category
-          const catClicked = await page.evaluate((text) => {
-            const container = document.querySelector('[data-automation-id="activeListContainer"]') || document;
-            const opts = container.querySelectorAll('[role="option"]');
-            for (const o of opts) {
-              const t = (o.textContent || "").trim();
-              if (t === text || t.toLowerCase().includes(text.toLowerCase())) {
-                (o as HTMLElement).click();
-                return true;
-              }
-            }
+          // Verify activeListContainer appeared
+          const hasContainer = await page.evaluate(() =>
+            !!document.querySelector('[data-automation-id="activeListContainer"]')
+          );
+          if (!hasContainer) {
+            console.error(`  skip ${tag} (no activeListContainer)`);
             return false;
-          }, category);
+          }
 
+          // Click the category using Playwright locator
+          const catClicked = await clickActiveListOption(page, category);
           if (!catClicked) {
             console.error(`  skip ${tag} (category "${category}" not found)`);
             await page.keyboard.press("Escape");
             return false;
           }
-          await page.waitForTimeout(600);
+          await page.waitForTimeout(800);
 
-          // Click the sub-option
-          const subClicked = await page.evaluate((text) => {
-            const container = document.querySelector('[data-automation-id="activeListContainer"]') || document;
-            const opts = container.querySelectorAll('[role="option"]');
-            const lower = text.toLowerCase();
-            for (const o of opts) {
-              const t = (o.textContent || "").trim();
-              if (t === text || t.toLowerCase() === lower || t.toLowerCase().includes(lower)) {
-                (o as HTMLElement).click();
-                return t;
-              }
-            }
-            return null;
-          }, value);
-
+          // Click the sub-option using Playwright locator
+          const subClicked = await clickActiveListOption(page, value);
           if (subClicked) {
-            console.error(`  select ${tag} → "${category} > ${subClicked}"`);
+            await dismissDropdown(page);
+            console.error(`  select ${tag} → "${category} > ${value}"`);
             return true;
           }
-          console.error(`  skip ${tag} (sub-option "${value}" not found in "${category}")`);
+
+          // Fuzzy fallback: read available options and try partial match
+          const available = await readActiveListOptions(page);
+          const lowerValue = value.toLowerCase();
+          const fuzzyMatch = available.find(opt => {
+            const lo = opt.toLowerCase();
+            return lo.includes(lowerValue) || lowerValue.includes(lo);
+          });
+          if (fuzzyMatch) {
+            const fuzzyClicked = await clickActiveListOption(page, fuzzyMatch);
+            if (fuzzyClicked) {
+              await dismissDropdown(page);
+              console.error(`  select ${tag} → "${category} > ${fuzzyMatch}"`);
+              return true;
+            }
+          }
+
+          console.error(`  skip ${tag} (sub-option "${value}" not found in "${category}", available: ${available.slice(0, 5).join(", ")})`);
           await page.keyboard.press("Escape");
           return false;
         } catch (e: any) {
           console.error(`  skip ${tag} (hierarchical select failed: ${e.message?.slice(0, 50)})`);
+          await page.keyboard.press("Escape").catch(() => {});
           return false;
         }
       }
@@ -592,42 +641,18 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
 
       if (!opt) {
         // No options known — try clicking to discover them on the fly
+        // Use Playwright locator clicks, not DOM el.click()
         try {
           await clickComboboxTrigger(page, field.id);
-          const clicked = await page.evaluate((ffId) => {
-            const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-            if (!el) return false;
-            const ff = (window as any).__ff;
-            // Find first visible option anywhere inside or in aria-controls
-            function tryClick(container: Element): boolean {
-              const opts = container.querySelectorAll('[role="option"], [role="menuitem"]');
-              for (const o of opts) {
-                if (ff.isVisible(o)) {
-                  (o as HTMLElement).click();
-                  return true;
-                }
-              }
-              return false;
+          await page.waitForTimeout(300);
+          const options = await readActiveListOptions(page);
+          if (options.length > 0) {
+            const clicked = await clickActiveListOption(page, options[0]);
+            if (clicked) {
+              await dismissDropdown(page);
+              console.error(`  select ${tag} → first available option`);
+              return true;
             }
-            if (tryClick(el)) return true;
-            const ctrlId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
-            if (ctrlId) {
-              const popup = document.getElementById(ctrlId);
-              if (popup && tryClick(popup)) return true;
-            }
-            // For <input> comboboxes, look in ancestor
-            if (el.tagName === "INPUT") {
-              const container = el.closest('[class*="select"], [class*="combobox"], .form-group');
-              if (container && tryClick(container)) return true;
-            }
-            // Workday: options in portal
-            const portal = document.querySelector('[data-automation-id="activeListContainer"]');
-            if (portal && tryClick(portal)) return true;
-            return false;
-          }, field.id);
-          if (clicked) {
-            console.error(`  select ${tag} → first available option`);
-            return true;
           }
           await page.keyboard.press("Escape");
           console.error(`  skip ${tag} (no options found)`);
@@ -638,91 +663,58 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
         }
       }
 
+      // Use Playwright locator clicks (clickActiveListOption), not raw DOM
+      // el.click(). Workday's UXI framework requires proper mouse events.
       try {
         await clickComboboxTrigger(page, field.id);
-        const hasAnswer = !!answer; // LLM gave us a specific answer
-        const clicked = await page.evaluate(
-          ({ ffId, text, strict }) => {
-            const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-            if (!el) return false;
-            const lowerText = text.toLowerCase();
+        await page.waitForTimeout(300);
 
-            function getOptionText(o: Element): string {
-              const clone = o.cloneNode(true) as HTMLElement;
-              clone.querySelectorAll('[class*="desc"], [class*="sub"], .option-desc, small')
-                .forEach((x: any) => x.remove());
-              return clone.textContent?.trim() || "";
-            }
-
-            function findAndClick(container: Element): boolean {
-              const opts = container.querySelectorAll('[role="option"], [role="menuitem"]');
-              // Try exact match first
-              for (const o of opts) {
-                if (getOptionText(o) === text) {
-                  (o as HTMLElement).click();
-                  return true;
-                }
-              }
-              // Try case-insensitive startsWith match (LLM said "No" but option is "No, I do not…")
-              for (const o of opts) {
-                const t = getOptionText(o).toLowerCase();
-                if (t.startsWith(lowerText) || lowerText.startsWith(t)) {
-                  (o as HTMLElement).click();
-                  return true;
-                }
-              }
-              // Try substring/includes match
-              for (const o of opts) {
-                const t = getOptionText(o).toLowerCase();
-                if (t.includes(lowerText) || lowerText.includes(t)) {
-                  (o as HTMLElement).click();
-                  return true;
-                }
-              }
-              // Only fall back to first visible if we DON'T have an explicit LLM answer
-              if (!strict) {
-                for (const o of opts) {
-                  const s = window.getComputedStyle(o as HTMLElement);
-                  if (s.display !== "none" && s.visibility !== "hidden") {
-                    (o as HTMLElement).click();
-                    return true;
-                  }
-                }
-              }
-              return false;
-            }
-
-            if (findAndClick(el)) return true;
-            const ctrlId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
-            if (ctrlId) {
-              const popup = document.getElementById(ctrlId);
-              if (popup && findAndClick(popup)) return true;
-            }
-            // For multi-selects
-            const dropdown = el.querySelector('[class*="dropdown"], [role="listbox"]');
-            if (dropdown && findAndClick(dropdown)) return true;
-            // Workday: options appear in a portal (activeListContainer) at body level
-            const portal = document.querySelector('[data-automation-id="activeListContainer"]');
-            if (portal && findAndClick(portal)) return true;
-            // Workday button dropdowns: UL[role="listbox"] sibling/nearby
-            const listboxes = document.querySelectorAll('[role="listbox"]');
-            for (const lb of listboxes) {
-              const r = (lb as HTMLElement).getBoundingClientRect();
-              if (r.height > 0 && findAndClick(lb)) return true;
-            }
-            return false;
-          },
-          { ffId: field.id, text: opt, strict: hasAnswer }
-        );
+        // Try direct Playwright locator click with exact option text
+        let clicked = await clickActiveListOption(page, opt);
         if (clicked) {
+          await dismissDropdown(page);
           console.error(`  select ${tag} → "${opt}"`);
           return true;
         }
+
+        // Fuzzy matching: read available options and find best match
+        const available = await readActiveListOptions(page);
+        const lowerOpt = opt.toLowerCase();
+
+        // Try case-insensitive startsWith match
+        let match = available.find(a => {
+          const la = a.toLowerCase();
+          return la.startsWith(lowerOpt) || lowerOpt.startsWith(la);
+        });
+
+        // Try substring/includes match
+        if (!match) {
+          match = available.find(a => {
+            const la = a.toLowerCase();
+            return la.includes(lowerOpt) || lowerOpt.includes(la);
+          });
+        }
+
+        // Fall back to first visible if we DON'T have an explicit LLM answer
+        if (!match && !answer) {
+          match = available[0];
+        }
+
+        if (match) {
+          clicked = await clickActiveListOption(page, match);
+          if (clicked) {
+            await dismissDropdown(page);
+            console.error(`  select ${tag} → "${match}"`);
+            return true;
+          }
+        }
+
         await page.keyboard.press("Escape");
-        console.error(`  skip ${tag} (could not click option)`);
+        console.error(`  skip ${tag} (could not click option "${opt}", available: ${available.slice(0, 5).join(", ")})`);
         return false;
       } catch (e: any) {
         console.error(`  skip ${tag} (${e.message?.slice(0, 50)})`);
+        await page.keyboard.press("Escape").catch(() => {});
         return false;
       }
     }
@@ -980,6 +972,9 @@ async function fillCurrentPage(page: Page, existingAnswers: AnswerMap = {}): Pro
       filled.add(field.id);
       await fillField(page, field, answers);
     }
+    // Dismiss any leftover open dropdowns/popups
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.evaluate(() => (document.activeElement as HTMLElement)?.blur()).catch(() => {});
     await page.waitForTimeout(400);
   }
 
