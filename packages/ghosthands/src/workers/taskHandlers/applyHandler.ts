@@ -50,16 +50,28 @@ export class ApplyHandler implements TaskHandler {
       return { success: false, error: `Action failed: ${actResult.message}` };
     }
 
-    // Extract page state to determine actual submission outcome
+    // Extract structured confirmation data from the page.
+    // Matches the legacy applyJob.ts schema: confirmation_id, success_message,
+    // submitted, application_status — plus page_type for routing.
     const PageStateSchema = z.object({
       page_type: z.enum(['confirmation', 'review', 'in_progress', 'unknown']),
-      evidence: z.string().optional(),
+      submitted: z.boolean(),
+      confirmation_id: z.string().optional(),
+      success_message: z.string().optional(),
+      application_status: z.string().optional(),
     });
 
     let pageState: z.infer<typeof PageStateSchema> | null = null;
     try {
       pageState = await adapter.extract(
-        'Look at the current page. Classify it as one of: "confirmation" (application was submitted — you see a thank you message, confirmation number, or success notice), "review" (application summary shown with a final Submit/Confirm button the user must click), "in_progress" (form fields still visible, application is not complete), "unknown" (cannot determine). Also provide brief evidence for your classification.',
+        'Look at the current page and extract:\n' +
+        '- page_type: "confirmation" if the application was submitted (thank you message, confirmation number, success notice), ' +
+        '"review" if there is a summary with a final Submit/Confirm button, ' +
+        '"in_progress" if form fields are still visible, "unknown" if you cannot determine.\n' +
+        '- submitted: true if the application was actually submitted, false otherwise.\n' +
+        '- confirmation_id: any confirmation number, application ID, or reference number visible on the page (optional).\n' +
+        '- success_message: the actual success/thank you text shown on the page (optional).\n' +
+        '- application_status: any status text like "Pending Review", "Under Consideration" (optional).',
         PageStateSchema,
       );
     } catch {
@@ -73,10 +85,11 @@ export class ApplyHandler implements TaskHandler {
         success: true,
         data: {
           submitted: true,
-          success_message: 'Application submitted successfully',
-          message: 'Application submitted successfully',
+          confirmation_id: pageState?.confirmation_id,
+          success_message: pageState?.success_message || 'Application submitted successfully',
+          application_status: pageState?.application_status,
+          message: pageState?.success_message || 'Application submitted successfully',
           page_type,
-          evidence: pageState?.evidence,
         },
       };
     }
@@ -90,7 +103,6 @@ export class ApplyHandler implements TaskHandler {
           submitted: false,
           message: 'Application reached review page — awaiting user submission',
           page_type,
-          evidence: pageState?.evidence,
         },
       };
     }
@@ -101,7 +113,7 @@ export class ApplyHandler implements TaskHandler {
       error: page_type === 'in_progress'
         ? 'Application form still in progress after agent execution'
         : 'Could not confirm application was submitted',
-      data: { submitted: false, page_type, evidence: pageState?.evidence },
+      data: { submitted: false, page_type },
     };
   }
 }
