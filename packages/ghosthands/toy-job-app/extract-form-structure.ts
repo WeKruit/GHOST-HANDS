@@ -525,7 +525,7 @@ export interface ComboboxInfo {
 // ── Workday portal helpers (module-level) ───────────────────
 
 // Read de-duplicated option texts from Workday's activeListContainer portal
-async function readActiveListOptions(page: Page): Promise<string[]> {
+export async function readActiveListOptions(page: Page): Promise<string[]> {
   const raw = await page.evaluate(() => {
     const container = document.querySelector('[data-automation-id="activeListContainer"]');
     if (!container) return [];
@@ -548,7 +548,7 @@ async function readActiveListOptions(page: Page): Promise<string[]> {
 
 // Click an option inside a Workday dropdown (activeListContainer portal OR native listbox)
 // Uses Playwright locators (page.evaluate el.click() doesn't fire Workday's React handlers)
-async function clickActiveListOption(page: Page, text: string): Promise<boolean> {
+export async function clickActiveListOption(page: Page, text: string): Promise<boolean> {
   try {
     // Try activeListContainer portal first (searchable selectinput dropdowns)
     const portal = page.locator('[data-automation-id="activeListContainer"]');
