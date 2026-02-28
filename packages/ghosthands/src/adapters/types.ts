@@ -37,6 +37,15 @@ export interface BrowserAutomationAdapter {
   /** Extract structured data from the current page using a Zod schema */
   extract<T>(instruction: string, schema: ZodSchema<T>): Promise<T>;
 
+  // -- Direct Execution (optional, v3) --
+
+  /**
+   * Execute a low-level action directly, bypassing LLM planning.
+   * Used by v3 MagnitudeHand to perform individual clicks/types at known coordinates.
+   * Action must have a `variant` string field (e.g., 'click', 'type', 'scroll').
+   */
+  exec?(action: { variant: string; [key: string]: unknown }): Promise<void>;
+
   // -- Observation (optional) --
 
   /**

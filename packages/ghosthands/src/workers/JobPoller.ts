@@ -3,8 +3,49 @@ import { Client as PgClient, Notification } from "pg";
 import { JobExecutor } from "./JobExecutor.js";
 import { getLogger } from '../monitoring/logger.js';
 
+const logger = getLogger({ service: 'JobPoller' });
+
 const POLL_INTERVAL_MS = 5_000;
 const DRAIN_TIMEOUT_MS = 30_000;
+
+/**
+ * Inline job pickup SQL — replaces the gh_pickup_next_job() function call.
+ *
+ * Matches BOTH 'pending' (legacy/REST-created) AND 'queued' (pg-boss-created)
+ * statuses so the legacy poller works regardless of how VALET dispatched the job.
+ * VALET's TaskQueueService inserts with status='queued'; the GH API inserts with
+ * status='pending' (DB default). Both must be claimable.
+ *
+ * Uses the same FOR UPDATE SKIP LOCKED + worker_affinity logic as migration 014.
+ */
+const PICKUP_SQL = `
+  WITH next_job AS (
+    SELECT id
+    FROM gh_automation_jobs
+    WHERE status IN ('pending', 'queued')
+      AND (scheduled_at IS NULL OR scheduled_at <= NOW())
+      AND (
+        worker_affinity = 'any'
+        OR (worker_affinity = 'preferred'
+            AND (target_worker_id IS NULL OR target_worker_id = $1))
+        OR (worker_affinity = 'strict' AND target_worker_id = $1)
+      )
+    ORDER BY
+      CASE WHEN target_worker_id = $1 THEN 0 ELSE 1 END ASC,
+      priority ASC,
+      created_at ASC
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+  )
+  UPDATE gh_automation_jobs
+  SET status = 'queued',
+      worker_id = $1,
+      last_heartbeat = NOW(),
+      updated_at = NOW()
+  FROM next_job
+  WHERE gh_automation_jobs.id = next_job.id
+  RETURNING gh_automation_jobs.*;
+`;
 
 export interface JobPollerOptions {
     supabase: SupabaseClient;
@@ -37,18 +78,45 @@ export class JobPoller {
     async start(): Promise<void> {
         this.running = true;
 
-        // Subscribe to Postgres NOTIFY for instant job pickup
-        await this.pgDirect.query("LISTEN gh_job_created");
-        this.pgDirect.on("notification", (_msg: Notification) => {
-            if (this.activeJobs < this.maxConcurrent) {
-                this.tryPickup();
-            }
-        });
+        // Subscribe to Postgres NOTIFY for instant job pickup.
+        // NOTE: If pgDirect connects through pgbouncer transaction mode,
+        // LISTEN state is dropped between transactions. The poll timer
+        // below compensates — NOTIFY is a best-effort optimization.
+        //
+        // TODO: pg_notify('gh_job_created', ...) is never called anywhere in the codebase.
+        // No trigger on gh_automation_jobs INSERT fires this notification.
+        // LISTEN is effectively a dead path — polling (5s interval) is the actual
+        // job discovery mechanism. To enable instant pickup, add a trigger:
+        //   CREATE OR REPLACE FUNCTION gh_notify_job_created() RETURNS trigger AS $$
+        //   BEGIN
+        //     PERFORM pg_notify('gh_job_created', NEW.id::text);
+        //     RETURN NEW;
+        //   END; $$ LANGUAGE plpgsql;
+        //   CREATE TRIGGER trg_gh_job_created AFTER INSERT ON gh_automation_jobs
+        //     FOR EACH ROW EXECUTE FUNCTION gh_notify_job_created();
+        try {
+            await this.pgDirect.query("LISTEN gh_job_created");
+            this.pgDirect.on("notification", (_msg: Notification) => {
+                if (this.activeJobs < this.maxConcurrent) {
+                    this.tryPickup().catch((err) => {
+                        logger.warn('Pickup from NOTIFY failed', { error: err instanceof Error ? err.message : String(err) });
+                    });
+                }
+            });
+        } catch (err) {
+            // LISTEN may fail through transaction-mode pgbouncer — non-fatal
+            logger.warn('LISTEN gh_job_created failed (polling will compensate)', {
+                error: err instanceof Error ? err.message : String(err),
+            });
+        }
 
-        // Fallback polling in case NOTIFY is missed (e.g. network blip)
+        // Poll every 5s — primary job discovery mechanism.
+        // NOTIFY is unreliable (no trigger fires it; pgbouncer drops LISTEN state).
         this.pollTimer = setInterval(() => {
             if (this.activeJobs < this.maxConcurrent) {
-                this.tryPickup();
+                this.tryPickup().catch((err) => {
+                    logger.warn('Poll pickup failed', { error: err instanceof Error ? err.message : String(err) });
+                });
             }
         }, POLL_INTERVAL_MS);
 
@@ -57,6 +125,12 @@ export class JobPoller {
 
         // Initial pickup attempt
         await this.tryPickup();
+
+        logger.info('JobPoller started', {
+            workerId: this.workerId,
+            pollIntervalMs: POLL_INTERVAL_MS,
+            maxConcurrent: this.maxConcurrent,
+        });
     }
 
     async stop(): Promise<void> {
@@ -81,7 +155,7 @@ export class JobPoller {
         // Always release claimed jobs on shutdown, regardless of whether they completed
         // This ensures clean handoff to other workers even if process is force-killed
         if (this.activeJobs > 0) {
-            getLogger().warn('Shutdown with active jobs still running', {
+            logger.warn('Shutdown with active jobs still running', {
                 activeJobs: this.activeJobs,
             });
         }
@@ -113,13 +187,13 @@ export class JobPoller {
             );
 
             if (result.rows && result.rows.length > 0) {
-                getLogger().info('Released jobs back to queue', {
+                logger.info('Released jobs back to queue', {
                     count: result.rows.length,
                     jobIds: result.rows.map((j: { id: string }) => j.id),
                 });
             }
         } catch (err) {
-            getLogger().error('Failed to release claimed jobs', {
+            logger.error('Failed to release claimed jobs', {
                 error: err instanceof Error ? err.message : String(err),
             });
         }
@@ -138,8 +212,11 @@ export class JobPoller {
     }
 
     /**
-     * Atomic job pickup using FOR UPDATE SKIP LOCKED via Postgres function.
+     * Atomic job pickup using FOR UPDATE SKIP LOCKED.
      * Multiple workers can safely call this concurrently without contention.
+     *
+     * Uses inline SQL (PICKUP_SQL) instead of the gh_pickup_next_job() function
+     * to match BOTH 'pending' and 'queued' statuses — cross-dispatch-mode compat.
      */
     private async tryPickup(): Promise<void> {
         if (!this.running || this.activeJobs >= this.maxConcurrent) return;
@@ -147,11 +224,7 @@ export class JobPoller {
 
         this.pickupInFlight = true;
         try {
-            // Use direct pg query instead of supabase.rpc to avoid JWT issues
-            const result = await this.pgDirect.query(
-                "SELECT * FROM gh_pickup_next_job($1::TEXT)",
-                [this.workerId]
-            );
+            const result = await this.pgDirect.query(PICKUP_SQL, [this.workerId]);
 
             if (!result.rows || result.rows.length === 0) {
                 return; // No jobs available
@@ -162,8 +235,9 @@ export class JobPoller {
 
             this.activeJobs++;
             this._currentJobId = job.id;
-            getLogger().info('Picked up job', {
+            logger.info('Picked up job', {
                 jobId: job.id, jobType: job.job_type,
+                previousStatus: job.status,
                 activeJobs: this.activeJobs, maxConcurrent: this.maxConcurrent,
             });
 
@@ -171,7 +245,7 @@ export class JobPoller {
             this.executor
                 .execute(job)
                 .catch((err) => {
-                    getLogger().error('Job executor error', {
+                    logger.error('Job executor error', {
                         jobId: job.id,
                         error: err instanceof Error ? err.message : String(err),
                     });
@@ -179,13 +253,15 @@ export class JobPoller {
                 .finally(() => {
                     this.activeJobs--;
                     this._currentJobId = null;
-                    getLogger().info('Job finished', {
+                    logger.info('Job finished', {
                         jobId: job.id,
                         activeJobs: this.activeJobs, maxConcurrent: this.maxConcurrent,
                     });
                     // Try to pick up the next job
                     if (this.running && this.activeJobs < this.maxConcurrent) {
-                        this.tryPickup();
+                        this.tryPickup().catch((err) => {
+                            logger.warn('Post-job pickup failed', { error: err instanceof Error ? err.message : String(err) });
+                        });
                     }
                 });
 
@@ -226,7 +302,7 @@ export class JobPoller {
             }
 
             const stuckJobIds = stuckResult.rows.map((j: { id: string }) => j.id);
-            getLogger().info('Found stuck jobs', { count: stuckJobIds.length, jobIds: stuckJobIds });
+            logger.info('Found stuck jobs', { count: stuckJobIds.length, jobIds: stuckJobIds });
 
             const requeued: string[] = [];
             const completedDueToProgress: string[] = [];
@@ -277,19 +353,19 @@ export class JobPoller {
             }
 
             if (requeued.length > 0) {
-                getLogger().info('Re-queued stuck jobs (no progress)', {
+                logger.info('Re-queued stuck jobs (no progress)', {
                     count: requeued.length,
                     jobIds: requeued,
                 });
             }
             if (completedDueToProgress.length > 0) {
-                getLogger().info('Marked stuck jobs as completed (form was submitted)', {
+                logger.info('Marked stuck jobs as completed (form was submitted)', {
                     count: completedDueToProgress.length,
                     jobIds: completedDueToProgress,
                 });
             }
         } catch (err) {
-            getLogger().error('Stuck job recovery failed', {
+            logger.error('Stuck job recovery failed', {
                 error: err instanceof Error ? err.message : String(err),
             });
         }

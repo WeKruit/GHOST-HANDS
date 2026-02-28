@@ -106,8 +106,8 @@ describe('CI/CD Workflow (ci.yml)', () => {
     expect(condition).toContain('push');
   });
 
-  test('deploy-production depends on deploy-asg (notifies VALET after EC2 update)', () => {
-    expect(ci.jobs['deploy-production'].needs).toContain('deploy-asg');
+  test('deploy-production depends on docker build (Kamal deploys via ATM)', () => {
+    expect(ci.jobs['deploy-production'].needs).toContain('docker');
   });
 });
 

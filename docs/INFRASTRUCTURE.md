@@ -62,7 +62,7 @@
 | **IAM Role** | `ghosthands-worker-role` | EC2 instance role | ASG lifecycle + ECR + CloudWatch |
 | **Instance Profile** | `ghosthands-worker-profile` | Attached to Launch Template | |
 | **Security Group** | `sg-0f7cbba074ee13801` | `valet-worker-staging` | Ports: 22, 80, 443, 3100, 6080, 8000, 8080 |
-| **Key Pair** | `valet-worker` | SSH access | `~/.ssh/valet-worker.pem` |
+| **Key Pair** | `valet-worker` | SSH access | `~/.ssh/wekruit-atm-server.pem` |
 | **VPC** | `vpc-001f5437cfda3f468` | Default | us-east-1 |
 | **Subnet** | `subnet-069f1f6705a683148` | us-east-1a | Public subnet |
 
@@ -157,7 +157,7 @@ aws secretsmanager update-secret \
   --secret-string "$(cat updated-secrets.json)"
 
 # 2. Option A: Re-pull on EC2 (restarts containers)
-ssh -i ~/.ssh/valet-worker.pem ubuntu@<ip> \
+ssh -i ~/.ssh/wekruit-atm-server.pem ubuntu@<ip> \
   "cd /opt/ghosthands && sudo bash scripts/pull-secrets.sh staging && docker compose down && docker compose up -d"
 
 # 3. Option B: Refresh via deploy-server API (no restart needed for deploy-server itself)
@@ -309,7 +309,7 @@ aws ec2 describe-instances \
   --query 'Reservations[].Instances[].{ID:InstanceId,IP:PublicIpAddress}' --output table
 
 # SSH
-ssh -i ~/.ssh/valet-worker.pem ubuntu@<instance-ip>
+ssh -i ~/.ssh/wekruit-atm-server.pem ubuntu@<instance-ip>
 ```
 
 ### Update the Golden AMI
@@ -318,7 +318,7 @@ When you deploy a new GH version, you need to update the AMI:
 
 ```bash
 # 1. SSH into any running ASG instance
-ssh -i ~/.ssh/valet-worker.pem ubuntu@<instance-ip>
+ssh -i ~/.ssh/wekruit-atm-server.pem ubuntu@<instance-ip>
 
 # 2. Pull latest Docker image
 cd /opt/ghosthands && docker compose pull
@@ -370,13 +370,13 @@ aws autoscaling start-instance-refresh \
 ## Onboarding Checklist (New Developer)
 
 1. **Get AWS access** — Ask team lead for IAM credentials or SSO login
-2. **Get SSH key** — `~/.ssh/valet-worker.pem` (ask team lead)
+2. **Get SSH key** — `~/.ssh/wekruit-atm-server.pem` (ask team lead)
 3. **Read the architecture** — This doc + `ASG-SETUP-GUIDE.md`
 4. **Verify CLI access:**
    ```bash
    aws sts get-caller-identity
    aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ghosthands-worker-asg
-   ssh -i ~/.ssh/valet-worker.pem ubuntu@<any-instance-ip> "docker ps"
+   ssh -i ~/.ssh/wekruit-atm-server.pem ubuntu@<any-instance-ip> "docker ps"
    ```
 5. **Understand the dispatch flow:**
    - VALET → pg-boss queue → GH Worker polls → executes → callback to VALET
@@ -423,7 +423,7 @@ EC2 instances accumulate Docker images, temp files, and logs over time. Automate
 
 ```bash
 # SSH into the instance
-ssh -i ~/.ssh/valet-worker.pem ubuntu@<instance-ip>
+ssh -i ~/.ssh/wekruit-atm-server.pem ubuntu@<instance-ip>
 
 # Install the cron job
 sudo bash /opt/ghosthands/scripts/setup-cleanup-cron.sh

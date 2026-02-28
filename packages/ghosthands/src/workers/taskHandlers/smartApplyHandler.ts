@@ -2138,14 +2138,21 @@ Set is_final_review to true ONLY if this is genuinely the last page before submi
     await this.throttleLlm(adapter);
 
     try {
-      await adapter.act(prompt);
+      const result = await adapter.act(prompt);
+      // Defense-in-depth: check result even though adapters now throw on failure.
+      if (!result.success) {
+        throw new Error(`[${label}] act() returned failure: ${result.message}`);
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       if (msg.includes('429') || msg.includes('rate_limit') || msg.includes('Too Many Requests')) {
         console.warn(`[SmartApply] [${label}] Rate limited (429) — waiting 30s before retry...`);
         await adapter.page.waitForTimeout(30_000);
         this.lastLlmCallTime = Date.now();
-        await adapter.act(prompt);
+        const retryResult = await adapter.act(prompt);
+        if (!retryResult.success) {
+          throw new Error(`[${label}] act() returned failure after retry: ${retryResult.message}`);
+        }
         return;
       }
       throw error;
