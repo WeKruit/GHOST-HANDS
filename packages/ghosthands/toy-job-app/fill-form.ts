@@ -49,14 +49,19 @@ function defaultValue(field: FormField): string {
   }
 }
 
-/** Look up an answer for a field, case-insensitive on field name. */
+/** Normalize a field name for matching: strip trailing *, trim whitespace. */
+function normalizeName(s: string): string {
+  return s.replace(/\s*\*+\s*$/, "").trim().toLowerCase();
+}
+
+/** Look up an answer for a field, case-insensitive, ignoring trailing * markers. */
 function getAnswer(answers: AnswerMap, field: FormField): string | undefined {
   // Try exact match first
   if (field.name in answers) return answers[field.name];
-  // Case-insensitive match
-  const lower = field.name.toLowerCase();
+  // Normalized match (case-insensitive, strip trailing *)
+  const norm = normalizeName(field.name);
   for (const [key, val] of Object.entries(answers)) {
-    if (key.toLowerCase() === lower) return val;
+    if (normalizeName(key) === norm) return val;
   }
   return undefined;
 }
@@ -98,10 +103,16 @@ Languages spoken: English (native), Mandarin Chinese (conversational)
 async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise<void> {
   for (const f of fields) {
     if (f.type !== "select" || f.isNative || (f.options && f.options.length > 0)) continue;
+    if (!f.name) continue; // skip unnamed fields (language switchers, etc.)
 
     try {
+      // Dismiss any lingering dropdown portal before opening next
+      await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
+      await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
+      await page.waitForTimeout(200);
+
       await clickComboboxTrigger(page, f.id);
-      await page.waitForTimeout(300);
+      await page.waitForTimeout(400);
 
       const options = await page.evaluate((ffId) => {
         const el = document.querySelector(`[data-ff-id="${ffId}"]`);
@@ -111,6 +122,8 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
         function collect(container: Element) {
           const opts = container.querySelectorAll('[role="option"], [role="menuitem"], li');
           for (const o of opts) {
+            const r = o.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
             const t = o.textContent?.trim();
             if (t && t.length < 200) results.push(t);
           }
@@ -126,7 +139,13 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
           const container = el.closest('[class*="select"], [class*="combobox"], .form-group');
           if (container) collect(container);
         }
-        return results;
+        // Workday: options in portal at body level
+        if (results.length === 0) {
+          const portal = document.querySelector('[data-automation-id="activeListContainer"]');
+          if (portal) collect(portal);
+        }
+        // De-duplicate
+        return [...new Set(results)];
       }, f.id);
 
       if (options.length > 0) {
@@ -230,12 +249,95 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
     case "number":
     case "password":
     case "search": {
-      // Skip combobox inputs — they look like text but are actually dropdown triggers
-      const isCombobox = await page.evaluate((ffId) => {
+      // Detect searchable dropdowns (Workday selectinput, comboboxes, etc.)
+      const searchDropdown = await page.evaluate((ffId) => {
         const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-        return el?.getAttribute("role") === "combobox";
+        if (!el) return false;
+        return (
+          el.getAttribute("role") === "combobox" ||
+          el.getAttribute("data-uxi-widget-type") === "selectinput" ||
+          el.getAttribute("data-automation-id") === "searchBox" ||
+          (el.getAttribute("autocomplete") === "off" && el.getAttribute("aria-controls"))
+        );
       }, field.id);
-      if (isCombobox) return false;
+
+      if (searchDropdown) {
+        const val = getAnswer(answers, field);
+        if (!val) {
+          console.error(`  skip ${tag} (searchable dropdown, no answer)`);
+          return false;
+        }
+        try {
+          // Click to open the dropdown
+          await page.click(sel, { timeout: 2000 });
+          await page.waitForTimeout(400);
+
+          // Type to search — this filters the cascading dropdown
+          await page.fill(sel, "", { timeout: 1000 }).catch(() => {});
+          await page.type(sel, val, { delay: 30 });
+          await page.waitForTimeout(1500);
+
+          // Try to click a matching element — scan broadly
+          const clicked = await page.evaluate((text) => {
+            const lowerText = text.toLowerCase();
+
+            // Strategy 1: ARIA/role-based elements
+            const roleEls = document.querySelectorAll(
+              '[role="option"], [role="menuitem"], [role="treeitem"], ' +
+              '[data-automation-id*="promptOption"], [data-automation-id*="menuItem"]'
+            );
+            for (const o of roleEls) {
+              const rect = o.getBoundingClientRect();
+              if (rect.width === 0 || rect.height === 0) continue;
+              const t = (o.textContent || "").trim().toLowerCase();
+              if (t === lowerText || t.includes(lowerText)) {
+                (o as HTMLElement).click();
+                return (o.textContent || "").trim();
+              }
+            }
+
+            // Strategy 2: Any visible element whose DIRECT text matches (not just textContent of children)
+            // This catches Workday's custom divs/spans that serve as clickable items
+            const allVisible = document.querySelectorAll(
+              'div[tabindex], div[data-automation-id], span[data-automation-id], ' +
+              'li, a, button, [role="button"]'
+            );
+            for (const o of allVisible) {
+              const rect = o.getBoundingClientRect();
+              if (rect.width === 0 || rect.height === 0) continue;
+              // Use direct childNodes text to avoid matching parent containers
+              let directText = "";
+              for (const n of o.childNodes) {
+                if (n.nodeType === Node.TEXT_NODE) directText += n.textContent;
+                else if (n.nodeType === Node.ELEMENT_NODE) directText += (n as Element).textContent;
+              }
+              directText = directText.trim().toLowerCase();
+              if (directText && (directText === lowerText || directText.includes(lowerText))) {
+                (o as HTMLElement).click();
+                return directText;
+              }
+            }
+            return null;
+          }, val);
+
+          if (clicked) {
+            console.error(`  search-select ${tag} → "${clicked}"`);
+            await page.waitForTimeout(300);
+            return true;
+          }
+
+          // Last resort: press down arrow + enter to select first search result
+          await page.keyboard.press("ArrowDown");
+          await page.waitForTimeout(200);
+          await page.keyboard.press("Enter");
+          console.error(`  search-select ${tag} → first result (keyboard)`);
+          await page.waitForTimeout(300);
+          return true;
+        } catch (e: any) {
+          console.error(`  skip ${tag} (searchable dropdown failed: ${e.message?.slice(0, 60)})`);
+          return false;
+        }
+      }
 
       const val = getAnswer(answers, field) ?? defaultValue(field);
       try {
@@ -317,6 +419,70 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
         }
       }
 
+      // Hierarchical dropdown: "Category > SubOption" path
+      if (answer && answer.includes(" > ")) {
+        const [category, value] = answer.split(" > ", 2);
+        try {
+          // Dismiss any open dropdowns first
+          await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
+          await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
+          await page.waitForTimeout(200);
+
+          // Open the dropdown
+          await page.click(sel, { timeout: 2000 }).catch(async () => {
+            await clickComboboxTrigger(page, field.id);
+          });
+          await page.waitForTimeout(500);
+
+          // Click the category
+          const catClicked = await page.evaluate((text) => {
+            const container = document.querySelector('[data-automation-id="activeListContainer"]') || document;
+            const opts = container.querySelectorAll('[role="option"]');
+            for (const o of opts) {
+              const t = (o.textContent || "").trim();
+              if (t === text || t.toLowerCase().includes(text.toLowerCase())) {
+                (o as HTMLElement).click();
+                return true;
+              }
+            }
+            return false;
+          }, category);
+
+          if (!catClicked) {
+            console.error(`  skip ${tag} (category "${category}" not found)`);
+            await page.keyboard.press("Escape");
+            return false;
+          }
+          await page.waitForTimeout(600);
+
+          // Click the sub-option
+          const subClicked = await page.evaluate((text) => {
+            const container = document.querySelector('[data-automation-id="activeListContainer"]') || document;
+            const opts = container.querySelectorAll('[role="option"]');
+            const lower = text.toLowerCase();
+            for (const o of opts) {
+              const t = (o.textContent || "").trim();
+              if (t === text || t.toLowerCase() === lower || t.toLowerCase().includes(lower)) {
+                (o as HTMLElement).click();
+                return t;
+              }
+            }
+            return null;
+          }, value);
+
+          if (subClicked) {
+            console.error(`  select ${tag} → "${category} > ${subClicked}"`);
+            return true;
+          }
+          console.error(`  skip ${tag} (sub-option "${value}" not found in "${category}")`);
+          await page.keyboard.press("Escape");
+          return false;
+        } catch (e: any) {
+          console.error(`  skip ${tag} (hierarchical select failed: ${e.message?.slice(0, 50)})`);
+          return false;
+        }
+      }
+
       // Custom dropdown: use answer if provided, else first non-placeholder
       const opt = answer
         ?? field.options?.find((o) => !PLACEHOLDER_RE.test(o))
@@ -352,6 +518,9 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
               const container = el.closest('[class*="select"], [class*="combobox"], .form-group');
               if (container && tryClick(container)) return true;
             }
+            // Workday: options in portal
+            const portal = document.querySelector('[data-automation-id="activeListContainer"]');
+            if (portal && tryClick(portal)) return true;
             return false;
           }, field.id);
           if (clicked) {
@@ -430,6 +599,9 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
             // For multi-selects
             const dropdown = el.querySelector('[class*="dropdown"], [role="listbox"]');
             if (dropdown && findAndClick(dropdown)) return true;
+            // Workday: options appear in a portal (activeListContainer) at body level
+            const portal = document.querySelector('[data-automation-id="activeListContainer"]');
+            if (portal && findAndClick(portal)) return true;
             return false;
           },
           { ffId: field.id, text: opt, strict: hasAnswer }
@@ -552,64 +724,140 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
   }
 }
 
-// ── Main ─────────────────────────────────────────────────────
+// ── Multi-page navigation ────────────────────────────────────
 
-async function main() {
-  const input = process.argv[2] || path.join(__dirname, "index.html");
-  const url = resolveUrl(input);
-  console.error(`Loading: ${url}\n`);
+const MAX_PAGES = 20;
 
-  const browser = await chromium.launch({ headless: false, slowMo: 50 });
-  const page = await browser.newPage();
-  await page.goto(url, { waitUntil: "networkidle" });
-  await injectHelpers(page);
+interface NavigationState {
+  hasNextButton: boolean;
+  hasSubmitButton: boolean;
+  nextButtonSelector: string | null;
+}
 
-  // Reveal all multi-step/accordion sections
-  await page.evaluate(() => {
-    document
-      .querySelectorAll(
-        '[data-section], .form-section, .form-step, .step-content, ' +
-          '.tab-pane, .accordion-content, .panel-body, [role="tabpanel"]'
-      )
-      .forEach((el: any) => {
-        el.style.display = "";
-        el.classList.add("active");
-        el.removeAttribute("hidden");
-        el.setAttribute("aria-hidden", "false");
-      });
+async function detectNavigationButtons(page: Page): Promise<NavigationState> {
+  return page.evaluate(() => {
+    // Clear stale nav markers from previous pages
+    document.querySelectorAll('[data-ff-nav]').forEach(el => el.removeAttribute('data-ff-nav'));
+
+    const NEXT_RE = /^(next|continue|proceed|save and continue|save & continue)/i;
+    const NEXT_PREFIX_RE = /^next:/i;
+    const SUBMIT_RE = /^(submit|apply|apply now|send application|submit application)/i;
+    const SUBMIT_INCLUDES_RE = /submit|apply now|send application/i;
+
+    const buttons = Array.from(document.querySelectorAll<HTMLElement>(
+      'button, [role="button"], input[type="submit"], a.btn, a[class*="btn"]'
+    ));
+
+    let hasNextButton = false;
+    let hasSubmitButton = false;
+    let nextButtonSelector: string | null = null;
+
+    for (const btn of buttons) {
+      const rect = btn.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      const style = window.getComputedStyle(btn);
+      if (style.display === "none" || style.visibility === "hidden") continue;
+
+      const text = (btn.textContent || (btn as HTMLInputElement).value || "").trim();
+
+      // Check submit first
+      if (btn.getAttribute("type") === "submit" || SUBMIT_RE.test(text) || SUBMIT_INCLUDES_RE.test(text)) {
+        hasSubmitButton = true;
+        continue;
+      }
+
+      // Check next
+      if (NEXT_RE.test(text) || NEXT_PREFIX_RE.test(text)) {
+        hasNextButton = true;
+        btn.setAttribute("data-ff-nav", "next");
+        nextButtonSelector = '[data-ff-nav="next"]';
+      }
+    }
+
+    return { hasNextButton, hasSubmitButton, nextButtonSelector };
   });
+}
 
-  // ── Extract fields and ask LLM for answers ─────────────────
+async function waitForPageTransition(page: Page, urlBefore: string): Promise<"same_page" | "new_page" | "new_url"> {
+  await page.waitForTimeout(500);
+  const urlAfter = page.url();
+
+  if (urlAfter !== urlBefore) {
+    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+    return "new_url";
+  }
+
+  await page.waitForTimeout(300);
+  return "new_page"; // assume in-page JS navigation worked
+}
+
+async function isMultiPageForm(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const sections = document.querySelectorAll(
+      ".form-section, .form-step, [data-section], .step-content"
+    );
+    if (sections.length <= 1) return false;
+
+    let hiddenCount = 0;
+    for (const s of sections) {
+      const style = window.getComputedStyle(s as HTMLElement);
+      if (style.display === "none" || s.getAttribute("aria-hidden") === "true") {
+        hiddenCount++;
+      }
+    }
+    return hiddenCount >= 1;
+  });
+}
+
+// ── Fill current page ────────────────────────────────────────
+
+async function fillCurrentPage(page: Page, existingAnswers: AnswerMap = {}): Promise<AnswerMap> {
+  // Re-inject helpers if page navigated to a new URL
+  const hasHelpers = await page.evaluate(() => !!(window as any).__ff).catch(() => false);
+  if (!hasHelpers) {
+    await injectHelpers(page);
+  }
+
   console.error("Extracting form fields…");
   const allFields = await extractFields(page);
   const visibleFields = allFields.filter((f) => f.visibleByDefault);
   console.error(`Found ${visibleFields.length} visible fields.`);
 
-  // Open custom dropdowns briefly to discover their options
+  if (visibleFields.length === 0) {
+    console.error("No visible fields on this page.");
+    return existingAnswers;
+  }
+
+  // Discover dropdown options (only for visible fields — skip hidden conditionals)
   console.error("Discovering dropdown options…");
-  await discoverDropdownOptions(page, allFields);
+  await discoverDropdownOptions(page, visibleFields);
 
-  console.error("\nAsking LLM for answers…\n");
+  // Only ask LLM about visible, named fields it hasn't answered yet
+  const unanswered = visibleFields.filter(
+    (f) => f.name && getAnswer(existingAnswers, f) === undefined && f.type !== "file"
+  );
 
-  // Send ALL fields (including hidden conditional ones) so the LLM can
-  // answer them if they appear later
-  const answers = await generateAnswers(allFields);
-  console.error(`LLM provided ${Object.keys(answers).length} answers.\n`);
+  const answers = { ...existingAnswers };
+  if (unanswered.length > 0) {
+    console.error(`\nAsking LLM for ${unanswered.length} new fields…\n`);
+    const newAnswers = await generateAnswers(unanswered);
+    Object.assign(answers, newAnswers);
+    console.error(`LLM provided ${Object.keys(newAnswers).length} answers.\n`);
+  } else {
+    console.error("All fields already answered from previous pages.\n");
+  }
 
-  // ── Iterative fill loop ───────────────────────────────────
+  // Iterative fill loop
   const filled = new Set<string>();
   let round = 0;
 
   while (round < 10) {
     round++;
     const fields = await extractFields(page);
-    const visible = fields.filter((f) => f.visibleByDefault);
-
-    // Find fields we haven't filled yet
+    const visible = fields.filter((f) => f.visibleByDefault && f.name);
     const toFill = visible.filter((f) => !filled.has(f.id));
     if (toFill.length === 0) break;
 
-    // If new fields appeared that the LLM hasn't seen, ask again
     const unseen = toFill.filter(
       (f) => getAnswer(answers, f) === undefined && f.type !== "file"
     );
@@ -620,19 +868,132 @@ async function main() {
     }
 
     console.error(`\nRound ${round}: ${toFill.length} new fields to fill…`);
-
     for (const field of toFill) {
       filled.add(field.id);
       await fillField(page, field, answers);
     }
-
-    // Wait for conditional logic to react
     await page.waitForTimeout(400);
   }
 
-  console.error(`\nDone! Filled ${filled.size} fields in ${round} round(s).`);
-  console.error("Browser left open for inspection. Press Ctrl+C to close.");
-  await new Promise(() => {});
+  console.error(`\nPage fill complete. ${filled.size} fields in ${round} round(s).`);
+  return answers;
+}
+
+// ── Multi-page orchestration ─────────────────────────────────
+
+async function fillMultiPageForm(page: Page): Promise<void> {
+  let answers: AnswerMap = {};
+  let pageNum = 0;
+
+  while (pageNum < MAX_PAGES) {
+    pageNum++;
+    console.error(`\n${"=".repeat(60)}`);
+    console.error(`PAGE ${pageNum}`);
+    console.error(`${"=".repeat(60)}\n`);
+
+    answers = await fillCurrentPage(page, answers);
+
+    const navState = await detectNavigationButtons(page);
+
+    if (navState.hasSubmitButton && !navState.hasNextButton) {
+      console.error(`\n${"=".repeat(60)}`);
+      console.error("FINAL PAGE — Submit button detected.");
+      console.error("NOT clicking Submit. Review and submit manually.");
+      console.error(`${"=".repeat(60)}\n`);
+      console.error(`Done! Processed ${pageNum} page(s).`);
+      return;
+    }
+
+    if (navState.hasNextButton && navState.nextButtonSelector) {
+      const urlBefore = page.url();
+      try {
+        // Try Playwright click first, fall back to JS .click() if it fails
+        try {
+          await page.click(navState.nextButtonSelector, { timeout: 3000 });
+        } catch {
+          // Playwright click failed (overlay, scroll, etc.) — force via JS
+          const clicked = await page.evaluate((sel) => {
+            const btn = document.querySelector<HTMLElement>(sel);
+            if (!btn) return false;
+            btn.click();
+            return true;
+          }, navState.nextButtonSelector);
+          if (!clicked) throw new Error("Button not found");
+        }
+        console.error("\n  Clicked Next button.");
+      } catch {
+        console.error("\n  Could not click Next button. Stopping.");
+        return;
+      }
+
+      const transition = await waitForPageTransition(page, urlBefore);
+      console.error(`  Page transition: ${transition}`);
+
+      if (transition === "new_url") {
+        await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+      }
+      continue;
+    }
+
+    // No navigation buttons — form is done or single-page
+    console.error("\nNo navigation buttons found. Form may be complete.");
+    console.error(`Done! Processed ${pageNum} page(s).`);
+    return;
+  }
+
+  console.error(`Reached max page limit (${MAX_PAGES}). Stopping.`);
+}
+
+// ── Main ─────────────────────────────────────────────────────
+
+async function main() {
+  const input = process.argv[2] || path.join(__dirname, "index.html");
+  const url = resolveUrl(input);
+  console.error(`Loading: ${url}\n`);
+
+  const browser = await chromium.launch({ headless: false, slowMo: 50 });
+  const page = await browser.newPage();
+  await page.goto(url, { waitUntil: "networkidle" });
+  // Wait for form fields to render (Workday/React SPAs need extra time)
+  await page.waitForSelector(
+    'input, select, textarea, [role="textbox"], [role="combobox"], [data-uxi-widget-type]',
+    { timeout: 15000 }
+  ).catch(() => {});
+  await page.waitForTimeout(1000); // Extra settle for React hydration
+  await injectHelpers(page);
+
+  const multiPage = await isMultiPageForm(page);
+  console.error(`Form type: ${multiPage ? "multi-page" : "single-page"}\n`);
+
+  if (multiPage) {
+    await fillMultiPageForm(page);
+  } else {
+    // Single-page: reveal all accordion/tab sections
+    await page.evaluate(() => {
+      document
+        .querySelectorAll(
+          '[data-section], .form-section, .form-step, .step-content, ' +
+            '.tab-pane, .accordion-content, .panel-body, [role="tabpanel"]'
+        )
+        .forEach((el: any) => {
+          el.style.display = "";
+          el.classList.add("active");
+          el.removeAttribute("hidden");
+          el.setAttribute("aria-hidden", "false");
+        });
+    });
+
+    await fillCurrentPage(page);
+  }
+
+  console.error("\nDone! Browser left open for inspection. Close the tab or press Ctrl+C to exit.");
+
+  // Exit when the user closes the page/tab or after 5 minutes
+  await Promise.race([
+    page.waitForEvent("close").catch(() => {}),
+    new Promise((resolve) => setTimeout(resolve, 300_000)),
+  ]);
+  await browser.close().catch(() => {});
 }
 
 main().catch((err) => {
