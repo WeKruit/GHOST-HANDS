@@ -17,6 +17,7 @@
         "worker:dev": "bun --watch src/workers/workerLauncher.ts",
         "worker:named": "bun src/workers/workerLauncher.ts --worker-id=my-name",
         "apply:simple": "bun src/scripts/apply-simple.ts",
+        "apply:web": "bun src/scripts/apply-web.ts",
         "apply:workday": "bun src/scripts/apply-workday.ts",
         "release-stuck-jobs": "bun src/scripts/release-stuck-jobs.ts",
         "test-shutdown": "bun src/scripts/test-shutdown-cleanup.ts",
