@@ -81,6 +81,8 @@ export function resolveUrl(input: string): string {
 export async function injectHelpers(page: Page) {
   const selectorStr = JSON.stringify(INTERACTIVE_SELECTOR);
   await page.evaluate(`
+    // Shim for tsx/esbuild __name helper (not available in browser context)
+    if (typeof __name === 'undefined') var __name = function(fn) { return fn; };
     window.__ff = {
       SELECTOR: ${selectorStr},
 
@@ -165,7 +167,7 @@ export async function extractFields(page: Page): Promise<FormField[]> {
     const seen = new Set();
     const out: any[] = [];
 
-    function shouldSkip(el: any): boolean {
+    const shouldSkip = (el: any): boolean => {
       // Skip elements inside dropdown panels (search inputs, listbox internals)
       if (el.closest('[class*="select-dropdown"], [class*="select-option"]'))
         return true;
@@ -203,7 +205,7 @@ export async function extractFields(page: Page): Promise<FormField[]> {
     }
 
     // Get only the "main" text of an option, ignoring description sub-elements
-    function getOptionMainText(opt: any): string {
+    const getOptionMainText = (opt: any): string => {
       // If it has child elements with description class, exclude them
       const clone = opt.cloneNode(true) as HTMLElement;
       clone
@@ -212,7 +214,7 @@ export async function extractFields(page: Page): Promise<FormField[]> {
         )
         .forEach((x: any) => x.remove());
       return clone.textContent?.trim() || "";
-    }
+    };
 
     document.querySelectorAll(ff.SELECTOR).forEach((el: any) => {
       if (seen.has(el)) return;
@@ -486,7 +488,7 @@ export async function findVisibleProbeTargets(page: Page): Promise<ComboboxInfo[
     const result: any[] = [];
     const seen = new Set();
 
-    function getOptionMainText(opt: any): string {
+    const getOptionMainText = (opt: any): string => {
       const clone = opt.cloneNode(true) as HTMLElement;
       clone
         .querySelectorAll(
@@ -494,7 +496,7 @@ export async function findVisibleProbeTargets(page: Page): Promise<ComboboxInfo[
         )
         .forEach((x: any) => x.remove());
       return clone.textContent?.trim() || "";
-    }
+    };
 
     // Native selects
     document.querySelectorAll("select").forEach((el: any) => {
@@ -625,7 +627,7 @@ export async function findVisibleProbeTargets(page: Page): Promise<ComboboxInfo[
           if (!el) return [];
           const ff = (window as any).__ff;
 
-          function extractOpts(container: Element): string[] {
+          const extractOpts = (container: Element): string[] => {
             return Array.from(
               container.querySelectorAll('[role="option"], [role="menuitem"]')
             )
@@ -638,7 +640,7 @@ export async function findVisibleProbeTargets(page: Page): Promise<ComboboxInfo[
                 return clone.textContent?.trim() || "";
               })
               .filter(Boolean);
-          }
+          };
 
           // 1. Look inside this combobox's dropdown first
           let opts = extractOpts(el);
@@ -800,7 +802,7 @@ export async function selectOption(
         const el = document.querySelector(`[data-ff-id="${ffId}"]`);
         if (!el) return false;
 
-        function matchOpt(opt: Element): boolean {
+        const matchOpt = (opt: Element): boolean => {
           const clone = opt.cloneNode(true) as HTMLElement;
           clone
             .querySelectorAll(
@@ -809,7 +811,7 @@ export async function selectOption(
             .forEach((x: any) => x.remove());
           const mainText = clone.textContent?.trim();
           return mainText === text;
-        }
+        };
 
         // Look for options within this combobox's dropdown
         const opts = el.querySelectorAll('[role="option"], [role="menuitem"]');

@@ -3,7 +3,8 @@ import path from 'node:path';
 import fs from 'node:fs';
 import type { TaskHandler, TaskContext, TaskResult, ValidationResult } from './types.js';
 import type { BrowserAutomationAdapter } from '../../adapters/types.js';
-import type { PlatformConfig, PageState, PageType, ScannedField } from './platforms/types.js';
+import type { PlatformConfig, PageState, PageType, ScannedField, ScanResult } from './platforms/types.js';
+import type { CostTracker } from '../costControl.js';
 import { detectPlatformFromUrl } from './platforms/index.js';
 import { findBestAnswer } from './platforms/genericConfig.js';
 import { ProgressStep } from '../progressTracker.js';
@@ -13,6 +14,12 @@ import { ProgressStep } from '../progressTracker.js';
 const PAGE_TRANSITION_WAIT_MS = 3_000;
 const MAX_FORM_PAGES = 15;
 const MIN_LLM_GAP_MS = 5_000; // Minimum gap between LLM calls to stay under rate limits
+
+// MagnitudeHand (Phase 2.75) — last-resort general GUI agent fallback
+const MAGNITUDE_HAND_BUDGET_CAP = 0.50;       // Max $ to spend in MagnitudeHand per page
+const MAGNITUDE_HAND_MAX_FIELDS = 15;          // Max fields to attempt per pass
+const MAGNITUDE_HAND_ACT_TIMEOUT_MS = 30_000;  // Timeout per individual act() call
+const MAGNITUDE_HAND_MIN_REMAINING_BUDGET = 0.02; // Skip if less than this remains
 
 // --- Handler ---
 
@@ -295,7 +302,7 @@ export class SmartApplyHandler implements TaskHandler {
             await progress.setStep(step as any);
 
             const fillPrompt = config.buildPagePrompt(pageState.page_type, dataPrompt);
-            const result = await this.fillPage(adapter, config, fillPrompt, qaMap, pageState.page_type, resumePath);
+            const result = await this.fillPage(adapter, config, fillPrompt, qaMap, pageState.page_type, resumePath, 0, 0, ctx.costTracker, dataPrompt);
 
             if (result === 'review') {
               // fillPage detected this is actually the review page
@@ -1091,6 +1098,8 @@ ${dataPrompt}`,
     resumePath?: string | null,
     _depth = 0,
     _llmCallsCarried = 0,
+    costTracker?: CostTracker,
+    dataPrompt?: string,
   ): Promise<'navigated' | 'review' | 'complete'> {
     const MAX_DEPTH = 3;     // max recursive retries on validation errors
     const MAX_CYCLES = 5;    // max scan-fill-rescan cycles (for conditional fields)
@@ -1328,6 +1337,63 @@ ${dataPrompt}`,
         }
       }
 
+      // ── PHASE 2.75: MAGNITUDE HAND FALLBACK ──
+      // After DOM fill + LLM fill + post-walk cleanup, any fields still
+      // unfilled are targets for Magnitude as a general GUI agent.
+      // This handles: nested dropdowns, custom widgets, autocomplete, etc.
+      const magnitudeUnfilled = scan.fields.filter(f =>
+        !f.filled &&
+        (!f.currentValue || f.currentValue.trim() === '') &&
+        f.kind !== 'file' && f.kind !== 'upload_button'
+      );
+
+      if (magnitudeUnfilled.length > 0) {
+        console.log(`[SmartApply] [${pageLabel}] ${magnitudeUnfilled.length} field(s) remain after DOM+LLM — invoking MagnitudeHand.`);
+
+        // Re-scan to get fresh field state (conditional fields may have appeared)
+        const freshScan = await config.scanPageFields(adapter);
+
+        // Merge filled status from original scan into fresh scan
+        for (const orig of scan.fields) {
+          if (orig.filled) {
+            const match = freshScan.fields.find(f => f.selector === orig.selector);
+            if (match) match.filled = true;
+          }
+        }
+
+        // Mark fields that already have values as filled
+        for (const f of freshScan.fields) {
+          if (f.currentValue && f.currentValue.trim() !== '') {
+            f.filled = true;
+          }
+        }
+
+        // Match answers from qaMap for unfilled fields
+        for (const f of freshScan.fields) {
+          if (!f.filled) {
+            f.matchedAnswer = findBestAnswer(f.label, qaMap) || undefined;
+          }
+        }
+
+        try {
+          const magnitudeFilled = await this.magnitudeHandFallback(
+            adapter, config, freshScan, qaMap, dataPrompt || '', pageLabel, costTracker,
+          );
+          if (magnitudeFilled > 0) {
+            console.log(`[SmartApply] [${pageLabel}] MagnitudeHand filled ${magnitudeFilled} field(s).`);
+          }
+        } catch (err) {
+          // Let BudgetExceededError propagate to caller
+          if (err instanceof Error && (
+            err.message.includes('Budget exceeded') ||
+            err.message.includes('Action limit exceeded')
+          )) {
+            throw err;
+          }
+          console.warn(`[SmartApply] [${pageLabel}] MagnitudeHand error: ${err}`);
+        }
+      }
+
       break; // Done filling, move to Phase 3
     }
 
@@ -1359,11 +1425,11 @@ ${dataPrompt}`,
         if (Math.abs(scrollAfterError - scrollBeforeClick) > 50) {
           // Site auto-scrolled to errors — re-fill at this position
           console.log(`[SmartApply] [${pageLabel}] Site auto-scrolled to errors. Re-running fill cycle.`);
-          return this.fillPage(adapter, config, fillPrompt, qaMap, pageLabel, resumePath, _depth + 1, llmCalls);
+          return this.fillPage(adapter, config, fillPrompt, qaMap, pageLabel, resumePath, _depth + 1, llmCalls, costTracker, dataPrompt);
         }
         await adapter.page.evaluate(() => window.scrollTo(0, 0));
         await adapter.page.waitForTimeout(500);
-        return this.fillPage(adapter, config, fillPrompt, qaMap, pageLabel, resumePath, _depth + 1, llmCalls);
+        return this.fillPage(adapter, config, fillPrompt, qaMap, pageLabel, resumePath, _depth + 1, llmCalls, costTracker, dataPrompt);
       }
 
       // Verify page changed
@@ -1387,7 +1453,7 @@ ${dataPrompt}`,
       const scrollAfterClick = await adapter.page.evaluate(() => window.scrollY);
       if (Math.abs(scrollAfterClick - scrollBeforeClick) > 50) {
         console.log(`[SmartApply] [${pageLabel}] Clicked Next — page auto-scrolled to unfilled fields. Re-filling.`);
-        return this.fillPage(adapter, config, fillPrompt, qaMap, pageLabel, resumePath, _depth + 1, llmCalls);
+        return this.fillPage(adapter, config, fillPrompt, qaMap, pageLabel, resumePath, _depth + 1, llmCalls, costTracker, dataPrompt);
       }
 
       console.log(`[SmartApply] [${pageLabel}] Clicked Next but page unchanged.`);
@@ -2150,6 +2216,175 @@ Set is_final_review to true ONLY if this is genuinely the last page before submi
       }
       throw error;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // MagnitudeHand — Last-resort general GUI agent fallback
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Phase 2.75: MagnitudeHand — Last-resort fallback for fields that DOM fill
+   * and LLM fill both failed to handle. Uses the adapter as a general GUI agent
+   * with per-field micro-scoped act() calls to minimize quadratic cost.
+   *
+   * Typical targets: nested/cascading dropdowns, custom ARIA widgets,
+   * autocomplete fields, contenteditable divs.
+   *
+   * Returns the number of fields successfully filled.
+   */
+  private async magnitudeHandFallback(
+    adapter: BrowserAutomationAdapter,
+    config: PlatformConfig,
+    scan: ScanResult,
+    qaMap: Record<string, string>,
+    dataPrompt: string,
+    pageLabel: string,
+    costTracker?: CostTracker,
+  ): Promise<number> {
+    // 1. Identify unfilled fields
+    const unfilled = scan.fields.filter(f =>
+      !f.filled &&
+      (!f.currentValue || f.currentValue.trim() === '') &&
+      f.kind !== 'file' && f.kind !== 'upload_button'
+    );
+
+    if (unfilled.length === 0) {
+      console.log(`[SmartApply] [${pageLabel}] MagnitudeHand: No unfilled fields — skipping.`);
+      return 0;
+    }
+
+    // 2. Budget gate — skip if insufficient budget remaining
+    if (costTracker) {
+      const remaining = costTracker.getRemainingBudget();
+      if (remaining < MAGNITUDE_HAND_MIN_REMAINING_BUDGET) {
+        console.log(`[SmartApply] [${pageLabel}] MagnitudeHand: Budget too low ($${remaining.toFixed(4)} remaining) — skipping.`);
+        return 0;
+      }
+    }
+
+    console.log(`[SmartApply] [${pageLabel}] MagnitudeHand: ${unfilled.length} unfilled field(s) — starting fallback.`);
+
+    // 3. Snapshot cost baseline for soft cap enforcement
+    const costBaseline = costTracker
+      ? costTracker.getTaskBudget() - costTracker.getRemainingBudget()
+      : 0;
+    let fieldsFilled = 0;
+    const fieldsToAttempt = unfilled.slice(0, MAGNITUDE_HAND_MAX_FIELDS);
+
+    for (const field of fieldsToAttempt) {
+      // 3a. Check soft cap — stop if MagnitudeHand has spent too much
+      if (costTracker) {
+        const currentCost = costTracker.getTaskBudget() - costTracker.getRemainingBudget();
+        const magnitudeHandSpent = currentCost - costBaseline;
+        if (magnitudeHandSpent >= MAGNITUDE_HAND_BUDGET_CAP) {
+          console.log(`[SmartApply] [${pageLabel}] MagnitudeHand: Soft cap reached ($${magnitudeHandSpent.toFixed(4)} / $${MAGNITUDE_HAND_BUDGET_CAP}) — stopping.`);
+          break;
+        }
+        if (costTracker.getRemainingBudget() < MAGNITUDE_HAND_MIN_REMAINING_BUDGET) {
+          console.log(`[SmartApply] [${pageLabel}] MagnitudeHand: Global budget exhausted — stopping.`);
+          break;
+        }
+      }
+
+      // 3b. Scroll field into view
+      if (field.selector) {
+        try {
+          await adapter.page.evaluate(
+            (sel: string) => document.querySelector(sel)?.scrollIntoView({ block: 'center' }),
+            field.selector,
+          );
+          await adapter.page.waitForTimeout(300);
+        } catch {
+          // Selector may be stale — continue anyway, Magnitude uses screenshots
+        }
+      }
+
+      // 3c. Build micro-scoped prompt for this single field
+      const answer = field.matchedAnswer || findBestAnswer(field.label, qaMap);
+      const prompt = this.buildMagnitudeHandPrompt(field, answer || undefined, dataPrompt);
+
+      // 3d. Execute via adapter.act() with timeout
+      const answerPreview = answer ? `"${answer.substring(0, 30)}${answer.length > 30 ? '...' : ''}"` : 'best judgment';
+      console.log(`[SmartApply] [${pageLabel}] MagnitudeHand: Filling "${field.label}" (${field.kind}) → ${answerPreview}`);
+
+      try {
+        await this.throttleLlm(adapter);
+        const result = await adapter.act(prompt, {
+          timeoutMs: MAGNITUDE_HAND_ACT_TIMEOUT_MS,
+        });
+
+        if (result.success) {
+          field.filled = true;
+          fieldsFilled++;
+          console.log(`[SmartApply] [${pageLabel}] MagnitudeHand: Filled "${field.label}" OK (${result.durationMs}ms)`);
+        } else {
+          console.warn(`[SmartApply] [${pageLabel}] MagnitudeHand: Failed "${field.label}": ${result.message}`);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // BudgetExceededError must propagate up
+        if (msg.includes('Budget exceeded') || msg.includes('Action limit exceeded')) {
+          console.warn(`[SmartApply] [${pageLabel}] MagnitudeHand: Budget/action limit hit — stopping.`);
+          throw err;
+        }
+        console.warn(`[SmartApply] [${pageLabel}] MagnitudeHand: Error on "${field.label}": ${msg}`);
+      }
+
+      // 3e. Dismiss any overlays the agent may have opened
+      await this.dismissOpenOverlays(adapter);
+    }
+
+    console.log(`[SmartApply] [${pageLabel}] MagnitudeHand: Filled ${fieldsFilled}/${fieldsToAttempt.length} field(s).`);
+    return fieldsFilled;
+  }
+
+  /**
+   * Build a minimal, focused prompt for a single MagnitudeHand field fill.
+   * Keeps the prompt short to minimize input tokens (cost optimization).
+   */
+  private buildMagnitudeHandPrompt(
+    field: ScannedField,
+    answer: string | undefined,
+    dataPrompt: string,
+  ): string {
+    const kindHints: Record<string, string> = {
+      custom_dropdown: 'This is a custom dropdown. Click it to open, find the correct option, and select it. If it has a search/autocomplete input, type the value first, wait for options to appear, then click the match.',
+      select: 'This is a dropdown menu. Click to open it, then select the correct option.',
+      contenteditable: 'This is a rich text editor. Click into it and type the value.',
+      aria_radio: 'This is a radio button group. Click the correct option.',
+      radio: 'This is a radio button group. Click the correct option.',
+      checkbox: 'This is a checkbox. Click it if it should be checked.',
+      date: 'This is a date field. Enter the date in the format shown.',
+      text: 'This is a text input field. Click into it and type the value.',
+      unknown: 'Interact with this form control appropriately.',
+    };
+
+    const fieldHint = kindHints[field.kind] || kindHints['unknown'];
+    const optionsList = field.options && field.options.length > 0
+      ? `\nAvailable options: [${field.options.slice(0, 20).join(', ')}${field.options.length > 20 ? ', ...' : ''}]`
+      : '';
+
+    const valueInstruction = answer
+      ? `Fill it with: "${answer}"`
+      : `Use your best judgment based on the applicant data below to pick the most reasonable value.`;
+
+    return `You are filling out a job application form. Focus ONLY on the single field described below. Do NOT interact with any other fields, buttons, or navigation elements.
+
+FIELD: "${field.label}"${field.isRequired ? ' [REQUIRED]' : ''}
+TYPE: ${field.kind}${optionsList}
+INSTRUCTION: ${valueInstruction}
+
+${fieldHint}
+
+RULES:
+- Fill ONLY this one field, then stop immediately.
+- Do NOT scroll the page or click Next/Submit.
+- Do NOT interact with any other fields.
+- If a dropdown has no matching option, select the closest reasonable match.
+- ONE attempt only — do not retry if it doesn't work.
+
+APPLICANT DATA:
+${dataPrompt}`;
   }
 
   /**

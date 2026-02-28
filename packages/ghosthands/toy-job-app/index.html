@@ -165,6 +165,115 @@
       margin-top: 1px;
     }
 
+    /* ── Nested dropdown (submenu) ── */
+    .nested-select {
+      position: relative;
+      width: 100%;
+    }
+    .nested-select-trigger {
+      width: 100%;
+      padding: 0.6rem 2rem 0.6rem 0.75rem;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      font-size: 0.925rem;
+      font-family: inherit;
+      background: #fafafa;
+      cursor: pointer;
+      user-select: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      text-align: left;
+      min-height: 2.5rem;
+      display: flex;
+      align-items: center;
+    }
+    .nested-select-trigger::after {
+      content: '';
+      position: absolute;
+      right: 0.75rem;
+      top: 50%;
+      transform: translateY(-50%);
+      border: 5px solid transparent;
+      border-top-color: #666;
+    }
+    .nested-select-trigger:focus,
+    .nested-select.open .nested-select-trigger {
+      outline: none;
+      border-color: #4361ee;
+      box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.15);
+      background: white;
+    }
+    .nested-select-trigger .placeholder { color: #9ca3af; }
+    .nested-select-dropdown {
+      display: none;
+      position: absolute;
+      top: calc(100% + 4px);
+      left: 0;
+      width: 220px;
+      background: white;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+      z-index: 100;
+      overflow: visible;
+    }
+    .nested-select.open .nested-select-dropdown { display: block; }
+    .nested-select-parent {
+      padding: 0.55rem 0.75rem;
+      cursor: pointer;
+      font-size: 0.9rem;
+      transition: background 0.1s;
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .nested-select-parent:first-child { border-radius: 7px 7px 0 0; }
+    .nested-select-parent:last-child { border-radius: 0 0 7px 7px; }
+    .nested-select-parent:hover,
+    .nested-select-parent.active {
+      background: #eef1ff;
+    }
+    .nested-select-parent::after {
+      content: '';
+      border: 4px solid transparent;
+      border-left-color: #999;
+      margin-left: 0.5rem;
+      flex-shrink: 0;
+    }
+    .nested-select-parent:hover::after,
+    .nested-select-parent.active::after {
+      border-left-color: #4361ee;
+    }
+    .nested-select-submenu {
+      display: none;
+      position: absolute;
+      left: calc(100% + 4px);
+      top: -1.5px;
+      width: 200px;
+      background: white;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+      z-index: 101;
+      overflow: hidden;
+    }
+    .nested-select-parent.active .nested-select-submenu { display: block; }
+    .nested-select-child {
+      padding: 0.5rem 0.75rem;
+      cursor: pointer;
+      font-size: 0.875rem;
+      transition: background 0.1s;
+    }
+    .nested-select-child:hover {
+      background: #eef1ff;
+      color: #4361ee;
+    }
+    .nested-select-child[aria-selected="true"] {
+      background: #dce3ff;
+      color: #3a0ca3;
+      font-weight: 600;
+    }
+
     /* ── Multi-select (tag-style) ── */
     .multi-select { position: relative; }
     .multi-select-trigger {
@@ -1196,6 +1305,143 @@
         </div>
       </div>
 
+      <!-- ═══════════════════════════════════════════════════════════
+           TRICKY FIELDS — These are designed to stump DOM-based fillers
+           and require a general GUI agent (MagnitudeHand) to handle.
+           ═══════════════════════════════════════════════════════════ -->
+      <div class="card">
+        <h2>Additional Questions</h2>
+
+        <!-- 1. Cascading / nested dropdowns: pick region → city appears -->
+        <div class="form-group">
+          <label>Preferred Office Region <span class="required">*</span></label>
+          <div class="custom-select" id="officeRegion" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Preferred Office Region" tabindex="0">
+            <div class="custom-select-trigger"><span class="placeholder">Select region…</span></div>
+            <div class="custom-select-dropdown" role="listbox">
+              <div class="custom-select-option" role="option" data-value="west">West Coast</div>
+              <div class="custom-select-option" role="option" data-value="east">East Coast</div>
+              <div class="custom-select-option" role="option" data-value="central">Central</div>
+              <div class="custom-select-option" role="option" data-value="intl">International</div>
+            </div>
+          </div>
+        </div>
+        <!-- Nested child dropdown — hidden until region is selected -->
+        <div class="form-group conditional" id="officeCityGroup">
+          <label>Preferred Office City <span class="required">*</span></label>
+          <div class="custom-select" id="officeCity" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Preferred Office City" tabindex="0">
+            <div class="custom-select-trigger"><span class="placeholder">Select city…</span></div>
+            <div class="custom-select-dropdown" role="listbox" id="officeCityOptions">
+              <!-- Options are populated dynamically by JS based on region -->
+            </div>
+          </div>
+        </div>
+
+        <!-- 2. Autocomplete / typeahead: type to search, pick from filtered results -->
+        <div class="form-group">
+          <label for="universitySearch">University Attended (type to search)</label>
+          <div class="autocomplete-wrapper" style="position:relative">
+            <input type="text" id="universitySearch" name="university" placeholder="Start typing a university name…" autocomplete="off"
+                   aria-label="University Attended" aria-autocomplete="list" aria-expanded="false" aria-controls="universityResults" role="combobox">
+            <div class="autocomplete-results" id="universityResults" role="listbox" style="
+              display:none; position:absolute; top:100%; left:0; right:0; background:white;
+              border:1.5px solid #d1d5db; border-radius:0 0 8px 8px; box-shadow:0 8px 24px rgba(0,0,0,0.12);
+              z-index:100; max-height:200px; overflow-y:auto;
+            "></div>
+          </div>
+          <div class="help-text">Search from our database of 50+ universities</div>
+        </div>
+
+        <!-- 3. Contenteditable rich-text area (not a real <textarea>) -->
+        <div class="form-group">
+          <label>Why do you want to work at Acme Corp?</label>
+          <div class="rich-text-toolbar" style="display:flex;gap:4px;padding:0.4rem 0.5rem;border:1.5px solid #d1d5db;border-bottom:none;border-radius:8px 8px 0 0;background:#f5f5f5;">
+            <button type="button" class="rt-btn" data-cmd="bold" title="Bold" style="padding:2px 8px;border:1px solid #ccc;border-radius:4px;background:white;cursor:pointer;font-weight:700;">B</button>
+            <button type="button" class="rt-btn" data-cmd="italic" title="Italic" style="padding:2px 8px;border:1px solid #ccc;border-radius:4px;background:white;cursor:pointer;font-style:italic;">I</button>
+            <button type="button" class="rt-btn" data-cmd="insertUnorderedList" title="Bullet List" style="padding:2px 8px;border:1px solid #ccc;border-radius:4px;background:white;cursor:pointer;">•</button>
+          </div>
+          <div class="rich-text-editor" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Why do you want to work at Acme Corp?"
+               data-placeholder="Share your motivation…"
+               style="min-height:120px;padding:0.75rem;border:1.5px solid #d1d5db;border-radius:0 0 8px 8px;font-size:0.925rem;font-family:inherit;outline:none;background:#fafafa;"></div>
+        </div>
+
+        <!-- 4. Custom rating slider — hidden real input behind a visual slider -->
+        <div class="form-group">
+          <label>How would you rate your proficiency in our tech stack? <span id="sliderValue" style="color:#4361ee;font-weight:700;">5</span>/10</label>
+          <div class="custom-slider" style="position:relative;height:36px;display:flex;align-items:center;padding:0 8px;">
+            <div class="slider-track" style="position:absolute;left:8px;right:8px;height:6px;background:#e0e0e0;border-radius:3px;">
+              <div class="slider-fill" id="sliderFill" style="width:50%;height:100%;background:linear-gradient(90deg,#4361ee,#3a0ca3);border-radius:3px;"></div>
+            </div>
+            <input type="range" id="techRating" name="techRating" min="1" max="10" value="5" aria-label="Tech stack proficiency rating"
+                   style="width:100%;opacity:0;position:absolute;left:0;right:0;cursor:pointer;height:36px;z-index:2;">
+            <div class="slider-thumb" id="sliderThumb" style="
+              position:absolute; left:calc(50% - 10px); width:20px; height:20px;
+              background:white; border:2px solid #4361ee; border-radius:50%;
+              box-shadow:0 2px 6px rgba(0,0,0,0.15); pointer-events:none; z-index:1;
+            "></div>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:0.75rem;color:#888;padding:0 8px;">
+            <span>Beginner</span><span>Expert</span>
+          </div>
+        </div>
+
+        <!-- 5. Cascading level 2: nested dropdown that depends on first nested -->
+        <div class="form-group conditional" id="officeFloorGroup">
+          <label>Preferred Floor</label>
+          <div class="custom-select" id="officeFloor" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Preferred Floor" tabindex="0">
+            <div class="custom-select-trigger"><span class="placeholder">Select floor…</span></div>
+            <div class="custom-select-dropdown" role="listbox" id="officeFloorOptions">
+              <!-- Populated by JS when city is selected -->
+            </div>
+          </div>
+        </div>
+
+        <!-- 6. Nested submenu dropdown: hover/click parent to reveal child submenu -->
+        <div class="form-group">
+          <label>Preferred Team <span class="required">*</span></label>
+          <p class="help-text" style="margin-bottom:0.35rem">Select a department, then pick your sub-team from the submenu</p>
+          <div class="nested-select" id="preferredTeam" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Preferred Team" tabindex="0">
+            <div class="nested-select-trigger"><span class="placeholder">Select team…</span></div>
+            <div class="nested-select-dropdown" role="listbox">
+              <div class="nested-select-parent" data-parent="engineering">
+                Engineering
+                <div class="nested-select-submenu">
+                  <div class="nested-select-child" role="option" data-value="engineering>frontend" data-parent-label="Engineering" data-child-label="Frontend">Frontend</div>
+                  <div class="nested-select-child" role="option" data-value="engineering>backend" data-parent-label="Engineering" data-child-label="Backend">Backend</div>
+                  <div class="nested-select-child" role="option" data-value="engineering>infrastructure" data-parent-label="Engineering" data-child-label="Infrastructure">Infrastructure</div>
+                  <div class="nested-select-child" role="option" data-value="engineering>ml-ai" data-parent-label="Engineering" data-child-label="ML/AI">ML/AI</div>
+                  <div class="nested-select-child" role="option" data-value="engineering>mobile" data-parent-label="Engineering" data-child-label="Mobile">Mobile</div>
+                </div>
+              </div>
+              <div class="nested-select-parent" data-parent="design">
+                Design
+                <div class="nested-select-submenu">
+                  <div class="nested-select-child" role="option" data-value="design>ui-ux" data-parent-label="Design" data-child-label="UI/UX">UI/UX</div>
+                  <div class="nested-select-child" role="option" data-value="design>visual-design" data-parent-label="Design" data-child-label="Visual Design">Visual Design</div>
+                  <div class="nested-select-child" role="option" data-value="design>design-systems" data-parent-label="Design" data-child-label="Design Systems">Design Systems</div>
+                </div>
+              </div>
+              <div class="nested-select-parent" data-parent="product">
+                Product
+                <div class="nested-select-submenu">
+                  <div class="nested-select-child" role="option" data-value="product>product-management" data-parent-label="Product" data-child-label="Product Management">Product Management</div>
+                  <div class="nested-select-child" role="option" data-value="product>product-analytics" data-parent-label="Product" data-child-label="Product Analytics">Product Analytics</div>
+                  <div class="nested-select-child" role="option" data-value="product>growth" data-parent-label="Product" data-child-label="Growth">Growth</div>
+                </div>
+              </div>
+              <div class="nested-select-parent" data-parent="operations">
+                Operations
+                <div class="nested-select-submenu">
+                  <div class="nested-select-child" role="option" data-value="operations>people-ops" data-parent-label="Operations" data-child-label="People Ops">People Ops</div>
+                  <div class="nested-select-child" role="option" data-value="operations>finance" data-parent-label="Operations" data-child-label="Finance">Finance</div>
+                  <div class="nested-select-child" role="option" data-value="operations>legal" data-parent-label="Operations" data-child-label="Legal">Legal</div>
+                  <div class="nested-select-child" role="option" data-value="operations>it" data-parent-label="Operations" data-child-label="IT">IT</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- Agreement checkboxes -->
       <div class="card">
         <h2>Agreements</h2>
@@ -1248,6 +1494,16 @@
   // Custom single-select dropdown
   // ═══════════════════════════════════════════════════════════
   function initCustomSelect(el) {
+    // Abort any previous event listeners from a prior init call on this element.
+    // This prevents duplicate handlers when initCustomSelect is called again
+    // (e.g., after dynamically populating cascading dropdown options).
+    if (el._customSelectAC) {
+      el._customSelectAC.abort();
+    }
+    const ac = new AbortController();
+    el._customSelectAC = ac;
+    const sig = { signal: ac.signal };
+
     const trigger = el.querySelector('.custom-select-trigger');
     const dropdown = el.querySelector('.custom-select-dropdown');
     const options = el.querySelectorAll('.custom-select-option');
@@ -1290,25 +1546,25 @@
     trigger.addEventListener('click', (e) => {
       e.stopPropagation();
       el.classList.contains('open') ? close() : open();
-    });
+    }, sig);
 
     options.forEach(opt => {
       opt.addEventListener('click', (e) => {
         e.stopPropagation();
         select(opt);
-      });
+      }, sig);
     });
 
     if (searchInput) {
-      searchInput.addEventListener('input', () => filterOptions(searchInput.value));
-      searchInput.addEventListener('click', (e) => e.stopPropagation());
+      searchInput.addEventListener('input', () => filterOptions(searchInput.value), sig);
+      searchInput.addEventListener('click', (e) => e.stopPropagation(), sig);
     }
 
     // Keyboard
     el.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
       if (e.key === 'Escape') close();
-    });
+    }, sig);
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -1426,9 +1682,11 @@
 
   // Close dropdowns on outside click
   document.addEventListener('click', () => {
-    document.querySelectorAll('.custom-select.open, .multi-select.open').forEach(s => {
+    document.querySelectorAll('.custom-select.open, .multi-select.open, .nested-select.open').forEach(s => {
       s.classList.remove('open');
       s.setAttribute('aria-expanded', 'false');
+      // Also deactivate nested parent items
+      s.querySelectorAll('.nested-select-parent.active').forEach(p => p.classList.remove('active'));
     });
   });
 
@@ -1659,6 +1917,287 @@
       item.remove();
     }
   }
+
+  // ═══════════════════════════════════════════════════════════
+  // TRICKY FIELDS — JS logic
+  // ═══════════════════════════════════════════════════════════
+
+  // ── 1. Cascading dropdowns: Region → City → Floor ──
+  const regionCities = {
+    west: ['San Francisco', 'Los Angeles', 'Seattle', 'Portland'],
+    east: ['New York', 'Boston', 'Washington DC', 'Miami'],
+    central: ['Chicago', 'Austin', 'Denver', 'Minneapolis'],
+    intl: ['London', 'Tokyo', 'Berlin', 'Sydney'],
+  };
+  const cityFloors = {
+    'San Francisco': ['Floor 1 — Engineering', 'Floor 2 — Design', 'Floor 3 — Executive'],
+    'Los Angeles': ['Floor 1 — Media', 'Floor 2 — Marketing'],
+    'Seattle': ['Floor 1 — Cloud Ops', 'Floor 2 — Research'],
+    'Portland': ['Floor 1 — Open Office'],
+    'New York': ['Floor 10 — Trading', 'Floor 11 — Analytics', 'Floor 12 — Legal'],
+    'Boston': ['Floor 1 — R&D', 'Floor 2 — Lab'],
+    'Washington DC': ['Floor 1 — Government Relations'],
+    'Miami': ['Floor 1 — Sales', 'Floor 2 — Support'],
+    'Chicago': ['Floor 1 — Finance', 'Floor 2 — Operations'],
+    'Austin': ['Floor 1 — Startup Hub'],
+    'Denver': ['Floor 1 — Remote Ops'],
+    'Minneapolis': ['Floor 1 — Midwest HQ'],
+    'London': ['Floor 1 — EMEA', 'Floor 2 — Compliance'],
+    'Tokyo': ['Floor 1 — APAC'],
+    'Berlin': ['Floor 1 — EU Engineering'],
+    'Sydney': ['Floor 1 — ANZ'],
+  };
+
+  // Watch the region dropdown for selections
+  const regionSelect = document.getElementById('officeRegion');
+  const cityGroup = document.getElementById('officeCityGroup');
+  const citySelect = document.getElementById('officeCity');
+  const cityOptContainer = document.getElementById('officeCityOptions');
+  const floorGroup = document.getElementById('officeFloorGroup');
+  const floorSelect = document.getElementById('officeFloor');
+  const floorOptContainer = document.getElementById('officeFloorOptions');
+
+  // Use a MutationObserver to detect when a region is selected
+  // (the custom-select code updates the trigger text)
+  const regionTrigger = regionSelect.querySelector('.custom-select-trigger');
+  new MutationObserver(() => {
+    const selected = regionTrigger.textContent.trim();
+    const regionKey = Object.keys(regionCities).find(k => {
+      const labels = { west: 'West Coast', east: 'East Coast', central: 'Central', intl: 'International' };
+      return labels[k] === selected;
+    });
+    if (regionKey) {
+      // Populate city options
+      cityOptContainer.innerHTML = '';
+      regionCities[regionKey].forEach(city => {
+        const opt = document.createElement('div');
+        opt.className = 'custom-select-option';
+        opt.setAttribute('role', 'option');
+        opt.dataset.value = city.toLowerCase().replace(/\s+/g, '-');
+        opt.textContent = city;
+        cityOptContainer.appendChild(opt);
+      });
+      cityGroup.classList.add('visible');
+      // Reset city trigger
+      citySelect.querySelector('.custom-select-trigger').innerHTML = '<span class="placeholder">Select city…</span>';
+      // Re-init the city custom select
+      initCustomSelect(citySelect);
+      // Hide floor until city is picked
+      floorGroup.classList.remove('visible');
+    } else {
+      cityGroup.classList.remove('visible');
+      floorGroup.classList.remove('visible');
+    }
+  }).observe(regionTrigger, { childList: true, subtree: true, characterData: true });
+
+  // Watch city dropdown for selections → populate floor
+  const cityTrigger = citySelect.querySelector('.custom-select-trigger');
+  new MutationObserver(() => {
+    const selectedCity = cityTrigger.textContent.trim();
+    const floors = cityFloors[selectedCity];
+    if (floors) {
+      floorOptContainer.innerHTML = '';
+      floors.forEach(floor => {
+        const opt = document.createElement('div');
+        opt.className = 'custom-select-option';
+        opt.setAttribute('role', 'option');
+        opt.dataset.value = floor.toLowerCase().replace(/\s+/g, '-');
+        opt.textContent = floor;
+        floorOptContainer.appendChild(opt);
+      });
+      floorGroup.classList.add('visible');
+      floorSelect.querySelector('.custom-select-trigger').innerHTML = '<span class="placeholder">Select floor…</span>';
+      initCustomSelect(floorSelect);
+    } else {
+      floorGroup.classList.remove('visible');
+    }
+  }).observe(cityTrigger, { childList: true, subtree: true, characterData: true });
+
+  // ── 2. Autocomplete / typeahead ──
+  const universities = [
+    'MIT', 'Stanford University', 'Harvard University', 'UC Berkeley',
+    'Caltech', 'Princeton University', 'Yale University', 'Columbia University',
+    'University of Chicago', 'University of Michigan', 'Georgia Tech',
+    'Carnegie Mellon University', 'Cornell University', 'UCLA', 'UIUC',
+    'University of Washington', 'Duke University', 'Northwestern University',
+    'Brown University', 'University of Pennsylvania', 'Rice University',
+    'Purdue University', 'University of Texas at Austin', 'Virginia Tech',
+    'Ohio State University', 'Penn State University', 'University of Wisconsin',
+    'University of Florida', 'Arizona State University', 'NYU',
+    'University of Southern California', 'Boston University', 'Northeastern University',
+    'University of Maryland', 'University of Minnesota', 'UC San Diego',
+    'UC Davis', 'UC Irvine', 'University of Colorado Boulder',
+    'University of North Carolina', 'Emory University', 'Vanderbilt University',
+    'Washington University in St. Louis', 'Tufts University', 'University of Virginia',
+    'Georgetown University', 'Johns Hopkins University', 'University of Rochester',
+    'Case Western Reserve University', 'Rensselaer Polytechnic Institute',
+  ];
+  const uniInput = document.getElementById('universitySearch');
+  const uniResults = document.getElementById('universityResults');
+  let uniDebounce;
+
+  uniInput.addEventListener('input', () => {
+    clearTimeout(uniDebounce);
+    uniDebounce = setTimeout(() => {
+      const q = uniInput.value.trim().toLowerCase();
+      if (q.length < 2) {
+        uniResults.style.display = 'none';
+        uniInput.setAttribute('aria-expanded', 'false');
+        return;
+      }
+      const matches = universities.filter(u => u.toLowerCase().includes(q)).slice(0, 8);
+      uniResults.innerHTML = '';
+      if (matches.length === 0) {
+        uniResults.innerHTML = '<div style="padding:0.5rem 0.75rem;color:#888;font-size:0.85rem;">No results found</div>';
+      } else {
+        matches.forEach(m => {
+          const opt = document.createElement('div');
+          opt.setAttribute('role', 'option');
+          opt.style.cssText = 'padding:0.5rem 0.75rem;cursor:pointer;font-size:0.9rem;';
+          opt.textContent = m;
+          opt.addEventListener('mouseenter', () => opt.style.background = '#eef1ff');
+          opt.addEventListener('mouseleave', () => opt.style.background = '');
+          opt.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            uniInput.value = m;
+            uniResults.style.display = 'none';
+            uniInput.setAttribute('aria-expanded', 'false');
+          });
+          uniResults.appendChild(opt);
+        });
+      }
+      uniResults.style.display = 'block';
+      uniInput.setAttribute('aria-expanded', 'true');
+    }, 250); // 250ms debounce — forces agent to wait
+  });
+
+  uniInput.addEventListener('blur', () => {
+    setTimeout(() => {
+      uniResults.style.display = 'none';
+      uniInput.setAttribute('aria-expanded', 'false');
+    }, 200);
+  });
+
+  // ── 3. Rich text toolbar ──
+  document.querySelectorAll('.rt-btn').forEach(btn => {
+    btn.addEventListener('mousedown', (e) => {
+      e.preventDefault(); // Don't steal focus from contenteditable
+      document.execCommand(btn.dataset.cmd, false, null);
+    });
+  });
+
+  // Placeholder behavior for contenteditable
+  const richEditor = document.querySelector('.rich-text-editor');
+  richEditor.addEventListener('focus', () => {
+    if (richEditor.textContent.trim() === '') richEditor.innerHTML = '';
+    richEditor.style.borderColor = '#4361ee';
+    richEditor.style.boxShadow = '0 0 0 3px rgba(67, 97, 238, 0.15)';
+    richEditor.style.background = 'white';
+  });
+  richEditor.addEventListener('blur', () => {
+    richEditor.style.borderColor = '#d1d5db';
+    richEditor.style.boxShadow = 'none';
+    richEditor.style.background = '#fafafa';
+  });
+
+  // ── 4. Custom slider ──
+  const sliderInput = document.getElementById('techRating');
+  const sliderFill = document.getElementById('sliderFill');
+  const sliderThumb = document.getElementById('sliderThumb');
+  const sliderValueLabel = document.getElementById('sliderValue');
+
+  sliderInput.addEventListener('input', () => {
+    const pct = ((sliderInput.value - 1) / 9) * 100;
+    sliderFill.style.width = pct + '%';
+    sliderThumb.style.left = 'calc(' + pct + '% - 10px)';
+    sliderValueLabel.textContent = sliderInput.value;
+  });
+
+  // ── 6. Nested submenu dropdown: Preferred Team ──
+  function initNestedSelect(el) {
+    const trigger = el.querySelector('.nested-select-trigger');
+    const dropdown = el.querySelector('.nested-select-dropdown');
+    const parents = el.querySelectorAll('.nested-select-parent');
+    const children = el.querySelectorAll('.nested-select-child');
+
+    function openDropdown() {
+      // Close all other open selects first
+      document.querySelectorAll('.custom-select.open, .multi-select.open, .nested-select.open').forEach(s => {
+        if (s !== el) {
+          s.classList.remove('open');
+          s.setAttribute('aria-expanded', 'false');
+        }
+      });
+      el.classList.add('open');
+      el.setAttribute('aria-expanded', 'true');
+    }
+
+    function closeDropdown() {
+      el.classList.remove('open');
+      el.setAttribute('aria-expanded', 'false');
+      // Deactivate all parent items
+      parents.forEach(p => p.classList.remove('active'));
+    }
+
+    function selectChild(child) {
+      // Deselect all children
+      children.forEach(c => c.setAttribute('aria-selected', 'false'));
+      // Select this child
+      child.setAttribute('aria-selected', 'true');
+      // Update trigger text to "Parent > Child" format
+      const parentLabel = child.dataset.parentLabel;
+      const childLabel = child.dataset.childLabel;
+      trigger.textContent = parentLabel + ' > ' + childLabel;
+      // Store value
+      el.dataset.value = child.dataset.value;
+      closeDropdown();
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    // Toggle dropdown on trigger click
+    trigger.addEventListener('click', (e) => {
+      e.stopPropagation();
+      el.classList.contains('open') ? closeDropdown() : openDropdown();
+    });
+
+    // Parent hover: show submenu (desktop-friendly)
+    parents.forEach(parent => {
+      parent.addEventListener('mouseenter', () => {
+        parents.forEach(p => p.classList.remove('active'));
+        parent.classList.add('active');
+      });
+
+      // Parent click: toggle submenu (mobile/click-friendly fallback)
+      parent.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const wasActive = parent.classList.contains('active');
+        parents.forEach(p => p.classList.remove('active'));
+        if (!wasActive) parent.classList.add('active');
+      });
+    });
+
+    // Child click: select the value
+    children.forEach(child => {
+      child.addEventListener('click', (e) => {
+        e.stopPropagation();
+        selectChild(child);
+      });
+    });
+
+    // Keyboard support
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDropdown(); }
+      if (e.key === 'Escape') closeDropdown();
+    });
+
+    // Close submenu when mouse leaves the dropdown entirely
+    dropdown.addEventListener('mouseleave', () => {
+      parents.forEach(p => p.classList.remove('active'));
+    });
+  }
+
+  // Init all nested selects
+  document.querySelectorAll('.nested-select').forEach(initNestedSelect);
 
   // ═══════════════════════════════════════════════════════════
   // Form submission
