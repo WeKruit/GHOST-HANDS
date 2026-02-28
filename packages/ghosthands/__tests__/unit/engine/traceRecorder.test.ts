@@ -147,7 +147,7 @@ describe('TraceRecorder', () => {
     });
   });
 
-  describe('recording click actions', () => {
+  describe('recording click actions (legacy)', () => {
     test('records click with locator from elementFromPoint', async () => {
       mockSetup.queueEvaluateResult(BUTTON_ELEMENT_INFO);
 
@@ -175,7 +175,7 @@ describe('TraceRecorder', () => {
     });
   });
 
-  describe('recording type actions', () => {
+  describe('recording type actions (legacy)', () => {
     test('records fill with value', async () => {
       mockSetup.queueEvaluateResult(SAMPLE_ELEMENT_INFO);
 
@@ -300,7 +300,7 @@ describe('TraceRecorder', () => {
     });
   });
 
-  describe('recording scroll actions', () => {
+  describe('recording scroll actions (legacy)', () => {
     test('records scroll action', async () => {
       mockSetup.queueEvaluateResult(BUTTON_ELEMENT_INFO);
 
@@ -325,7 +325,7 @@ describe('TraceRecorder', () => {
     });
   });
 
-  describe('recording navigate actions', () => {
+  describe('recording navigate actions (legacy)', () => {
     test('records navigate/load action with URL', async () => {
       const recorder = new TraceRecorder({
         adapter: mockSetup.adapter,
@@ -445,6 +445,382 @@ describe('TraceRecorder', () => {
 
       const trace = recorder.getTrace();
       expect(trace[0].healthScore).toBe(1.0);
+    });
+  });
+
+  // ── Magnitude namespaced variant tests ──────────────────────────────
+
+  describe('Magnitude mouse:click variant', () => {
+    test('records mouse:click as click action', async () => {
+      mockSetup.queueEvaluateResult(BUTTON_ELEMENT_INFO);
+
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      mockSetup.emitter.emit('actionDone', {
+        variant: 'mouse:click',
+        x: 100,
+        y: 200,
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      const trace = recorder.getTrace();
+      expect(trace).toHaveLength(1);
+      expect(trace[0].action).toBe('click');
+      expect(trace[0].locator.testId).toBe('submit-btn');
+    });
+
+    test('records mouse:double_click as click action', async () => {
+      mockSetup.queueEvaluateResult(BUTTON_ELEMENT_INFO);
+
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      mockSetup.emitter.emit('actionDone', {
+        variant: 'mouse:double_click',
+        x: 100,
+        y: 200,
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      const trace = recorder.getTrace();
+      expect(trace).toHaveLength(1);
+      expect(trace[0].action).toBe('click');
+    });
+
+    test('records mouse:right_click as click action', async () => {
+      mockSetup.queueEvaluateResult(BUTTON_ELEMENT_INFO);
+
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      mockSetup.emitter.emit('actionDone', {
+        variant: 'mouse:right_click',
+        x: 50,
+        y: 75,
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      const trace = recorder.getTrace();
+      expect(trace).toHaveLength(1);
+      expect(trace[0].action).toBe('click');
+    });
+  });
+
+  describe('Magnitude keyboard:type variant', () => {
+    test('uses last-clicked element info (no page.evaluate call)', async () => {
+      // Only one evaluate call for the click — keyboard:type should not call evaluate
+      mockSetup.queueEvaluateResult(SAMPLE_ELEMENT_INFO);
+
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      // Click first to establish lastClickInfo
+      mockSetup.emitter.emit('actionDone', {
+        variant: 'mouse:click',
+        x: 200,
+        y: 300,
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Then type — should reuse last-click element info
+      mockSetup.emitter.emit('actionDone', {
+        variant: 'keyboard:type',
+        content: 'test@example.com',
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const trace = recorder.getTrace();
+      expect(trace).toHaveLength(2);
+      expect(trace[0].action).toBe('click');
+      expect(trace[1].action).toBe('fill');
+      expect(trace[1].value).toBe('test@example.com');
+      expect(trace[1].locator.testId).toBe('email-input');
+
+      // page.evaluate should only have been called once (for the click)
+      expect(mockSetup.mockPage.evaluate).toHaveBeenCalledTimes(1);
+    });
+
+    test('skipped when no prior click (no lastClickInfo)', async () => {
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      // keyboard:type with no prior click
+      mockSetup.emitter.emit('actionDone', {
+        variant: 'keyboard:type',
+        content: 'orphaned text',
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const trace = recorder.getTrace();
+      expect(trace).toHaveLength(0);
+    });
+
+    test('template detection works with keyboard:type', async () => {
+      mockSetup.queueEvaluateResult(SAMPLE_ELEMENT_INFO);
+
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+        userData: { email: 'jane@example.com' },
+      });
+      recorder.start();
+
+      // Click, then type a matching value
+      mockSetup.emitter.emit('actionDone', {
+        variant: 'mouse:click',
+        x: 200,
+        y: 300,
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      mockSetup.emitter.emit('actionDone', {
+        variant: 'keyboard:type',
+        content: 'jane@example.com',
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const trace = recorder.getTrace();
+      expect(trace[1].action).toBe('fill');
+      expect(trace[1].value).toBe('{{email}}');
+    });
+  });
+
+  describe('Magnitude mouse:scroll variant', () => {
+    test('records mouse:scroll as scroll action', async () => {
+      mockSetup.queueEvaluateResult(BUTTON_ELEMENT_INFO);
+
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      mockSetup.emitter.emit('actionDone', {
+        variant: 'mouse:scroll',
+        x: 100,
+        y: 200,
+        deltaX: 0,
+        deltaY: 500,
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      const trace = recorder.getTrace();
+      expect(trace).toHaveLength(1);
+      expect(trace[0].action).toBe('scroll');
+    });
+  });
+
+  describe('Magnitude browser:nav variant', () => {
+    test('records browser:nav as navigate with URL', async () => {
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      mockSetup.emitter.emit('actionDone', {
+        variant: 'browser:nav',
+        url: 'https://example.com/apply',
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      const trace = recorder.getTrace();
+      expect(trace).toHaveLength(1);
+      expect(trace[0].action).toBe('navigate');
+      expect(trace[0].value).toBe('https://example.com/apply');
+      expect(trace[0].locator.css).toBe('body');
+    });
+  });
+
+  describe('Magnitude keyboard key press variants', () => {
+    test('keyboard:enter records as press with value Enter', async () => {
+      mockSetup.queueEvaluateResult(SAMPLE_ELEMENT_INFO);
+
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      // Click first to set lastClickInfo
+      mockSetup.emitter.emit('actionDone', { variant: 'mouse:click', x: 100, y: 200 });
+      await new Promise((r) => setTimeout(r, 50));
+
+      mockSetup.emitter.emit('actionDone', { variant: 'keyboard:enter' });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const trace = recorder.getTrace();
+      expect(trace).toHaveLength(2);
+      expect(trace[1].action).toBe('press');
+      expect(trace[1].value).toBe('Enter');
+      expect(trace[1].locator.testId).toBe('email-input');
+    });
+
+    test('keyboard:tab records as press with value Tab', async () => {
+      mockSetup.queueEvaluateResult(BUTTON_ELEMENT_INFO);
+
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      mockSetup.emitter.emit('actionDone', { variant: 'mouse:click', x: 50, y: 60 });
+      await new Promise((r) => setTimeout(r, 50));
+
+      mockSetup.emitter.emit('actionDone', { variant: 'keyboard:tab' });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const trace = recorder.getTrace();
+      expect(trace).toHaveLength(2);
+      expect(trace[1].action).toBe('press');
+      expect(trace[1].value).toBe('Tab');
+    });
+
+    test('keyboard:enter without prior click uses body locator', async () => {
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      mockSetup.emitter.emit('actionDone', { variant: 'keyboard:enter' });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const trace = recorder.getTrace();
+      expect(trace).toHaveLength(1);
+      expect(trace[0].action).toBe('press');
+      expect(trace[0].value).toBe('Enter');
+      expect(trace[0].locator.css).toBe('body');
+    });
+  });
+
+  describe('Magnitude wait variant', () => {
+    test('records wait action', async () => {
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      mockSetup.emitter.emit('actionDone', { variant: 'wait' });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const trace = recorder.getTrace();
+      expect(trace).toHaveLength(1);
+      expect(trace[0].action).toBe('wait');
+      expect(trace[0].locator.css).toBe('body');
+    });
+  });
+
+  describe('skipped Magnitude variants', () => {
+    test('mouse:drag is silently skipped', async () => {
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      mockSetup.emitter.emit('actionDone', { variant: 'mouse:drag', x: 10, y: 20 });
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(recorder.getTrace()).toHaveLength(0);
+    });
+
+    test('browser:nav:back is silently skipped', async () => {
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      mockSetup.emitter.emit('actionDone', { variant: 'browser:nav:back' });
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(recorder.getTrace()).toHaveLength(0);
+    });
+
+    test('browser:tab:* variants are silently skipped', async () => {
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      mockSetup.emitter.emit('actionDone', { variant: 'browser:tab:new' });
+      mockSetup.emitter.emit('actionDone', { variant: 'browser:tab:close' });
+      mockSetup.emitter.emit('actionDone', { variant: 'browser:tab:switch' });
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(recorder.getTrace()).toHaveLength(0);
+    });
+  });
+
+  describe('reset clears lastClickInfo', () => {
+    test('keyboard:type after reset with no new click is skipped', async () => {
+      mockSetup.queueEvaluateResult(BUTTON_ELEMENT_INFO);
+
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+      });
+      recorder.start();
+
+      // Click to set lastClickInfo
+      mockSetup.emitter.emit('actionDone', { variant: 'mouse:click', x: 100, y: 200 });
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(recorder.getTrace()).toHaveLength(1);
+
+      // Reset clears both steps and lastClickInfo
+      recorder.reset();
+      expect(recorder.getTrace()).toHaveLength(0);
+
+      // keyboard:type without a new click should be skipped
+      mockSetup.emitter.emit('actionDone', { variant: 'keyboard:type', content: 'hello' });
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(recorder.getTrace()).toHaveLength(0);
+    });
+  });
+
+  describe('full Magnitude sequence', () => {
+    test('nav → click → type → enter produces correct trace', async () => {
+      mockSetup.queueEvaluateResult(SAMPLE_ELEMENT_INFO); // for the click
+
+      const recorder = new TraceRecorder({
+        adapter: mockSetup.adapter,
+        userData: { email: 'test@example.com' },
+      });
+      recorder.start();
+
+      // 1. Navigate
+      mockSetup.emitter.emit('actionDone', { variant: 'browser:nav', url: 'https://example.com/apply' });
+      await new Promise((r) => setTimeout(r, 50));
+
+      // 2. Click the email field
+      mockSetup.emitter.emit('actionDone', { variant: 'mouse:click', x: 200, y: 300 });
+      await new Promise((r) => setTimeout(r, 50));
+
+      // 3. Type email
+      mockSetup.emitter.emit('actionDone', { variant: 'keyboard:type', content: 'test@example.com' });
+      await new Promise((r) => setTimeout(r, 50));
+
+      // 4. Press Enter
+      mockSetup.emitter.emit('actionDone', { variant: 'keyboard:enter' });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const trace = recorder.getTrace();
+      expect(trace).toHaveLength(4);
+      expect(trace[0]).toMatchObject({ order: 0, action: 'navigate', value: 'https://example.com/apply' });
+      expect(trace[1]).toMatchObject({ order: 1, action: 'click', locator: { testId: 'email-input' } });
+      expect(trace[2]).toMatchObject({ order: 2, action: 'fill', value: '{{email}}' });
+      expect(trace[3]).toMatchObject({ order: 3, action: 'press', value: 'Enter' });
     });
   });
 });

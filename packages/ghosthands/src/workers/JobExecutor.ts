@@ -12,7 +12,7 @@ import { ProgressTracker, ProgressStep } from './progressTracker.js';
 import { loadModelConfig } from '../config/models.js';
 import { taskHandlerRegistry } from './taskHandlers/registry.js';
 import { callbackNotifier } from './callbackNotifier.js';
-import type { TaskContext, TaskResult } from './taskHandlers/types.js';
+import type { TaskHandler, TaskContext, TaskResult } from './taskHandlers/types.js';
 import { SessionManager } from '../sessions/SessionManager.js';
 import { BlockerDetector, type BlockerResult, type BlockerType } from '../detection/BlockerDetector.js';
 import { ExecutionEngine } from '../engine/ExecutionEngine.js';
@@ -25,6 +25,7 @@ import { ThoughtThrottle, JOB_EVENT_TYPES } from '../events/JobEventTypes.js';
 import { ResumeDownloader, type ResumeRef } from './resumeDownloader.js';
 import { ResumeProfileLoader } from '../db/resumeProfileLoader.js';
 import { getLogger } from '../monitoring/logger.js';
+import { AgentApplyHandler } from './taskHandlers/agentApplyHandler.js';
 
 const logger = getLogger({ service: 'job-executor' });
 
@@ -87,6 +88,7 @@ const BLOCKER_CONFIDENCE_THRESHOLD = 0.6;
 const MAX_POST_RESUME_CHECKS = 3;
 const BLOCKER_CHECK_INTERVAL_MS = 15_000; // Minimum interval between action-triggered blocker checks
 const PERIODIC_BLOCKER_CHECK_MS = 30_000; // Periodic timer-based blocker check interval
+const BLOCKER_CHECK_TIMEOUT_MS = 20_000; // Timeout for any single blocker check call
 const CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK = 3; // Check for blockers after this many consecutive action failures
 
 /** Error codes that should trigger HITL instead of immediate retry */
@@ -111,7 +113,6 @@ function detectPlatform(url: string): string {
   if (url.includes('linkedin.com')) return 'linkedin';
   if (url.includes('lever.co')) return 'lever';
   if (url.includes('myworkdayjobs.com') || url.includes('workday.com')) return 'workday';
-  if (url.includes('amazon.jobs') || url.includes('www.amazon.jobs')) return 'amazon';
   if (url.includes('icims.com')) return 'icims';
   if (url.includes('taleo.net')) return 'taleo';
   if (url.includes('smartrecruiters.com')) return 'smartrecruiters';
@@ -321,8 +322,19 @@ export class JobExecutor {
       // 1b. Auto-populate user_data from VALET's resumes table if not provided
       await this.enrichJobFromResumeProfile(job);
 
-      // 2. Resolve task handler
-      const handler = taskHandlerRegistry.getOrThrow(job.job_type);
+      // 2. Resolve task handler — execution_mode can override the default handler
+      let handler: TaskHandler = taskHandlerRegistry.getOrThrow(job.job_type);
+      if (job.execution_mode === 'agent_apply') {
+        handler = new AgentApplyHandler();
+        logger.info('execution_mode override: using AgentApplyHandler', { jobId: job.id });
+      } else if (job.execution_mode === 'smart_apply') {
+        // SmartApplyHandler is already registered in the registry as 'smart_apply'.
+        // If the job_type doesn't match, override with SmartApplyHandler.
+        if (handler.type !== 'smart_apply') {
+          handler = taskHandlerRegistry.getOrThrow('smart_apply');
+          logger.info('execution_mode override: using SmartApplyHandler', { jobId: job.id });
+        }
+      }
 
       // 3. Validate input if handler supports it
       if (handler.validate) {
@@ -412,6 +424,7 @@ export class JobExecutor {
       }
 
       // 7. Create and start adapter
+      logger.debug('[exec] Step 7: Creating adapter', { jobId: job.id });
       const adapterType = (process.env.GH_BROWSER_ENGINE || 'magnitude') as AdapterType;
       adapter = createAdapter(adapterType);
       this._activeAdapter = adapter;
@@ -421,11 +434,34 @@ export class JobExecutor {
         llm: llmSetup.llm,
         ...(llmSetup.imageLlm && { imageLlm: llmSetup.imageLlm }),
         ...(storedSession ? { storageState: storedSession } : {}),
-        systemPrompt: 'You are a form-filling agent. RULES: (1) ONE action at a time. (2) TOP TO BOTTOM — start at the topmost unanswered field, never skip ahead. (3) DO NOT TOUCH any question that is even slightly cut off at the bottom of the screen. (4) Before reporting done, scan top to bottom and confirm every 100% visible question is answered. (5) When done with all fully visible fields, IMMEDIATELY report done. Do NOT use the wait action. Reporting done IS what triggers scrolling. (6) NEVER scroll or navigate.',
         browserOptions: { headless },
       });
 
-      console.log(`[JobExecutor] Adapter started for job ${job.id}`);
+      logger.debug('[exec] Step 7: Adapter started, waiting for page load', { jobId: job.id, adapterType });
+
+      // 7b. Wait for page to be ready before any interactions (SPA pages like Greenhouse need this)
+      try {
+        await Promise.race([
+          adapter.page.waitForLoadState('domcontentloaded'),
+          new Promise((resolve) => setTimeout(resolve, 10_000)),
+        ]);
+        logger.debug('[exec] Step 7: Page domcontentloaded', { jobId: job.id });
+      } catch {
+        logger.debug('[exec] Step 7: Page load wait skipped', { jobId: job.id });
+      }
+
+      // 7c. For SPA platforms (non-Workday), wait for networkidle to let React/JS finish rendering
+      if (platform !== 'workday') {
+        try {
+          await Promise.race([
+            adapter.page.waitForLoadState('networkidle'),
+            new Promise((resolve) => setTimeout(resolve, 15_000)),
+          ]);
+          logger.debug('[exec] Step 7c: Page networkidle (SPA ready)', { jobId: job.id });
+        } catch {
+          logger.debug('[exec] Step 7c: networkidle wait skipped (timeout ok)', { jobId: job.id });
+        }
+      }
 
       // 7a. Attach StagehandObserver for enriched blocker detection (optional)
       if (adapter.type === 'magnitude' && 'setObserver' in adapter) {
@@ -453,11 +489,13 @@ export class JobExecutor {
         }
       }
 
+      logger.debug('[exec] Step 8: Registering credentials', { jobId: job.id, hasCredentials: !!credentials });
       // 8. Register credentials if available
       if (credentials) {
         adapter.registerCredentials(credentials);
       }
 
+      logger.debug('[exec] Step 8.5: Injecting browser session', { jobId: job.id, hasSessionManager: !!this.sessionManager });
       // 8.5. Inject stored browser session (e.g. Google auth cookies)
       if (this.sessionManager) try {
         // Load Google session for Sign-in-with-Google flows
@@ -490,13 +528,17 @@ export class JobExecutor {
         // Reload page after cookie injection so Workday SSO picks up the Google session
         if (googleSessionInjected) {
           getLogger().info('Reloading page after session injection');
+          logger.debug('[exec] Step 8.5: Reloading page (networkidle)...', { jobId: job.id });
           await adapter.page.reload({ waitUntil: 'networkidle' }).catch(() => {});
           await adapter.page.waitForTimeout(2000);
+          logger.debug('[exec] Step 8.5: Page reload complete', { jobId: job.id });
         }
       } catch (err) {
         // Session injection failure is non-fatal — worker can still try fresh login
         getLogger().warn('Session injection failed (non-fatal)', { error: err instanceof Error ? err.message : String(err) });
       }
+
+      logger.debug('[exec] Step 8.5: Session injection done', { jobId: job.id });
 
       // 8a. Auto-attach resume to file inputs via Playwright filechooser event.
       // This covers ALL execution paths (handlers, cookbook, crash recovery).
@@ -512,15 +554,35 @@ export class JobExecutor {
         adapter.page.on('filechooser', fileChooserHandler);
       }
 
-      // 8.6. Check for blockers after initial page navigation
-      console.log(`[JobExecutor] Checking for blockers...`);
-      const initiallyBlocked = await this.checkForBlockers(job, adapter, costTracker);
-      if (initiallyBlocked) {
-        throw new Error('Page blocked after initial navigation and HITL resolution failed');
+      // 8.6. Check for blockers after initial page navigation (with timeout)
+      // Skip for non-Workday platforms — SPA pages (Greenhouse) cause page.evaluate() to hang
+      const skipInitialBlockerCheck = platform !== 'workday';
+      if (skipInitialBlockerCheck) {
+        logger.debug('[exec] Step 8.6: Skipping initial blocker check (non-workday platform)', { jobId: job.id, platform });
+      } else {
+        logger.debug('[exec] Step 8.6: Checking for blockers', { jobId: job.id });
+        let initiallyBlocked = false;
+        try {
+          initiallyBlocked = await Promise.race([
+            this.checkForBlockers(job, adapter, costTracker),
+            new Promise<false>((resolve) =>
+              setTimeout(() => {
+                logger.warn('[exec] Step 8.6: Blocker check timed out, skipping', { jobId: job.id });
+                resolve(false);
+              }, BLOCKER_CHECK_TIMEOUT_MS),
+            ),
+          ]);
+        } catch (err) {
+          logger.warn('[exec] Step 8.6: Blocker check error, skipping', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+        }
+        if (initiallyBlocked) {
+          throw new Error('Page blocked after initial navigation and HITL resolution failed');
+        }
+        logger.debug('[exec] Step 8.6: Blocker check passed', { jobId: job.id });
       }
-      console.log(`[JobExecutor] Blocker check complete — clear`);
 
       // 9. Try ExecutionEngine (cookbook replay) before Magnitude handler
+      logger.debug('[exec] Step 9: Trying cookbook engine', { jobId: job.id });
       await progress.setStep(ProgressStep.NAVIGATING);
 
       const logEventFn = (eventType: string, metadata: Record<string, any>) =>
@@ -533,7 +595,6 @@ export class JobExecutor {
         }),
       });
 
-      console.log(`[JobExecutor] Checking for cookbook...`);
       const engineResult = await executionEngine.execute({
         job,
         adapter,
@@ -542,6 +603,8 @@ export class JobExecutor {
         logEvent: logEventFn,
         resumeFilePath,
       });
+
+      logger.debug('[exec] Step 9: Engine result', { jobId: job.id, success: engineResult.success, mode: engineResult.mode });
 
       // Track TraceRecorder for Magnitude path (manual training)
       let traceRecorder: TraceRecorder | null = null;
@@ -681,29 +744,27 @@ export class JobExecutor {
       });
 
       // Start periodic blocker check timer (catches blockers even when adapter is stuck)
-      blockerCheckInterval = setInterval(async () => {
-        if (!adapter || adapter.isPaused?.()) return; // Don't check while paused
-        try {
-          const blocked = await this.checkForBlockers(job, adapter, costTracker);
-          if (blocked) {
-            // Already handled internally — the job will be paused
+      // Only for workday_apply — SPA platforms (Greenhouse) cause page.evaluate() to hang,
+      // creating contention with Magnitude's own evaluate calls
+      if (handler.type === 'workday_apply') {
+        blockerCheckInterval = setInterval(async () => {
+          if (!adapter || adapter.isPaused?.()) return; // Don't check while paused
+          try {
+            await Promise.race([
+              this.checkForBlockers(job, adapter, costTracker),
+              new Promise<false>((resolve) => setTimeout(() => resolve(false), BLOCKER_CHECK_TIMEOUT_MS)),
+            ]);
+          } catch {
+            // Non-fatal
           }
-        } catch {
-          // Non-fatal
-        }
-      }, PERIODIC_BLOCKER_CHECK_MS);
+        }, PERIODIC_BLOCKER_CHECK_MS);
+      } else {
+        logger.debug('[exec] Periodic blocker checks disabled for non-workday handler', { jobId: job.id, handler: handler.type });
+      }
 
       // 10. Build TaskContext and delegate to handler (with crash recovery)
-      const rawTimeout = job.timeout_seconds;
-      const MIN_TIMEOUT_SECONDS = 1800; // 30 minutes minimum — agent needs time for multi-step forms
-      const timeoutMs = Math.max(typeof rawTimeout === 'number' && rawTimeout > 0 ? rawTimeout : MIN_TIMEOUT_SECONDS, MIN_TIMEOUT_SECONDS) * 1000;
-      getLogger().info('Job execution timeout configured', {
-        jobId: job.id,
-        raw_timeout_seconds: rawTimeout,
-        effective_timeout_seconds: timeoutMs / 1000,
-        timeoutMs,
-        handler: handler.type,
-      });
+      logger.debug('[exec] Step 10: Delegating to handler', { jobId: job.id, handler: handler.type, timeoutSeconds: job.timeout_seconds });
+      const timeoutMs = job.timeout_seconds * 1000;
       await this.updateJobStatus(job.id, 'running', `Executing ${handler.type} handler (Magnitude mode)`);
 
       let taskResult: TaskResult | undefined;
@@ -721,10 +782,12 @@ export class JobExecutor {
         };
 
         try {
+          logger.debug('[exec] Step 10: Calling handler.execute()', { jobId: job.id, handler: handler.type, attempt: crashRecoveryAttempts });
           taskResult = await Promise.race([
             handler.execute(ctx),
             this.createTimeout(timeoutMs),
           ]);
+          logger.debug('[exec] Step 10: Handler returned', { jobId: job.id, success: taskResult?.success });
           break; // Success -- exit retry loop
         } catch (execError) {
           const execMsg = execError instanceof Error ? execError.message : String(execError);
@@ -1253,7 +1316,8 @@ export class JobExecutor {
       }
     });
 
-    adapter.on('actionStarted', async (action: { variant: string }) => {
+    adapter.on('actionStarted', (action: { variant: string }) => {
+      logger.debug('[magnitude] actionStarted', { variant: action.variant, jobId: job.id });
       blockerState.consecutiveFailures++;
       costTracker.recordAction(); // throws ActionLimitExceededError if over limit
       costTracker.recordModeStep('magnitude');
@@ -1263,16 +1327,14 @@ export class JobExecutor {
         action_count: costTracker.getSnapshot().actionCount,
       });
 
+      // Fire-and-forget — never await in event handlers (blocks Magnitude's page.evaluate)
       if (blockerState.consecutiveFailures >= CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK && adapter) {
-        try {
-          await this.checkForBlockers(job, adapter, costTracker);
-        } catch {
-          // Non-fatal
-        }
+        this.checkForBlockers(job, adapter, costTracker).catch(() => {});
       }
     });
 
-    adapter.on('actionDone', async (action: { variant: string }) => {
+    adapter.on('actionDone', (action: { variant: string }) => {
+      logger.debug('[magnitude] actionDone', { variant: action.variant, jobId: job.id });
       progress.onActionDone(action.variant);
       blockerState.consecutiveFailures = 0;
       this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
@@ -1283,27 +1345,29 @@ export class JobExecutor {
       const now = Date.now();
       if (now - blockerState.lastCheckTime >= BLOCKER_CHECK_INTERVAL_MS) {
         blockerState.lastCheckTime = now;
-        try {
-          const currentUrl = await adapter.getCurrentUrl();
-          if (currentUrl !== blockerState.lastKnownUrl) {
-            blockerState.lastKnownUrl = currentUrl;
-            try {
-              const currentDomain = new URL(currentUrl).hostname;
-              if (currentDomain !== targetDomain) {
-                await this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
-                  from_domain: targetDomain,
-                  to_url: currentUrl,
-                });
+        // Fire-and-forget — never await in event handlers (blocks Magnitude's page.evaluate)
+        (async () => {
+          try {
+            const currentUrl = await adapter.getCurrentUrl();
+            if (currentUrl !== blockerState.lastKnownUrl) {
+              blockerState.lastKnownUrl = currentUrl;
+              try {
+                const currentDomain = new URL(currentUrl).hostname;
+                if (currentDomain !== targetDomain) {
+                  this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
+                    from_domain: targetDomain,
+                    to_url: currentUrl,
+                  });
+                }
+              } catch {
+                // Invalid URL — skip domain comparison
               }
-            } catch {
-              // Invalid URL — skip domain comparison
             }
+            this.checkForBlockers(job, adapter, costTracker).catch(() => {});
+          } catch {
+            // Detection errors are non-fatal
           }
-          await this.checkForBlockers(job, adapter, costTracker);
-        } catch (err) {
-          if ((err as Error).message?.includes('Blocker detected')) throw err;
-          // Detection errors are non-fatal
-        }
+        })();
       }
     });
 
@@ -1357,7 +1421,6 @@ export class JobExecutor {
     }
 
     if (!blockerResult || blockerResult.confidence < BLOCKER_CONFIDENCE_THRESHOLD) {
-      console.log(`[JobExecutor] Blocker check result: ${blockerResult ? `type=${blockerResult.type} confidence=${blockerResult.confidence} (below threshold ${BLOCKER_CONFIDENCE_THRESHOLD})` : 'no blocker detected'}`);
       await this.logJobEvent(job.id, JOB_EVENT_TYPES.OBSERVATION_COMPLETED, {
         result: 'clear',
         url: currentUrl,
@@ -1365,34 +1428,7 @@ export class JobExecutor {
       return false;
     }
 
-    // SAFETY: If the blocker is a captcha but the page has form inputs, it's a
-    // form-level captcha (e.g. hCaptcha on Lever) — not blocking page access.
-    // These captchas activate at submission time, not during form filling.
-    if (blockerResult.type === 'captcha' || blockerResult.type === 'verification') {
-      try {
-        const formInputCount = await adapter.page.evaluate(() => {
-          return document.querySelectorAll(
-            'input[type="text"], input[type="email"], input[type="tel"], ' +
-            'input[type="url"], input[type="number"], textarea, select, ' +
-            'input[type="file"], [role="combobox"], [role="listbox"]'
-          ).length;
-        });
-        if (formInputCount >= 2) {
-          console.log(`[JobExecutor] Captcha detected (${blockerResult.selector}) but page has ${formInputCount} form inputs — treating as form-level captcha, not a blocker`);
-          await this.logJobEvent(job.id, JOB_EVENT_TYPES.OBSERVATION_COMPLETED, {
-            result: 'clear',
-            url: currentUrl,
-            note: `Captcha present but page has ${formInputCount} form inputs — form-level captcha, not access blocker`,
-          });
-          return false;
-        }
-      } catch {
-        // page.evaluate failed — fall through to normal blocker handling
-      }
-    }
-
     // Blocker detected — emit event and trigger HITL
-    console.log(`[JobExecutor] BLOCKER DETECTED: type=${blockerResult.type} confidence=${blockerResult.confidence} source=${blockerResult.source} details="${blockerResult.details}" selector="${blockerResult.selector || 'N/A'}"`);
     await this.logJobEvent(job.id, JOB_EVENT_TYPES.BLOCKER_DETECTED, {
       blocker_type: blockerResult.type,
       confidence: blockerResult.confidence,

@@ -9,7 +9,7 @@ set -euo pipefail
 #
 # Usage:
 #   ./scripts/deploy-to-asg.sh <image-tag>
-#   ./scripts/deploy-to-asg.sh staging-abc1234 --ssh-key ~/.ssh/valet-worker.pem
+#   ./scripts/deploy-to-asg.sh staging-abc1234 --ssh-key ~/.ssh/wekruit-atm-server.pem
 #
 # Required env vars:
 #   AWS_ASG_NAME    - Auto Scaling Group name
@@ -18,7 +18,7 @@ set -euo pipefail
 #   ECR_REPOSITORY  - ECR repository name
 #
 # Optional env vars:
-#   SSH_KEY_PATH    - Path to SSH private key (default: ~/.ssh/valet-worker.pem)
+#   SSH_KEY_PATH    - Path to SSH private key (default: ~/.ssh/wekruit-atm-server.pem)
 #   SSH_USER        - SSH user (default: ubuntu)
 #   GHOSTHANDS_DIR  - Remote GH directory (default: /opt/ghosthands)
 
@@ -27,7 +27,7 @@ ASG_NAME="${AWS_ASG_NAME:?AWS_ASG_NAME is required}"
 REGION="${AWS_REGION:-us-east-1}"
 ECR_REG="${ECR_REGISTRY:?ECR_REGISTRY is required}"
 ECR_REPO="${ECR_REPOSITORY:?ECR_REPOSITORY is required}"
-SSH_KEY_PATH="${SSH_KEY_PATH:-$HOME/.ssh/valet-worker.pem}"
+SSH_KEY_PATH="${SSH_KEY_PATH:-$HOME/.ssh/wekruit-atm-server.pem}"
 SSH_USER="${SSH_USER:-ubuntu}"
 REMOTE_DIR="${GHOSTHANDS_DIR:-/opt/ghosthands}"
 
