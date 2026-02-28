@@ -39,7 +39,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["bun", "--watch", "packages/ghosthands/src/workers/main.ts"]
+    command: ["bun", "--watch", "packages/ghosthands/src/workers/workerLauncher.ts"]
     ports:
       - "${GH_WORKER_PORT:-3101}:3101"
     env_file: .env

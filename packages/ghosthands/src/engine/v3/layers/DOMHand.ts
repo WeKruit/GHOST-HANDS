@@ -14,6 +14,7 @@ import { FieldMatcher } from '../FieldMatcher';
 import { DOMActionExecutor } from '../DOMActionExecutor';
 import { VerificationEngine } from '../VerificationEngine';
 import { getPlatformHandler } from '../platforms';
+import { toV2FieldModel, toV2PageModel } from '../v2compat';
 import type {
   LayerContext,
   V3ObservationResult,
@@ -21,17 +22,16 @@ import type {
   PlannedAction,
   ExecutionResult,
   ReviewResult,
-  AnalysisResult,
   LayerError,
   FormField,
-  FormSection,
 } from '../types';
-import type { FieldModel, PageModel } from '../v2types';
+import type { PageModel } from '../v2types';
+import type { BrowserAutomationAdapter } from '../../../adapters/types';
 
 /**
  * Convert a v2 FieldModel (from ported PageScanner) to a v3 FormField.
  */
-function fieldModelToFormField(fm: FieldModel): FormField {
+function fieldModelToFormField(fm: import('../v2types').FieldModel): FormField {
   return {
     id: fm.id,
     selector: fm.selector,
@@ -44,6 +44,7 @@ function fieldModelToFormField(fm: FieldModel): FormField {
     required: fm.isRequired,
     currentValue: fm.currentValue,
     options: fm.options,
+    groupKey: fm.groupKey,
     boundingBox: fm.boundingBox,
     visible: fm.isVisible,
     disabled: fm.isDisabled,
@@ -90,6 +91,11 @@ export class DOMHand extends LayerHand {
       disabled: b.isDisabled,
     }));
 
+    // Populate domDepth + parentContainer for fields that lack durable selectors.
+    // These are needed by SectionOrchestrator.fieldFingerprint() to disambiguate
+    // repeated labels in dynamic sections (e.g., multiple "Company" fields).
+    await this.populateStructuralMetadata(ctx.page, fields);
+
     // Generate fingerprint from URL + field structure
     const fingerprint = `${pageModel.url}::${fields.map((f) => f.selector).join(',')}`.slice(0, 256);
 
@@ -109,91 +115,122 @@ export class DOMHand extends LayerHand {
     };
   }
 
+  /**
+   * Populate domDepth and parentContainer for each field via a single page.evaluate.
+   * Only needed for fields without durable selectors (no id, no data-testid, no name).
+   * This makes fieldFingerprint() produce distinct fingerprints for repeated labels.
+   */
+  private async populateStructuralMetadata(
+    page: import('playwright').Page,
+    fields: FormField[],
+  ): Promise<void> {
+    try {
+      const selectors = fields.map((f) => f.selector);
+      const metadata = await page.evaluate((sels: string[]) => {
+        return sels.map((sel) => {
+          const el = document.querySelector(sel);
+          if (!el) return { depth: -1, container: '', ordinal: -1 };
+
+          // Compute DOM depth
+          let depth = 0;
+          let node: Element | null = el;
+          while (node && node !== document.documentElement) {
+            depth++;
+            node = node.parentElement;
+          }
+
+          // Compute ordinal: index among same-tag siblings in parent.
+          // Disambiguates repeated anonymous siblings under the same named section
+          // (e.g., two "Company" text inputs in adjacent work-experience rows).
+          let ordinal = 0;
+          if (el.parentElement) {
+            const siblings = Array.from(el.parentElement.children).filter(
+              (child) => child.tagName === el.tagName,
+            );
+            ordinal = siblings.indexOf(el);
+          }
+
+          // Find nearest named container (section, fieldset, or element with data-automation-id/id)
+          let container = '';
+          node = el.parentElement;
+          while (node && node !== document.body) {
+            const tag = node.tagName.toLowerCase();
+            if (tag === 'section' || tag === 'fieldset') {
+              container = node.id || node.getAttribute('data-automation-id') || tag;
+              break;
+            }
+            const autoId = node.getAttribute('data-automation-id');
+            if (autoId) {
+              container = autoId;
+              break;
+            }
+            if (node.id && !node.id.startsWith('gh-')) {
+              container = node.id;
+              break;
+            }
+            node = node.parentElement;
+          }
+
+          return { depth, container, ordinal };
+        });
+      }, selectors);
+
+      for (let i = 0; i < fields.length; i++) {
+        const m = metadata[i];
+        if (m) {
+          fields[i].domDepth = m.depth;
+          fields[i].domOrdinal = m.ordinal;
+          if (m.container) fields[i].parentContainer = m.container;
+        }
+      }
+    } catch {
+      // Non-fatal — fingerprinting falls back to label+type
+    }
+  }
+
   async process(observation: V3ObservationResult, ctx: LayerContext): Promise<FieldMatch[]> {
     const userData = ctx.userProfile as Record<string, string>;
-    const qaAnswers = (ctx.userProfile as any)?.qaAnswers ?? {};
+    const qaAnswers = (ctx.userProfile as Record<string, unknown>)?.qaAnswers as Record<string, string> ?? {};
     const matcher = new FieldMatcher(userData, qaAnswers, getPlatformHandler(observation.platform));
 
-    // Convert v3 FormFields back to v2 FieldModel for the ported FieldMatcher
-    const pageModel: PageModel = {
-      url: observation.url,
-      platform: observation.platform,
-      pageType: observation.pageType,
-      fields: observation.fields.map((f) => ({
-        id: f.id,
-        selector: f.selector,
-        automationId: f.automationId,
-        name: f.name,
-        fieldType: f.fieldType as any,
-        fillStrategy: 'tier0' as any,
-        isRequired: f.required,
-        isVisible: f.visible,
-        isDisabled: f.disabled,
-        label: f.label,
-        placeholder: f.placeholder,
-        ariaLabel: f.ariaLabel,
-        currentValue: f.currentValue ?? '',
-        isEmpty: !f.currentValue || f.currentValue.trim() === '',
-        boundingBox: f.boundingBox ?? { x: 0, y: 0, width: 0, height: 0 },
-        absoluteY: f.boundingBox?.y ?? 0,
-      })),
-      buttons: observation.buttons.map((b) => ({
-        selector: b.selector,
-        text: b.text,
-        automationId: undefined,
-        role: 'unknown' as any,
-        boundingBox: b.boundingBox ?? { x: 0, y: 0, width: 0, height: 0 },
-        isDisabled: b.disabled ?? false,
-      })),
-      timestamp: observation.timestamp,
-      scrollHeight: 0,
-      viewportHeight: 0,
-    };
-
+    const pageModel = toV2PageModel(observation);
     const { matches } = matcher.match(pageModel);
 
-    // Convert v2 FieldMatch to v3 FieldMatch
-    return matches.map((m) => ({
-      field: observation.fields.find((f) => f.id === m.field.id) ?? observation.fields[0],
-      userDataKey: m.userDataKey,
-      value: m.value,
-      confidence: m.confidence,
-      matchMethod: m.matchMethod as FieldMatch['matchMethod'],
-    }));
+    // Convert v2 FieldMatch to v3 FieldMatch.
+    // Filter out matches where the v3 field can't be found — falling back to fields[0]
+    // would silently map the wrong value to the wrong field.
+    return matches
+      .map((m) => {
+        const v3Field = observation.fields.find((f) => f.id === m.field.id);
+        if (!v3Field) return null;
+        return {
+          field: v3Field,
+          userDataKey: m.userDataKey,
+          value: m.value,
+          confidence: m.confidence,
+          matchMethod: m.matchMethod as FieldMatch['matchMethod'],
+        };
+      })
+      .filter((m): m is FieldMatch => m !== null);
   }
 
   async execute(actions: PlannedAction[], ctx: LayerContext): Promise<ExecutionResult[]> {
-    const executor = new DOMActionExecutor(ctx.page, { type: 'mock' } as any);
+    // DOMActionExecutor requires a BrowserAutomationAdapter but DOMHand never uses Tier 3.
+    // Pass a stub adapter since only Tier 0 (DOM injection) is used.
+    const stubAdapter = { type: 'stub', act: () => Promise.resolve({ success: false }) } as unknown as BrowserAutomationAdapter;
+    const executor = new DOMActionExecutor(ctx.page, stubAdapter);
     const results: ExecutionResult[] = [];
 
     for (const action of actions) {
       const start = Date.now();
 
-      // Use the v2 DOMActionExecutor's Tier 0 path
-      const v2Field: FieldModel = {
-        id: action.field.id,
-        selector: action.field.selector,
-        automationId: action.field.automationId,
-        name: action.field.name,
-        fieldType: action.field.fieldType as any,
-        fillStrategy: 'tier0' as any,
-        isRequired: action.field.required,
-        isVisible: action.field.visible,
-        isDisabled: action.field.disabled,
-        label: action.field.label,
-        placeholder: action.field.placeholder,
-        ariaLabel: action.field.ariaLabel,
-        currentValue: action.field.currentValue ?? '',
-        isEmpty: true,
-        boundingBox: action.field.boundingBox ?? { x: 0, y: 0, width: 0, height: 0 },
-        absoluteY: action.field.boundingBox?.y ?? 0,
-      };
+      const v2Field = toV2FieldModel(action.field);
 
       const result = await executor.execute({
         field: v2Field,
         value: action.value,
         tier: 0,
-        action: action.actionType as any,
+        action: action.actionType as import('../v2types').ActionType,
         retryCount: 0,
         maxRetries: 2,
       });
@@ -236,21 +273,7 @@ export class DOMHand extends LayerHand {
         continue;
       }
 
-      const v2Field: FieldModel = {
-        id: action.field.id,
-        selector: action.field.selector,
-        fieldType: action.field.fieldType as any,
-        fillStrategy: 'tier0' as any,
-        isRequired: action.field.required,
-        isVisible: true,
-        isDisabled: false,
-        label: action.field.label,
-        currentValue: '',
-        isEmpty: false,
-        boundingBox: action.field.boundingBox ?? { x: 0, y: 0, width: 0, height: 0 },
-        absoluteY: 0,
-      };
-
+      const v2Field = toV2FieldModel(action.field);
       const verification = await verifier.verify(v2Field, action.value);
       reviews.push({
         verified: verification.passed,
@@ -265,66 +288,6 @@ export class DOMHand extends LayerHand {
     return reviews;
   }
 
-  async analyze(
-    observation: V3ObservationResult,
-    _history: V3ObservationResult[],
-    ctx: LayerContext,
-  ): Promise<AnalysisResult> {
-    // DOMHand analysis: Extended DOM traversal for hidden/conditional fields
-    const discovered = await ctx.page.evaluate(() => {
-      const allInputs = document.querySelectorAll(
-        'input:not([type="hidden"]), textarea, select, [role="combobox"], [role="listbox"]',
-      );
-      const fields: Array<{
-        selector: string;
-        label: string;
-        type: string;
-        visible: boolean;
-      }> = [];
-
-      for (const el of allInputs) {
-        const rect = el.getBoundingClientRect();
-        const visible = rect.width > 0 && rect.height > 0;
-        if (!visible) continue;
-
-        const label =
-          (el as HTMLInputElement).labels?.[0]?.textContent?.trim() ||
-          el.getAttribute('aria-label') ||
-          el.getAttribute('placeholder') ||
-          '';
-
-        fields.push({
-          selector: el.id ? `#${el.id}` : `[name="${el.getAttribute('name')}"]`,
-          label,
-          type: el.getAttribute('type') || el.tagName.toLowerCase(),
-          visible,
-        });
-      }
-
-      return fields;
-    });
-
-    // Find fields not in the original observation
-    const knownSelectors = new Set(observation.fields.map((f) => f.selector));
-    const newFields: FormField[] = discovered
-      .filter((d) => !knownSelectors.has(d.selector))
-      .map((d, i) => ({
-        id: `discovered-${i}`,
-        selector: d.selector,
-        fieldType: mapV2FieldType(d.type),
-        label: d.label,
-        required: false,
-        visible: d.visible,
-        disabled: false,
-      }));
-
-    return {
-      discoveredFields: newFields,
-      suggestedValues: [],
-      costIncurred: 0,
-    };
-  }
-
   throwError(error: unknown, _ctx: LayerContext): LayerError {
     const category = this.classifyError(error);
     return {
@@ -332,7 +295,6 @@ export class DOMHand extends LayerHand {
       message: error instanceof Error ? error.message : String(error),
       layer: 'dom',
       recoverable: category !== 'browser_disconnected',
-      shouldEscalate: true, // DOM failures should always try Stagehand next
     };
   }
 }

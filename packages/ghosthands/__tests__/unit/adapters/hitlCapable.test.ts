@@ -249,9 +249,13 @@ describe('createAdapter factory', () => {
   });
 
   test('createAdapter throws for unimplemented adapters', () => {
-    expect(() => createAdapter('stagehand')).toThrow('not yet implemented');
     expect(() => createAdapter('actionbook')).toThrow('not yet implemented');
     expect(() => createAdapter('hybrid')).toThrow('not yet implemented');
+  });
+
+  test('createAdapter creates stagehand adapter', () => {
+    const adapter = createAdapter('stagehand');
+    expect(adapter.type).toBe('stagehand');
   });
 
   test('createAdapter throws for unknown type', () => {

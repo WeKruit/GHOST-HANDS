@@ -85,10 +85,10 @@ services:
   # For VALET-routed workers, start via docker run with GH_WORKER_ID:
   #   docker run -d --env-file .env \
   #     -e GH_WORKER_ID=<sandbox-uuid> -e GH_HEADLESS=false \
-  #     ${ECR_IMAGE} bun packages/ghosthands/src/workers/main.ts
+  #     ${ECR_IMAGE} bun packages/ghosthands/src/workers/workerLauncher.ts
   worker:
     image: ${ECR_IMAGE:-ghosthands:latest}
-    command: ["bun", "packages/ghosthands/src/workers/main.ts"]
+    command: ["bun", "packages/ghosthands/src/workers/workerLauncher.ts"]
     network_mode: host
     env_file: .env
     environment:

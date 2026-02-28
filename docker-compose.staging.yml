@@ -82,7 +82,7 @@ services:
   # GhostHands Worker (default instance, no target routing)
   worker:
     image: ${ECR_IMAGE:-ghosthands:latest}
-    command: ["bun", "packages/ghosthands/src/workers/main.ts"]
+    command: ["bun", "packages/ghosthands/src/workers/workerLauncher.ts"]
     network_mode: host
     env_file: .env
     environment:

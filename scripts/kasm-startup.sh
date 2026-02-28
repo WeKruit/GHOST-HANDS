@@ -55,4 +55,4 @@ echo "[kasm-startup] API server PID=$API_PID" | tee -a "$LOG"
 
 # Start GH worker (foreground — Kasm monitors this process)
 echo "[kasm-startup] $(date -u +%FT%TZ) Starting worker..." | tee -a "$LOG"
-exec bun packages/ghosthands/src/workers/main.ts 2>&1 | tee -a "$WORKER_LOG"
+exec bun packages/ghosthands/src/workers/workerLauncher.ts 2>&1 | tee -a "$WORKER_LOG"

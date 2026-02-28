@@ -11,7 +11,7 @@ primary_region = "iad"
   MAX_CONCURRENT_JOBS = "2"
 
 [processes]
-  worker = "bun packages/ghosthands/src/workers/main.ts"
+  worker = "bun packages/ghosthands/src/workers/workerLauncher.ts"
 
 [[vm]]
   size = "performance-2x"

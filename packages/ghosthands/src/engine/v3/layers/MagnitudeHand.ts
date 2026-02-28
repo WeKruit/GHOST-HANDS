@@ -4,11 +4,12 @@
  * Wraps existing MagnitudeAdapter from staging.
  * Uses adapter.exec() for cheap direct actions when possible.
  * Falls back to adapter.act() for complex interactions requiring LLM planning.
- * This is the top layer — throwError sets shouldEscalate=false.
+ * This is the top layer — throwError sets recoverable based on error type.
  */
 
 import { LayerHand } from '../LayerHand';
 import { VerificationEngine } from '../VerificationEngine';
+import { toV2FieldModel, toV2PageModel } from '../v2compat';
 import type {
   LayerContext,
   V3ObservationResult,
@@ -16,7 +17,6 @@ import type {
   PlannedAction,
   ExecutionResult,
   ReviewResult,
-  AnalysisResult,
   LayerError,
   FormField,
 } from '../types';
@@ -33,7 +33,7 @@ export class MagnitudeHand extends LayerHand {
   constructor(private adapter: BrowserAutomationAdapter) {
     super();
     // Track token costs from adapter events
-    this.adapter.on('tokensUsed', (usage: any) => {
+    this.adapter.on('tokensUsed', (usage: { inputCost?: number; outputCost?: number }) => {
       this.totalTokenCost += (usage.inputCost ?? 0) + (usage.outputCost ?? 0);
     });
   }
@@ -52,7 +52,7 @@ export class MagnitudeHand extends LayerHand {
 
       fields = await Promise.all(
         elements.map(async (el, i) => {
-          const info = await ctx.page.evaluate((selector) => {
+          const info = await ctx.page.evaluate((selector: string) => {
             const element = document.querySelector(selector);
             if (!element) return null;
             const rect = element.getBoundingClientRect();
@@ -89,12 +89,13 @@ export class MagnitudeHand extends LayerHand {
       );
     }
 
+    // P2-1: CSS.escape for button IDs
     const buttons = await ctx.page.evaluate(() => {
       const btns = document.querySelectorAll('button, input[type="submit"], [role="button"]');
       return Array.from(btns).map((b) => {
         const rect = b.getBoundingClientRect();
         return {
-          selector: b.id ? `#${b.id}` : '',
+          selector: b.id ? `#${CSS.escape(b.id)}` : '',
           text: (b.textContent || '').trim(),
           disabled: (b as HTMLButtonElement).disabled || false,
           boundingBox: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
@@ -124,47 +125,35 @@ export class MagnitudeHand extends LayerHand {
     const { getPlatformHandler } = await import('../platforms');
 
     const userData = ctx.userProfile as Record<string, string>;
-    const qaAnswers = (ctx.userProfile as any)?.qaAnswers ?? {};
+    const qaAnswers = (ctx.userProfile as Record<string, unknown>)?.qaAnswers as Record<string, string> ?? {};
     const matcher = new FieldMatcher(userData, qaAnswers, getPlatformHandler(observation.platform));
 
-    const pageModel = {
-      url: observation.url,
-      platform: observation.platform,
-      pageType: observation.pageType,
-      fields: observation.fields.map((f) => ({
-        id: f.id,
-        selector: f.selector,
-        automationId: f.automationId,
-        name: f.name,
-        fieldType: f.fieldType as any,
-        fillStrategy: 'tier0' as any,
-        isRequired: f.required,
-        isVisible: f.visible,
-        isDisabled: f.disabled,
-        label: f.label || f.stagehandDescription || '',
-        placeholder: f.placeholder,
-        ariaLabel: f.ariaLabel,
-        currentValue: f.currentValue ?? '',
-        isEmpty: !f.currentValue || f.currentValue.trim() === '',
-        boundingBox: f.boundingBox ?? { x: 0, y: 0, width: 0, height: 0 },
-        absoluteY: f.boundingBox?.y ?? 0,
-      })),
-      buttons: [],
-      timestamp: observation.timestamp,
-    };
+    // Use stagehand descriptions as label fallback
+    const pageModel = toV2PageModel(observation);
+    for (let i = 0; i < pageModel.fields.length; i++) {
+      const v3Field = observation.fields[i];
+      if ((!pageModel.fields[i].label || pageModel.fields[i].label.trim() === '') && v3Field?.stagehandDescription) {
+        pageModel.fields[i].label = v3Field.stagehandDescription;
+      }
+    }
 
-    const { matches, unmatched } = matcher.match(pageModel as any);
+    const { matches } = matcher.match(pageModel);
 
-    // For unmatched fields, Magnitude can use LLM to infer
-    // (deferred to analyze() to avoid unnecessary LLM calls)
-
-    return matches.map((m) => ({
-      field: observation.fields.find((f) => f.id === m.field.id) ?? observation.fields[0],
-      userDataKey: m.userDataKey,
-      value: m.value,
-      confidence: m.confidence,
-      matchMethod: m.matchMethod as FieldMatch['matchMethod'],
-    }));
+    // Filter out matches where the v3 field can't be found — falling back to fields[0]
+    // would silently map the wrong value to the wrong field.
+    return matches
+      .map((m) => {
+        const v3Field = observation.fields.find((f) => f.id === m.field.id);
+        if (!v3Field) return null;
+        return {
+          field: v3Field,
+          userDataKey: m.userDataKey,
+          value: m.value,
+          confidence: m.confidence,
+          matchMethod: m.matchMethod as FieldMatch['matchMethod'],
+        };
+      })
+      .filter((m): m is FieldMatch => m !== null);
   }
 
   async execute(actions: PlannedAction[], ctx: LayerContext): Promise<ExecutionResult[]> {
@@ -233,21 +222,7 @@ export class MagnitudeHand extends LayerHand {
         continue;
       }
 
-      const v2Field = {
-        id: action.field.id,
-        selector: action.field.selector,
-        fieldType: action.field.fieldType as any,
-        fillStrategy: 'tier0' as any,
-        isRequired: action.field.required,
-        isVisible: true,
-        isDisabled: false,
-        label: action.field.label,
-        currentValue: '',
-        isEmpty: false,
-        boundingBox: action.field.boundingBox ?? { x: 0, y: 0, width: 0, height: 0 },
-        absoluteY: 0,
-      };
-
+      const v2Field = toV2FieldModel(action.field);
       const verification = await verifier.verify(v2Field, action.value);
       reviews.push({
         verified: verification.passed,
@@ -262,69 +237,6 @@ export class MagnitudeHand extends LayerHand {
     return reviews;
   }
 
-  async analyze(
-    observation: V3ObservationResult,
-    _history: V3ObservationResult[],
-    ctx: LayerContext,
-  ): Promise<AnalysisResult> {
-    // Full vision LLM analysis — most expensive but most thorough
-    const costBefore = this.totalTokenCost;
-
-    try {
-      const { z } = await import('zod');
-      const analysis = await this.adapter.extract(
-        'Analyze this page. List all form fields that still need to be filled, including any conditional fields that may have appeared. For each field, provide its label, type, and suggested value if possible.',
-        z.object({
-          fields: z.array(z.object({
-            label: z.string(),
-            type: z.string(),
-            suggestedValue: z.string().optional(),
-            selector: z.string().optional(),
-          })),
-        }),
-      );
-
-      const knownSelectors = new Set(observation.fields.map((f) => f.selector));
-      const discoveredFields: FormField[] = analysis.fields
-        .filter((f: any) => f.selector && !knownSelectors.has(f.selector))
-        .map((f: any, i: number) => ({
-          id: `mag-analyze-${i}`,
-          selector: f.selector,
-          fieldType: 'unknown' as const,
-          label: f.label,
-          required: false,
-          visible: true,
-          disabled: false,
-        }));
-
-      const suggestedValues: FieldMatch[] = analysis.fields
-        .filter((f: any) => f.suggestedValue)
-        .map((f: any) => {
-          const existing = observation.fields.find(
-            (of) => of.label.toLowerCase() === f.label.toLowerCase(),
-          );
-          return existing
-            ? {
-                field: existing,
-                userDataKey: f.label,
-                value: f.suggestedValue!,
-                confidence: 0.7,
-                matchMethod: 'llm_inference' as const,
-              }
-            : null;
-        })
-        .filter(Boolean) as FieldMatch[];
-
-      return {
-        discoveredFields,
-        suggestedValues,
-        costIncurred: this.totalTokenCost - costBefore,
-      };
-    } catch {
-      return { discoveredFields: [], suggestedValues: [], costIncurred: this.totalTokenCost - costBefore };
-    }
-  }
-
   throwError(error: unknown, _ctx: LayerContext): LayerError {
     const category = this.classifyError(error);
     return {
@@ -332,7 +244,6 @@ export class MagnitudeHand extends LayerHand {
       message: error instanceof Error ? error.message : String(error),
       layer: 'magnitude',
       recoverable: category !== 'browser_disconnected' && category !== 'budget_exceeded',
-      shouldEscalate: false, // Top layer — nowhere to escalate
     };
   }
 
@@ -343,10 +254,6 @@ export class MagnitudeHand extends LayerHand {
    * Dramatically cheaper than act().
    */
   private async executeViaExec(action: PlannedAction): Promise<void> {
-    const bb = action.field.boundingBox!;
-    const centerX = bb.x + bb.width / 2;
-    const centerY = bb.y + bb.height / 2;
-
     if (action.actionType === 'fill' || action.actionType === 'clear_and_fill') {
       // Click the field, then type
       await this.adapter.exec!({ variant: 'click', target: action.field.label });

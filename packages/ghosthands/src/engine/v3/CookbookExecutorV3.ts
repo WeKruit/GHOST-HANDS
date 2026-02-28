@@ -19,14 +19,16 @@ import type {
   BoundingBox,
   ActionType,
 } from './types';
-import type { FieldModel } from './v2types';
+import type { FieldModel, ActionType as V2ActionType } from './v2types';
 import type { BrowserAutomationAdapter } from '../../adapters/types';
 
 export interface CookbookV3Result {
   success: boolean;
+  actionsTotal: number;
   actionsAttempted: number;
   actionsSucceeded: number;
   actionsFailed: number;
+  actionsSkipped: number;
   costIncurred: number;
   failedAt?: number;
   error?: string;
@@ -70,15 +72,23 @@ export class CookbookExecutorV3 {
   ): Promise<CookbookV3Result> {
     const result: CookbookV3Result = {
       success: false,
+      actionsTotal: entry.actions.length,
       actionsAttempted: 0,
       actionsSucceeded: 0,
       actionsFailed: 0,
+      actionsSkipped: 0,
       costIncurred: 0,
     };
 
-    const domExecutor = new DOMActionExecutor(page, { type: 'mock' } as any);
+    const stubAdapter = { type: 'stub', act: () => Promise.resolve({ success: false }) } as unknown as BrowserAutomationAdapter;
+    const domExecutor = new DOMActionExecutor(page, stubAdapter);
     const verifier = new VerificationEngine(page);
     let consecutiveFailures = 0;
+
+    // Wrap logEvent to swallow failures — telemetry must never abort execution
+    const safeLog = async (eventType: string, metadata: Record<string, unknown>) => {
+      try { await this.logEvent?.(eventType, metadata); } catch { /* swallow */ }
+    };
 
     for (let i = 0; i < entry.actions.length; i++) {
       const action = entry.actions[i];
@@ -86,7 +96,8 @@ export class CookbookExecutorV3 {
 
       // Skip low-health actions
       if (actionHealth < this.minActionHealth) {
-        await this.logEvent?.('cookbook_action_skipped', {
+        result.actionsSkipped++;
+        await safeLog('cookbook_action_skipped', {
           index: i,
           label: action.fieldSnapshot.label,
           health: actionHealth,
@@ -98,7 +109,8 @@ export class CookbookExecutorV3 {
       // Resolve template value
       const value = this.resolveTemplate(action.domAction.valueTemplate, userData);
       if (value === null) {
-        await this.logEvent?.('cookbook_action_skipped', {
+        result.actionsSkipped++;
+        await safeLog('cookbook_action_skipped', {
           index: i,
           label: action.fieldSnapshot.label,
           reason: 'unresolvable_template',
@@ -120,7 +132,7 @@ export class CookbookExecutorV3 {
       if (domSuccess) {
         result.actionsSucceeded++;
         consecutiveFailures = 0;
-        await this.logEvent?.('cookbook_action_success', {
+        await safeLog('cookbook_action_success', {
           index: i,
           label: action.fieldSnapshot.label,
           strategy: 'dom',
@@ -130,12 +142,12 @@ export class CookbookExecutorV3 {
 
       // Strategy 2: GUI fallback via Magnitude exec() (cheap)
       if (this.adapter?.exec && action.guiAction) {
-        const guiSuccess = await this.tryGUIReplay(action, value);
+        const guiSuccess = await this.tryGUIReplay(action, value, verifier);
         if (guiSuccess) {
           result.actionsSucceeded++;
           result.costIncurred += 0.001; // Cheap exec() call
           consecutiveFailures = 0;
-          await this.logEvent?.('cookbook_action_success', {
+          await safeLog('cookbook_action_success', {
             index: i,
             label: action.fieldSnapshot.label,
             strategy: 'gui',
@@ -148,7 +160,7 @@ export class CookbookExecutorV3 {
       result.actionsFailed++;
       consecutiveFailures++;
 
-      await this.logEvent?.('cookbook_action_failed', {
+      await safeLog('cookbook_action_failed', {
         index: i,
         label: action.fieldSnapshot.label,
       });
@@ -160,8 +172,17 @@ export class CookbookExecutorV3 {
       }
     }
 
-    // Success if we completed more than half the actions
-    result.success = result.actionsSucceeded > 0 &&
+    // Success requires ALL of:
+    // 1. We attempted >75% of total actions (skips count against us)
+    // 2. At least one action succeeded
+    // 3. Failures are ≤30% of succeeded count
+    // This prevents "half the page skipped" from being treated as success.
+    const attemptRatio = result.actionsTotal > 0
+      ? result.actionsAttempted / result.actionsTotal
+      : 0;
+    result.success =
+      attemptRatio > 0.75 &&
+      result.actionsSucceeded > 0 &&
       result.actionsFailed <= result.actionsSucceeded * 0.3;
 
     return result;
@@ -177,30 +198,28 @@ export class CookbookExecutorV3 {
     verifier: VerificationEngine,
   ): Promise<boolean> {
     try {
-      const v2Field: FieldModel = {
+      const { toV2FieldModel } = await import('./v2compat');
+      const v2Field = toV2FieldModel({
         id: action.fieldSnapshot.id,
         selector: action.fieldSnapshot.selector,
         automationId: action.fieldSnapshot.automationId,
         name: action.fieldSnapshot.name,
-        fieldType: action.fieldSnapshot.fieldType as any,
-        fillStrategy: 'native_setter',
-        isRequired: action.fieldSnapshot.required ?? false,
-        isVisible: true,
-        isDisabled: false,
+        fieldType: action.fieldSnapshot.fieldType,
         label: action.fieldSnapshot.label,
         placeholder: action.fieldSnapshot.placeholder,
         ariaLabel: action.fieldSnapshot.ariaLabel,
+        required: action.fieldSnapshot.required ?? false,
+        visible: true,
+        disabled: false,
         currentValue: '',
-        isEmpty: true,
-        boundingBox: action.fieldSnapshot.boundingBox ?? { x: 0, y: 0, width: 0, height: 0 },
-        absoluteY: action.fieldSnapshot.boundingBox?.y ?? 0,
-      };
+        boundingBox: action.fieldSnapshot.boundingBox,
+      });
 
       const execResult = await executor.execute({
         field: v2Field,
         value,
         tier: 0,
-        action: action.domAction.action as any,
+        action: action.domAction.action as V2ActionType,
         retryCount: 0,
         maxRetries: 1,
       });
@@ -217,10 +236,12 @@ export class CookbookExecutorV3 {
 
   /**
    * Try GUI replay: use coordinate-based click/type via adapter.exec().
+   * Verifies the field value was actually applied — no-exception is NOT enough.
    */
   private async tryGUIReplay(
     action: CookbookAction,
     value: string,
+    verifier: VerificationEngine,
   ): Promise<boolean> {
     if (!this.adapter?.exec || !action.guiAction) return false;
 
@@ -242,6 +263,31 @@ export class CookbookExecutorV3 {
           target: action.fieldSnapshot.label,
         });
       }
+
+      // Verify the value was actually applied — exec() succeeding without
+      // exception does NOT mean the field was correctly filled.
+      if (action.guiAction.variant === 'type') {
+        const { toV2FieldModel } = await import('./v2compat');
+        const v2Field = toV2FieldModel({
+          id: action.fieldSnapshot.id,
+          selector: action.fieldSnapshot.selector,
+          automationId: action.fieldSnapshot.automationId,
+          name: action.fieldSnapshot.name,
+          fieldType: action.fieldSnapshot.fieldType,
+          label: action.fieldSnapshot.label,
+          placeholder: action.fieldSnapshot.placeholder,
+          ariaLabel: action.fieldSnapshot.ariaLabel,
+          required: action.fieldSnapshot.required ?? false,
+          visible: true,
+          disabled: false,
+          currentValue: '',
+          boundingBox: action.fieldSnapshot.boundingBox,
+        });
+        const verification = await verifier.verify(v2Field, value);
+        return verification.passed;
+      }
+
+      // Click actions don't have a value to verify
       return true;
     } catch {
       return false;

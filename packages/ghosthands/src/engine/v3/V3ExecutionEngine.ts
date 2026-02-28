@@ -3,13 +3,18 @@
  *
  * Replaces ExecutionEngine (v1) when engine_version=3.
  *
- * Flow:
- *   1. Try CookbookExecutorV3 (DOM-first replay) — nearly free
- *   2. On failure → SectionOrchestrator (3-layer escalation)
- *   3. Record successful runs for future cookbook replay
+ * Execution modes:
+ *   - 'auto'          → cookbook first, then 3-layer orchestrator as fallback (default)
+ *   - 'hybrid'        → skip cookbook, go straight to 3-layer orchestrator
+ *   - 'ai_only'       → skip cookbook, go straight to 3-layer orchestrator
+ *   - 'cookbook_only'  → cookbook only, fail if no manual exists or cookbook fails
  *
  * The SectionOrchestrator handles the observe→match→plan→execute→review loop
  * across all three layers (DOM → Stagehand → Magnitude).
+ *
+ * Note: 'smart_apply' and 'agent_apply' modes are handled by their respective
+ * TaskHandlers (SmartApplyHandler, AgentApplyHandler) in the job executor,
+ * not by this engine.
  */
 
 import { SectionOrchestrator, type OrchestratorResult } from './SectionOrchestrator';
@@ -28,6 +33,9 @@ import type { CostTracker } from '../../workers/costControl';
 import type { ProgressTracker } from '../../workers/progressTracker';
 
 // ── Types ────────────────────────────────────────────────────────────────
+
+/** Execution modes supported by the V3 engine */
+export type V3ExecutionMode = 'auto' | 'hybrid' | 'ai_only' | 'cookbook_only';
 
 export interface V3ExecutionResult {
   success: boolean;
@@ -55,6 +63,8 @@ export interface V3ExecutionParams {
   budgetUsd?: number;
   /** Optional secondary adapter for Stagehand layer */
   stagehandAdapter?: BrowserAutomationAdapter;
+  /** Execution mode — defaults to 'auto' (cookbook → orchestrator) */
+  executionMode?: V3ExecutionMode;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────
@@ -85,57 +95,119 @@ export class V3ExecutionEngine {
       errors: [],
     };
 
+    // Helper: log without aborting the run on transient failures
+    const safeLog = async (eventType: string, metadata: Record<string, unknown>) => {
+      try { await params.logEvent(eventType, metadata); } catch { /* swallow */ }
+    };
+
+    const mode = params.executionMode ?? 'auto';
+    await safeLog('v3_execution_mode', { mode });
+
+    // ── cookbook_only: fail fast if no cookbook ──────────────────────
+    if (mode === 'cookbook_only' && !params.cookbook) {
+      result.errors.push('cookbook_only mode requested but no cookbook available');
+      await safeLog('v3_cookbook_only_no_manual', {});
+      return result;
+    }
+
+    // ── Skip cookbook for hybrid/ai_only modes ──────────────────────
+    const tryCookbook = (mode === 'auto' || mode === 'cookbook_only') && params.cookbook;
+
     // ── Step 1: Try cookbook replay if available ──────────────────────
-    if (params.cookbook) {
-      await params.logEvent('v3_mode_selected', { mode: 'cookbook' });
+    if (tryCookbook) {
+      await safeLog('v3_mode_selected', { mode: 'cookbook' });
       params.costTracker?.setMode?.('cookbook');
       params.progress?.setExecutionMode?.('cookbook');
 
-      const cookbookExecutor = new CookbookExecutorV3({
-        adapter: params.adapter,
-        logEvent: params.logEvent,
-      });
-
-      const userData = params.userProfile as Record<string, string>;
-      const cookbookResult = await cookbookExecutor.execute(
-        params.page,
-        params.cookbook,
-        userData,
-      );
-
-      result.cookbookResult = cookbookResult;
-      totalCost += cookbookResult.costIncurred;
-
-      if (cookbookResult.success) {
-        result.success = true;
-        result.mode = 'cookbook';
-        result.totalCost = totalCost;
-        result.actionsExecuted = cookbookResult.actionsAttempted;
-        result.actionsVerified = cookbookResult.actionsSucceeded;
-
-        await params.logEvent('v3_cookbook_success', {
-          actions_attempted: cookbookResult.actionsAttempted,
-          actions_succeeded: cookbookResult.actionsSucceeded,
-          cost: totalCost,
+      try {
+        const cookbookExecutor = new CookbookExecutorV3({
+          adapter: params.adapter,
+          logEvent: params.logEvent,
         });
 
-        return result;
-      }
+        const userData = params.userProfile as Record<string, string>;
+        const cookbookResult = await cookbookExecutor.execute(
+          params.page,
+          params.cookbook!,
+          userData,
+        );
 
-      await params.logEvent('v3_cookbook_failed', {
-        reason: cookbookResult.error ?? 'insufficient_success_rate',
-        actions_failed: cookbookResult.actionsFailed,
-      });
+        result.cookbookResult = cookbookResult;
+        totalCost += cookbookResult.costIncurred;
+
+        // Sync cookbook cost into CostTracker for system-wide tracking
+        try {
+          if (cookbookResult.costIncurred > 0) {
+            params.costTracker.recordTokenUsage({
+              inputTokens: 0,
+              outputTokens: 0,
+              inputCost: cookbookResult.costIncurred,
+              outputCost: 0,
+            });
+          }
+          for (let i = 0; i < cookbookResult.actionsAttempted; i++) {
+            params.costTracker.recordAction();
+          }
+        } catch {
+          // CostTracker budget/action limit exceeded — cookbook already tracks internally
+        }
+
+        if (cookbookResult.success) {
+          result.success = true;
+          result.mode = 'cookbook';
+          result.totalCost = totalCost;
+          result.actionsExecuted = cookbookResult.actionsAttempted;
+          result.actionsVerified = cookbookResult.actionsSucceeded;
+          result.actionsFailed = cookbookResult.actionsFailed;
+
+          await safeLog('v3_cookbook_success', {
+            actions_attempted: cookbookResult.actionsAttempted,
+            actions_succeeded: cookbookResult.actionsSucceeded,
+            actions_failed: cookbookResult.actionsFailed,
+            actions_skipped: cookbookResult.actionsSkipped,
+            cost: totalCost,
+          });
+
+          return result;
+        }
+
+        await safeLog('v3_cookbook_failed', {
+          reason: cookbookResult.error ?? 'insufficient_success_rate',
+          actions_failed: cookbookResult.actionsFailed,
+        });
+
+        // cookbook_only: do NOT fall through to orchestrator
+        if (mode === 'cookbook_only') {
+          result.errors.push('cookbook_only mode: cookbook failed, not escalating');
+          result.totalCost = totalCost;
+          return result;
+        }
+      } catch (cookbookErr) {
+        // Cookbook failure (including logging errors) should NOT abort the entire run.
+        // Fall through to orchestrator (unless cookbook_only mode).
+        await safeLog('v3_cookbook_error', {
+          error: cookbookErr instanceof Error ? cookbookErr.message : String(cookbookErr),
+        });
+
+        if (mode === 'cookbook_only') {
+          result.errors.push(`cookbook_only mode: cookbook threw: ${cookbookErr instanceof Error ? cookbookErr.message : String(cookbookErr)}`);
+          result.totalCost = totalCost;
+          return result;
+        }
+      }
     }
 
     // ── Step 2: SectionOrchestrator (3-layer escalation) ────────────
-    await params.logEvent('v3_mode_selected', { mode: 'v3_orchestrator' });
-    params.costTracker?.setMode?.('hybrid' as any);
-    params.progress?.setExecutionMode?.('hybrid' as any);
+    await safeLog('v3_mode_selected', { mode: 'v3_orchestrator' });
+    params.costTracker?.setMode?.('hybrid');
+    // ProgressTracker only supports 'cookbook'|'magnitude'; use 'magnitude' as closest match
+    params.progress?.setExecutionMode?.('magnitude');
 
     // Build layer stack
     const layers: LayerHand[] = [new DOMHand()];
 
+    // StagehandHand is optional — enables DOM→Stagehand→Magnitude escalation path.
+    // Without it, the orchestrator escalates directly from DOMHand to MagnitudeHand.
     if (params.stagehandAdapter) {
       layers.push(new StagehandHand(params.stagehandAdapter));
     }
@@ -153,10 +225,10 @@ export class V3ExecutionEngine {
       platformHint: params.platformHint,
       cookbook: params.cookbook,
       logger: {
-        info: (msg, meta) => params.logEvent('v3_info', { message: msg, ...meta }),
-        warn: (msg, meta) => params.logEvent('v3_warn', { message: msg, ...meta }),
-        error: (msg, meta) => params.logEvent('v3_error', { message: msg, ...meta }),
-        debug: (msg, meta) => params.logEvent('v3_debug', { message: msg, ...meta }),
+        info: (msg, meta) => { params.logEvent('v3_info', { message: msg, ...meta }).catch(() => {}); },
+        warn: (msg, meta) => { params.logEvent('v3_warn', { message: msg, ...meta }).catch(() => {}); },
+        error: (msg, meta) => { params.logEvent('v3_error', { message: msg, ...meta }).catch(() => {}); },
+        debug: (msg, meta) => { params.logEvent('v3_debug', { message: msg, ...meta }).catch(() => {}); },
       },
     };
 
@@ -171,7 +243,28 @@ export class V3ExecutionEngine {
       result.errors = orchResult.errors;
       totalCost += orchResult.totalCost;
 
-      await params.logEvent('v3_orchestrator_complete', {
+      // Sync orchestrator cost into CostTracker for system-wide tracking.
+      // Record cost in a single call, then record action count separately.
+      // Do NOT call recordModeStep('magnitude') for every action — the orchestrator
+      // uses a mix of DOM (free), Stagehand (cheap), and Magnitude (expensive) layers.
+      // We don't have per-layer action counts here, so only record the aggregate cost.
+      try {
+        if (orchResult.totalCost > 0) {
+          params.costTracker.recordTokenUsage({
+            inputTokens: 0,
+            outputTokens: 0,
+            inputCost: orchResult.totalCost,
+            outputCost: 0,
+          });
+        }
+        for (let i = 0; i < orchResult.actionsExecuted; i++) {
+          params.costTracker.recordAction();
+        }
+      } catch {
+        // CostTracker budget/action limit exceeded — orchestrator already handles budget internally
+      }
+
+      await safeLog('v3_orchestrator_complete', {
         success: orchResult.success,
         pages: orchResult.pagesProcessed,
         actions_executed: orchResult.actionsExecuted,
@@ -181,7 +274,7 @@ export class V3ExecutionEngine {
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       result.errors.push(errorMsg);
-      await params.logEvent('v3_orchestrator_error', { error: errorMsg });
+      await safeLog('v3_orchestrator_error', { error: errorMsg });
     }
 
     result.totalCost = totalCost;

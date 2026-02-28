@@ -16,4 +16,5 @@ export {
   buildSelfIdentifyPrompt,
   buildGenericPagePrompt,
   buildGoogleSignInFallbackPrompt,
+  type SelfIdFields,
 } from './workday/workdayPrompts.js';

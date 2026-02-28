@@ -173,7 +173,7 @@ start_targeted_worker() {
     --label "$WORKER_LABEL" \
     --label "gh.worker_id=$worker_id" \
     --label "gh.status_port=$status_port" \
-    "$image" bun packages/ghosthands/src/workers/main.ts
+    "$image" bun packages/ghosthands/src/workers/workerLauncher.ts
 
   log "Worker $name started"
   echo "WORKER_NAME=$name"
