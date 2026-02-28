@@ -84,11 +84,6 @@ export const JOB_TYPE_BUDGET_OVERRIDES: Record<string, number> = {
   workday_apply: 2.00,
 };
 
-/** Per-job-type budget overrides (in USD) — bypasses quality preset when present */
-export const JOB_TYPE_BUDGET_OVERRIDES: Record<string, number> = {
-  workday_apply: 2.00,
-};
-
 /** Per-user monthly budget (in USD) by subscription tier */
 export const MONTHLY_BUDGET: Record<BudgetTier, number> = {
   free: 0.50,
