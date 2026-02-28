@@ -229,6 +229,11 @@ export class CostTracker {
   getActionLimit(): number {
     return this.actionLimit;
   }
+
+  /** How much budget remains for this task. */
+  getRemainingBudget(): number {
+    return Math.max(0, this.taskBudget - (this.inputCost + this.outputCost));
+  }
 }
 
 // ---------------------------------------------------------------------------
