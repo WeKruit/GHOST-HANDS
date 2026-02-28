@@ -69,7 +69,16 @@ export class ApplyHandler implements TaskHandler {
     const page_type = pageState?.page_type ?? 'unknown';
 
     if (page_type === 'confirmation') {
-      return { success: true, data: { message: 'Application submitted successfully', page_type, evidence: pageState?.evidence } };
+      return {
+        success: true,
+        data: {
+          submitted: true,
+          success_message: 'Application submitted successfully',
+          message: 'Application submitted successfully',
+          page_type,
+          evidence: pageState?.evidence,
+        },
+      };
     }
 
     if (page_type === 'review') {
@@ -77,7 +86,12 @@ export class ApplyHandler implements TaskHandler {
         success: false,
         awaitingUserReview: true,
         keepBrowserOpen: true,
-        data: { message: 'Application reached review page — awaiting user submission', page_type, evidence: pageState?.evidence },
+        data: {
+          submitted: false,
+          message: 'Application reached review page — awaiting user submission',
+          page_type,
+          evidence: pageState?.evidence,
+        },
       };
     }
 
@@ -87,7 +101,7 @@ export class ApplyHandler implements TaskHandler {
       error: page_type === 'in_progress'
         ? 'Application form still in progress after agent execution'
         : 'Could not confirm application was submitted',
-      data: { page_type, evidence: pageState?.evidence },
+      data: { submitted: false, page_type, evidence: pageState?.evidence },
     };
   }
 }

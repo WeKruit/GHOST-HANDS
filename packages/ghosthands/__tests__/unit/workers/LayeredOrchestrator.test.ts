@@ -588,4 +588,208 @@ describe('LayeredOrchestrator', () => {
       expect(invalid.errors!.length).toBeGreaterThan(0);
     });
   });
+
+  // =========================================================================
+  // ApplyHandler result payload
+  // =========================================================================
+
+  describe('ApplyHandler', () => {
+    test('has correct type and validates input', async () => {
+      const { ApplyHandler } = await import('../../../src/workers/taskHandlers/applyHandler.js');
+      const handler = new ApplyHandler();
+      expect(handler.type).toBe('apply');
+
+      const valid = handler.validate!({ user_data: { first_name: 'Jane', last_name: 'Doe', email: 'jane@example.com' } });
+      expect(valid.valid).toBe(true);
+
+      const invalid = handler.validate!({ user_data: { first_name: '', last_name: '', email: 'bad' } });
+      expect(invalid.valid).toBe(false);
+    });
+
+    test('confirmation page returns success with submitted=true and success_message', async () => {
+      const { ApplyHandler } = await import('../../../src/workers/taskHandlers/applyHandler.js');
+      const handler = new ApplyHandler();
+
+      const adapter = createMockAdapter({
+        extract: vi.fn().mockResolvedValue({ page_type: 'confirmation', evidence: 'Thank you for applying' }),
+      });
+      const ctx = {
+        job: { task_description: 'Apply to job', input_data: { user_data: { first_name: 'Jane' } }, target_url: 'https://example.com' },
+        adapter,
+        dataPrompt: 'User data here',
+      } as any;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      expect(result.data?.submitted).toBe(true);
+      expect(result.data?.success_message).toBe('Application submitted successfully');
+      expect(result.data?.page_type).toBe('confirmation');
+    });
+
+    test('review page returns awaitingUserReview with submitted=false', async () => {
+      const { ApplyHandler } = await import('../../../src/workers/taskHandlers/applyHandler.js');
+      const handler = new ApplyHandler();
+
+      const adapter = createMockAdapter({
+        extract: vi.fn().mockResolvedValue({ page_type: 'review', evidence: 'Submit button visible' }),
+      });
+      const ctx = {
+        job: { task_description: 'Apply to job', input_data: { user_data: { first_name: 'Jane' } }, target_url: 'https://example.com' },
+        adapter,
+        dataPrompt: 'User data here',
+      } as any;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect(result.awaitingUserReview).toBe(true);
+      expect(result.keepBrowserOpen).toBe(true);
+      expect(result.data?.submitted).toBe(false);
+      expect(result.data?.page_type).toBe('review');
+    });
+
+    test('in_progress page returns failure with submitted=false', async () => {
+      const { ApplyHandler } = await import('../../../src/workers/taskHandlers/applyHandler.js');
+      const handler = new ApplyHandler();
+
+      const adapter = createMockAdapter({
+        extract: vi.fn().mockResolvedValue({ page_type: 'in_progress', evidence: 'Form fields still visible' }),
+      });
+      const ctx = {
+        job: { task_description: 'Apply to job', input_data: { user_data: { first_name: 'Jane' } }, target_url: 'https://example.com' },
+        adapter,
+        dataPrompt: 'User data here',
+      } as any;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('still in progress');
+      expect(result.data?.submitted).toBe(false);
+      expect(result.data?.page_type).toBe('in_progress');
+    });
+
+    test('unknown page type returns failure with submitted=false', async () => {
+      const { ApplyHandler } = await import('../../../src/workers/taskHandlers/applyHandler.js');
+      const handler = new ApplyHandler();
+
+      const adapter = createMockAdapter({
+        extract: vi.fn().mockResolvedValue({ page_type: 'unknown' }),
+      });
+      const ctx = {
+        job: { task_description: 'Apply to job', input_data: { user_data: { first_name: 'Jane' } }, target_url: 'https://example.com' },
+        adapter,
+        dataPrompt: 'User data here',
+      } as any;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Could not confirm');
+      expect(result.data?.submitted).toBe(false);
+    });
+
+    test('act() failure returns error without extracting page state', async () => {
+      const { ApplyHandler } = await import('../../../src/workers/taskHandlers/applyHandler.js');
+      const handler = new ApplyHandler();
+
+      const adapter = createMockAdapter({
+        act: vi.fn().mockResolvedValue({ success: false, message: 'element not found', durationMs: 50 }),
+      });
+      const ctx = {
+        job: { task_description: 'Apply to job', input_data: { user_data: { first_name: 'Jane' } }, target_url: 'https://example.com' },
+        adapter,
+        dataPrompt: 'User data here',
+      } as any;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Action failed');
+      expect(adapter.extract).not.toHaveBeenCalled();
+    });
+
+    test('extract failure treats page as unknown', async () => {
+      const { ApplyHandler } = await import('../../../src/workers/taskHandlers/applyHandler.js');
+      const handler = new ApplyHandler();
+
+      const adapter = createMockAdapter({
+        extract: vi.fn().mockRejectedValue(new Error('LLM timeout')),
+      });
+      const ctx = {
+        job: { task_description: 'Apply to job', input_data: { user_data: { first_name: 'Jane' } }, target_url: 'https://example.com' },
+        adapter,
+        dataPrompt: 'User data here',
+      } as any;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect(result.data?.submitted).toBe(false);
+    });
+  });
+
+  // =========================================================================
+  // Single-page multi-mode: DOM → LLM → MagnitudeHand on same adapter
+  // =========================================================================
+
+  describe('single-page multi-mode sequencing', () => {
+    test('DOM fill → LLM fill → MagnitudeHand on same page with shared adapter', async () => {
+      const adapter = createMockAdapter();
+
+      // Track all act() calls to verify sequencing
+      const actCalls: string[] = [];
+      (adapter.act as Mock).mockImplementation(async (prompt: string) => {
+        actCalls.push(prompt.substring(0, 60));
+        return { success: true, message: 'done', durationMs: 100 };
+      });
+
+      // page.evaluate: return different values based on call context
+      // The mock needs to handle many evaluate calls. We let it default to false/falsy
+      // but override specific behaviors.
+      let urlIdx = 0;
+      (adapter.getCurrentUrl as Mock).mockImplementation(() => `https://example.com/page${++urlIdx}`);
+
+      const nameField = makeField('First Name', 'text');
+      const dropdownField = makeField('Department', 'custom_dropdown');
+      const radioField = makeField('Shift', 'aria_radio');
+
+      const config = createMockConfig({
+        detectPageByUrl: vi.fn()
+          .mockReturnValueOnce(null)
+          .mockReturnValue({ page_type: 'review', page_title: 'Review' }),
+        detectPageByDOM: vi.fn().mockResolvedValue({ page_type: 'questions', page_title: 'Form' }),
+        scanPageFields: vi.fn().mockResolvedValue({
+          fields: [nameField, dropdownField, radioField],
+          scrollHeight: 1000,
+          viewportHeight: 800,
+        }),
+        // DOM fill: succeeds for text field, fails for dropdown and radio
+        fillScannedField: vi.fn().mockImplementation(async (_adapter: any, field: ScannedField) => {
+          if (field.kind === 'text') return true;
+          return false; // dropdown and radio fail DOM fill → escalate to LLM
+        }),
+        clickNextButton: vi.fn().mockResolvedValue('review_detected'),
+        detectValidationErrors: vi.fn().mockResolvedValue(false),
+      });
+
+      const orchestrator = buildOrchestrator({ adapter, config });
+      const result = await orchestrator.run(defaultRunParams);
+
+      // Phase 1: DOM fill should have been called for all 3 fields
+      expect(config.fillScannedField).toHaveBeenCalled();
+
+      // Phase 2 + 2.75: LLM and/or MagnitudeHand should have been invoked
+      // because dropdown and radio failed DOM fill
+      // adapter.act should have been called (for LLM fill and/or MagnitudeHand)
+      expect(adapter.act).toHaveBeenCalled();
+
+      // Result should be successful (reached review)
+      expect(result.success).toBe(true);
+      expect(result.awaitingUserReview).toBe(true);
+      // DOM filled at least 1 (text field)
+      expect(result.domFilled).toBeGreaterThanOrEqual(1);
+    });
+  });
 });
