@@ -26,6 +26,9 @@ COPY package.json bun.lock turbo.json ./
 COPY packages/ghosthands/package.json packages/ghosthands/
 COPY scripts/package.json scripts/
 
+# Copy patches for patchedDependencies (e.g. stagehand)
+COPY patches/ patches/
+
 # Install dependencies (magnitude-core and magnitude-extract come from npm)
 RUN bun install --frozen-lockfile
 
