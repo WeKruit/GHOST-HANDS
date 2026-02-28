@@ -67,6 +67,9 @@ export const PLACEHOLDER_RE = /^(select|choose|pick|--|—)/i;
 // Max options to probe per combobox — beyond this it's likely a data-entry field
 // (e.g. country picker), not a conditional trigger
 export const MAX_PROBE_OPTIONS = 20;
+// For large dropdowns (> MAX_PROBE_OPTIONS), sample this many options to detect conditionals.
+// Higher = more country-specific fields discovered, but slower.
+export const SAMPLE_PROBE_COUNT = 10;
 
 // ── Helpers ──────────────────────────────────────────────────
 
@@ -90,14 +93,41 @@ export async function injectHelpers(page: Page) {
         // 1. aria-labelledby
         var lblBy = el.getAttribute('aria-labelledby');
         if (lblBy) {
+          // For Workday selectinputs, the container holds both the label refs AND value refs.
+          // Skip any referenced element inside the selectinput/combobox container (those are displayed values).
+          var uxiC = el.closest('[data-uxi-widget-type]') || el.closest('[role="combobox"]');
           var t = lblBy.split(/\\s+/)
-            .map(function(id) { var r = document.getElementById(id); return r ? r.textContent.trim() : ''; })
+            .map(function(id) {
+              var r = document.getElementById(id);
+              if (!r) return '';
+              // Skip refs inside the widget container (current value, "Required" text, etc.)
+              if (uxiC && uxiC.contains(r)) return '';
+              // Skip refs inside el itself
+              if (el.contains(r)) return '';
+              return r.textContent.trim();
+            })
             .filter(Boolean).join(' ');
           if (t) return t;
         }
         // 2. aria-label
         var al = el.getAttribute('aria-label');
-        if (al) return al.trim();
+        if (al) {
+          al = al.trim();
+          // Workday dropdown buttons bake "Label + CurrentValue + Required" into aria-label.
+          // Strip the current value (textContent) and "Required" to get the clean label.
+          if (el.getAttribute('aria-haspopup') === 'listbox' && el.textContent) {
+            var val = el.textContent.trim();
+            if (val && al.includes(val)) {
+              al = al.replace(val, '');
+              if (/\\bRequired\\b/i.test(al)) {
+                el.dataset.ffRequired = 'true';
+                al = al.replace(/\\s*Required\\s*/gi, ' ');
+              }
+              al = al.replace(/\\s+/g, ' ').trim();
+            }
+          }
+          if (al) return al;
+        }
         // 3. label[for]
         if (el.id) {
           var lbl = document.querySelector('label[for="' + el.id + '"]');
@@ -173,6 +203,9 @@ export async function extractFields(page: Page): Promise<FormField[]> {
         return true;
       // Skip elements inside intl-tel-input dropdown panels (country code picker internals)
       if (el.closest('.iti__dropdown-content'))
+        return true;
+      // Skip elements inside Workday dropdown portals (activeListContainer)
+      if (el.closest('[data-automation-id="activeListContainer"]'))
         return true;
       // Skip standalone role="listbox" inside a role="combobox" (it's the popup)
       if (
@@ -291,7 +324,8 @@ export async function extractFields(page: Page): Promise<FormField[]> {
         required:
           el.required ||
           el.getAttribute("aria-required") === "true" ||
-          el.dataset.required === "true",
+          el.dataset.required === "true" ||
+          el.dataset.ffRequired === "true",
         visible,
         isNative,
         isMultiSelect,
@@ -433,6 +467,9 @@ export async function tagAndSnapshot(page: Page): Promise<Record<string, boolean
         return;
       if (el.closest('.iti__dropdown-content'))
         return;
+      // Skip elements inside Workday dropdown portals
+      if (el.closest('[data-automation-id="activeListContainer"]'))
+        return;
       if (
         el.getAttribute("role") === "listbox" &&
         el.closest('[role="combobox"]')
@@ -485,6 +522,59 @@ export interface ComboboxInfo {
   options: string[];
 }
 
+// ── Workday portal helpers (module-level) ───────────────────
+
+// Read de-duplicated option texts from Workday's activeListContainer portal
+async function readActiveListOptions(page: Page): Promise<string[]> {
+  const raw = await page.evaluate(() => {
+    const container = document.querySelector('[data-automation-id="activeListContainer"]');
+    if (!container) return [];
+    let items = Array.from(container.querySelectorAll('[role="option"]'));
+    if (items.length === 0) {
+      items = Array.from(container.querySelectorAll(
+        '[data-automation-id="promptOption"], [data-automation-id="menuItem"]'
+      ));
+    }
+    return items
+      .filter((o: any) => {
+        const r = o.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      })
+      .map((o: any) => (o.textContent || "").trim())
+      .filter(Boolean);
+  });
+  return [...new Set(raw)];
+}
+
+// Click an option inside a Workday dropdown (activeListContainer portal OR native listbox)
+// Uses Playwright locators (page.evaluate el.click() doesn't fire Workday's React handlers)
+async function clickActiveListOption(page: Page, text: string): Promise<boolean> {
+  try {
+    // Try activeListContainer portal first (searchable selectinput dropdowns)
+    const portal = page.locator('[data-automation-id="activeListContainer"]');
+    if (await portal.count() > 0) {
+      let option = portal.locator(`[role="option"]`).filter({ hasText: text }).first();
+      if (await option.count() === 0) {
+        option = portal.locator(`[data-automation-id="promptOption"], [data-automation-id="menuItem"]`)
+          .filter({ hasText: text }).first();
+      }
+      if (await option.count() > 0) {
+        await option.click({ timeout: 2000 });
+        return true;
+      }
+    }
+    // Fallback: native UL[role="listbox"] dropdown (Country, State, Phone Device Type)
+    const listbox = page.locator('[role="listbox"]:visible [role="option"]').filter({ hasText: text }).first();
+    if (await listbox.count() > 0) {
+      await listbox.click({ timeout: 2000 });
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export async function findVisibleProbeTargets(
   page: Page,
   skipDiscoveryIds?: Set<string>,
@@ -529,6 +619,9 @@ export async function findVisibleProbeTargets(
         // Skip elements inside intl-tel-input dropdown panels
         if (el.closest('.iti__dropdown-content'))
           return;
+        // Skip elements inside Workday dropdown portals
+        if (el.closest('[data-automation-id="activeListContainer"]'))
+          return;
         // Skip search inputs inside dropdown containers
         if (el.tagName === "INPUT" && el.type === "search" && el.closest('[class*="dropdown"], [role="dialog"]'))
           return;
@@ -566,6 +659,8 @@ export async function findVisibleProbeTargets(
       .querySelectorAll('[data-uxi-widget-type="selectinput"], [aria-haspopup="listbox"]')
       .forEach((el: any) => {
         if (seen.has(el) || !ff.isVisible(el)) return;
+        // Skip elements inside Workday dropdown portals
+        if (el.closest('[data-automation-id="activeListContainer"]')) return;
         seen.add(el);
         result.push({
           id: el.getAttribute("data-ff-id") || ff.tag(el),
@@ -581,6 +676,8 @@ export async function findVisibleProbeTargets(
       .querySelectorAll('[role="radiogroup"], .radio-cards, .radio-group')
       .forEach((group: any) => {
         if (seen.has(group) || !ff.isVisible(group)) return;
+        // Skip groups inside Workday dropdown portals
+        if (group.closest('[data-automation-id="activeListContainer"]')) return;
         seen.add(group);
 
         const radios = group.querySelectorAll(
@@ -623,6 +720,7 @@ export async function findVisibleProbeTargets(
       .querySelectorAll('[role="switch"]')
       .forEach((el: any) => {
         if (seen.has(el) || !ff.isVisible(el)) return;
+        if (el.closest('[data-automation-id="activeListContainer"]')) return;
         seen.add(el);
         const id = el.getAttribute("data-ff-id") || ff.tag(el);
         result.push({
@@ -639,6 +737,8 @@ export async function findVisibleProbeTargets(
       .querySelectorAll('input[type="checkbox"], [role="checkbox"]')
       .forEach((el: any) => {
         if (seen.has(el) || !ff.isVisible(el)) return;
+        // Skip checkboxes inside Workday dropdown portals
+        if (el.closest('[data-automation-id="activeListContainer"]')) return;
         // Skip checkboxes inside multi-checkbox groups
         const inGroup = el.closest('.checkbox-group, [role="group"]');
         if (inGroup) {
@@ -660,51 +760,6 @@ export async function findVisibleProbeTargets(
 
     return result;
   });
-
-  // Helper: read de-duplicated option texts from activeListContainer
-  async function readActiveListOptions(page: Page): Promise<string[]> {
-    const raw = await page.evaluate(() => {
-      const container = document.querySelector('[data-automation-id="activeListContainer"]');
-      if (!container) return [];
-      // Use [role="option"] first; these are the leaf interactive items in Workday
-      let items = Array.from(container.querySelectorAll('[role="option"]'));
-      if (items.length === 0) {
-        items = Array.from(container.querySelectorAll(
-          '[data-automation-id="promptOption"], [data-automation-id="menuItem"]'
-        ));
-      }
-      return items
-        .filter((o: any) => {
-          const r = o.getBoundingClientRect();
-          return r.width > 0 && r.height > 0;
-        })
-        .map((o: any) => (o.textContent || "").trim())
-        .filter(Boolean);
-    });
-    // De-duplicate while preserving order
-    return [...new Set(raw)];
-  }
-
-  // Helper: click an option inside activeListContainer using Playwright locator
-  // (page.evaluate el.click() doesn't fire Workday's React handlers)
-  async function clickActiveListOption(page: Page, text: string): Promise<boolean> {
-    try {
-      const container = page.locator('[data-automation-id="activeListContainer"]');
-      // Try role="option" first
-      let option = container.locator(`[role="option"]`).filter({ hasText: text }).first();
-      if (await option.count() === 0) {
-        option = container.locator(`[data-automation-id="promptOption"], [data-automation-id="menuItem"]`)
-          .filter({ hasText: text }).first();
-      }
-      if (await option.count() > 0) {
-        await option.click({ timeout: 2000 });
-        return true;
-      }
-      return false;
-    } catch {
-      return false;
-    }
-  }
 
   // For custom comboboxes with no options found, click to discover
   for (const cb of raw) {
@@ -1120,6 +1175,7 @@ export async function discoverConditionals(page: Page) {
 
     // Mark all as probed upfront
     const toProbe: ComboboxInfo[] = [];
+    const sampleProbe: ComboboxInfo[] = []; // large dropdowns to sample
     for (const cb of comboboxes) {
       if (!probed.has(cb.id)) {
         probed.add(cb.id);
@@ -1127,12 +1183,142 @@ export async function discoverConditionals(page: Page) {
         if (cb.options.length > 0) {
           discoveredOptions.set(cb.id, cb.options);
         }
-        // Only probe comboboxes with a label and manageable number of options
-        // (country pickers etc. with 200+ options are data-entry, not conditional triggers)
         // Skip unnamed comboboxes — they're usually language switchers or other chrome
-        if (cb.label && cb.options.length <= MAX_PROBE_OPTIONS) {
+        if (!cb.label) continue;
+        if (cb.options.length <= MAX_PROBE_OPTIONS) {
           toProbe.push(cb);
+        } else {
+          // Large dropdown — sample a few options to detect conditionals
+          sampleProbe.push(cb);
         }
+      }
+    }
+
+    // Sample-probe large dropdowns first (e.g., Country with 250 options).
+    // Pick a few non-placeholder options spread across the list.
+    // Skip hierarchical dropdowns (options contain " > ") — their selection needs special handling.
+    for (const cb of sampleProbe) {
+      const candidates = cb.options.filter(
+        (o) => !PLACEHOLDER_RE.test(o) && !o.includes(" > ")
+      );
+      if (candidates.length === 0) continue;
+      // Pick evenly spaced samples from the option list
+      const step = Math.max(1, Math.floor(candidates.length / SAMPLE_PROBE_COUNT));
+      const samples: string[] = [];
+      for (let i = 0; i < candidates.length && samples.length < SAMPLE_PROBE_COUNT; i += step) {
+        samples.push(candidates[i]);
+      }
+
+      console.error(`  sampling ${samples.length} of ${candidates.length} options for "${cb.label}"…`);
+
+      // Remember original value so we can restore it
+      const originalValue = await page.evaluate((ffId) => {
+        const el = document.querySelector(`[data-ff-id="${ffId}"]`) as HTMLElement;
+        return el?.textContent?.trim() || "";
+      }, cb.id);
+
+      for (const optionText of samples) {
+        const hasHelpers = await page.evaluate(() => !!(window as any).__ff).catch(() => false);
+        if (!hasHelpers) await injectHelpers(page);
+
+        const before = await tagAndSnapshot(page);
+
+        // For Workday buttons (aria-haspopup="listbox"), use portal-based selection
+        const isWorkdayButton = await page.evaluate((ffId) => {
+          const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+          return el?.tagName === "BUTTON" && el?.getAttribute("aria-haspopup") === "listbox";
+        }, cb.id);
+
+        let selected = false;
+        if (isWorkdayButton) {
+          // Click the button to open dropdown
+          await page.click(`[data-ff-id="${cb.id}"]`).catch(() => {});
+          await page.waitForTimeout(500);
+          // Workday dropdowns are virtualized — type to search first
+          const searchInput = page.locator('[data-automation-id="searchBox"] input, [data-automation-id="activeListContainer"] input[type="text"]');
+          if (await searchInput.count() > 0) {
+            await searchInput.fill(optionText);
+            await page.waitForTimeout(400);
+          }
+          selected = await clickActiveListOption(page, optionText);
+          await page.waitForTimeout(500);
+        } else {
+          try {
+            await selectOption(page, cb, optionText);
+            selected = true;
+          } catch {
+            selected = false;
+          }
+        }
+
+        if (!selected) {
+          console.error(`  [warn] Could not select "${optionText}" for sample probe in ${cb.label}`);
+          // Dismiss any open dropdown
+          await page.keyboard.press("Escape").catch(() => {});
+          await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
+          await page.waitForTimeout(200);
+          continue;
+        }
+
+        await page.waitForTimeout(300);
+
+        // Re-inject helpers if DOM was re-rendered
+        const hasHelpers2 = await page.evaluate(() => !!(window as any).__ff).catch(() => false);
+        if (!hasHelpers2) await injectHelpers(page);
+
+        const after = await tagAndSnapshot(page);
+
+        const appeared = Object.keys(after).filter(
+          (id) => after[id] && !before[id]
+        );
+
+        if (appeared.length > 0) {
+          // Record dependency as "any value" — the exact value doesn't matter
+          const chain: ConditionChain = [
+            ...parentChain,
+            { field: cb.label, equals: "*" },
+          ];
+
+          const revealedFields = await extractFields(page);
+          for (const ffId of appeared) {
+            if (!rules.has(ffId)) rules.set(ffId, []);
+            // Only add the wildcard rule once per field
+            const existing = rules.get(ffId)!;
+            if (!existing.some((c) => c.length === chain.length && c[c.length - 1]?.equals === "*" && c[c.length - 1]?.field === cb.label)) {
+              existing.push(chain);
+            }
+
+            if (!fieldDetails.has(ffId)) {
+              const detail = revealedFields.find((f) => f.id === ffId);
+              if (detail) {
+                detail.visibleByDefault = false;
+                fieldDetails.set(ffId, detail);
+              }
+            }
+          }
+        }
+
+        // Reset: select back the original value
+        if (isWorkdayButton && originalValue && originalValue !== optionText) {
+          await page.click(`[data-ff-id="${cb.id}"]`).catch(() => {});
+          await page.waitForTimeout(500);
+          const searchInput2 = page.locator('[data-automation-id="searchBox"] input, [data-automation-id="activeListContainer"] input[type="text"]');
+          if (await searchInput2.count() > 0) {
+            await searchInput2.fill(originalValue);
+            await page.waitForTimeout(400);
+          }
+          const restored = await clickActiveListOption(page, originalValue);
+          if (!restored) {
+            await page.keyboard.press("Escape").catch(() => {});
+          }
+          await page.waitForTimeout(500);
+        } else {
+          await resetProbeTarget(page, cb);
+        }
+
+        // Re-inject helpers after possible DOM changes
+        const hasHelpers3 = await page.evaluate(() => !!(window as any).__ff).catch(() => false);
+        if (!hasHelpers3) await injectHelpers(page);
       }
     }
 
@@ -1253,7 +1439,14 @@ async function main() {
     }
   }
 
-  // 3. Build output (strip internal fields)
+  // 3. Build output (strip internal fields and unnamed/junk fields)
+  fields = fields.filter((f) => {
+    if (!f.name) return false;
+    // Workday internal elements (multi-select pill display, etc.)
+    if (f.name === "items selected") return false;
+    return true;
+  });
+
   const title = await page.title();
   const result: FormStructure = {
     url,
