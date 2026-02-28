@@ -1,10 +1,5 @@
-import path from 'node:path';
-import fs from 'node:fs';
 import { z } from 'zod';
 import type { TaskHandler, TaskContext, TaskResult, ValidationResult } from './types.js';
-import { detectPlatformFromUrl } from './platforms/index.js';
-import { LayeredOrchestrator } from './LayeredOrchestrator.js';
-import { BlockerDetector } from '../../detection/BlockerDetector.js';
 
 /**
  * Zod schema for ApplyHandler input validation.
@@ -18,9 +13,17 @@ const ApplyInputSchema = z.object({
   }).passthrough().optional(),
 }).passthrough();
 
+/**
+ * ApplyHandler — One-shot agent execution via adapter.act().
+ *
+ * This handler delegates the entire application process to the adapter's
+ * agent (Magnitude/Stagehand) in a single act() call. It does NOT use
+ * the LayeredOrchestrator — use SmartApplyHandler (type: 'smart_apply')
+ * for structured multi-page form filling with cost tiers.
+ */
 export class ApplyHandler implements TaskHandler {
   readonly type = 'apply';
-  readonly description = 'Apply to a job posting by filling out the application form';
+  readonly description = 'Apply to a job posting via one-shot agent execution';
 
   validate(inputData: Record<string, any>): ValidationResult {
     const result = ApplyInputSchema.safeParse(inputData);
@@ -34,75 +37,19 @@ export class ApplyHandler implements TaskHandler {
   }
 
   async execute(ctx: TaskContext): Promise<TaskResult> {
-    const { job, adapter, progress, costTracker } = ctx;
-    const userProfile = job.input_data.user_data as Record<string, any> | undefined;
+    const { job, adapter } = ctx;
 
-    // If no user_data, fall back to simple one-shot adapter.act()
-    if (!userProfile || !userProfile.first_name) {
-      const actResult = await adapter.act(job.task_description, {
-        prompt: ctx.resumeFilePath
-          ? `${ctx.dataPrompt}\n\nA resume file is available for upload. When you encounter a file upload field for resume/CV, click it to trigger the file dialog — the file will be attached automatically.`
-          : ctx.dataPrompt,
-        data: job.input_data.user_data,
-      });
-
-      if (!actResult.success) {
-        return { success: false, error: `Action failed: ${actResult.message}` };
-      }
-
-      return { success: true, data: { message: 'Applied via single-shot agent' } };
-    }
-
-    // Route through LayeredOrchestrator for structured multi-page apply
-    const qaOverrides = job.input_data.qa_overrides || {};
-    const config = detectPlatformFromUrl(job.target_url);
-    const dataPrompt = config.buildDataPrompt(userProfile, qaOverrides);
-    const qaMap = config.buildQAMap(userProfile, qaOverrides);
-
-    let resumePath: string | null = null;
-    if (userProfile.resume_path) {
-      const resolved = path.isAbsolute(userProfile.resume_path)
-        ? userProfile.resume_path
-        : path.resolve(process.cwd(), userProfile.resume_path);
-      if (fs.existsSync(resolved)) resumePath = resolved;
-    }
-    // Also check ctx.resumeFilePath (downloaded by JobExecutor)
-    if (!resumePath && ctx.resumeFilePath) {
-      resumePath = ctx.resumeFilePath;
-    }
-
-    const orchestrator = new LayeredOrchestrator({
-      adapter,
-      config,
-      costTracker,
-      progress,
-      blockerDetector: new BlockerDetector(),
+    const actResult = await adapter.act(job.task_description, {
+      prompt: ctx.resumeFilePath
+        ? `${ctx.dataPrompt}\n\nA resume file is available for upload. When you encounter a file upload field for resume/CV, click it to trigger the file dialog — the file will be attached automatically.`
+        : ctx.dataPrompt,
+      data: job.input_data.user_data,
     });
 
-    const result = await orchestrator.run({
-      userProfile,
-      qaMap,
-      dataPrompt,
-      resumePath,
-    });
+    if (!actResult.success) {
+      return { success: false, error: `Action failed: ${actResult.message}` };
+    }
 
-    return {
-      success: result.success,
-      keepBrowserOpen: result.keepBrowserOpen,
-      awaitingUserReview: result.awaitingUserReview,
-      error: result.error,
-      data: {
-        platform: result.platform,
-        pages_processed: result.pagesProcessed,
-        final_page: result.finalPage,
-        dom_filled: result.domFilled,
-        llm_filled: result.llmFilled,
-        magnitude_filled: result.magnitudeFilled,
-        total_fields: result.totalFields,
-        message: result.awaitingUserReview
-          ? 'Application filled. Waiting for user to review and submit.'
-          : result.error || `Processed ${result.pagesProcessed} pages.`,
-      },
-    };
+    return { success: true, data: { message: 'Applied via single-shot agent' } };
   }
 }
