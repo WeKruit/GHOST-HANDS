@@ -161,7 +161,7 @@
       "provider": "anthropic",
       "model": "claude-haiku-4-5-20251001",
       "vision": true,
-      "cost": { "input": 0.80, "output": 4.00, "unit": "$/M tokens" }
+      "cost": { "input": 1.00, "output": 5.00, "unit": "$/M tokens" }
     },
     "glm-5": {
       "provider": "zhipu",

@@ -1,3 +1,12 @@
+diff --git a/node_modules/@browserbasehq/stagehand/.bun-tag-6670a05df0098229 b/.bun-tag-6670a05df0098229
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@browserbasehq/stagehand/.bun-tag-8a39a66b09cf9fed b/.bun-tag-8a39a66b09cf9fed
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@browserbasehq/stagehand/.bun-tag-c3780e6135f14eeb b/.bun-tag-c3780e6135f14eeb
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
 diff --git a/dist/cjs/lib/inference.js b/dist/cjs/lib/inference.js
 index d12bc5790bee7e8f4427d913af8341235ad6c3a5..65f62bebda48f0943c44008ae0b23db961e73728 100644
 --- a/dist/cjs/lib/inference.js
@@ -117,18 +126,48 @@ index 6d1dd543ee6ad55d1ac6a37c3e6253f9b14c17d6..69df22ed2eca357af44e2bb8c66533fa
              });
          }
 diff --git a/dist/cjs/lib/v3/agent/tools/type.js b/dist/cjs/lib/v3/agent/tools/type.js
-index d6c59522e495a3986dc48cd558b8fbc4a325f4f1..def8b1f0e4cef2ddf14e00d9984442a41f31be34 100644
+index d6c59522e495a3986dc48cd558b8fbc4a325f4f1..4a91dc21abefd4d37d6b43272666f7c027a55532 100644
 --- a/dist/cjs/lib/v3/agent/tools/type.js
 +++ b/dist/cjs/lib/v3/agent/tools/type.js
-@@ -94,7 +94,7 @@ const typeTool = (v3, provider, variables) => {
-                 if (result.screenshotBase64) {
-                     content.push({
-                         type: "media",
+@@ -5,7 +5,7 @@ const ai_1 = require("ai");
+ const zod_1 = require("zod");
+ const coordinateNormalization_js_1 = require("../utils/coordinateNormalization.js");
+ const xpath_js_1 = require("../utils/xpath.js");
+-const screenshotHandler_js_1 = require("../utils/screenshotHandler.js");
++
+ const variables_js_1 = require("../utils/variables.js");
+ const typeTool = (v3, provider, variables) => {
+     const hasVariables = variables && Object.keys(variables).length > 0;
+@@ -46,7 +46,6 @@ const typeTool = (v3, provider, variables) => {
+                     returnXpath: shouldCollectXpath,
+                 });
+                 await page.type(actualText);
+-                const screenshotBase64 = await (0, screenshotHandler_js_1.waitAndCaptureScreenshot)(page);
+                 // Record as an "act" step with proper Action for deterministic replay (only when caching)
+                 if (shouldCollectXpath) {
+                     const normalizedXpath = (0, xpath_js_1.ensureXPath)(xpath);
+@@ -69,7 +68,6 @@ const typeTool = (v3, provider, variables) => {
+                     success: true,
+                     describe,
+                     text, // Return original text (with %variableName% tokens) to avoid exposing sensitive values to LLM
+-                    screenshotBase64,
+                 };
+             }
+             catch (error) {
+@@ -91,13 +89,6 @@ const typeTool = (v3, provider, variables) => {
+                         }),
+                     },
+                 ];
+-                if (result.screenshotBase64) {
+-                    content.push({
+-                        type: "media",
 -                        mediaType: "image/png",
-+                        mediaType: "image/jpeg",
-                         data: result.screenshotBase64,
-                     });
-                 }
+-                        data: result.screenshotBase64,
+-                    });
+-                }
+                 return { type: "content", value: content };
+             }
+             return {
 diff --git a/dist/cjs/lib/v3/agent/tools/wait.js b/dist/cjs/lib/v3/agent/tools/wait.js
 index 91f09e1d863d0a37d2974482ef2c08226abc1469..05272c37dfe3c273636f671e11fd9f799c190d28 100644
 --- a/dist/cjs/lib/v3/agent/tools/wait.js
@@ -304,18 +343,48 @@ index d4125a97de2da8ea92e97a23f43d35891a0b5ec7..6b21e2ceefda9d2034e50f93781d1094
              });
          }
 diff --git a/dist/esm/lib/v3/agent/tools/type.js b/dist/esm/lib/v3/agent/tools/type.js
-index 275b1bea8c5a31a79a55f6b94f425ffa39c393e1..c6b86f08eb279aa33d49457e1180f7c194970f56 100644
+index 275b1bea8c5a31a79a55f6b94f425ffa39c393e1..5c85e41fadca8072db9763a1c3fb61b4aa6c24e3 100644
 --- a/dist/esm/lib/v3/agent/tools/type.js
 +++ b/dist/esm/lib/v3/agent/tools/type.js
-@@ -91,7 +91,7 @@ export const typeTool = (v3, provider, variables) => {
-                 if (result.screenshotBase64) {
-                     content.push({
-                         type: "media",
+@@ -2,7 +2,7 @@ import { tool } from "ai";
+ import { z } from "zod";
+ import { processCoordinates } from "../utils/coordinateNormalization.js";
+ import { ensureXPath } from "../utils/xpath.js";
+-import { waitAndCaptureScreenshot } from "../utils/screenshotHandler.js";
++
+ import { substituteVariables } from "../utils/variables.js";
+ export const typeTool = (v3, provider, variables) => {
+     const hasVariables = variables && Object.keys(variables).length > 0;
+@@ -43,7 +43,6 @@ export const typeTool = (v3, provider, variables) => {
+                     returnXpath: shouldCollectXpath,
+                 });
+                 await page.type(actualText);
+-                const screenshotBase64 = await waitAndCaptureScreenshot(page);
+                 // Record as an "act" step with proper Action for deterministic replay (only when caching)
+                 if (shouldCollectXpath) {
+                     const normalizedXpath = ensureXPath(xpath);
+@@ -66,7 +65,6 @@ export const typeTool = (v3, provider, variables) => {
+                     success: true,
+                     describe,
+                     text, // Return original text (with %variableName% tokens) to avoid exposing sensitive values to LLM
+-                    screenshotBase64,
+                 };
+             }
+             catch (error) {
+@@ -88,13 +86,6 @@ export const typeTool = (v3, provider, variables) => {
+                         }),
+                     },
+                 ];
+-                if (result.screenshotBase64) {
+-                    content.push({
+-                        type: "media",
 -                        mediaType: "image/png",
-+                        mediaType: "image/jpeg",
-                         data: result.screenshotBase64,
-                     });
-                 }
+-                        data: result.screenshotBase64,
+-                    });
+-                }
+                 return { type: "content", value: content };
+             }
+             return {
 diff --git a/dist/esm/lib/v3/agent/tools/wait.js b/dist/esm/lib/v3/agent/tools/wait.js
 index 1a49245a4e32af0b5cffaedd75dc0a3409e5315f..eebe845ec76b597cf001e3dd68e253da34401ca6 100644
 --- a/dist/esm/lib/v3/agent/tools/wait.js

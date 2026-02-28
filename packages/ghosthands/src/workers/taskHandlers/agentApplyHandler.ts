@@ -14,6 +14,29 @@ import type { StagehandAdapter } from '../../adapters/stagehand.js';
 import { ProgressStep } from '../progressTracker.js';
 import { getLogger } from '../../monitoring/logger.js';
 import { detectPlatformFromUrl } from './platforms/index.js';
+import { loadModelConfig } from '../../config/index.js';
+
+// ── Cost rates per model ($/M tokens) ────────────────────────────────────
+const MODEL_COSTS: Record<string, { input: number; output: number }> = {
+  'opus':   { input: 5.00,  output: 25.00 },
+  'sonnet': { input: 3.00,  output: 15.00 },
+  'haiku':  { input: 1.00,  output: 5.00  },
+};
+
+/** Resolve cost rates from a model alias or full model name */
+function resolveCostRates(modelNameOrAlias: string): { input: number; output: number } {
+  const lower = modelNameOrAlias.toLowerCase();
+  for (const [key, rates] of Object.entries(MODEL_COSTS)) {
+    if (lower.includes(key)) return rates;
+  }
+  // Fallback: try loadModelConfig
+  try {
+    const resolved = loadModelConfig(modelNameOrAlias);
+    return { input: resolved.cost.input, output: resolved.cost.output };
+  } catch {
+    return { input: 0, output: 0 };
+  }
+}
 
 // ── Metrics Snapshot ──────────────────────────────────────────────────────
 
@@ -77,9 +100,10 @@ export class AgentApplyHandler implements TaskHandler {
     const stagehand = stagehandAdapter.getStagehand();
 
     // Get model cost config for USD calculation
+    // Agent planner uses the main model; act/observe use the executionModel (Haiku)
     const resolvedModel = stagehandAdapter.getResolvedModel();
-    const costPerMInput = resolvedModel?.cost.input ?? 0;
-    const costPerMOutput = resolvedModel?.cost.output ?? 0;
+    const agentCost = resolveCostRates(resolvedModel?.model || resolvedModel?.alias || 'haiku');
+    const execCost = resolveCostRates('haiku'); // executionModel is hardcoded to Haiku
 
     // 2. Detect platform for hints
     const platformConfig = detectPlatformFromUrl(job.target_url);
@@ -113,6 +137,7 @@ export class AgentApplyHandler implements TaskHandler {
     const agent = stagehand.agent({
       mode: 'dom',
       systemPrompt,
+      executionModel: 'anthropic/claude-haiku-4-5-20251001',
     });
 
     let stepCount = 0;
@@ -172,7 +197,7 @@ export class AgentApplyHandler implements TaskHandler {
             const obsOut = currentMetrics.observeCompletion - metricsBefore.observeCompletion;
             const subCallIn = actIn + obsIn;
             const subCallOut = actOut + obsOut;
-            const subCallCost = subCallIn * (costPerMInput / 1_000_000) + subCallOut * (costPerMOutput / 1_000_000);
+            const subCallCost = subCallIn * (execCost.input / 1_000_000) + subCallOut * (execCost.output / 1_000_000);
             logger.info('[Agent] Running cost (sub-calls only, planner not yet available)', {
               step: stepCount,
               actIO: `${actIn}/${actOut}`,
@@ -221,9 +246,11 @@ export class AgentApplyHandler implements TaskHandler {
       // 4. Total = planner + act + observe (no overlap)
       const totalIn = agentPlannerIn + actInDelta + observeInDelta;
       const totalOut = agentPlannerOut + actOutDelta + observeOutDelta;
-      const inputCost = totalIn * (costPerMInput / 1_000_000);
-      const outputCost = totalOut * (costPerMOutput / 1_000_000);
-      const totalCostUsd = inputCost + outputCost;
+      const plannerCost = agentPlannerIn * (agentCost.input / 1_000_000) + agentPlannerOut * (agentCost.output / 1_000_000);
+      const actObserveCost = (actInDelta + observeInDelta) * (execCost.input / 1_000_000) + (actOutDelta + observeOutDelta) * (execCost.output / 1_000_000);
+      const inputCost = agentPlannerIn * (agentCost.input / 1_000_000) + (actInDelta + observeInDelta) * (execCost.input / 1_000_000);
+      const outputCost = agentPlannerOut * (agentCost.output / 1_000_000) + (actOutDelta + observeOutDelta) * (execCost.output / 1_000_000);
+      const totalCostUsd = plannerCost + actObserveCost;
 
       // Record to costTracker for budget enforcement and DB persistence
       costTracker.recordTokenUsage({
@@ -254,7 +281,7 @@ export class AgentApplyHandler implements TaskHandler {
       return {
         success: result.success,
         keepBrowserOpen: true,
-        awaitingUserReview: result.success,
+        awaitingUserReview: true,
         data: {
           platform: platformConfig.platformId,
           message: result.message,
@@ -288,14 +315,15 @@ export class AgentApplyHandler implements TaskHandler {
       const obsOut = metricsAfter.observeCompletion - metricsBefore.observeCompletion;
       const totalIn = agentIn + actIn + obsIn;
       const totalOut = agentOut + actOut + obsOut;
-      const totalCostUsd = totalIn * (costPerMInput / 1_000_000) + totalOut * (costPerMOutput / 1_000_000);
+      const totalCostUsd = agentIn * (agentCost.input / 1_000_000) + agentOut * (agentCost.output / 1_000_000)
+        + (actIn + obsIn) * (execCost.input / 1_000_000) + (actOut + obsOut) * (execCost.output / 1_000_000);
 
       if (totalIn > 0 || totalOut > 0) {
         costTracker.recordTokenUsage({
           inputTokens: totalIn,
           outputTokens: totalOut,
-          inputCost: totalIn * (costPerMInput / 1_000_000),
-          outputCost: totalOut * (costPerMOutput / 1_000_000),
+          inputCost: agentIn * (agentCost.input / 1_000_000) + (actIn + obsIn) * (execCost.input / 1_000_000),
+          outputCost: agentOut * (agentCost.output / 1_000_000) + (actOut + obsOut) * (execCost.output / 1_000_000),
         });
       }
 
@@ -332,7 +360,8 @@ function buildSystemPrompt(
   resumePath: string | null | undefined,
   platformId: string,
 ): string {
-  const loginPassword = (profile.password || process.env.TEST_GMAIL_PASSWORD || 'GhApp2026!x') + 'aA1!';
+  const basePassword = profile.password || process.env.TEST_GMAIL_PASSWORD || 'GhApp2026!x';
+  const workdayPassword = basePassword + 'aA1!'; // Strengthened for Workday account creation complexity requirements
   const lines: string[] = [];
 
   // ── Role & Tool Usage (MOST IMPORTANT — goes first) ──
@@ -340,13 +369,18 @@ function buildSystemPrompt(
   lines.push('');
   lines.push('HOW TO USE YOUR TOOLS:');
   lines.push('');
-  lines.push('act: Your primary tool. Be EXTREMELY specific about which element to interact with.');
+  lines.push('act: Your primary tool. Be EXTREMELY specific — always include the QUESTION LABEL or SECTION NAME to disambiguate.');
   lines.push('  GOOD: act("click the Sign In button next to Already have an account")');
   lines.push('  GOOD: act("type happy.wu@gmail.com into the Email Address text field")');
-  lines.push(`  GOOD: act("type ${loginPassword} into the Password text field")`);
+  lines.push(`  GOOD: act("type ${basePassword} into the Password text field")`);
+  lines.push('  GOOD: act("click the \\"Yes\\" option in the dropdown for \\"Are you a citizen of the United States?\\"")');
+  lines.push('  GOOD: act("click the dropdown button for \\"Did you previously work for RTX?\\"")');
+  lines.push('  BAD:  act("click the \\"No\\" option in the listbox")  ← WHICH listbox? There are multiple on the page!');
   lines.push('  BAD:  act("click Sign In")  ← too vague, will fail if multiple matches');
   lines.push('  BAD:  act("type email into the email field")  ← types the WORD "email" instead of the actual address');
   lines.push('  BAD:  act("enter password")  ← types the WORD "password"');
+  lines.push('');
+  lines.push('CRITICAL: When there are multiple dropdowns/listboxes/buttons on the page, ALWAYS include the question label or nearby heading in your act instruction to identify WHICH one you mean.');
   lines.push('');
   lines.push('When using act to type, ALWAYS include the LITERAL value to type in quotes:');
   lines.push(`  act("type \\"${profile.email}\\" into the Email Address field")`);
@@ -376,7 +410,13 @@ function buildSystemPrompt(
   // ── Credentials (high priority — near the top) ──
   lines.push('LOGIN CREDENTIALS (use these EXACT strings when typing):');
   lines.push(`  Email: ${profile.email}`);
-  lines.push(`  Password: ${loginPassword}`);
+  lines.push(`  Google Account Password: ${basePassword}`);
+  lines.push(`  Workday Account Password: ${workdayPassword}`);
+  lines.push('');
+  lines.push('PASSWORD RULES:');
+  lines.push('- For Google sign-in / "Sign in with Google": use the Google Account Password');
+  lines.push('- For Workday login or account creation: use the Workday Account Password');
+  lines.push('- If unsure which platform you are logging into, use the Google Account Password for Google pages and the Workday Account Password for everything else.');
   lines.push('');
 
   // ── Applicant Data ──
@@ -432,7 +472,7 @@ function buildSystemPrompt(
 
   // Resume
   if (resumePath) {
-    lines.push('RESUME: Click any file upload field for resume/CV — the file will be attached automatically.');
+    lines.push('RESUME: Always try clicking the "Attach" or "Upload" button FIRST for resume/CV fields — the file will be uploaded automatically. Only fall back to "Enter manually" if the upload button fails or does not exist.');
     lines.push('');
   }
 
@@ -449,7 +489,7 @@ function buildSystemPrompt(
   lines.push('RULES:');
   lines.push('- ALWAYS prefer "Sign in with Google" or "Continue with Google" when available. Only use email/password if Google sign-in is not an option.');
   lines.push('- Fill ALL fields with ACTUAL DATA values, never field labels.');
-  lines.push('- For dropdowns, click to open, then select the closest match.');
+  lines.push('- For dropdowns: (1) click the dropdown button to OPEN it, (2) then in a SEPARATE act call, click the option you want. Never try to select an option and open the dropdown in the same act call.');
   lines.push('- For "How did you hear?" → "LinkedIn" or "Online Job Board".');
   lines.push('- Click Next/Continue to advance through pages.');
   lines.push('- NEVER click Submit/Submit Application.');
@@ -461,7 +501,9 @@ function buildSystemPrompt(
     lines.push('');
     lines.push('WORKDAY TIPS:');
     lines.push('- Multi-step form with progress bar at top.');
-    lines.push('- DROPDOWNS: NEVER scroll through dropdown options. ALWAYS type your desired value into the dropdown search field to filter results, then select from the filtered list. Dropdowns use virtual rendering — only ~20 options are visible at a time, so scrolling will miss most options.');
+    lines.push('- SEARCHABLE DROPDOWNS: NEVER scroll through dropdown options. ALWAYS type your desired value into the search field to filter, then click the matching option from the filtered list. Dropdowns use virtual rendering — only ~20 options are visible at a time, so scrolling will miss most options.');
+    lines.push('- SEARCHABLE DROPDOWN CONFIRMATION: After typing in a searchable dropdown, you MUST click the matching option that appears in the filtered list. Just typing is NOT enough — the value is not selected until you click the option. If no options appear after typing, press Enter to trigger a search, then click the result.');
+    lines.push('- SELECT-ONE DROPDOWNS (Yes/No, Select One): These are NOT searchable. Click the dropdown button to OPEN it, then in a SEPARATE act call click the option. Always reference the QUESTION LABEL: act("click the \\"Yes\\" option in the dropdown for \\"Are you a citizen?\\""), NOT act("click the \\"Yes\\" option in the listbox").');
     lines.push('- If "Create Account" page appears, check for "Already have an account? Sign In" link at the bottom.');
     lines.push('- Custom ARIA widgets: if fillForm fails on a field, use act instead.');
     lines.push('- MULTISELECT PILLS: The × button on selected pills is hidden from the accessibility tree. To remove a selected value, click/focus the pill (the option element), then press Delete or Backspace. Do NOT try to click the × icon directly — it will always fail.');
@@ -486,7 +528,7 @@ function buildInstruction(
   ];
 
   if (resumePath) {
-    parts.push('Upload the resume when you see a file upload field for resume/CV.');
+    parts.push('For resume/CV fields, try clicking the "Attach" or "Upload" button first — the file uploads automatically. Fall back to "Enter manually" only if upload fails.');
   }
 
   parts.push('Navigate through all pages by clicking Next/Continue.');

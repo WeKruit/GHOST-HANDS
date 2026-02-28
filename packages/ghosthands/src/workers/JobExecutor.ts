@@ -695,7 +695,8 @@ export class JobExecutor {
 
       // 10. Build TaskContext and delegate to handler (with crash recovery)
       const rawTimeout = job.timeout_seconds;
-      const timeoutMs = (typeof rawTimeout === 'number' && rawTimeout > 0 ? rawTimeout : 1800) * 1000;
+      const MIN_TIMEOUT_SECONDS = 1800; // 30 minutes minimum — agent needs time for multi-step forms
+      const timeoutMs = Math.max(typeof rawTimeout === 'number' && rawTimeout > 0 ? rawTimeout : MIN_TIMEOUT_SECONDS, MIN_TIMEOUT_SECONDS) * 1000;
       getLogger().info('Job execution timeout configured', {
         jobId: job.id,
         raw_timeout_seconds: rawTimeout,
