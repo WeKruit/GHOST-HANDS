@@ -18,6 +18,8 @@ build-err.txt
 .env.local
 .env.*.local
 .env.deploy
+.env.staging
+.env.production
 
 # IDE
 .vscode/

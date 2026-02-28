@@ -481,7 +481,10 @@ export class LayeredOrchestrator {
 
     if (hasGoogleSSO) {
       console.log('[Orchestrator] Google SSO button found — clicking...');
-      await adapter.act('Click the "Sign in with Google" button, Google icon/logo button, or "Continue with Google" option. Click ONLY ONE button, then report done.');
+      const ssoResult = await adapter.act('Click the "Sign in with Google" button, Google icon/logo button, or "Continue with Google" option. Click ONLY ONE button, then report done.');
+      if (!ssoResult.success) {
+        console.warn(`[Orchestrator] Google SSO click failed: ${ssoResult.message} — continuing anyway.`);
+      }
       await this.waitForPageSettled();
       return;
     }
@@ -598,7 +601,10 @@ export class LayeredOrchestrator {
         });
 
         if (!clicked) {
-          await adapter.act('Click the "Sign In", "Log In", "Next", or "Continue" button. Click ONLY ONE button.');
+          const submitResult = await adapter.act('Click the "Sign In", "Log In", "Next", or "Continue" button. Click ONLY ONE button.');
+          if (!submitResult.success) {
+            console.warn(`[Orchestrator] Login submit click failed: ${submitResult.message}`);
+          }
         }
 
         await adapter.page.waitForTimeout(3000);
@@ -646,7 +652,10 @@ export class LayeredOrchestrator {
             return false;
           });
           if (!clickedCreate) {
-            await adapter.act('The login failed. Look for a "Create Account", "Sign Up", "Register", or "Don\'t have an account?" link and click it. Click ONLY ONE link.');
+            const createResult = await adapter.act('The login failed. Look for a "Create Account", "Sign Up", "Register", or "Don\'t have an account?" link and click it. Click ONLY ONE link.');
+            if (!createResult.success) {
+              console.warn(`[Orchestrator] Create account link click failed: ${createResult.message}`);
+            }
           }
           await this.waitForPageSettled();
         }
@@ -655,9 +664,12 @@ export class LayeredOrchestrator {
     }
 
     // No form fields — use LLM
-    await adapter.act(
+    const loginResult = await adapter.act(
       'This is a login page. First, look for a "Sign In" or "Log In" button and click it. Only if there is no sign-in option, click a "Create Account" or "Sign Up" link instead. Click ONLY ONE button, then report done.',
     );
+    if (!loginResult.success) {
+      console.warn(`[Orchestrator] Login LLM fallback failed: ${loginResult.message}`);
+    }
     await this.waitForPageSettled();
   }
 
@@ -728,7 +740,10 @@ export class LayeredOrchestrator {
         return false;
       });
       if (!clicked) {
-        await adapter.act('Click the "Continue" or "Confirm" button to proceed with Google sign-in.');
+        const confirmResult = await adapter.act('Click the "Continue" or "Confirm" button to proceed with Google sign-in.');
+        if (!confirmResult.success) {
+          console.warn(`[Orchestrator] Google confirm click failed: ${confirmResult.message}`);
+        }
       }
       await adapter.page.waitForTimeout(2000);
       return;
@@ -747,7 +762,12 @@ export class LayeredOrchestrator {
         }
         return false;
       }, email);
-      if (!clicked) await adapter.act(`Click on the account "${email}" to sign in with it.`);
+      if (!clicked) {
+        const chooserResult = await adapter.act(`Click on the account "${email}" to sign in with it.`);
+        if (!chooserResult.success) {
+          console.warn(`[Orchestrator] Google account chooser click failed: ${chooserResult.message}`);
+        }
+      }
       await adapter.page.waitForTimeout(2000);
       return;
     }
@@ -778,7 +798,7 @@ export class LayeredOrchestrator {
     const passwordHint = password
       ? `- If you see a "Password" field, type the password and click "Next".`
       : `- If you see a "Password" field, report the task as done (no password available).`;
-    await adapter.act(
+    const googleResult = await adapter.act(
       `This is a Google sign-in page. Move through the sign-in flow for "${email}":
 - If you see a "Continue", "Confirm", or "Allow" button, click it to proceed.
 - If you see the account "${email}" listed, click on it to select it.
@@ -787,6 +807,9 @@ ${passwordHint}
 - If you see a CAPTCHA or image challenge, report the task as done.
 Click only ONE button, then report the task as done.`,
     );
+    if (!googleResult.success) {
+      console.warn(`[Orchestrator] Google sign-in LLM fallback failed: ${googleResult.message}`);
+    }
     await adapter.page.waitForTimeout(2000);
   }
 
@@ -1717,9 +1740,14 @@ Set is_final_review to true ONLY if this is genuinely the last page before submi
   }
 
   /**
-   * Calls adapter.act() and checks the ActionResult.success flag.
-   * Returns true if the action succeeded, false if it reported failure.
-   * Throws only on budget/action-limit errors and unrecoverable exceptions.
+   * Calls adapter.act() with health check and rate-limit throttling.
+   *
+   * Returns `true` if the action succeeded, `false` if:
+   *   - the page appears broken (skips LLM call entirely)
+   *   - adapter returned `{ success: false }` (element not found, field mismatch, etc.)
+   *
+   * Retries once on 429/rate-limit errors (30s backoff).
+   * Re-throws all other exceptions (budget exceeded, action limit, browser crash).
    */
   private async safeAct(prompt: string, label: string): Promise<boolean> {
     const healthy = await this.isPageHealthy();
