@@ -451,7 +451,8 @@ export async function extractFields(page: Page): Promise<FormField[]> {
     }
   }
 
-  return fields;
+  // Strip Workday internal elements (multi-select pill display, etc.)
+  return fields.filter((f) => f.name !== "items selected");
 }
 
 // ── Visibility snapshot ──────────────────────────────────────
