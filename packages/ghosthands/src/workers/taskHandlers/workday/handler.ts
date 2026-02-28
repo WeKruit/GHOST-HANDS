@@ -64,12 +64,25 @@ export class WorkdayApplyHandler implements TaskHandler {
     const userProfile = job.input_data.user_data as WorkdayUserProfile;
     const qaOverrides = job.input_data.qa_overrides || {};
 
+    // Wire the downloaded resume file path into the profile so handleExperiencePage can upload it
+    if (ctx.resumeFilePath) {
+      userProfile.resume_path = ctx.resumeFilePath;
+    }
+
     const logger = getLogger();
     logger.info('Starting application', { targetUrl: job.target_url, applicant: `${userProfile.first_name} ${userProfile.last_name}` });
 
     // Build the data prompt with all user information
     const dataPrompt = this.buildDataPrompt(userProfile, qaOverrides);
     this.fullQAMap = this.buildFullQAMap(userProfile, qaOverrides);
+
+    // Self-identification fields for voluntary disclosure / self-identify prompts
+    const selfId = {
+      gender: userProfile.gender || 'Male',
+      race_ethnicity: userProfile.race_ethnicity || 'Asian (Not Hispanic or Latino)',
+      veteran_status: userProfile.veteran_status || 'I am not a protected veteran',
+      disability_status: userProfile.disability_status || 'No, I Don\'t Have A Disability',
+    };
 
     let pagesProcessed = 0;
 
@@ -131,7 +144,7 @@ export class WorkdayApplyHandler implements TaskHandler {
 
           case 'voluntary_disclosure': {
             await progress.setStep(ProgressStep.ANSWERING_QUESTIONS);
-            const vResult = await handleVoluntaryDisclosure(adapter, dataPrompt, this.fullQAMap);
+            const vResult = await handleVoluntaryDisclosure(adapter, dataPrompt, this.fullQAMap, selfId);
             if (vResult === 'review_detected') {
               pageState = { page_type: 'review', page_title: 'Review' };
               continue;
@@ -141,7 +154,7 @@ export class WorkdayApplyHandler implements TaskHandler {
 
           case 'self_identify': {
             await progress.setStep(ProgressStep.ANSWERING_QUESTIONS);
-            const sResult = await handleSelfIdentify(adapter, dataPrompt, this.fullQAMap);
+            const sResult = await handleSelfIdentify(adapter, dataPrompt, this.fullQAMap, selfId);
             if (sResult === 'review_detected') {
               pageState = { page_type: 'review', page_title: 'Review' };
               continue;
@@ -254,8 +267,9 @@ export class WorkdayApplyHandler implements TaskHandler {
       // Contact info dropdowns
       'Country': profile.address.country,
       'Country/Territory': profile.address.country,
-      'State': profile.address.state,
-      'State/Province': profile.address.state,
+      // NOTE: State is intentionally NOT in the QA map. The profile stores abbreviations
+      // (e.g. "CA") but Workday dropdowns use full names ("California"). The LLM handles
+      // this mapping automatically via the data prompt.
       'Phone Device Type': profile.phone_device_type || 'Mobile',
       'Phone Type': profile.phone_device_type || 'Mobile',
       // Text field answers (used by fillTextFieldsProgrammatically too)
@@ -306,15 +320,16 @@ export class WorkdayApplyHandler implements TaskHandler {
     }
 
     if (profile.education?.length > 0) {
-      const edu = profile.education[0];
       parts.push('');
       parts.push('--- EDUCATION ---');
-      parts.push(`School/University → ${edu.school}`);
-      parts.push(`Degree → ${edu.degree}`);
-      parts.push(`Field of Study → ${edu.field_of_study}`);
-      if (edu.gpa) parts.push(`GPA → ${edu.gpa}`);
-      parts.push(`Start Date → ${edu.start_date}`);
-      parts.push(`End Date → ${edu.end_date}`);
+      for (const edu of profile.education) {
+        parts.push(`School/University → ${edu.school}`);
+        parts.push(`Degree → ${edu.degree}`);
+        parts.push(`Field of Study → ${edu.field_of_study}`);
+        if (edu.gpa) parts.push(`GPA → ${edu.gpa}`);
+        parts.push(`Start Date → ${edu.start_date}`);
+        parts.push(`End Date → ${edu.end_date}`);
+      }
     }
 
     // Q&A overrides for screening questions
@@ -330,7 +345,7 @@ export class WorkdayApplyHandler implements TaskHandler {
     parts.push('--- GENERAL RULES ---');
     parts.push(`Work Authorization → ${profile.work_authorization}`);
     parts.push(`Visa Sponsorship → ${profile.visa_sponsorship}`);
-    parts.push('For self-identification: Gender → select "Male". Race/Ethnicity → select "Asian (Not Hispanic or Latino)". Veteran Status → select "I am not a protected veteran". Disability → select "I do not wish to answer".');
+    parts.push(`For self-identification: Gender → select "${profile.gender}". Race/Ethnicity → select "${profile.race_ethnicity}". Veteran Status → select "${profile.veteran_status}". Disability → select "${profile.disability_status}".`);
     parts.push('For any question not listed above, select the most reasonable/common answer.');
     parts.push('DROPDOWN TECHNIQUE: After clicking a dropdown, ALWAYS TYPE your desired answer first (e.g. "No", "Yes", "Male", "Website") to filter the list. If a matching option appears, click it. If typing does not produce a match, click whitespace to close the dropdown, then re-click it and try typing a shorter keyword. The popup menu that appears after clicking a dropdown ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions. NEVER use arrow keys inside dropdowns. NEVER use mouse scroll inside dropdowns.');
     parts.push('NESTED DROPDOWNS: Some dropdowns have sub-menus. After selecting a category (e.g. "Website"), a second list appears with specific options (e.g. "workday.com"). Select the sub-option. Do NOT click any back arrow or "\u2190 Category" button — that navigates backwards.');

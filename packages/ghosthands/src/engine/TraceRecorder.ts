@@ -21,22 +21,55 @@ export interface TraceRecorderOptions {
   userData?: Record<string, string>;
 }
 
-// ── Magnitude action event shapes ──────────────────────────────────────
+// ── Magnitude action event shapes (namespaced variants) ──────────────
 
-interface ClickAction {
+interface MouseClickAction {
+  variant: 'mouse:click' | 'mouse:double_click' | 'mouse:right_click';
+  x: number;
+  y: number;
+}
+
+interface KeyboardTypeAction {
+  variant: 'keyboard:type';
+  content: string;
+}
+
+interface KeyboardKeyAction {
+  variant: 'keyboard:enter' | 'keyboard:tab' | 'keyboard:backspace' | 'keyboard:select_all';
+}
+
+interface MouseScrollAction {
+  variant: 'mouse:scroll';
+  x: number;
+  y: number;
+  deltaX: number;
+  deltaY: number;
+}
+
+interface BrowserNavAction {
+  variant: 'browser:nav';
+  url: string;
+}
+
+interface WaitAction {
+  variant: 'wait';
+}
+
+// Legacy simplified variants (backward compat with tests / older adapters)
+interface LegacyClickAction {
   variant: 'click';
   x: number;
   y: number;
 }
 
-interface TypeAction {
+interface LegacyTypeAction {
   variant: 'type';
   x: number;
   y: number;
   content: string;
 }
 
-interface ScrollAction {
+interface LegacyScrollAction {
   variant: 'scroll';
   x: number;
   y: number;
@@ -44,12 +77,23 @@ interface ScrollAction {
   deltaY: number;
 }
 
-interface LoadAction {
+interface LegacyLoadAction {
   variant: 'load';
   url: string;
 }
 
-type ActionEvent = ClickAction | TypeAction | ScrollAction | LoadAction | { variant: string; [key: string]: any };
+type ActionEvent =
+  | MouseClickAction
+  | KeyboardTypeAction
+  | KeyboardKeyAction
+  | MouseScrollAction
+  | BrowserNavAction
+  | WaitAction
+  | LegacyClickAction
+  | LegacyTypeAction
+  | LegacyScrollAction
+  | LegacyLoadAction
+  | { variant: string; [key: string]: any };
 
 // ── Element info returned by page.evaluate ────────────────────────────
 
@@ -64,6 +108,23 @@ interface ElementInfo {
   xpath: string;
 }
 
+// ── Skipped variants (no-op, no step recorded) ────────────────────────
+
+const SKIPPED_VARIANTS = new Set([
+  'mouse:drag',
+  'browser:nav:back',
+  'browser:tab:new',
+  'browser:tab:close',
+  'browser:tab:switch',
+]);
+
+function isSkippedVariant(variant: string): boolean {
+  if (SKIPPED_VARIANTS.has(variant)) return true;
+  // Match browser:tab:* wildcard
+  if (variant.startsWith('browser:tab:')) return true;
+  return false;
+}
+
 // ── TraceRecorder ──────────────────────────────────────────────────────
 
 export class TraceRecorder {
@@ -72,6 +133,7 @@ export class TraceRecorder {
   private steps: ManualStep[] = [];
   private recording = false;
   private boundHandler: ((action: ActionEvent) => void) | null = null;
+  private lastClickInfo: { x: number; y: number; elementInfo: ElementInfo } | null = null;
 
   constructor(options: TraceRecorderOptions) {
     this.adapter = options.adapter;
@@ -103,9 +165,10 @@ export class TraceRecorder {
     return [...this.steps];
   }
 
-  /** Clear all recorded steps. */
+  /** Clear all recorded steps and last-click state. */
   reset(): void {
     this.steps = [];
+    this.lastClickInfo = null;
   }
 
   /** Whether the recorder is currently listening for events. */
@@ -123,43 +186,113 @@ export class TraceRecorder {
   }
 
   private async recordAction(action: ActionEvent): Promise<void> {
-    const stepAction = mapVariantToAction(action.variant);
+    const { variant } = action;
+
+    // Skip variants we don't record
+    if (isSkippedVariant(variant)) return;
+
+    const stepAction = mapVariantToAction(variant);
     if (!stepAction) return;
 
-    // Navigation does not need elementFromPoint
-    if (action.variant === 'load') {
-      const loadAction = action as LoadAction;
+    // ── Navigation (no elementFromPoint needed) ──
+
+    if (variant === 'load' || variant === 'browser:nav') {
+      const navAction = action as { url: string };
       const step: ManualStep = {
         order: this.steps.length,
         locator: { css: 'body' },
         action: 'navigate',
-        value: loadAction.url,
+        value: navAction.url,
         healthScore: 1.0,
       };
       this.steps.push(step);
       return;
     }
 
-    // Actions with coordinates need elementFromPoint
-    const coordAction = action as { x: number; y: number; content?: string };
+    // ── Wait ──
+
+    if (variant === 'wait') {
+      const step: ManualStep = {
+        order: this.steps.length,
+        locator: { css: 'body' },
+        action: 'wait',
+        healthScore: 1.0,
+      };
+      this.steps.push(step);
+      return;
+    }
+
+    // ── Keyboard key presses (enter, tab, backspace, select_all) ──
+
+    if (variant.startsWith('keyboard:') && variant !== 'keyboard:type') {
+      const keyName = mapVariantToKeyName(variant);
+      if (!keyName) return;
+
+      // Use last-clicked element for locator, or fallback to body
+      const locator: LocatorDescriptor = this.lastClickInfo
+        ? buildLocator(this.lastClickInfo.elementInfo)
+        : { css: 'body' };
+
+      const step: ManualStep = {
+        order: this.steps.length,
+        locator,
+        action: 'press',
+        value: keyName,
+        healthScore: 1.0,
+      };
+      this.steps.push(step);
+      return;
+    }
+
+    // ── keyboard:type — uses lastClickInfo instead of elementFromPoint ──
+
+    if (variant === 'keyboard:type' || variant === 'type') {
+      const typeAction = action as { content: string; x?: number; y?: number };
+      let elementInfo: ElementInfo | null = null;
+
+      if (variant === 'type' && typeAction.x !== undefined && typeAction.y !== undefined) {
+        // Legacy variant: has coordinates, use elementFromPoint
+        elementInfo = await this.extractElementInfo(typeAction.x, typeAction.y);
+      } else {
+        // Magnitude variant: no coordinates, use last-clicked element
+        elementInfo = this.lastClickInfo?.elementInfo ?? null;
+      }
+
+      if (!elementInfo) return;
+
+      const locator = buildLocator(elementInfo);
+      const value = this.templatize(typeAction.content);
+
+      const step: ManualStep = {
+        order: this.steps.length,
+        locator,
+        action: 'fill',
+        value,
+        healthScore: 1.0,
+      };
+      this.steps.push(step);
+      return;
+    }
+
+    // ── Click and scroll — actions with coordinates ──
+
+    const coordAction = action as { x: number; y: number };
     if (coordAction.x === undefined || coordAction.y === undefined) return;
 
     const elementInfo = await this.extractElementInfo(coordAction.x, coordAction.y);
     if (!elementInfo) return;
 
-    const locator = buildLocator(elementInfo);
-    let value: string | undefined;
-
-    if (action.variant === 'type') {
-      const typeAction = action as TypeAction;
-      value = this.templatize(typeAction.content);
+    // Track last click for subsequent keyboard:type events
+    if (stepAction === 'click') {
+      this.lastClickInfo = { x: coordAction.x, y: coordAction.y, elementInfo };
     }
+
+    const locator = buildLocator(elementInfo);
 
     const step: ManualStep = {
       order: this.steps.length,
       locator,
       action: stepAction,
-      ...(value !== undefined && { value }),
       healthScore: 1.0,
     };
 
@@ -234,13 +367,45 @@ export class TraceRecorder {
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-/** Map Magnitude action variant to ManualStep action. */
+/** Map Magnitude action variant to ManualStep action. Supports both namespaced and legacy names. */
 function mapVariantToAction(variant: string): ManualStep['action'] | null {
   switch (variant) {
+    // Magnitude namespaced variants
+    case 'mouse:click':
+    case 'mouse:double_click':
+    case 'mouse:right_click':
+      return 'click';
+    case 'keyboard:type':
+      return 'fill';
+    case 'keyboard:enter':
+    case 'keyboard:tab':
+    case 'keyboard:backspace':
+    case 'keyboard:select_all':
+      return 'press';
+    case 'mouse:scroll':
+      return 'scroll';
+    case 'browser:nav':
+      return 'navigate';
+    case 'wait':
+      return 'wait';
+
+    // Legacy simplified variants (backward compat)
     case 'click': return 'click';
     case 'type': return 'fill';
     case 'scroll': return 'scroll';
     case 'load': return 'navigate';
+
+    default: return null;
+  }
+}
+
+/** Map keyboard variant to key name for press action value. */
+function mapVariantToKeyName(variant: string): string | null {
+  switch (variant) {
+    case 'keyboard:enter': return 'Enter';
+    case 'keyboard:tab': return 'Tab';
+    case 'keyboard:backspace': return 'Backspace';
+    case 'keyboard:select_all': return 'Control+A';
     default: return null;
   }
 }

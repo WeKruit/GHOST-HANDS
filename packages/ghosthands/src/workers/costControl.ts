@@ -107,7 +107,7 @@ export const JOB_TYPE_ACTION_LIMITS: Record<string, number> = {
   scrape: 30,
   fill_form: 40,
   custom: 50,
-  workday_apply: 200,
+  workday_apply: 10000,
 };
 
 // ---------------------------------------------------------------------------
