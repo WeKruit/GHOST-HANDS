@@ -48,7 +48,6 @@ export class SmartApplyHandler implements TaskHandler {
     const config = detectPlatformFromUrl(job.target_url);
     console.log(`[SmartApply] Platform: ${config.displayName} (${config.platformId})`);
     console.log(`[SmartApply] Starting application for ${job.target_url}`);
-    console.log(`[SmartApply] Applicant: ${userProfile.first_name} ${userProfile.last_name}`);
 
     // Build data prompt and QA map via platform config
     const dataPrompt = config.buildDataPrompt(userProfile, qaOverrides);
@@ -62,14 +61,14 @@ export class SmartApplyHandler implements TaskHandler {
         : path.resolve(process.cwd(), userProfile.resume_path);
       if (fs.existsSync(resolved)) {
         resumePath = resolved;
-        console.log(`[SmartApply] Resume found: ${resumePath}`);
+        console.log('[SmartApply] Resume file found');
       } else {
         console.warn(`[SmartApply] Resume not found at ${resolved} — skipping upload.`);
       }
     }
     if (!resumePath && ctx.resumeFilePath) {
       resumePath = ctx.resumeFilePath;
-      console.log(`[SmartApply] Using JobExecutor resume: ${resumePath}`);
+      console.log('[SmartApply] Using JobExecutor resume file');
     }
 
     // Create orchestrator and run

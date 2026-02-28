@@ -476,6 +476,72 @@ describe('LayeredOrchestrator', () => {
   });
 
   // =========================================================================
+  // safeAct failure handling
+  // =========================================================================
+
+  describe('safeAct failure handling', () => {
+    test('LLM fill phase handles safeAct returning false gracefully', async () => {
+      const adapter = createMockAdapter();
+      // act() returns failure (not throwing) — safeAct returns false
+      (adapter.act as Mock).mockResolvedValue({ success: false, message: 'element not found', durationMs: 50 });
+
+      let urlIdx = 0;
+      (adapter.getCurrentUrl as Mock).mockImplementation(() => `https://example.com/page${++urlIdx}`);
+
+      const config = createMockConfig({
+        detectPageByUrl: vi.fn()
+          .mockReturnValueOnce(null)
+          .mockReturnValue({ page_type: 'review', page_title: 'Review' }),
+        detectPageByDOM: vi.fn().mockResolvedValue({ page_type: 'questions', page_title: 'Form' }),
+        scanPageFields: vi.fn().mockResolvedValue({
+          fields: [makeField('First Name')],
+          scrollHeight: 1000,
+          viewportHeight: 800,
+        }),
+        fillScannedField: vi.fn().mockResolvedValue(false), // DOM fill fails
+        clickNextButton: vi.fn().mockResolvedValue('review_detected'),
+      });
+
+      const orchestrator = buildOrchestrator({ adapter, config });
+      const result = await orchestrator.run(defaultRunParams);
+
+      // Should still complete — act failure doesn't crash the orchestrator
+      expect(result.success).toBe(true);
+      expect(result.awaitingUserReview).toBe(true);
+    });
+  });
+
+  // =========================================================================
+  // Filechooser listener cleanup
+  // =========================================================================
+
+  describe('filechooser listener', () => {
+    test('registers filechooser handler when resumePath provided', async () => {
+      const adapter = createMockAdapter();
+      const config = createMockConfig({
+        detectPageByUrl: vi.fn().mockReturnValue({ page_type: 'review', page_title: 'Review' }),
+      });
+
+      const orchestrator = buildOrchestrator({ adapter, config });
+      await orchestrator.run({ ...defaultRunParams, resumePath: '/tmp/resume.pdf' });
+
+      expect(adapter.page.on).toHaveBeenCalledWith('filechooser', expect.any(Function));
+    });
+
+    test('does not register filechooser handler when no resumePath', async () => {
+      const adapter = createMockAdapter();
+      const config = createMockConfig({
+        detectPageByUrl: vi.fn().mockReturnValue({ page_type: 'review', page_title: 'Review' }),
+      });
+
+      const orchestrator = buildOrchestrator({ adapter, config });
+      await orchestrator.run({ ...defaultRunParams, resumePath: null });
+
+      expect(adapter.page.on).not.toHaveBeenCalled();
+    });
+  });
+
+  // =========================================================================
   // SmartApplyHandler integration
   // =========================================================================
 
