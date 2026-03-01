@@ -141,8 +141,7 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
 
     try {
       // Dismiss any lingering dropdown portal before opening next
-      await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
-      await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
+      await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
       await page.waitForTimeout(300);
 
       await clickComboboxTrigger(page, f.id);
@@ -228,8 +227,7 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
             // Close and dismiss before next category
             await page.keyboard.press("Escape");
             await page.waitForTimeout(200);
-            await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
-            await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
+            await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
             await page.waitForTimeout(200);
           }
 
@@ -284,8 +282,7 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
 
       // Ensure dropdown is fully closed
       await page.keyboard.press("Escape");
-      await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
-      await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
+      await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
       await page.waitForTimeout(300);
     } catch {
       // Ignore — some fields won't open
@@ -388,8 +385,13 @@ Example response:
 async function dismissDropdown(page: Page): Promise<void> {
   await page.waitForTimeout(200);
   await page.keyboard.press("Escape").catch(() => {});
-  // Click the page title / top of page — far from any dropdown trigger
-  await page.click("body", { position: { x: 1, y: 1 }, force: true }).catch(() => {});
+  // Blur + synthetic click to dismiss Workday portals (activeListContainer).
+  // Uses evaluate instead of page.click("body") to avoid scrolling to top.
+  await page.evaluate(() => {
+    (document.activeElement as HTMLElement)?.blur();
+    document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  }).catch(() => {});
   await page.waitForTimeout(150);
 }
 
@@ -620,17 +622,20 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
         }
       }
 
+      // opt will be set by hierarchical fallthrough or below
+      let opt: string | undefined;
+
       // Hierarchical dropdown: "Category > SubOption" path
       // IMPORTANT: Must use Playwright locator clicks (clickActiveListOption),
       // not raw DOM el.click(). Workday's UXI framework requires proper
       // mousedown/mouseup/click events.
+      // On failure, falls through to the normal flat select path below.
       if (answer && answer.includes(" > ")) {
         const [category, value] = answer.split(" > ", 2);
         try {
           // Dismiss any open dropdowns first
-          await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
-          await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
-          await page.waitForTimeout(200);
+          await page.keyboard.press("Escape").catch(() => {});
+          await page.waitForTimeout(300);
 
           // Open the dropdown
           await clickComboboxTrigger(page, field.id);
@@ -640,52 +645,90 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
           const hasContainer = await page.evaluate(() =>
             !!document.querySelector('[data-automation-id="activeListContainer"]')
           );
-          if (!hasContainer) {
-            console.error(`  skip ${tag} (no activeListContainer)`);
-            return false;
-          }
 
-          // Click the category using Playwright locator
-          const catClicked = await clickActiveListOption(page, category);
-          if (!catClicked) {
-            console.error(`  skip ${tag} (category "${category}" not found)`);
-            await page.keyboard.press("Escape");
-            return false;
-          }
-          await page.waitForTimeout(800);
+          if (hasContainer) {
+            // Click the category using Playwright locator
+            const catClicked = await clickActiveListOption(page, category);
+            if (catClicked) {
+              await page.waitForTimeout(1000);
 
-          // Click the sub-option using Playwright locator
-          const subClicked = await clickActiveListOption(page, value);
-          if (subClicked) {
-            await dismissDropdown(page);
-            console.error(`  select ${tag} → "${category} > ${value}"`);
-            return true;
-          }
+              // Check if portal is still open with sub-options
+              const portalOpen = await page.evaluate(() =>
+                !!document.querySelector('[data-automation-id="activeListContainer"]')
+              );
 
-          // Fuzzy fallback: read available options and try partial match
-          const available = await readActiveListOptions(page);
-          const lowerValue = value.toLowerCase();
-          const fuzzyMatch = available.find(opt => {
-            const lo = opt.toLowerCase();
-            return lo.includes(lowerValue) || lowerValue.includes(lo);
-          });
-          if (fuzzyMatch) {
-            const fuzzyClicked = await clickActiveListOption(page, fuzzyMatch);
-            if (fuzzyClicked) {
-              await dismissDropdown(page);
-              console.error(`  select ${tag} → "${category} > ${fuzzyMatch}"`);
-              return true;
+              if (portalOpen) {
+                // Portal open — find and click sub-option.
+                // The list may be VIRTUALIZED (only ~18 items rendered at a time).
+                // We need to scroll to find options not in the initial viewport.
+
+                // Helper: search visible options for the target, tag it if found
+                const findAndTag = async (): Promise<boolean> => {
+                  return page.evaluate((searchText) => {
+                    const c = document.querySelector('[data-automation-id="activeListContainer"]');
+                    if (!c) return false;
+                    const items = Array.from(c.querySelectorAll('[role="option"]'));
+                    const lower = searchText.toLowerCase().trim();
+                    for (const item of items) {
+                      const r = (item as HTMLElement).getBoundingClientRect();
+                      if (r.height === 0) continue;
+                      const t = (item.textContent || '').trim().toLowerCase();
+                      if (t === lower || t.includes(lower) || lower.includes(t)) {
+                        (item as HTMLElement).setAttribute('data-ff-click-target', 'sub');
+                        return true;
+                      }
+                    }
+                    return false;
+                  }, value);
+                };
+
+                // Try 1: check currently visible items
+                let foundSub = await findAndTag();
+
+                // Try 2: scroll through virtualized list to find the option
+                if (!foundSub) {
+                  for (let scrollAttempt = 0; scrollAttempt < 30; scrollAttempt++) {
+                    await page.evaluate(() => {
+                      const c = document.querySelector('[data-automation-id="activeListContainer"]') as HTMLElement;
+                      if (c) c.scrollTop += 300;
+                    });
+                    await page.waitForTimeout(150);
+                    foundSub = await findAndTag();
+                    if (foundSub) break;
+                  }
+                }
+
+                if (foundSub) {
+                  await page.locator('[data-ff-click-target="sub"]').first().click({ timeout: 2000 });
+                  await page.evaluate(() => document.querySelectorAll('[data-ff-click-target]').forEach(el => el.removeAttribute('data-ff-click-target')));
+                  await dismissDropdown(page);
+                  console.error(`  select ${tag} → "${category} > ${value}"`);
+                  return true;
+                }
+
+                // Try 3: clickActiveListOption (in case scrolling brought it into view)
+                const subClicked = await clickActiveListOption(page, value);
+                if (subClicked) {
+                  await dismissDropdown(page);
+                  console.error(`  select ${tag} → "${category} > ${value}"`);
+                  return true;
+                }
+
+                console.error(`    [hierarchical] "${value}" not found in "${category}" sub-options after scrolling`);
+              } else {
+                console.error(`    [hierarchical] portal closed after clicking "${category}"`);
+              }
             }
           }
 
-          console.error(`  skip ${tag} (sub-option "${value}" not found in "${category}", available: ${available.slice(0, 5).join(", ")})`);
-          await page.keyboard.press("Escape");
-          return false;
-        } catch (e: any) {
-          console.error(`  skip ${tag} (hierarchical select failed: ${e.message?.slice(0, 50)})`);
+          // Hierarchical path didn't work — close and fall through to flat select
           await page.keyboard.press("Escape").catch(() => {});
-          return false;
+          await dismissDropdown(page);
+        } catch {
+          await page.keyboard.press("Escape").catch(() => {});
         }
+        // Fall through: try the sub-option value as a flat select, then the full answer
+        opt = value; // try just the sub-option text first
       }
 
       // Multi-select: if answer contains commas, click each option individually
@@ -731,9 +774,12 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
       }
 
       // Custom dropdown: use answer if provided, else first non-placeholder
-      const opt = answer
-        ?? field.options?.find((o) => !PLACEHOLDER_RE.test(o))
-        ?? field.options?.[0];
+      // If hierarchical fallthrough set opt above, use that; otherwise derive from answer/options
+      if (!opt) {
+        opt = answer
+          ?? field.options?.find((o) => !PLACEHOLDER_RE.test(o))
+          ?? field.options?.[0];
+      }
 
       if (!opt) {
         // No options known — try clicking to discover them on the fly
@@ -773,6 +819,28 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
           return true;
         }
 
+        // Workday type-to-search: if the selectinput has a search box, type to filter
+        try {
+          const hasSearch = await page.evaluate((ffId) => {
+            const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+            if (!el) return false;
+            const input = el.querySelector('input[type="text"], input:not([type])') as HTMLInputElement;
+            if (input && document.activeElement === input) return true;
+            // Check if the element itself is an input
+            return el.tagName === 'INPUT' && (el as HTMLInputElement).type !== 'hidden';
+          }, field.id);
+          if (hasSearch) {
+            await page.keyboard.type(opt.slice(0, 30), { delay: 50 });
+            await page.waitForTimeout(500);
+            clicked = await clickActiveListOption(page, opt);
+            if (clicked) {
+              await dismissDropdown(page);
+              console.error(`  select ${tag} → "${opt}" (typed)`);
+              return true;
+            }
+          }
+        } catch { /* type-to-search failed */ }
+
         // Fuzzy matching: read available options and find best match
         const available = await readActiveListOptions(page);
         const lowerOpt = opt.toLowerCase();
@@ -810,7 +878,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
         // (for dynamically-populated custom dropdowns not using Workday portal)
         try {
           await page.keyboard.press("Escape").catch(() => {});
-          await page.click("body", { position: { x: 1, y: 1 }, force: true }).catch(() => {});
+          await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
           await page.waitForTimeout(200);
           // Click the trigger child (not the combobox itself, to avoid toggling closed)
           const triggerChild = page.locator(`${sel} > [class*="trigger"], ${sel} > button, ${sel} > div`).first();
@@ -820,14 +888,73 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
             await page.click(sel, { timeout: 1000 });
           }
           await page.waitForTimeout(300);
-          const directOption = page.locator(`${sel} [role="option"]`).filter({ hasText: opt }).first();
-          if (await directOption.count() > 0) {
-            await directOption.click({ timeout: 2000 });
-            await dismissDropdown(page);
-            console.error(`  select ${tag} → "${opt}" (direct)`);
-            return true;
+          // Look for options with various selectors (role="option", li, menuitem)
+          for (const optSel of [
+            `${sel} [role="option"]`,
+            `${sel} li`,
+            `${sel} [role="menuitem"]`,
+          ]) {
+            const directOption = page.locator(optSel).filter({ hasText: opt }).first();
+            if (await directOption.count() > 0) {
+              await directOption.click({ timeout: 2000 });
+              await dismissDropdown(page);
+              console.error(`  select ${tag} → "${opt}" (direct)`);
+              return true;
+            }
           }
         } catch { /* direct approach failed */ }
+
+        // Native <select> fallback: check if there's a hidden native select inside/near the element
+        try {
+          const nativeSelect = await page.evaluate((ffId) => {
+            const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+            if (!el) return null;
+            // Check inside the element
+            let sel = el.querySelector("select") as HTMLSelectElement | null;
+            // Check in parent form-group
+            if (!sel) {
+              const group = el.closest(".form-group, .field, .form-field, fieldset, .select-container");
+              if (group) sel = group.querySelector("select");
+            }
+            // Check sibling
+            if (!sel && el.nextElementSibling?.tagName === "SELECT") {
+              sel = el.nextElementSibling as HTMLSelectElement;
+            }
+            if (!sel) return null;
+            return sel.getAttribute("data-ff-id") || sel.id || null;
+          }, field.id);
+
+          if (nativeSelect) {
+            const nativeSel = nativeSelect.startsWith("ff-")
+              ? `[data-ff-id="${nativeSelect}"]`
+              : `#${nativeSelect}`;
+            try {
+              await page.selectOption(nativeSel, { label: opt }, { timeout: 2000 });
+              console.error(`  select ${tag} → "${opt}" (native fallback)`);
+              return true;
+            } catch {
+              // Try fuzzy match on native option text
+              const matched = await page.evaluate(
+                ({ selector, text }) => {
+                  const el = document.querySelector(selector) as HTMLSelectElement;
+                  if (!el) return null;
+                  const lower = text.toLowerCase();
+                  for (const o of el.options) {
+                    const t = o.textContent?.trim().toLowerCase() || "";
+                    if (t.includes(lower) || lower.includes(t)) return o.value;
+                  }
+                  return null;
+                },
+                { selector: nativeSel, text: opt }
+              );
+              if (matched) {
+                await page.selectOption(nativeSel, matched, { timeout: 2000 });
+                console.error(`  select ${tag} → "${opt}" (native fuzzy)`);
+                return true;
+              }
+            }
+          }
+        } catch { /* native fallback failed */ }
 
         await page.keyboard.press("Escape");
         console.error(`  skip ${tag} (could not click option "${opt}", available: ${available.slice(0, 5).join(", ")})`);
@@ -1214,14 +1341,26 @@ async function fillCurrentPage(page: Page, existingAnswers: AnswerMap = {}, exis
     console.error(`\nRound ${round}: ${toFill.length} new fields to fill…`);
     for (const field of toFill) {
       filled.add(field.id);
-      // For repeater fields, build a field-specific answer map using the disambiguated key
+      // For repeater fields, build a field-specific answer map using the disambiguated key.
+      // Use normalizeName to match LLM keys that may differ by trailing * markers.
       const key = fieldIdMap[field.id];
-      const fieldAnswers = key ? { ...answers, [field.name]: answers[key] } : answers;
+      let resolvedAnswer: string | undefined;
+      if (key) {
+        resolvedAnswer = answers[key]; // exact match
+        if (resolvedAnswer === undefined) {
+          // Try normalized match (e.g., "How Did You Hear About Us?*" vs "How Did You Hear About Us?")
+          const normKey = normalizeName(key);
+          for (const [k, v] of Object.entries(answers)) {
+            if (normalizeName(k) === normKey) { resolvedAnswer = v; break; }
+          }
+        }
+      }
+      const fieldAnswers = resolvedAnswer !== undefined ? { ...answers, [field.name]: resolvedAnswer } : answers;
       await fillField(page, field, fieldAnswers);
     }
     // Dismiss any leftover open dropdowns/popups
     await page.keyboard.press("Escape").catch(() => {});
-    await page.evaluate(() => (document.activeElement as HTMLElement)?.blur()).catch(() => {});
+    await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
     await page.waitForTimeout(400);
   }
 

@@ -526,51 +526,130 @@ export interface ComboboxInfo {
 
 // ── Workday portal helpers (module-level) ───────────────────
 
-// Read de-duplicated option texts from Workday's activeListContainer portal
+// Read de-duplicated option texts from any visible dropdown (Workday portal, ARIA listbox, or generic)
 export async function readActiveListOptions(page: Page): Promise<string[]> {
   const raw = await page.evaluate(() => {
-    const container = document.querySelector('[data-automation-id="activeListContainer"]');
-    if (!container) return [];
-    let items = Array.from(container.querySelectorAll('[role="option"]'));
-    if (items.length === 0) {
-      items = Array.from(container.querySelectorAll(
-        '[data-automation-id="promptOption"], [data-automation-id="menuItem"]'
-      ));
+    const results: string[] = [];
+    function collect(items: Element[]) {
+      for (const o of items) {
+        const r = (o as HTMLElement).getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        const t = (o.textContent || "").trim();
+        if (t && t.length < 200) results.push(t);
+      }
     }
-    return items
-      .filter((o: any) => {
-        const r = o.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
-      })
-      .map((o: any) => (o.textContent || "").trim())
-      .filter(Boolean);
+
+    // 1. Workday activeListContainer portal
+    const container = document.querySelector('[data-automation-id="activeListContainer"]');
+    if (container) {
+      let items = Array.from(container.querySelectorAll('[role="option"]'));
+      if (items.length === 0) {
+        items = Array.from(container.querySelectorAll(
+          '[data-automation-id="promptOption"], [data-automation-id="menuItem"]'
+        ));
+      }
+      collect(items);
+    }
+
+    // 2. Any visible [role="listbox"] on the page
+    if (results.length === 0) {
+      const listboxes = document.querySelectorAll('[role="listbox"]');
+      for (const lb of listboxes) {
+        const r = (lb as HTMLElement).getBoundingClientRect();
+        if (r.height > 0) {
+          collect(Array.from(lb.querySelectorAll('[role="option"]')));
+        }
+      }
+    }
+
+    // 3. Any visible standalone [role="option"] elements
+    if (results.length === 0) {
+      collect(Array.from(document.querySelectorAll('[role="option"]')).filter(el => {
+        const r = (el as HTMLElement).getBoundingClientRect();
+        return r.height > 0;
+      }));
+    }
+
+    // 4. Generic dropdown li items in visible containers
+    if (results.length === 0) {
+      const dropdowns = document.querySelectorAll(
+        '[class*="dropdown"]:not([style*="display: none"]), [class*="menu"]:not([style*="display: none"]), [class*="listbox"]:not([style*="display: none"])'
+      );
+      for (const dd of dropdowns) {
+        const r = (dd as HTMLElement).getBoundingClientRect();
+        if (r.height > 0) {
+          collect(Array.from(dd.querySelectorAll('li')));
+        }
+      }
+    }
+
+    return [...new Set(results)];
   });
-  return [...new Set(raw)];
+  return raw;
 }
 
-// Click an option inside a Workday dropdown (activeListContainer portal OR native listbox)
-// Uses Playwright locators (page.evaluate el.click() doesn't fire Workday's React handlers)
+// Click an option inside a dropdown (Workday portal, ARIA listbox, or generic)
+// Uses Playwright locators (page.evaluate el.click() doesn't fire React handlers)
 export async function clickActiveListOption(page: Page, text: string): Promise<boolean> {
+  // Use exact text match regex to avoid substring issues (e.g. "Male" matching "Female")
+  const exactRe = new RegExp(`^\\s*${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i');
   try {
-    // Try activeListContainer portal first (searchable selectinput dropdowns)
+    // Try activeListContainer portal first (Workday searchable selectinput dropdowns)
     const portal = page.locator('[data-automation-id="activeListContainer"]');
     if (await portal.count() > 0) {
-      let option = portal.locator(`[role="option"]`).filter({ hasText: text }).first();
+      let option = portal.locator(`[role="option"]`).filter({ hasText: exactRe }).first();
       if (await option.count() === 0) {
         option = portal.locator(`[data-automation-id="promptOption"], [data-automation-id="menuItem"]`)
-          .filter({ hasText: text }).first();
+          .filter({ hasText: exactRe }).first();
       }
       if (await option.count() > 0) {
         await option.click({ timeout: 2000 });
         return true;
       }
+      // Fall back to substring match in portal
+      option = portal.locator(`[role="option"]`).filter({ hasText: text }).first();
+      if (await option.count() > 0) {
+        await option.click({ timeout: 2000 });
+        return true;
+      }
     }
-    // Fallback: native UL[role="listbox"] dropdown (Country, State, Phone Device Type)
-    const listbox = page.locator('[role="listbox"]:visible [role="option"]').filter({ hasText: text }).first();
+
+    // Try visible [role="listbox"] [role="option"] (standard ARIA pattern)
+    const listbox = page.locator('[role="listbox"]:visible [role="option"]').filter({ hasText: exactRe }).first();
     if (await listbox.count() > 0) {
       await listbox.click({ timeout: 2000 });
       return true;
     }
+
+    // Broader: any visible [role="option"] on the page (not necessarily inside [role="listbox"])
+    const anyOption = page.locator('[role="option"]:visible').filter({ hasText: exactRe }).first();
+    if (await anyOption.count() > 0) {
+      await anyOption.click({ timeout: 2000 });
+      return true;
+    }
+
+    // Generic dropdown patterns: visible li items in open dropdown containers
+    for (const containerSel of [
+      'ul:visible li',
+      '[class*="dropdown"]:visible li',
+      '[class*="menu"]:visible li',
+      '[class*="select"]:visible li',
+      '[class*="listbox"]:visible li',
+    ]) {
+      const li = page.locator(containerSel).filter({ hasText: exactRe }).first();
+      if (await li.count() > 0) {
+        await li.click({ timeout: 2000 });
+        return true;
+      }
+    }
+
+    // Substring fallback for non-portal options
+    const subMatch = page.locator('[role="listbox"]:visible [role="option"]').filter({ hasText: text }).first();
+    if (await subMatch.count() > 0) {
+      await subMatch.click({ timeout: 2000 });
+      return true;
+    }
+
     return false;
   } catch {
     return false;
@@ -769,8 +848,7 @@ export async function findVisibleProbeTargets(
     if (cb.kind === "select" && !cb.isNative && cb.options.length === 0 && cb.id) {
       try {
         // Dismiss any lingering dropdown portals (Workday reuses them)
-        await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
-        await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
+        await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
         await page.waitForTimeout(300);
 
         await clickComboboxTrigger(page, cb.id);
@@ -858,7 +936,7 @@ export async function findVisibleProbeTargets(
               await page.keyboard.press("Escape");
               await page.waitForTimeout(200);
               await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
-              await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
+              await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
               await page.waitForTimeout(200);
             }
 
@@ -928,8 +1006,7 @@ export async function findVisibleProbeTargets(
 
         // Ensure dropdown is fully closed
         await page.keyboard.press("Escape");
-        await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
-        await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
+        await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
         await page.waitForTimeout(300);
       } catch {
         // ignore — might not be an openable combobox
@@ -1257,7 +1334,7 @@ export async function discoverConditionals(page: Page) {
           console.error(`  [warn] Could not select "${optionText}" for sample probe in ${cb.label}`);
           // Dismiss any open dropdown
           await page.keyboard.press("Escape").catch(() => {});
-          await page.click("body", { position: { x: 0, y: 0 }, force: true }).catch(() => {});
+          await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
           await page.waitForTimeout(200);
           continue;
         }
