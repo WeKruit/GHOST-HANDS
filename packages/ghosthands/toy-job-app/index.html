@@ -974,6 +974,45 @@
             <input type="date" id="startDate" name="startDate">
           </div>
 
+          <!-- Workday-style date input: MM/YYYY spinbutton pair -->
+          <div class="form-group">
+            <label>Available From (Workday-style)</label>
+            <div id="availableFrom" aria-label="Available From" role="group" data-automation-id="dateInputWrapper" style="display:flex;align-items:center;gap:2px;">
+              <div id="availableFrom-dateSectionMonth" tabindex="-1" style="position:relative;">
+                <div aria-hidden="true" id="availableFrom-dateSectionMonth-display" data-automation-id="dateSectionMonth-display"
+                     style="position:absolute;top:0;left:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;pointer-events:none;color:#999;font-size:14px;">MM</div>
+                <input role="spinbutton" aria-label="Month" aria-valuemax="12" aria-valuemin="1" aria-valuetext="MM"
+                       id="availableFrom-dateSectionMonth-input" data-automation-id="dateSectionMonth-input"
+                       style="width:40px;height:32px;text-align:center;border:1px solid #ccc;border-radius:4px;font-size:14px;background:transparent;position:relative;z-index:1;"
+                       value="">
+              </div>
+              <span style="color:#999;">/</span>
+              <div id="availableFrom-dateSectionYear" tabindex="0" style="position:relative;">
+                <div aria-hidden="true" id="availableFrom-dateSectionYear-display" data-automation-id="dateSectionYear-display"
+                     style="position:absolute;top:0;left:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;pointer-events:none;color:#999;font-size:14px;">YYYY</div>
+                <input role="spinbutton" aria-label="Year" aria-valuemax="9999" aria-valuemin="1" aria-valuetext="YYYY"
+                       id="availableFrom-dateSectionYear-input" data-automation-id="dateSectionYear-input"
+                       style="width:55px;height:32px;text-align:center;border:1px solid #ccc;border-radius:4px;font-size:14px;background:transparent;position:relative;z-index:1;"
+                       value="">
+              </div>
+            </div>
+            <script>
+              // Hide placeholder when input has value (mimics Workday behavior)
+              document.querySelectorAll('[data-automation-id$="-input"]').forEach(input => {
+                const display = input.previousElementSibling;
+                input.addEventListener('input', () => {
+                  if (display) display.style.display = input.value ? 'none' : 'flex';
+                });
+                input.addEventListener('focus', () => {
+                  if (display) display.style.display = 'none';
+                });
+                input.addEventListener('blur', () => {
+                  if (display) display.style.display = input.value ? 'none' : 'flex';
+                });
+              });
+            </script>
+          </div>
+
           <!-- Workday-style hierarchical dropdown: Referral source -->
           <div class="form-group">
             <label for="referralSource">How did you hear about us? <span class="required">*</span></label>
