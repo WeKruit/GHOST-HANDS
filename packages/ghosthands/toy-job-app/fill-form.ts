@@ -20,10 +20,28 @@
 import type { Page } from "playwright";
 import { startBrowserAgent, type BrowserAgent } from "magnitude-core";
 import * as path from "path";
+import * as fs from "fs";
 import Anthropic from "@anthropic-ai/sdk";
 
 // Load .env from packages/ghosthands/
 process.loadEnvFile(path.resolve(__dirname, "..", ".env"));
+
+// ── Log file setup ──────────────────────────────────────────
+// If GH_LOG_FILE=true in .env, mirror all console.error output to a timestamped log file
+let logStream: fs.WriteStream | null = null;
+if (process.env.GH_LOG_FILE === "true") {
+  const logsDir = path.resolve(__dirname, "..", "logs");
+  if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const logPath = path.join(logsDir, `fill-form-${timestamp}.txt`);
+  logStream = fs.createWriteStream(logPath, { flags: "a" });
+  const origError = console.error.bind(console);
+  console.error = (...args: any[]) => {
+    origError(...args);
+    logStream!.write(args.map(String).join(" ") + "\n");
+  };
+  console.error(`Logging to: ${logPath}`);
+}
 
 import { createClient } from "@supabase/supabase-js";
 import { ResumeProfileLoader } from "../src/db/resumeProfileLoader";
@@ -878,7 +896,8 @@ async function main() {
   console.error(`LLM provided ${Object.keys(answers).length} answers.\n`);
 
   // ── Iterative fill loop ───────────────────────────────────
-  const filled = new Set<string>();
+  const attempted = new Set<string>();
+  const domFilledOk = new Set<string>(); // fields DOMhand successfully filled
   let round = 0;
 
   while (round < 10) {
@@ -886,8 +905,8 @@ async function main() {
     const fields = await extractFields(page);
     const visible = fields.filter((f) => f.visibleByDefault);
 
-    // Find fields we haven't filled yet
-    const toFill = visible.filter((f) => !filled.has(f.id));
+    // Find fields we haven't attempted yet
+    const toFill = visible.filter((f) => !attempted.has(f.id));
     if (toFill.length === 0) break;
 
     // If new fields appeared that the LLM hasn't seen, ask again
@@ -906,15 +925,16 @@ async function main() {
     console.error(`\nRound ${round}: ${toFill.length} new fields to fill…`);
 
     for (const field of toFill) {
-      filled.add(field.id);
-      await fillField(page, field, answers);
+      attempted.add(field.id);
+      const ok = await fillField(page, field, answers);
+      if (ok) domFilledOk.add(field.id);
     }
 
     // Wait for conditional logic to react
     await page.waitForTimeout(400);
   }
 
-  console.error(`\nDone! Filled ${filled.size} fields in ${round} round(s).`);
+  console.error(`\nDone! Filled ${domFilledOk.size}/${attempted.size} fields in ${round} round(s).`);
 
   // ── MagnitudeHand Fallback (real Magnitude visual agent) ────
   // Re-extract fields and identify truly unfilled ones. Then use Magnitude's
@@ -926,8 +946,11 @@ async function main() {
     const postVisible = postFields.filter((f) => f.visibleByDefault);
 
     // Robust unfilled detection — handles radio, checkbox, range, contenteditable
+    // Skip fields that DOMhand already filled successfully (trust its return value)
     const unfilledFields: FormField[] = [];
     for (const f of postVisible) {
+      if (domFilledOk.has(f.id)) continue; // DOMhand succeeded — no need for Magnitude
+
       const isFilled = await page.evaluate((ffId) => {
         const el = document.querySelector(`[data-ff-id="${ffId}"]`);
         if (!el) return true; // element gone → skip
