@@ -154,6 +154,18 @@ export async function injectHelpers(page: Page) {
           var tx2 = c2.textContent.trim();
           if (tx2) return tx2;
         }
+        // 4b. File inputs: walk up to find nearest card/section heading
+        if (el.type === 'file') {
+          var card = el.closest('.card, .section, [class*="upload"], [class*="drop"]');
+          if (card) {
+            var parent = card.closest('.card, .section') || card;
+            var hdr = parent.querySelector('h1, h2, h3, h4, legend, [class*="heading"], [class*="title"]');
+            if (hdr) {
+              var ht = hdr.textContent.trim();
+              if (ht) return ht;
+            }
+          }
+        }
         // 5. Fallback
         return el.placeholder || el.getAttribute('title') || '';
       },
@@ -1064,7 +1076,7 @@ export async function clickComboboxTrigger(page: Page, id: string): Promise<void
       await page.focus(`[data-ff-id="${id}"]`);
     }
   }
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(600);
 }
 
 export async function selectOption(
