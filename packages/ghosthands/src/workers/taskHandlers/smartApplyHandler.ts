@@ -8,6 +8,8 @@ import type { CostTracker } from '../costControl.js';
 import { detectPlatformFromUrl } from './platforms/index.js';
 import { findBestAnswer } from './platforms/genericConfig.js';
 import { ProgressStep } from '../progressTracker.js';
+import { fillFormOnPage, buildProfileText } from './formFiller.js';
+import type { WorkdayUserProfile } from './workday/workdayTypes.js';
 
 // --- Constants ---
 
@@ -29,6 +31,8 @@ export class SmartApplyHandler implements TaskHandler {
   private lastLlmCallTime = 0;
   /** True after we've attempted native login — prevents re-trying login on Create Account pages */
   loginAttempted = false;
+  /** True after clicking Apply — prevents SPA re-detection as job_listing */
+  private applyClicked = false;
 
   validate(inputData: Record<string, any>): ValidationResult {
     const errors: string[] = [];
@@ -56,9 +60,10 @@ export class SmartApplyHandler implements TaskHandler {
     console.log(`[SmartApply] Starting application for ${job.target_url}`);
     console.log(`[SmartApply] Applicant: ${userProfile.first_name} ${userProfile.last_name}`);
 
-    // Build data prompt and QA map via platform config
+    // Build data prompt, QA map, and profile text for formFiller
     const dataPrompt = config.buildDataPrompt(userProfile, qaOverrides);
     const qaMap = config.buildQAMap(userProfile, qaOverrides);
+    const profileText = buildProfileText(userProfile as WorkdayUserProfile);
 
     // Resolve resume file path (if provided)
     let resumePath: string | null = null;
@@ -130,10 +135,19 @@ export class SmartApplyHandler implements TaskHandler {
           lastPageSignature = pageSignature;
         }
 
+        // SPA guard: after clicking Apply on SPAs (Greenhouse), the URL doesn't
+        // change and the form page may still have Apply-like buttons — override to questions
+        if (pageState.page_type === 'job_listing' && this.applyClicked) {
+          console.log(`[SmartApply] SPA guard: already clicked Apply — treating as questions page`);
+          pageState.page_type = 'questions' as any;
+          pageState.page_title = 'Form Page (SPA)';
+        }
+
         // Handle based on page type
         switch (pageState.page_type) {
           case 'job_listing':
             await this.handleJobListing(adapter);
+            this.applyClicked = true;
             break;
 
           case 'login':
@@ -301,8 +315,7 @@ export class SmartApplyHandler implements TaskHandler {
               : ProgressStep.FILLING_FORM;
             await progress.setStep(step as any);
 
-            const fillPrompt = config.buildPagePrompt(pageState.page_type, dataPrompt);
-            const result = await this.fillPage(adapter, config, fillPrompt, qaMap, pageState.page_type, resumePath, 0, 0, ctx.costTracker, dataPrompt);
+            const result = await this.fillPage(adapter, config, resumePath, profileText);
 
             if (result === 'review') {
               // fillPage detected this is actually the review page
@@ -1080,325 +1093,39 @@ ${dataPrompt}`,
   // =========================================================================
 
   /**
-   * Fill the current page using a scan-first approach:
-   *   Phase 0 (SCAN):    Scroll through the page to discover ALL fields.
-   *   Phase 1 (DOM FILL): Fill matched fields programmatically by selector.
-   *   Phase 2 (LLM FILL): Give the LLM precise context about remaining fields.
-   *   Phase 3 (ADVANCE):  Click Next or detect review page.
-   *
-   * The LLM NEVER scrolls or clicks navigation buttons. It only fills fields.
-   * All scrolling and page navigation is handled deterministically by the orchestrator.
+   * Fill the current page using the proven formFiller approach:
+   *   1. formFiller: extract fields, LLM answers, DOM fill, MagnitudeHand fallback
+   *   2. ADVANCE:   Click Next or detect review page.
    */
   private async fillPage(
     adapter: BrowserAutomationAdapter,
     config: PlatformConfig,
-    fillPrompt: string,
-    qaMap: Record<string, string>,
-    pageLabel: string,
     resumePath?: string | null,
+    profileText?: string,
     _depth = 0,
-    _llmCallsCarried = 0,
-    costTracker?: CostTracker,
-    dataPrompt?: string,
   ): Promise<'navigated' | 'review' | 'complete'> {
-    const MAX_DEPTH = 3;     // max recursive retries on validation errors
-    const MAX_CYCLES = 5;    // max scan-fill-rescan cycles (for conditional fields)
-    const MAX_LLM_CALLS = 100;
-    let llmCalls = _llmCallsCarried;
+    const MAX_DEPTH = 3;
 
     if (_depth >= MAX_DEPTH) {
-      console.warn(`[SmartApply] [${pageLabel}] Hit max fill depth (${MAX_DEPTH}) — giving up on validation errors.`);
+      console.warn(`[SmartApply] Hit max fill depth (${MAX_DEPTH}) — giving up on validation errors.`);
       return 'complete';
     }
-    let resumeUploaded = false;
 
     // Safety: check if this is actually the review page (misclassified)
     if (await this.checkIfReviewPage(adapter)) {
-      console.log(`[SmartApply] [${pageLabel}] SAFETY: This is the review page — skipping all fill logic.`);
+      console.log(`[SmartApply] SAFETY: This is the review page — skipping all fill logic.`);
       return 'review';
     }
 
-    for (let cycle = 0; cycle < MAX_CYCLES; cycle++) {
-      // ── PHASE 0: SCAN ──
-      console.log(`[SmartApply] [${pageLabel}] Cycle ${cycle + 1} — scanning page...`);
-      const scan = await config.scanPageFields(adapter);
-
-      const emptyFields = scan.fields.filter(f => !f.currentValue || f.currentValue.trim() === '');
-      const filledFields = scan.fields.filter(f => f.currentValue && f.currentValue.trim() !== '');
-      console.log(`[SmartApply] [${pageLabel}] Scan: ${scan.fields.length} total, ${emptyFields.length} empty, ${filledFields.length} filled`);
-
-      if (emptyFields.length === 0) {
-        console.log(`[SmartApply] [${pageLabel}] No empty fields found — advancing.`);
-        break; // Go to Phase 3 (ADVANCE)
-      }
-
-      // Log what was found
-      for (const f of emptyFields) {
-        console.log(`[SmartApply] [${pageLabel}]   [${f.kind}] "${f.label}" (${f.fillStrategy})${f.options ? ` opts: [${f.options.slice(0, 3).join(', ')}${f.options.length > 3 ? '...' : ''}]` : ''}`);
-      }
-
-      // ── PHASE 0.5: RESUME UPLOAD ──
-      if (resumePath && !resumeUploaded) {
-        const fileField = scan.fields.find(f => f.kind === 'file' && !f.currentValue);
-        if (fileField) {
-          const uploaded = await this.uploadResumeIfPresent(adapter, resumePath);
-          if (uploaded) {
-            resumeUploaded = true;
-            fileField.filled = true;
-          }
-        }
-        // If no file input but there's an upload button, use LLM click
-        if (!resumeUploaded) {
-          const uploadBtn = scan.fields.find(f => f.kind === 'upload_button' && !f.filled);
-          if (uploadBtn) {
-            console.log(`[SmartApply] [${pageLabel}] Upload button found — clicking via LLM to trigger file dialog...`);
-            try {
-              // Scroll to it first
-              await adapter.page.evaluate(
-                (sel: string) => document.querySelector(sel)?.scrollIntoView({ block: 'center' }),
-                uploadBtn.selector,
-              );
-              await adapter.page.waitForTimeout(300);
-              await this.safeAct(adapter,
-                'Click the resume/CV upload button or drag-and-drop area to open the file picker. ' +
-                'Look for text like "Upload", "Attach", "Choose File", "Browse", "Add Resume", or a drag-and-drop zone. ' +
-                'Click it ONCE, then report done immediately. Do NOT fill any other fields.',
-                pageLabel);
-              llmCalls++;
-              await adapter.page.waitForTimeout(3000);
-              resumeUploaded = true;
-              uploadBtn.filled = true;
-            } catch (err) {
-              console.warn(`[SmartApply] [${pageLabel}] LLM resume upload click failed: ${err}`);
-            }
-          }
-        }
-      }
-
-      // ── PHASE 1: DOM FILL ──
-      let domFills = 0;
-      const unfilled = scan.fields.filter(f => !f.filled && (!f.currentValue || f.currentValue.trim() === ''));
-
-      for (const field of unfilled) {
-        if (field.kind === 'file' || field.kind === 'upload_button') continue; // handled above
-
-        const answer = findBestAnswer(field.label, qaMap);
-        if (!answer) continue;
-
-        field.matchedAnswer = answer;
-
-        try {
-          const success = await config.fillScannedField(adapter, field, answer);
-          if (success) {
-            field.filled = true;
-            domFills++;
-            console.log(`[SmartApply] [${pageLabel}] DOM-filled "${field.label}" → "${answer.substring(0, 30)}${answer.length > 30 ? '...' : ''}" (${field.kind})`);
-          }
-        } catch (err) {
-          console.warn(`[SmartApply] [${pageLabel}] DOM fill failed for "${field.label}": ${err}`);
-        }
-      }
-
-      // Also check required/consent checkboxes (these use pattern matching, not qaMap)
-      domFills += await config.checkRequiredCheckboxes(adapter);
-
-      if (domFills > 0) {
-        console.log(`[SmartApply] [${pageLabel}] DOM filled ${domFills} field(s) total`);
-      }
-
-      // ── PHASE 2: LLM FILL (scroll-and-rescan per viewport) ──
-      // Instead of relying on the initial scan's absoluteY (which goes stale when
-      // DOM fills trigger conditional fields), we scroll through the page and
-      // do a live rescan of visible fields at each position.
-      const initialUnfilled = scan.fields.filter(f => !f.filled && (!f.currentValue || f.currentValue.trim() === '') && f.kind !== 'file' && f.kind !== 'upload_button');
-
-      if (initialUnfilled.length > 0 && llmCalls < MAX_LLM_CALLS) {
-        // Scroll to top before starting LLM viewport walk
-        await adapter.page.evaluate(() => window.scrollTo(0, 0));
-        await adapter.page.waitForTimeout(400);
-
-        const vpHeight = await adapter.page.evaluate(() => window.innerHeight);
-        const totalHeight = await adapter.page.evaluate(() => document.documentElement.scrollHeight);
-        const maxScrollPos = Math.max(0, totalHeight - vpHeight);
-        let currentScrollPos = 0;
-        const maxLLMScrollSteps = 10;
-        let llmScrollSteps = 0;
-
-        while (llmScrollSteps < maxLLMScrollSteps && llmCalls < MAX_LLM_CALLS) {
-          // Live-scan what's actually visible right now
-          const visibleFields = await this.scanVisibleUnfilledFields(adapter, config, qaMap);
-
-          if (visibleFields.length > 0) {
-            const groupContext = this.buildScanContextForLLM(visibleFields);
-            const enrichedPrompt = `${fillPrompt}\n\nFIELDS VISIBLE IN CURRENT VIEWPORT (${visibleFields.length} field(s) detected by scan):\n${groupContext}\n\nFill the fields listed above. They are currently visible and empty. Use the expected values shown where provided.\n\nADDITIONALLY: If you see any other visible empty required fields on screen (marked with * or "required") that are NOT listed above, fill those too. Some custom dropdowns or non-standard UI components may not appear in the scan. For dropdowns that don't have a text input, click them to open, then select the correct option.\n\nCRITICAL: NEVER skip a [REQUIRED] field (marked with * or [REQUIRED]). If no exact data is available, use your best judgment to pick the most reasonable answer. For example, "Degree Status" → "Completed" or "Graduated", "Visa Status" → "Authorized to work", etc. Required fields MUST be filled.\n\nIMPORTANT — STUCK FIELD RULE: If you type a value into a dropdown/autocomplete field and NO matching options appear in the dropdown list, the value is NOT available. Do NOT retry the same field or retype the same value. Instead: select all text in the field, delete it to clear it, click somewhere else to close any popups, then move on to the next field. You get ONE attempt per field — if it doesn't match, clear it and move on.\n\nDROPDOWN NAVIGATION: For click-to-open dropdowns (not search/type fields) showing a long list of options where the option you need is not visible, you MAY press ArrowDown repeatedly to scroll through options within the dropdown, then press Enter or click to select. This scrolls within the dropdown only, not the page.\n\nDo NOT scroll the page or click Next.`;
-
-            const fieldsBefore = await this.getVisibleFieldValues(adapter);
-            const checkedBefore = await this.getCheckedCheckboxes(adapter);
-
-            console.log(`[SmartApply] [${pageLabel}] LLM call ${llmCalls + 1}/${MAX_LLM_CALLS} for ${visibleFields.length} visible field(s): ${visibleFields.map(f => `"${f.label}"`).join(', ')}`);
-            try {
-              await this.safeAct(adapter, enrichedPrompt, pageLabel);
-            } catch (actError) {
-              console.warn(`[SmartApply] [${pageLabel}] LLM act() failed: ${actError instanceof Error ? actError.message : actError}`);
-            }
-            llmCalls++;
-
-            await this.dismissOpenOverlays(adapter);
-            await this.restoreUncheckedCheckboxes(adapter, checkedBefore);
-
-            // If LLM made changes, re-check this same position (conditional fields may have appeared)
-            const fieldsAfter = await this.getVisibleFieldValues(adapter);
-            if (fieldsAfter !== fieldsBefore) {
-              // Mark matched scan fields as filled
-              for (const vf of visibleFields) {
-                const match = scan.fields.find(sf => sf.selector === vf.selector);
-                if (match) match.filled = true;
-              }
-              continue; // re-scan same viewport position before scrolling
-            }
-          }
-
-          // Scroll down to next viewport position
-          if (currentScrollPos >= maxScrollPos) break;
-          currentScrollPos = Math.min(currentScrollPos + Math.round(vpHeight * 0.7), maxScrollPos);
-          await adapter.page.evaluate((y: number) => window.scrollTo(0, y), currentScrollPos);
-          await adapter.page.waitForTimeout(400);
-          llmScrollSteps++;
-        }
-      }
-
-      // ── POST-WALK CLEANUP ──
-      // After the viewport walk, fields at the viewport edge may have been seen
-      // but not filled (LLM reported them "cut off"). Scroll to each remaining
-      // unfilled field and attempt a targeted fill.
-      const postWalkUnfilled = scan.fields.filter(f =>
-        !f.filled && (!f.currentValue || f.currentValue.trim() === '') &&
-        f.kind !== 'file' && f.kind !== 'upload_button'
-      );
-
-      if (postWalkUnfilled.length > 0) {
-        console.log(`[SmartApply] [${pageLabel}] Post-walk cleanup: ${postWalkUnfilled.length} field(s) still unfilled`);
-
-        for (const field of postWalkUnfilled) {
-          const answer = field.matchedAnswer || findBestAnswer(field.label, qaMap);
-          if (!answer) continue;
-
-          // Scroll the field fully into view
-          if (field.selector) {
-            try {
-              await adapter.page.evaluate(
-                (sel: string) => document.querySelector(sel)?.scrollIntoView({ block: 'center' }),
-                field.selector,
-              );
-              await adapter.page.waitForTimeout(300);
-            } catch {}
-          }
-
-          try {
-            const ok = await config.fillScannedField(adapter, field, answer);
-            if (ok) {
-              field.filled = true;
-              domFills++;
-              console.log(`[SmartApply] [${pageLabel}] Post-walk filled "${field.label}" → "${answer.substring(0, 30)}${answer.length > 30 ? '...' : ''}" (${field.kind})`);
-            }
-          } catch (err) {
-            console.warn(`[SmartApply] [${pageLabel}] Post-walk DOM fill failed for "${field.label}": ${err}`);
-          }
-        }
-
-        // For fields that DOM fill couldn't handle, do one targeted LLM call
-        const stillUnfilled = postWalkUnfilled.filter(f => !f.filled);
-        if (stillUnfilled.length > 0 && llmCalls < MAX_LLM_CALLS + 2) {
-          // Scroll to the first unfilled field
-          const target = stillUnfilled[0];
-          if (target.selector) {
-            try {
-              await adapter.page.evaluate(
-                (sel: string) => document.querySelector(sel)?.scrollIntoView({ block: 'center' }),
-                target.selector,
-              );
-              await adapter.page.waitForTimeout(300);
-            } catch {}
-          }
-
-          const visibleFields = await this.scanVisibleUnfilledFields(adapter, config, qaMap);
-          if (visibleFields.length > 0) {
-            const groupContext = this.buildScanContextForLLM(visibleFields);
-            const cleanupPrompt = `${fillPrompt}\n\nFIELDS VISIBLE IN CURRENT VIEWPORT (${visibleFields.length} field(s) detected by scan):\n${groupContext}\n\nFill the fields listed above. They are currently visible and empty. Use the expected values shown where provided.\n\nCRITICAL: NEVER skip a [REQUIRED] field (marked with * or [REQUIRED]). If no exact data is available, use your best judgment to pick the most reasonable answer.\n\nDo NOT scroll the page or click Next.`;
-
-            console.log(`[SmartApply] [${pageLabel}] Post-walk LLM cleanup for ${visibleFields.length} remaining field(s): ${visibleFields.map(f => `"${f.label}"`).join(', ')}`);
-            try {
-              await this.safeAct(adapter, cleanupPrompt, pageLabel);
-              llmCalls++;
-            } catch (err) {
-              console.warn(`[SmartApply] [${pageLabel}] Post-walk LLM call failed: ${err instanceof Error ? err.message : err}`);
-            }
-          }
-        }
-      }
-
-      // ── PHASE 2.75: MAGNITUDE HAND FALLBACK ──
-      // After DOM fill + LLM fill + post-walk cleanup, any fields still
-      // unfilled are targets for Magnitude as a general GUI agent.
-      // This handles: nested dropdowns, custom widgets, autocomplete, etc.
-      const magnitudeUnfilled = scan.fields.filter(f =>
-        !f.filled &&
-        (!f.currentValue || f.currentValue.trim() === '') &&
-        f.kind !== 'file' && f.kind !== 'upload_button'
-      );
-
-      if (magnitudeUnfilled.length > 0) {
-        console.log(`[SmartApply] [${pageLabel}] ${magnitudeUnfilled.length} field(s) remain after DOM+LLM — invoking MagnitudeHand.`);
-
-        // Re-scan to get fresh field state (conditional fields may have appeared)
-        const freshScan = await config.scanPageFields(adapter);
-
-        // Merge filled status from original scan into fresh scan
-        for (const orig of scan.fields) {
-          if (orig.filled) {
-            const match = freshScan.fields.find(f => f.selector === orig.selector);
-            if (match) match.filled = true;
-          }
-        }
-
-        // Mark fields that already have values as filled
-        for (const f of freshScan.fields) {
-          if (f.currentValue && f.currentValue.trim() !== '') {
-            f.filled = true;
-          }
-        }
-
-        // Match answers from qaMap for unfilled fields
-        for (const f of freshScan.fields) {
-          if (!f.filled) {
-            f.matchedAnswer = findBestAnswer(f.label, qaMap) || undefined;
-          }
-        }
-
-        try {
-          const magnitudeFilled = await this.magnitudeHandFallback(
-            adapter, config, freshScan, qaMap, dataPrompt || '', pageLabel, costTracker,
-          );
-          if (magnitudeFilled > 0) {
-            console.log(`[SmartApply] [${pageLabel}] MagnitudeHand filled ${magnitudeFilled} field(s).`);
-          }
-        } catch (err) {
-          // Let BudgetExceededError propagate to caller
-          if (err instanceof Error && (
-            err.message.includes('Budget exceeded') ||
-            err.message.includes('Action limit exceeded')
-          )) {
-            throw err;
-          }
-          console.warn(`[SmartApply] [${pageLabel}] MagnitudeHand error: ${err}`);
-        }
-      }
-
-      break; // Done filling, move to Phase 3
+    // ── FILL PHASE: Use formFiller (DOM fill + MagnitudeHand fallback) ──
+    if (profileText) {
+      const fillResult = await fillFormOnPage(adapter.page, adapter, profileText, resumePath);
+      console.log(`[SmartApply] formFiller: ${fillResult.domFilled} DOM + ${fillResult.magnitudeFilled} Magnitude filled (${fillResult.llmCalls} LLM calls)`);
     }
 
-    // ── PHASE 3: ADVANCE ──
-    // Clean up scan attributes before navigating
+    // ── ADVANCE PHASE: Click Next or detect review page ──
+    // Clean up any data-ff-id attributes (formFiller tags elements)
+    // and also clean up legacy scan attributes
     await adapter.page.evaluate(() => {
       document.querySelectorAll('[data-gh-scan-idx]').forEach(el => el.removeAttribute('data-gh-scan-idx'));
     });
@@ -1413,23 +1140,14 @@ ${dataPrompt}`,
 
     const clickResult = await config.clickNextButton(adapter);
     if (clickResult === 'clicked') {
-      console.log(`[SmartApply] [${pageLabel}] Clicked Next via DOM.`);
+      console.log(`[SmartApply] Clicked Next via DOM.`);
       await adapter.page.waitForTimeout(2000);
 
       // Check for validation errors
       const hasErrors = await config.detectValidationErrors(adapter);
       if (hasErrors) {
-        console.log(`[SmartApply] [${pageLabel}] Validation errors after clicking Next — re-scanning.`);
-        // Re-scan and re-fill from the position the site scrolled to
-        const scrollAfterError = await adapter.page.evaluate(() => window.scrollY);
-        if (Math.abs(scrollAfterError - scrollBeforeClick) > 50) {
-          // Site auto-scrolled to errors — re-fill at this position
-          console.log(`[SmartApply] [${pageLabel}] Site auto-scrolled to errors. Re-running fill cycle.`);
-          return this.fillPage(adapter, config, fillPrompt, qaMap, pageLabel, resumePath, _depth + 1, llmCalls, costTracker, dataPrompt);
-        }
-        await adapter.page.evaluate(() => window.scrollTo(0, 0));
-        await adapter.page.waitForTimeout(500);
-        return this.fillPage(adapter, config, fillPrompt, qaMap, pageLabel, resumePath, _depth + 1, llmCalls, costTracker, dataPrompt);
+        console.log(`[SmartApply] Validation errors after clicking Next — re-filling.`);
+        return this.fillPage(adapter, config, resumePath, profileText, _depth + 1);
       }
 
       // Verify page changed
@@ -1452,15 +1170,15 @@ ${dataPrompt}`,
       // Check if site auto-scrolled (validation errors without error markers)
       const scrollAfterClick = await adapter.page.evaluate(() => window.scrollY);
       if (Math.abs(scrollAfterClick - scrollBeforeClick) > 50) {
-        console.log(`[SmartApply] [${pageLabel}] Clicked Next — page auto-scrolled to unfilled fields. Re-filling.`);
-        return this.fillPage(adapter, config, fillPrompt, qaMap, pageLabel, resumePath, _depth + 1, llmCalls, costTracker, dataPrompt);
+        console.log(`[SmartApply] Clicked Next — page auto-scrolled to unfilled fields. Re-filling.`);
+        return this.fillPage(adapter, config, resumePath, profileText, _depth + 1);
       }
 
-      console.log(`[SmartApply] [${pageLabel}] Clicked Next but page unchanged.`);
+      console.log(`[SmartApply] Clicked Next but page unchanged.`);
     }
 
     if (clickResult === 'review_detected') {
-      console.log(`[SmartApply] [${pageLabel}] Review page detected — not clicking Submit.`);
+      console.log(`[SmartApply] Review page detected — not clicking Submit.`);
       return 'review';
     }
 
@@ -1474,21 +1192,18 @@ ${dataPrompt}`,
 
       const finalClick = await config.clickNextButton(adapter);
       if (finalClick === 'clicked') {
-        console.log(`[SmartApply] [${pageLabel}] Clicked Next at content bottom.`);
+        console.log(`[SmartApply] Clicked Next at content bottom.`);
         await adapter.page.waitForTimeout(2000);
         await this.waitForPageLoad(adapter);
         return 'navigated';
       }
       if (finalClick === 'review_detected') {
-        console.log(`[SmartApply] [${pageLabel}] Review page detected at content bottom.`);
+        console.log(`[SmartApply] Review page detected at content bottom.`);
         return 'review';
       }
     }
 
-    // Fallback review detection: if clickNextButton() couldn't advance the page
-    // (no Next/Submit matched its patterns), check if we're on a single-page form
-    // that's done filling. If there's any submit-like button and few/no unfilled
-    // fields, treat as review so the user can take over.
+    // Fallback review detection
     const hasSubmitFallback = await adapter.page.evaluate(() => {
       const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a.btn'));
       return btns.some(b => {
@@ -1497,11 +1212,11 @@ ${dataPrompt}`,
       });
     });
     if (hasSubmitFallback) {
-      console.log(`[SmartApply] [${pageLabel}] Submit button present but clickNextButton() didn't match — treating as review.`);
+      console.log(`[SmartApply] Submit button present — treating as review.`);
       return 'review';
     }
 
-    console.log(`[SmartApply] [${pageLabel}] Page complete. LLM calls: ${llmCalls}`);
+    console.log(`[SmartApply] Page complete.`);
     return 'complete';
   }
 

@@ -129,10 +129,18 @@ When a job is picked up, the worker runs `SmartApplyHandler`:
 
 1. **Navigates** to the application URL
 2. **Detects** the platform and loads platform-specific config
-3. **Scans** all form fields on the page
-4. **DOM fills** ~95% of fields programmatically (fast, $0 cost)
-5. **MagnitudeHand fallback** — for tricky fields the DOM filler can't handle (typeaheads, cascading dropdowns, custom widgets), the real Magnitude visual agent takes over with the blue cursor
+3. **Clicks Apply** (if on a job listing page)
+4. **formFiller** takes over for each form page:
+   - Injects browser-side helpers and extracts all form fields via `data-ff-id` tagging
+   - Discovers dropdown options by briefly opening custom dropdowns
+   - Asks **Claude Haiku 4.5** for answers (single LLM call for all fields — requires `ANTHROPIC_API_KEY`)
+   - Iteratively fills fields via Playwright DOM manipulation (fast, near-$0)
+   - Re-extracts after each round to catch conditional fields that appeared
+   - **MagnitudeHand fallback** — for tricky fields the DOM filler can't handle (typeaheads, cascading dropdowns, custom widgets), micro-scoped `adapter.act()` calls use the real Magnitude visual agent (blue cursor)
+5. **Clicks Next** / advances to the next page (handled by `genericConfig.clickNextButton`)
 6. **Stops** at the review/summary page (does NOT submit)
+
+> **Note:** The form-filling approach is the same proven logic used by `toy-job-app/fill-form.ts`, adapted as a production module (`src/workers/taskHandlers/formFiller.ts`).
 
 ---
 
@@ -183,11 +191,12 @@ Start worker:
                                         Submit job:
   Worker picks up job...                  npx tsx --env-file=.env \
   [SmartApply] Platform: greenhouse       src/scripts/apply.ts -- \
-  [SmartApply] Scanning fields...         --user-id=<uuid> \
-  [SmartApply] DOM fill: 42 fields        --url=<url> \
-  [MagnitudeHand] 2 unfilled fields       --worker-id=dev-1
-  [MagnitudeHand] Filled 2/2
-  [SmartApply] Done!
+  [formFiller] Found 15 visible fields    --user-id=<uuid> \
+  [formFiller] LLM provided 15 answers    --url=<url> \
+  [formFiller] DOM fill done: 13/15       --worker-id=dev-1
+  [formFiller] [MagnitudeHand] 2 unfilled
+  [SmartApply] formFiller: 13 DOM + 2 Mag
+  [SmartApply] Clicked Next via DOM.
                                         If something goes wrong:
                                           npx tsx --env-file=.env \
                                             src/scripts/kill-jobs.ts
