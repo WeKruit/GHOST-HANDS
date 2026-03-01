@@ -207,7 +207,7 @@ export function createValetRoutes(pool: pg.Pool) {
 
     // Verify job exists and is paused
     const { rows } = await pool.query(
-      'SELECT id, status FROM gh_automation_jobs WHERE id = $1::UUID',
+      'SELECT id, status, execution_mode, metadata FROM gh_automation_jobs WHERE id = $1::UUID',
       [jobId]
     );
 
@@ -221,6 +221,74 @@ export function createValetRoutes(pool: pg.Pool) {
         message: `Job is not paused (current status: ${rows[0].status})`,
       }, 409);
     }
+
+    const isMastra = rows[0].execution_mode === 'mastra';
+
+    // --- MASTRA-MODE RESUME (PRD V5.2 Section 8.1) ---
+    if (isMastra) {
+      const metadata = rows[0].metadata || {};
+
+      // AD-6: Require mastra_run_id to exist
+      if (!metadata.mastra_run_id) {
+        return c.json({
+          error: 'invalid_state',
+          message: 'Mastra job has no mastra_run_id — cannot resume',
+        }, 409);
+      }
+
+      // AD-7: Check dispatch mode compatibility
+      const dispatchMode = process.env.JOB_DISPATCH_MODE || 'legacy';
+      if (dispatchMode === 'queue') {
+        return c.json({
+          error: 'unsupported_mode',
+          message: 'Mastra resume is not supported in queue dispatch mode (Phase 1)',
+        }, 409);
+      }
+
+      // Store resolution data in interaction_data
+      if (body.resolution_type || body.resolution_data) {
+        await pool.query(`
+          UPDATE gh_automation_jobs
+          SET interaction_data = COALESCE(interaction_data, '{}'::jsonb) || $2::jsonb,
+              updated_at = NOW()
+          WHERE id = $1::UUID
+        `, [jobId, JSON.stringify({
+          resolution_type: body.resolution_type || 'manual',
+          resolution_data: body.resolution_data || null,
+          resolved_by: body.resolved_by,
+          resolved_at: new Date().toISOString(),
+        })]);
+      }
+
+      // Set resume intent flags + move to 'pending' for JobPoller pickup
+      const resumeNonce = crypto.randomUUID();
+      await pool.query(`
+        UPDATE gh_automation_jobs
+        SET status = 'pending',
+            paused_at = NULL,
+            metadata = jsonb_set(
+              jsonb_set(COALESCE(metadata, '{}'::jsonb), '{resume_requested}', 'true'::jsonb, true),
+              '{resume_nonce}', to_jsonb($2::text), true
+            ),
+            status_message = $3,
+            updated_at = NOW()
+        WHERE id = $1::UUID
+          AND status = 'paused'
+      `, [jobId, resumeNonce, `Mastra resume requested by ${body.resolved_by}`]);
+
+      // Wake dispatcher via NOTIFY (legacy mode)
+      await pool.query("SELECT pg_notify('gh_job_created', $1)", [jobId]);
+
+      return c.json({
+        job_id: jobId,
+        status: 'pending',
+        resolved_by: body.resolved_by,
+        resolution_type: body.resolution_type || 'manual',
+        resume_nonce: resumeNonce,
+      });
+    }
+
+    // --- LEGACY RESUME (existing behavior) ---
 
     // Store resolution data in interaction_data JSONB before firing NOTIFY
     // so the JobExecutor can read credentials/codes when it wakes up

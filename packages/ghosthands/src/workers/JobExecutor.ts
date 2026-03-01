@@ -26,6 +26,11 @@ import { ResumeDownloader, type ResumeRef } from './resumeDownloader.js';
 import { ResumeProfileLoader } from '../db/resumeProfileLoader.js';
 import { getLogger } from '../monitoring/logger.js';
 import { AgentApplyHandler } from './taskHandlers/agentApplyHandler.js';
+import { getMastra } from '../workflows/mastra/init.js';
+import { buildApplyWorkflow } from '../workflows/mastra/applyWorkflow.js';
+import { isMastraResume, claimResume, persistMastraRunId } from '../workflows/mastra/resumeCoordinator.js';
+import { workflowState, type RuntimeContext, type WorkflowState } from '../workflows/mastra/types.js';
+import { finalizeCookbookSuccess, finalizeHandlerResult } from './finalization.js';
 
 const logger = getLogger({ service: 'job-executor' });
 
@@ -552,6 +557,24 @@ export class JobExecutor {
           }
         };
         adapter.page.on('filechooser', fileChooserHandler);
+      }
+
+      // --- MASTRA WORKFLOW PATH ---
+      if (job.execution_mode === 'mastra') {
+        const logEventFn = (eventType: string, metadata: Record<string, any>) =>
+          this.logJobEvent(job.id, eventType, metadata);
+        await this.executeMastraWorkflow({
+          job,
+          adapter: adapter!,
+          handler,
+          costTracker,
+          progress,
+          credentials,
+          dataPrompt,
+          resumeFilePath,
+          logEventFn,
+        });
+        return;
       }
 
       // 8.6. Check for blockers after initial page navigation (with timeout)
@@ -1222,6 +1245,198 @@ export class JobExecutor {
         });
       }
     }
+  }
+
+  /**
+   * Execute a job using the Mastra workflow engine.
+   * Implements PRD V5.2 Phase 1: wraps cookbook + handler in a durable workflow
+   * with suspend/resume for HITL blockers.
+   */
+  private async executeMastraWorkflow(opts: {
+    job: AutomationJob;
+    adapter: BrowserAutomationAdapter;
+    handler: TaskHandler;
+    costTracker: CostTracker;
+    progress: ProgressTracker;
+    credentials: Record<string, string> | null;
+    dataPrompt: string;
+    resumeFilePath: string | null;
+    logEventFn: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
+  }): Promise<void> {
+    const { job, adapter, handler, costTracker, progress, credentials, dataPrompt, resumeFilePath, logEventFn } = opts;
+    const logger = getLogger({ service: 'mastra-executor' });
+
+    // Build RuntimeContext (closure-injected, never serialized)
+    const rt: RuntimeContext = {
+      job,
+      handler,
+      adapter: adapter as any, // HitlCapableAdapter
+      costTracker,
+      progress,
+      credentials,
+      dataPrompt,
+      resumeFilePath,
+      supabase: this.supabase,
+      logEvent: logEventFn,
+    };
+
+    // Build the workflow (per-job, captures rt via closure)
+    const workflow = buildApplyWorkflow(rt);
+    const mastra = getMastra();
+
+    // Register workflow with Mastra for this execution.
+    // Use per-job key to avoid addWorkflow's silent skip on duplicate keys
+    // (a new workflow is built per job with a unique RuntimeContext closure).
+    const workflowKey = `gh_apply_${job.id}`;
+    mastra.addWorkflow(workflow, workflowKey);
+    const registeredWf = mastra.getWorkflow(workflowKey);
+
+    // Check if this is a resume or a fresh execution
+    const isResume = isMastraResume(job);
+
+    let result: any;
+
+    if (isResume) {
+      // --- RESUME PATH ---
+      logger.info('Mastra resume path', { jobId: job.id, runId: job.metadata.mastra_run_id });
+
+      // Atomically claim the resume
+      const claimed = this.pgPool
+        ? await claimResume(this.pgPool, job.id, job.metadata.mastra_run_id)
+        : null;
+
+      if (!claimed) {
+        logger.warn('Resume claim failed (already claimed or preconditions not met)', { jobId: job.id });
+        return;
+      }
+
+      // Read resolution type (non-destructive) — the workflow step handles
+      // the full read-and-clear of credentials via readAndClearResolutionData.
+      // We must NOT call readResolutionData here as it would clear the
+      // credentials before the workflow step can inject them into the browser.
+      let resolutionType = 'manual';
+      const { data: interactionRow } = await this.supabase
+        .from('gh_automation_jobs')
+        .select('interaction_data')
+        .eq('id', job.id)
+        .single();
+      if (interactionRow?.interaction_data?.resolution_type) {
+        resolutionType = interactionRow.interaction_data.resolution_type;
+      }
+
+      const run = await registeredWf.createRun({ runId: job.metadata.mastra_run_id });
+      result = await run.resume({
+        step: 'check_blockers_checkpoint',
+        resumeData: {
+          resolutionType,
+          resumeNonce: job.metadata.resume_nonce || crypto.randomUUID(),
+        },
+      });
+    } else {
+      // --- FRESH EXECUTION PATH ---
+      const run = await registeredWf.createRun();
+
+      // Persist the mastra_run_id before execution
+      if (this.pgPool) {
+        await persistMastraRunId(this.pgPool, job.id, run.runId);
+      }
+      // Also update job.metadata in memory for consistency
+      job.metadata = { ...job.metadata, mastra_run_id: run.runId };
+
+      logger.info('Mastra fresh execution', { jobId: job.id, runId: run.runId });
+
+      const initialState = workflowState.parse({
+        jobId: job.id,
+        userId: job.user_id,
+        targetUrl: job.target_url,
+        platform: job.metadata?.platform || 'other',
+        qualityPreset: resolveQualityPreset(job.input_data, job.metadata),
+        budgetUsd: costTracker.getRemainingBudget(),
+        cookbook: {},
+        handler: {},
+        hitl: {},
+        metrics: {},
+      });
+
+      result = await run.start({ inputData: initialState });
+    }
+
+    logger.info('Mastra workflow completed', { jobId: job.id, status: result?.status });
+
+    // --- FINALIZATION ---
+    // The workflow returned; now we finalize based on the result status.
+    // Finalization stays in JobExecutor (not inside the workflow) to avoid
+    // duplicating the ~150 lines of finalization logic.
+
+    if (result?.status === 'suspended') {
+      // Workflow suspended for HITL — worker can now process other jobs
+      logger.info('Workflow suspended for HITL, worker released', { jobId: job.id });
+      return;
+    }
+
+    // Extract the workflow state from the result
+    const finalState = result?.result as WorkflowState | undefined;
+
+    if (!finalState) {
+      logger.error('Mastra workflow returned no result', { jobId: job.id, rawResult: result });
+      throw new Error('Mastra workflow returned no result');
+    }
+
+    if (finalState.cookbook.success) {
+      // Cookbook path finalization
+      await finalizeCookbookSuccess({
+        job,
+        adapter,
+        costTracker,
+        progress,
+        sessionManager: this.sessionManager,
+        workerId: this.workerId,
+        supabase: this.supabase,
+        logEvent: logEventFn,
+        uploadScreenshot: (jid, name, buf) => this.uploadScreenshot(jid, name, buf),
+        engineResult: {
+          success: true,
+          mode: 'cookbook',
+          manualId: finalState.cookbook.manualId || undefined,
+          cookbookSteps: finalState.cookbook.steps,
+          magnitudeSteps: 0,
+        },
+      });
+      return;
+    }
+
+    if (finalState.handler.attempted && finalState.handler.taskResult) {
+      // Handler path finalization
+      const { awaitingReview } = await finalizeHandlerResult({
+        job,
+        adapter,
+        costTracker,
+        progress,
+        sessionManager: this.sessionManager,
+        workerId: this.workerId,
+        supabase: this.supabase,
+        logEvent: logEventFn,
+        uploadScreenshot: (jid, name, buf) => this.uploadScreenshot(jid, name, buf),
+        taskResult: finalState.handler.taskResult as any,
+        finalMode: 'magnitude',
+        engineResult: {
+          success: false,
+          mode: 'magnitude',
+          cookbookSteps: finalState.cookbook.steps,
+          magnitudeSteps: costTracker.getSnapshot().actionCount,
+        },
+      });
+
+      if (awaitingReview) {
+        // Block indefinitely — browser stays open for user review
+        logger.info('Browser is open for manual review, heartbeat continues', { jobId: job.id });
+        await new Promise<void>(() => {});
+      }
+      return;
+    }
+
+    // Workflow completed but neither cookbook nor handler succeeded — fail
+    throw new Error(`Mastra workflow completed with unexpected state: ${finalState.status}`);
   }
 
   // --- Error handling ---
