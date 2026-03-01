@@ -1016,82 +1016,24 @@
          ══════════════════════════════════════════════════════════ -->
     <div class="form-section" data-section="2">
 
-      <!-- Work Experience (repeater) -->
+      <!-- Work Experience (repeater — starts empty, click Add to reveal) -->
       <div class="card">
         <h2>Work Experience</h2>
+        <p class="empty-state" id="workEmptyState" style="font-size:0.9rem;color:#888;margin-bottom:1rem">No work experience added yet. Click the button below to add a position.</p>
         <div class="repeater-list" id="workExperienceList">
-          <div class="repeater-item" data-index="0">
-            <button type="button" class="remove-btn" title="Remove" onclick="removeRepeaterItem(this)">&times;</button>
-            <div class="form-row">
-              <div class="form-group">
-                <label>Job Title <span class="required">*</span></label>
-                <input type="text" name="work[0].title" required placeholder="Software Engineer">
-              </div>
-              <div class="form-group">
-                <label>Company <span class="required">*</span></label>
-                <input type="text" name="work[0].company" required placeholder="Acme Inc.">
-              </div>
-              <div class="form-group">
-                <label>Start Date</label>
-                <input type="date" name="work[0].startDate">
-              </div>
-              <div class="form-group">
-                <label>End Date</label>
-                <input type="date" name="work[0].endDate">
-              </div>
-            </div>
-            <div class="form-group">
-              <div class="toggle-row">
-                <span class="toggle-label">I currently work here</span>
-                <label class="toggle-switch" role="switch" aria-label="I currently work here" aria-checked="false">
-                  <input type="checkbox" name="work[0].current">
-                  <div class="toggle-track"></div>
-                  <div class="toggle-thumb"></div>
-                </label>
-              </div>
-            </div>
-          </div>
+          <!-- Items added dynamically via "Add" button -->
         </div>
-        <button type="button" class="add-btn" onclick="addWorkExperience()">+ Add another position</button>
+        <button type="button" class="add-btn" id="addWorkBtn" onclick="addWorkExperience()">+ Add Work Experience</button>
       </div>
 
-      <!-- Education (repeater) -->
+      <!-- Education (repeater — starts empty, click Add to reveal) -->
       <div class="card">
         <h2>Education</h2>
+        <p class="empty-state" id="eduEmptyState" style="font-size:0.9rem;color:#888;margin-bottom:1rem">No education added yet. Click the button below to add a school.</p>
         <div class="repeater-list" id="educationList">
-          <div class="repeater-item" data-index="0">
-            <button type="button" class="remove-btn" title="Remove" onclick="removeRepeaterItem(this)">&times;</button>
-            <div class="form-row">
-              <div class="form-group">
-                <label>School / University <span class="required">*</span></label>
-                <input type="text" name="edu[0].school" required placeholder="MIT">
-              </div>
-              <div class="form-group">
-                <label>Degree</label>
-                <div class="custom-select edu-degree" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Degree" tabindex="0">
-                  <div class="custom-select-trigger"><span class="placeholder">Select degree…</span></div>
-                  <div class="custom-select-dropdown" role="listbox">
-                    <div class="custom-select-option" role="option" data-value="hs">High School Diploma</div>
-                    <div class="custom-select-option" role="option" data-value="associate">Associate's</div>
-                    <div class="custom-select-option" role="option" data-value="bachelor">Bachelor's</div>
-                    <div class="custom-select-option" role="option" data-value="master">Master's</div>
-                    <div class="custom-select-option" role="option" data-value="phd">PhD / Doctorate</div>
-                    <div class="custom-select-option" role="option" data-value="bootcamp">Bootcamp / Certificate</div>
-                  </div>
-                </div>
-              </div>
-              <div class="form-group">
-                <label>Field of Study</label>
-                <input type="text" name="edu[0].field" placeholder="Computer Science">
-              </div>
-              <div class="form-group">
-                <label>Graduation Year</label>
-                <input type="number" name="edu[0].gradYear" placeholder="2024" min="1950" max="2035">
-              </div>
-            </div>
-          </div>
+          <!-- Items added dynamically via "Add" button -->
         </div>
-        <button type="button" class="add-btn" onclick="addEducation()">+ Add another school</button>
+        <button type="button" class="add-btn" id="addEduBtn" onclick="addEducation()">+ Add Education</button>
       </div>
 
       <!-- Skills (multi-select) -->
@@ -1316,6 +1258,29 @@
   // Custom single-select dropdown
   // ═══════════════════════════════════════════════════════════
   function initCustomSelect(el) {
+    // Prevent double-initialization (e.g. State dropdown re-inited when Country changes)
+    if (el._csInited) {
+      // Just re-bind option clicks for new dynamically-added options
+      el.querySelectorAll('.custom-select-option').forEach(opt => {
+        if (!opt._csBound) {
+          opt._csBound = true;
+          opt.addEventListener('click', (e) => {
+            e.stopPropagation();
+            el.querySelectorAll('.custom-select-option').forEach(o => o.setAttribute('aria-selected', 'false'));
+            opt.setAttribute('aria-selected', 'true');
+            const mainText = opt.childNodes[0].textContent.trim();
+            el.querySelector('.custom-select-trigger').innerHTML = mainText;
+            el.dataset.value = opt.dataset.value;
+            el.classList.remove('open');
+            el.setAttribute('aria-expanded', 'false');
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          });
+        }
+      });
+      return;
+    }
+    el._csInited = true;
+
     const trigger = el.querySelector('.custom-select-trigger');
     const dropdown = el.querySelector('.custom-select-dropdown');
     const options = el.querySelectorAll('.custom-select-option');
@@ -1755,15 +1720,17 @@
   // ═══════════════════════════════════════════════════════════
   // Repeater: Work Experience
   // ═══════════════════════════════════════════════════════════
-  let workCount = 1;
+  let workCount = 0;
   function addWorkExperience() {
     const list = document.getElementById('workExperienceList');
+    const emptyState = document.getElementById('workEmptyState');
+    if (emptyState) emptyState.style.display = 'none';
     const idx = workCount++;
     const item = document.createElement('div');
     item.className = 'repeater-item';
     item.dataset.index = idx;
     item.innerHTML = `
-      <button type="button" class="remove-btn" title="Remove" onclick="removeRepeaterItem(this)">&times;</button>
+      <button type="button" class="remove-btn" title="Remove" onclick="removeWorkItem(this)">&times;</button>
       <div class="form-row">
         <div class="form-group">
           <label>Job Title <span class="required">*</span></label>
@@ -1772,6 +1739,10 @@
         <div class="form-group">
           <label>Company <span class="required">*</span></label>
           <input type="text" name="work[${idx}].company" required placeholder="Acme Inc.">
+        </div>
+        <div class="form-group">
+          <label>Location</label>
+          <input type="text" name="work[${idx}].location" placeholder="San Francisco, CA">
         </div>
         <div class="form-group">
           <label>Start Date</label>
@@ -1792,9 +1763,13 @@
           </label>
         </div>
       </div>
+      <div class="form-group">
+        <label>Description</label>
+        <textarea name="work[${idx}].description" rows="3" placeholder="Describe your responsibilities and achievements…"></textarea>
+      </div>
     `;
     list.appendChild(item);
-    // Reinit toggles
+    // Reinit toggles for the new item
     item.querySelectorAll('.toggle-switch').forEach(sw => {
       const input = sw.querySelector('input');
       sw.addEventListener('click', () => {
@@ -1802,20 +1777,33 @@
         sw.setAttribute('aria-checked', String(input.checked));
       });
     });
+    // Scroll to the new item
+    item.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  function removeWorkItem(btn) {
+    const item = btn.closest('.repeater-item');
+    item.remove();
+    const list = document.getElementById('workExperienceList');
+    if (list.children.length === 0) {
+      document.getElementById('workEmptyState').style.display = '';
+    }
   }
 
   // ═══════════════════════════════════════════════════════════
   // Repeater: Education
   // ═══════════════════════════════════════════════════════════
-  let eduCount = 1;
+  let eduCount = 0;
   function addEducation() {
     const list = document.getElementById('educationList');
+    const emptyState = document.getElementById('eduEmptyState');
+    if (emptyState) emptyState.style.display = 'none';
     const idx = eduCount++;
     const item = document.createElement('div');
     item.className = 'repeater-item';
     item.dataset.index = idx;
     item.innerHTML = `
-      <button type="button" class="remove-btn" title="Remove" onclick="removeRepeaterItem(this)">&times;</button>
+      <button type="button" class="remove-btn" title="Remove" onclick="removeEduItem(this)">&times;</button>
       <div class="form-row">
         <div class="form-group">
           <label>School / University <span class="required">*</span></label>
@@ -1847,13 +1835,15 @@
     `;
     list.appendChild(item);
     item.querySelectorAll('.custom-select').forEach(initCustomSelect);
+    item.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
 
-  function removeRepeaterItem(btn) {
+  function removeEduItem(btn) {
     const item = btn.closest('.repeater-item');
-    const list = item.parentElement;
-    if (list.children.length > 1) {
-      item.remove();
+    item.remove();
+    const list = document.getElementById('educationList');
+    if (list.children.length === 0) {
+      document.getElementById('eduEmptyState').style.display = '';
     }
   }
 

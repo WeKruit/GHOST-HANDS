@@ -86,6 +86,7 @@ export function resolveUrl(input: string): string {
 export async function injectHelpers(page: Page) {
   const selectorStr = JSON.stringify(INTERACTIVE_SELECTOR);
   await page.evaluate(`
+    var _prevNextId = (window.__ff && window.__ff.nextId) || 0;
     window.__ff = {
       SELECTOR: ${selectorStr},
 
@@ -178,7 +179,7 @@ export async function injectHelpers(page: Page) {
         return '';
       },
 
-      nextId: 0,
+      nextId: _prevNextId,
       tag: function(el) {
         if (!el.hasAttribute('data-ff-id')) {
           el.setAttribute('data-ff-id', 'ff-' + (window.__ff.nextId++));

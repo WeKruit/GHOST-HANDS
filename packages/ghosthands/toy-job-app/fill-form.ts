@@ -94,9 +94,24 @@ LinkedIn: https://linkedin.com/in/alexchen
 Portfolio: https://alexchen.dev
 GitHub: https://github.com/alexchen
 
-Current Role: Senior Software Engineer at Stripe (3 years)
-Previous: Software Engineer at Dropbox (2 years)
-Education: B.S. Computer Science, UC Berkeley, 2018
+Work Experience:
+1. Senior Software Engineer at Stripe (Jan 2022 – Present, San Francisco, CA)
+   - Lead backend team building payment processing APIs serving 10M+ daily transactions
+   - Designed and shipped distributed billing system reducing payment failures by 35%
+   - Mentored 4 junior engineers, led architecture reviews for cross-team projects
+
+2. Software Engineer at Dropbox (Jun 2019 – Dec 2021, San Francisco, CA)
+   - Built real-time file sync engine for desktop client using Python and Rust
+   - Improved sync performance by 40% through delta compression and batched uploads
+   - Contributed to migration from monolith to microservices architecture
+
+3. Software Engineering Intern at Google (May 2018 – Aug 2018, Mountain View, CA)
+   - Developed internal dashboard for monitoring ML pipeline health using Angular and Go
+   - Automated weekly reporting workflow saving 5 hours/week for the data ops team
+
+Education:
+1. B.S. Computer Science, UC Berkeley, 2019 (GPA: 3.8)
+2. High School Diploma, Lowell High School, 2015
 
 Skills: TypeScript, Python, React, Node.js, PostgreSQL, AWS, Docker, Kubernetes
 Interests: distributed systems, developer tools, AI/ML applications
@@ -278,12 +293,37 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
   }
 }
 
-async function generateAnswers(fields: FormField[]): Promise<AnswerMap> {
+interface GenerateResult {
+  answers: AnswerMap;
+  /** Maps field.id → disambiguated name used as the JSON key */
+  fieldIdToKey: Record<string, string>;
+}
+
+async function generateAnswers(fields: FormField[]): Promise<GenerateResult> {
   const client = new Anthropic();
 
+  // Disambiguate duplicate field names by appending " #2", " #3", etc.
+  // This ensures the LLM returns unique JSON keys for each field.
+  const nameCounts = new Map<string, number>();
+  const disambiguatedNames: string[] = [];
+  for (const f of fields) {
+    const norm = f.name.toLowerCase().trim();
+    const count = (nameCounts.get(norm) || 0) + 1;
+    nameCounts.set(norm, count);
+    disambiguatedNames.push(count > 1 ? `${f.name} #${count}` : f.name);
+  }
+
+  // Build field-id → disambiguated-name mapping
+  const fieldIdToKey: Record<string, string> = {};
+  for (let i = 0; i < fields.length; i++) {
+    fieldIdToKey[fields[i].id] = disambiguatedNames[i];
+  }
+
   // Build a compact description of each field for the prompt
-  const fieldDescriptions = fields.map((f) => {
-    let desc = `- "${f.name}" (type: ${f.type})`;
+  const fieldDescriptions = fields.map((f, i) => {
+    const displayName = disambiguatedNames[i];
+    const typeLabel = (f as any).isMultiSelect ? "multi-select" : f.type;
+    let desc = `- "${displayName}" (type: ${typeLabel})`;
     if (f.options?.length) desc += ` options: [${f.options.join(", ")}]`;
     if (f.choices?.length) desc += ` choices: [${f.choices.join(", ")}]`;
     if (f.section) desc += ` [section: ${f.section}]`;
@@ -310,8 +350,11 @@ Rules:
 - For dropdowns WITHOUT listed options, provide your best guess for the value.
 - For checkboxes/toggles, respond with "checked"/"unchecked" or "on"/"off".
 - For file upload fields, skip them (don't include in output).
+- For multi-select fields, respond with an ARRAY of selected options, e.g. ["Option A", "Option B"].
 - For demographic/EEO fields (gender, race, ethnicity, veteran, disability), use the applicant's actual demographic info from their profile. Pick the option that best matches.
+- Fields with "#2", "#3" etc. are REPEATED fields (e.g. for multiple work experiences or education entries). Use the corresponding numbered entry from the profile. "Job Title #2" = the 2nd work experience, "School / University #2" = the 2nd education entry.
 - You MUST respond with ONLY a valid JSON object. No explanation, no commentary, no markdown fences.
+- Use the EXACT field names shown above (including any "#N" suffix) as JSON keys.
 
 Example response:
 {"First Name": "Alexander", "Last Name": "Chen", "Email": "alex.chen@gmail.com"}`,
@@ -330,10 +373,10 @@ Example response:
       if (Array.isArray(v)) (parsed as any)[k] = v.join(",");
       else if (typeof v === "number") (parsed as any)[k] = String(v);
     }
-    return parsed;
+    return { answers: parsed, fieldIdToKey };
   } catch (e) {
     console.error("Failed to parse LLM response as JSON, using empty answers");
-    return {};
+    return { answers: {}, fieldIdToKey };
   }
 }
 
@@ -510,15 +553,26 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
         const currentDisplay = await page.evaluate((ffId) => {
           const el = document.querySelector(`[data-ff-id="${ffId}"]`);
           if (!el) return "";
-          // Workday combobox: check the input value or the pill/selected text
+          // For INPUT elements, return the value directly
           if (el.tagName === "INPUT") return (el as HTMLInputElement).value.trim();
-          // Multi-select pill area: check text content
+          // Workday selectinput: check the search input value
+          const searchInput = el.querySelector('[data-automation-id="searchBox"], .wd-selectinput-search');
+          if (searchInput) return (searchInput as HTMLInputElement).value.trim();
+          // Workday pill area: check selected item text
           const pills = el.closest('[data-automation-id]')
             ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
           if (pills) return pills.textContent?.trim() || "";
-          return el.textContent?.trim() || "";
+          // Custom dropdown: read ONLY the trigger text, not the entire dropdown
+          const trigger = el.querySelector('.custom-select-trigger, .multi-select-trigger, [class*="select-trigger"]');
+          if (trigger) return trigger.textContent?.trim() || "";
+          // Fallback: clone and strip dropdown/listbox children to avoid reading all options
+          const clone = el.cloneNode(true) as HTMLElement;
+          clone.querySelectorAll('[role="listbox"], [class*="dropdown"], [class*="select-dropdown"]').forEach((x: any) => x.remove());
+          return clone.textContent?.trim() || "";
         }, field.id);
-        if (currentDisplay && currentDisplay.toLowerCase().includes(answer.toLowerCase())) {
+        // Don't skip if the display is a placeholder
+        const isPlaceholder = !currentDisplay || /^(select|choose|pick|prefer not|--|—|\+\d{1,3}$)/i.test(currentDisplay);
+        if (!isPlaceholder && currentDisplay.toLowerCase().includes(answer.toLowerCase())) {
           console.error(`  skip ${tag} (already has "${currentDisplay}")`);
           return true;
         }
@@ -634,6 +688,48 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
         }
       }
 
+      // Multi-select: if answer contains commas, click each option individually
+      if (answer && answer.includes(",")) {
+        const values = answer.split(",").map(v => v.trim()).filter(Boolean);
+        let clicked = 0;
+        try {
+          // Open the dropdown ONCE — don't reopen per value (toggling closes it)
+          await clickComboboxTrigger(page, field.id);
+          await page.waitForTimeout(300);
+
+          for (const val of values) {
+            try {
+              const ok = await clickActiveListOption(page, val);
+              if (ok) {
+                clicked++;
+                await page.waitForTimeout(200);
+              } else {
+                // Try fuzzy match
+                const available = await readActiveListOptions(page);
+                const lv = val.toLowerCase();
+                const fuzzy = available.find(a => {
+                  const la = a.toLowerCase();
+                  return la.includes(lv) || lv.includes(la);
+                });
+                if (fuzzy) {
+                  const fok = await clickActiveListOption(page, fuzzy);
+                  if (fok) clicked++;
+                  await page.waitForTimeout(200);
+                }
+              }
+            } catch { /* keep going */ }
+          }
+        } catch { /* open failed */ }
+        if (clicked > 0) {
+          await dismissDropdown(page);
+          console.error(`  multi-select ${tag} → ${clicked}/${values.length} options`);
+          return true;
+        }
+        await page.keyboard.press("Escape").catch(() => {});
+        console.error(`  skip ${tag} (multi-select failed)`);
+        return false;
+      }
+
       // Custom dropdown: use answer if provided, else first non-placeholder
       const opt = answer
         ?? field.options?.find((o) => !PLACEHOLDER_RE.test(o))
@@ -708,6 +804,30 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
             return true;
           }
         }
+
+        // Last resort: dismiss any open state, re-open via Playwright click on the
+        // trigger child, then find the option inside the field's own dropdown
+        // (for dynamically-populated custom dropdowns not using Workday portal)
+        try {
+          await page.keyboard.press("Escape").catch(() => {});
+          await page.click("body", { position: { x: 1, y: 1 }, force: true }).catch(() => {});
+          await page.waitForTimeout(200);
+          // Click the trigger child (not the combobox itself, to avoid toggling closed)
+          const triggerChild = page.locator(`${sel} > [class*="trigger"], ${sel} > button, ${sel} > div`).first();
+          if (await triggerChild.count() > 0) {
+            await triggerChild.click({ timeout: 1000 });
+          } else {
+            await page.click(sel, { timeout: 1000 });
+          }
+          await page.waitForTimeout(300);
+          const directOption = page.locator(`${sel} [role="option"]`).filter({ hasText: opt }).first();
+          if (await directOption.count() > 0) {
+            await directOption.click({ timeout: 2000 });
+            await dismissDropdown(page);
+            console.error(`  select ${tag} → "${opt}" (direct)`);
+            return true;
+          }
+        } catch { /* direct approach failed */ }
 
         await page.keyboard.press("Escape");
         console.error(`  skip ${tag} (could not click option "${opt}", available: ${available.slice(0, 5).join(", ")})`);
@@ -909,14 +1029,127 @@ async function isMultiPageForm(page: Page): Promise<boolean> {
   });
 }
 
+// ── Repeater section handling (Work Experience / Education "Add" buttons) ──
+
+interface RepeaterInfo {
+  label: string;           // e.g. "Work Experience", "Education"
+  addButtonSelector: string;
+  currentCount: number;
+}
+
+/** Detect repeater sections (Work Experience, Education) that have "Add" buttons. */
+async function detectRepeaters(page: Page): Promise<RepeaterInfo[]> {
+  return page.evaluate(() => {
+    const repeaters: any[] = [];
+    const ADD_RE = /^\+?\s*(add)\b/i;
+
+    // Find all buttons that look like "Add" buttons
+    const buttons = Array.from(document.querySelectorAll<HTMLElement>(
+      'button, [role="button"], a.add-btn, .add-btn'
+    ));
+
+    for (const btn of buttons) {
+      const rect = btn.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      const style = window.getComputedStyle(btn);
+      if (style.display === "none" || style.visibility === "hidden") continue;
+
+      const text = (btn.textContent || "").trim();
+      if (!ADD_RE.test(text)) continue;
+
+      // Figure out what section this Add button belongs to
+      const card = btn.closest('.card, .section, [class*="section"], [class*="card"]');
+      const heading = card?.querySelector('h2, h3, h4, [class*="heading"], [class*="title"]');
+      const label = heading?.textContent?.trim() || text;
+
+      // Count existing repeater items in this section
+      const list = card?.querySelector('.repeater-list, [class*="repeater"], [class*="entries"]');
+      const currentCount = list ? list.children.length : 0;
+
+      // Tag the button for Playwright to click
+      const marker = `ff-add-${repeaters.length}`;
+      btn.setAttribute('data-ff-add', marker);
+
+      repeaters.push({
+        label,
+        addButtonSelector: `[data-ff-add="${marker}"]`,
+        currentCount,
+      });
+    }
+
+    return repeaters;
+  });
+}
+
+/** Count how many entries the profile has for a given repeater section. */
+function countProfileEntries(profileString: string, sectionLabel: string): number {
+  const lower = sectionLabel.toLowerCase();
+
+  if (lower.includes("work") || lower.includes("experience") || lower.includes("employment")) {
+    // Count numbered entries (e.g. "1. ", "2. ", "3. ") under "Work Experience:"
+    const match = profileString.match(/Work Experience:\s*\n([\s\S]*?)(?=\nEducation:|\nSkills:|\nWork auth)/);
+    if (match) {
+      const entries = match[1].match(/^\s*\d+\.\s/gm);
+      return entries ? entries.length : 1;
+    }
+    // Fallback: count lines with "at <Company>"
+    const atMatches = profileString.match(/\bat\s+[A-Z]\w/g);
+    return atMatches ? Math.min(atMatches.length, 5) : 1;
+  }
+
+  if (lower.includes("education") || lower.includes("school")) {
+    const match = profileString.match(/Education:\s*\n([\s\S]*?)(?=\nSkills:|\nWork auth|\nInterests:|\nDemographics:)/);
+    if (match) {
+      const entries = match[1].match(/^\s*\d+\.\s/gm);
+      return entries ? entries.length : 1;
+    }
+    return 1;
+  }
+
+  return 1; // Default: add one entry for unknown sections
+}
+
+/** Click "Add" buttons to create the right number of repeater entries. */
+async function expandRepeaters(page: Page, profileString: string): Promise<void> {
+  const repeaters = await detectRepeaters(page);
+  if (repeaters.length === 0) return;
+
+  console.error(`\nFound ${repeaters.length} repeater section(s):`);
+
+  for (const rep of repeaters) {
+    const needed = countProfileEntries(profileString, rep.label);
+    const toAdd = Math.max(0, needed - rep.currentCount);
+
+    console.error(`  "${rep.label}": need ${needed} entries, have ${rep.currentCount}, adding ${toAdd}`);
+
+    for (let i = 0; i < toAdd; i++) {
+      try {
+        await page.click(rep.addButtonSelector, { timeout: 3000 });
+        await page.waitForTimeout(500); // Wait for DOM to update / animation
+      } catch (e: any) {
+        console.error(`    Failed to click Add button (attempt ${i + 1}): ${e.message?.slice(0, 50)}`);
+        break;
+      }
+    }
+  }
+
+  // Wait for all new fields to settle
+  await page.waitForTimeout(500);
+}
+
 // ── Fill current page ────────────────────────────────────────
 
-async function fillCurrentPage(page: Page, existingAnswers: AnswerMap = {}): Promise<AnswerMap> {
+async function fillCurrentPage(page: Page, existingAnswers: AnswerMap = {}, existingIdMap: Record<string, string> = {}): Promise<{ answers: AnswerMap; fieldIdMap: Record<string, string> }> {
   // Re-inject helpers if page navigated to a new URL
   const hasHelpers = await page.evaluate(() => !!(window as any).__ff).catch(() => false);
   if (!hasHelpers) {
     await injectHelpers(page);
   }
+
+  // Expand repeater sections (Work Experience, Education) before extracting fields
+  await expandRepeaters(page, SAMPLE_PROFILE);
+  // Re-inject helpers after DOM changes from Add button clicks
+  await injectHelpers(page);
 
   console.error("Extracting form fields…");
   const allFields = await extractFields(page);
@@ -925,7 +1158,7 @@ async function fillCurrentPage(page: Page, existingAnswers: AnswerMap = {}): Pro
 
   if (visibleFields.length === 0) {
     console.error("No visible fields on this page.");
-    return existingAnswers;
+    return { answers: existingAnswers, fieldIdMap: existingIdMap };
   }
 
   // Discover dropdown options (only for visible fields — skip hidden conditionals)
@@ -933,16 +1166,23 @@ async function fillCurrentPage(page: Page, existingAnswers: AnswerMap = {}): Pro
   await discoverDropdownOptions(page, visibleFields);
 
   // Only ask LLM about visible, named fields it hasn't answered yet
-  const unanswered = visibleFields.filter(
-    (f) => f.name && getAnswer(existingAnswers, f) === undefined && f.type !== "file"
-  );
+  // For fields with an existing ID mapping, check by their disambiguated key
+  const unanswered = visibleFields.filter((f) => {
+    if (!f.name || f.type === "file") return false;
+    const key = existingIdMap[f.id];
+    if (key && existingAnswers[key] !== undefined) return false;
+    if (getAnswer(existingAnswers, f) !== undefined) return false;
+    return true;
+  });
 
   const answers = { ...existingAnswers };
+  const fieldIdMap = { ...existingIdMap };
   if (unanswered.length > 0) {
     console.error(`\nAsking LLM for ${unanswered.length} new fields…\n`);
-    const newAnswers = await generateAnswers(unanswered);
-    Object.assign(answers, newAnswers);
-    console.error(`LLM provided ${Object.keys(newAnswers).length} answers.\n`);
+    const result = await generateAnswers(unanswered);
+    Object.assign(answers, result.answers);
+    Object.assign(fieldIdMap, result.fieldIdToKey);
+    console.error(`LLM provided ${Object.keys(result.answers).length} answers.\n`);
   } else {
     console.error("All fields already answered from previous pages.\n");
   }
@@ -958,19 +1198,26 @@ async function fillCurrentPage(page: Page, existingAnswers: AnswerMap = {}): Pro
     const toFill = visible.filter((f) => !filled.has(f.id));
     if (toFill.length === 0) break;
 
-    const unseen = toFill.filter(
-      (f) => getAnswer(answers, f) === undefined && f.type !== "file"
-    );
+    const unseen = toFill.filter((f) => {
+      if (f.type === "file") return false;
+      const key = fieldIdMap[f.id];
+      if (key && answers[key] !== undefined) return false;
+      return getAnswer(answers, f) === undefined;
+    });
     if (unseen.length > 0 && round > 1) {
       console.error(`\n${unseen.length} new fields discovered — asking LLM…`);
-      const extra = await generateAnswers(unseen);
-      Object.assign(answers, extra);
+      const result = await generateAnswers(unseen);
+      Object.assign(answers, result.answers);
+      Object.assign(fieldIdMap, result.fieldIdToKey);
     }
 
     console.error(`\nRound ${round}: ${toFill.length} new fields to fill…`);
     for (const field of toFill) {
       filled.add(field.id);
-      await fillField(page, field, answers);
+      // For repeater fields, build a field-specific answer map using the disambiguated key
+      const key = fieldIdMap[field.id];
+      const fieldAnswers = key ? { ...answers, [field.name]: answers[key] } : answers;
+      await fillField(page, field, fieldAnswers);
     }
     // Dismiss any leftover open dropdowns/popups
     await page.keyboard.press("Escape").catch(() => {});
@@ -979,13 +1226,14 @@ async function fillCurrentPage(page: Page, existingAnswers: AnswerMap = {}): Pro
   }
 
   console.error(`\nPage fill complete. ${filled.size} fields in ${round} round(s).`);
-  return answers;
+  return { answers, fieldIdMap };
 }
 
 // ── Multi-page orchestration ─────────────────────────────────
 
 async function fillMultiPageForm(page: Page): Promise<void> {
   let answers: AnswerMap = {};
+  let fieldIdMap: Record<string, string> = {};
   let pageNum = 0;
 
   while (pageNum < MAX_PAGES) {
@@ -994,7 +1242,9 @@ async function fillMultiPageForm(page: Page): Promise<void> {
     console.error(`PAGE ${pageNum}`);
     console.error(`${"=".repeat(60)}\n`);
 
-    answers = await fillCurrentPage(page, answers);
+    const result = await fillCurrentPage(page, answers, fieldIdMap);
+    answers = result.answers;
+    fieldIdMap = result.fieldIdMap;
 
     const navState = await detectNavigationButtons(page);
 
