@@ -56,10 +56,12 @@ const SELECTOR_PATTERNS: Omit<DOMMatch, 'details'>[] = [
   { type: 'captcha', selector: 'audio[src*="captcha"]', confidence: 0.85 },
 
   // -- Login --
-  // NOTE: Login detection removed from BlockerDetector. Login pages are expected
-  // navigation in the application flow — task handlers (SmartApplyHandler,
-  // WorkdayApplyHandler) handle login/auth pages directly. Only truly unsolvable
-  // blockers (CAPTCHAs, bot checks, rate limits) belong here.
+  { type: 'login', selector: 'form[action*="login"]', confidence: 0.8 },
+  { type: 'login', selector: 'form[action*="signin"]', confidence: 0.8 },
+  { type: 'login', selector: 'form[action*="sign-in"]', confidence: 0.8 },
+  { type: 'login', selector: 'input[type="password"]', confidence: 0.6 },
+  { type: 'login', selector: '#login-form', confidence: 0.85 },
+  { type: 'login', selector: '[data-testid="login-form"]', confidence: 0.85 },
 
   // -- Bot check --
   { type: 'bot_check', selector: '#challenge-running', confidence: 0.95 },
@@ -91,7 +93,9 @@ const TEXT_PATTERNS: { type: BlockerType; pattern: RegExp; confidence: number }[
   { type: '2fa', pattern: /email verification/i, confidence: 0.7 },
 
   // -- Login text --
-  // Removed: login text patterns handled by task handlers, not the blocker detector.
+  { type: 'login', pattern: /sign in to continue/i, confidence: 0.85 },
+  { type: 'login', pattern: /session (has )?expired/i, confidence: 0.8 },
+  { type: 'login', pattern: /please (log|sign) ?in/i, confidence: 0.75 },
 
   // -- Bot check text --
   { type: 'bot_check', pattern: /checking your browser/i, confidence: 0.85 },
@@ -130,7 +134,10 @@ const OBSERVE_CLASSIFICATION: { pattern: RegExp; type: BlockerType; confidence: 
   { pattern: /funcaptcha/i, type: 'captcha', confidence: 0.85 },
   { pattern: /not a robot/i, type: 'captcha', confidence: 0.85 },
 
-  // Login — removed: handled by task handlers directly.
+  // Login
+  { pattern: /sign.?in|log.?in/i, type: 'login', confidence: 0.75 },
+  { pattern: /password/i, type: 'login', confidence: 0.7 },
+  { pattern: /session expired/i, type: 'login', confidence: 0.8 },
 
   // 2FA
   { pattern: /two.?factor|2fa|mfa/i, type: '2fa', confidence: 0.85 },
@@ -227,10 +234,7 @@ export class BlockerDetector {
     try {
       const currentUrl = await adapter.getCurrentUrl();
       const urlResult = this.checkUrl(currentUrl);
-      if (urlResult && urlResult.confidence >= 0.8) {
-        console.log(`[BlockerDetector] URL match: type=${urlResult.type} confidence=${urlResult.confidence} details="${urlResult.details}"`);
-        return urlResult;
-      }
+      if (urlResult && urlResult.confidence >= 0.8) return urlResult;
     } catch {
       // getCurrentUrl() can fail if browser is disconnected
     }
@@ -238,32 +242,17 @@ export class BlockerDetector {
     // Pass 1: Fast DOM detection
     const domMatches = await this.runDOMDetection(adapter.page);
 
-    if (domMatches.length > 0) {
-      console.log(`[BlockerDetector] DOM found ${domMatches.length} match(es):`);
-      for (const m of domMatches) {
-        console.log(`  - type=${m.type} confidence=${m.confidence} source=${m.source} selector="${m.selector || 'text'}" details="${m.details}"`);
-      }
-    } else {
-      console.log(`[BlockerDetector] DOM detection: no matches`);
-    }
-
     // If DOM found a high-confidence blocker, return immediately (skip observe)
     const bestDOM = domMatches.length > 0
       ? domMatches.sort((a, b) => b.confidence - a.confidence)[0]
       : null;
 
     if (bestDOM && bestDOM.confidence >= 0.8) {
-      console.log(`[BlockerDetector] High-confidence DOM match — skipping observe(). Returning: type=${bestDOM.type} confidence=${bestDOM.confidence}`);
       return bestDOM;
     }
 
     // Pass 2: observe()-based detection
     const observeResult = await this.runObserveDetection(adapter);
-    if (observeResult) {
-      console.log(`[BlockerDetector] Observe result: type=${observeResult.type} confidence=${observeResult.confidence} details="${observeResult.details}"`);
-    } else {
-      console.log(`[BlockerDetector] Observe detection: no blockers found`);
-    }
 
     // No results from either pass
     if (!bestDOM && !observeResult) return null;
@@ -278,7 +267,7 @@ export class BlockerDetector {
     if (bestDOM && observeResult && bestDOM.type === observeResult.type) {
       // Same type from both sources: boost confidence
       const combinedConfidence = Math.min(1.0, bestDOM.confidence + observeResult.confidence * 0.3);
-      const combined: BlockerResult = {
+      return {
         type: bestDOM.type,
         confidence: combinedConfidence,
         selector: bestDOM.selector,
@@ -286,15 +275,11 @@ export class BlockerDetector {
         source: 'combined',
         observedElements: observeResult.observedElements,
       };
-      console.log(`[BlockerDetector] Combined result: type=${combined.type} confidence=${combined.confidence}`);
-      return combined;
     }
 
     // Different types — return the higher confidence one
     if (bestDOM && observeResult) {
-      const winner = bestDOM.confidence >= observeResult.confidence ? bestDOM : observeResult;
-      console.log(`[BlockerDetector] Returning higher-confidence result: type=${winner.type} confidence=${winner.confidence} source=${winner.source}`);
-      return winner;
+      return bestDOM.confidence >= observeResult.confidence ? bestDOM : observeResult;
     }
 
     return null;
@@ -304,21 +289,33 @@ export class BlockerDetector {
    * Run DOM-based detection (selector patterns + text patterns).
    */
   private async runDOMDetection(page: Page): Promise<BlockerResult[]> {
+    const DOM_EVAL_TIMEOUT_MS = 10_000;
     const matches: BlockerResult[] = [];
 
-    // 1. Check selector-based patterns via page.evaluate
-    const selectorResults = await page.evaluate((patterns: { selector: string; type: string; confidence: number }[]) => {
-      const found: { selector: string; type: string; confidence: number; visible: boolean }[] = [];
-      for (const p of patterns) {
-        const el = document.querySelector(p.selector);
-        if (el) {
-          const rect = el.getBoundingClientRect();
-          const visible = rect.width > 0 && rect.height > 0;
-          found.push({ ...p, visible });
-        }
-      }
-      return found;
-    }, SELECTOR_PATTERNS.map(p => ({ selector: p.selector, type: p.type, confidence: p.confidence })));
+    // 1. Check selector-based patterns via page.evaluate (with timeout)
+    let selectorResults: { selector: string; type: string; confidence: number; visible: boolean }[] = [];
+    try {
+      selectorResults = await Promise.race([
+        page.evaluate((patterns: { selector: string; type: string; confidence: number }[]) => {
+          const found: { selector: string; type: string; confidence: number; visible: boolean }[] = [];
+          for (const p of patterns) {
+            const el = document.querySelector(p.selector);
+            if (el) {
+              const rect = el.getBoundingClientRect();
+              const visible = rect.width > 0 && rect.height > 0;
+              found.push({ ...p, visible });
+            }
+          }
+          return found;
+        }, SELECTOR_PATTERNS.map(p => ({ selector: p.selector, type: p.type, confidence: p.confidence }))),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('DOM selector evaluate timed out')), DOM_EVAL_TIMEOUT_MS),
+        ),
+      ]);
+    } catch {
+      // page.evaluate timed out or failed — skip DOM selector check
+      return matches;
+    }
 
     for (const result of selectorResults) {
       // Visible elements get full confidence; hidden ones get reduced
@@ -332,10 +329,21 @@ export class BlockerDetector {
       });
     }
 
-    // 2. Check text patterns against page body text
-    const bodyText = await page.evaluate(() => {
-      return document.body?.innerText?.substring(0, 5000) || '';
-    });
+    // 2. Check text patterns against page body text (with timeout)
+    let bodyText = '';
+    try {
+      bodyText = await Promise.race([
+        page.evaluate(() => {
+          return document.body?.innerText?.substring(0, 5000) || '';
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('DOM text evaluate timed out')), DOM_EVAL_TIMEOUT_MS),
+        ),
+      ]);
+    } catch {
+      // page.evaluate timed out or failed — skip text pattern check
+      return matches;
+    }
 
     for (const { type, pattern, confidence } of TEXT_PATTERNS) {
       if (pattern.test(bodyText)) {
@@ -358,18 +366,17 @@ export class BlockerDetector {
   private async runObserveDetection(adapter: BrowserAutomationAdapter): Promise<BlockerResult | null> {
     if (!adapter.observe) return null;
 
-    const OBSERVE_TIMEOUT_MS = 15_000; // 15s timeout — observe() has no built-in timeout
-
     let elements: ObservedElement[] | undefined;
     try {
+      const OBSERVE_TIMEOUT_MS = 15_000;
       elements = await Promise.race([
         adapter.observe(OBSERVE_INSTRUCTION),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('Observe timed out after 15s')), OBSERVE_TIMEOUT_MS),
+        new Promise<undefined>((_, reject) =>
+          setTimeout(() => reject(new Error('observe() timed out')), OBSERVE_TIMEOUT_MS),
         ),
       ]);
     } catch {
-      // observe() may fail or time out — fall through
+      // observe() may fail or time out if the page is in an unusual state; fall through
       return null;
     }
 

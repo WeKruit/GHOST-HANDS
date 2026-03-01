@@ -1,14 +1,21 @@
 # ──────────────────────────────────────────────────
-# GhostHands Production Dockerfile
-# Multi-stage build: deps -> build -> runtime
+# GhostHands Unified Dockerfile
+# Multi-stage build: deps -> build -> kasm runtime
 #
-# Targets: API server and Worker (same image, different CMD)
-#   API:    docker run ghosthands  (default)
-#   Worker: docker run ghosthands bun packages/ghosthands/src/workers/main.ts
+# Combines the production GH worker with Kasm desktop (KasmVNC)
+# for built-in live-view capability on every worker container.
+#
+# Targets: API server, Worker (with VNC desktop), Deploy Server
+#   API:    docker run ghosthands bun packages/ghosthands/src/api/server.ts
+#   Worker: docker run ghosthands  (default — runs via kasm-startup.sh)
+#   Deploy: docker run ghosthands bun scripts/deploy-server.ts
+#
+# Build:
+#   docker build -t ghosthands:latest .
 # ──────────────────────────────────────────────────
 
-# Stage 1: Install dependencies
-FROM oven/bun:1.2-debian AS deps
+# Stage 1: Install dependencies + build TypeScript
+FROM oven/bun:1.2-debian AS build
 
 WORKDIR /app
 
@@ -19,11 +26,11 @@ COPY package.json bun.lock turbo.json ./
 COPY packages/ghosthands/package.json packages/ghosthands/
 COPY scripts/package.json scripts/
 
+# Copy patches for patchedDependencies (e.g. stagehand)
+COPY patches/ patches/
+
 # Install dependencies (magnitude-core and magnitude-extract come from npm)
 RUN bun install --frozen-lockfile
-
-# Stage 2: Build TypeScript
-FROM deps AS build
 
 # Copy source
 COPY packages/ packages/
@@ -33,8 +40,8 @@ COPY tsconfig.base.json ./
 # Build
 RUN bun run build
 
-# Stage 3: Production runtime
-FROM oven/bun:1.2-debian AS runtime
+# Stage 2: Kasm desktop runtime with GH worker
+FROM kasmweb/core-ubuntu-noble:1.16.1
 
 # Build metadata (set via --build-arg in CI)
 ARG COMMIT_SHA="unknown"
@@ -44,8 +51,11 @@ ENV COMMIT_SHA=${COMMIT_SHA}
 ENV BUILD_TIME=${BUILD_TIME}
 ENV IMAGE_TAG=${IMAGE_TAG}
 
-# Install system dependencies for Patchright/Chromium
+USER root
+
+# Install system dependencies for Patchright/Chromium + unzip for bun installer
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    unzip \
     ca-certificates \
     curl \
     libnss3 \
@@ -64,12 +74,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgbm1 \
     libpango-1.0-0 \
     libcairo2 \
-    libasound2 \
+    libasound2t64 \
     libwayland-client0 \
     fonts-noto-color-emoji \
     fonts-liberation \
     && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Install bun globally (to /usr/local/bin so all users can access it)
+RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash
+ENV PATH="/usr/local/bin:$PATH"
 
 # BAML runtime uses vendored OpenSSL (native-tls-vendored) via openssl-probe.
 # The vendored OpenSSL's default OPENSSLDIR is /usr/local/ssl (from openssl-src
@@ -82,30 +96,62 @@ RUN mkdir -p /usr/local/ssl && \
     ln -s /etc/ssl/certs/ca-certificates.crt /usr/local/ssl/cert.pem && \
     ln -s /etc/ssl/certs /usr/local/ssl/certs
 
-WORKDIR /app
+# Copy built GH worker from build stage
+COPY --from=build /app/node_modules /opt/ghosthands/node_modules
+COPY --from=build /app/package.json /opt/ghosthands/
+COPY --from=build /app/packages/ghosthands/dist /opt/ghosthands/packages/ghosthands/dist
+COPY --from=build /app/packages/ghosthands/src /opt/ghosthands/packages/ghosthands/src
+COPY --from=build /app/packages/ghosthands/package.json /opt/ghosthands/packages/ghosthands/
+COPY --from=build /app/scripts /opt/ghosthands/scripts
 
-# Copy node_modules (includes magnitude-core from npm)
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/package.json ./
+# Make GH worker directory accessible to kasm-user (uid 1000)
+RUN chown -R 1000:1000 /opt/ghosthands
 
-# Copy ghosthands package (dist + source for bun direct execution)
-COPY --from=build /app/packages/ghosthands/dist ./packages/ghosthands/dist
-COPY --from=build /app/packages/ghosthands/src ./packages/ghosthands/src
-COPY --from=build /app/packages/ghosthands/package.json ./packages/ghosthands/
+# Create Patchright browser cache directory (kasm-user home may not have .cache)
+RUN mkdir -p /home/kasm-user/.cache/ms-playwright && \
+    chown -R 1000:1000 /home/kasm-user/.cache
 
-# Copy scripts (deploy-server, docker-client, ecr-auth, container-configs)
-COPY --from=build /app/scripts ./scripts
-# Note: bun hoists all dependencies to root node_modules/, so
-# packages/ghosthands/node_modules/ typically doesn't exist.
+# Install Patchright browser as kasm-user
+USER 1000
+RUN cd /opt/ghosthands && bunx patchright install chromium
 
-# Create non-root user first so browser install goes to the right home dir
-RUN groupadd -r ghosthands && useradd -r -g ghosthands -m ghosthands
+# Copy custom startup script (Kasm runs this after desktop is ready)
+USER root
+COPY scripts/kasm-startup.sh /dockerstartup/custom_startup.sh
+RUN chmod +x /dockerstartup/custom_startup.sh
 
-# Install Patchright browser binaries (Chromium only) as ghosthands user
-# Must run AFTER creating the user so browsers install to /home/ghosthands/.cache/
-USER ghosthands
-RUN bunx patchright install chromium
+# Copy VNC wrapper entrypoint (WEK-602)
+# When Kamal overrides ENTRYPOINT, the Kasm default entrypoint chain
+# (/dockerstartup/kasm_default_profile.sh → vnc_startup.sh → kasm_startup.sh)
+# is bypassed, leaving port 6901 without a listener. This wrapper starts
+# the VNC stack in the background, then exec's into the CMD (bun process).
+COPY scripts/entrypoint-with-vnc.sh /opt/ghosthands/scripts/entrypoint-with-vnc.sh
+RUN chmod +x /opt/ghosthands/scripts/entrypoint-with-vnc.sh
 
-# Default: start API server
-EXPOSE 3100
-CMD ["bun", "packages/ghosthands/src/api/server.ts"]
+# KasmVNC config
+COPY config/kasmvnc.yaml /etc/kasmvnc/kasmvnc.yaml
+
+# Generate snakeoil SSL cert for KasmVNC HTTPS (kasmvnc.yaml: protocol=https)
+# Must chmod /etc/ssl/private so kasm-user (uid 1000) can read the key
+RUN apt-get update && apt-get install -y --no-install-recommends ssl-cert \
+    && rm -rf /var/lib/apt/lists/* \
+    && make-ssl-cert generate-default-snakeoil \
+    && chmod 755 /etc/ssl/private \
+    && chmod 644 /etc/ssl/private/ssl-cert-snakeoil.key
+
+# Kamal v2 requires a service label to match the deploy config
+LABEL service="ghosthands"
+
+# Expose ports: GH API, Worker status, KasmVNC web
+EXPOSE 3100 3101 6901
+
+# Run as kasm-user (uid 1000)
+USER 1000
+
+WORKDIR /opt/ghosthands
+
+# VNC wrapper entrypoint: starts Kasm VNC stack, then exec's CMD.
+# Orchestrators (Kamal, docker-compose, deploy-server) override CMD only;
+# the entrypoint ensures VNC always starts regardless of the target service.
+ENTRYPOINT ["/opt/ghosthands/scripts/entrypoint-with-vnc.sh"]
+CMD ["bun", "packages/ghosthands/src/workers/workerLauncher.ts"]
