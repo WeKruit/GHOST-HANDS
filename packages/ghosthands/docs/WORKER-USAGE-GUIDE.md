@@ -104,43 +104,67 @@ No need to specify the platform — it's detected from the URL.
 
 ---
 
-## Direct Testing (No Worker)
+## Two Ways to Run
 
-For quick local testing without the worker pipeline, use `fill-form.ts`:
+There are two ways to fill a job application: **direct mode** (single process, no database) and **worker mode** (job queue + worker process). Both use the same form-filling logic under the hood.
+
+### Direct Mode (`fill-form.ts`)
+
+Runs everything in a single process — no database, no job queue, no worker. Useful for quick testing and debugging.
 
 ```bash
-# With a real user profile from Supabase
-npx tsx toy-job-app/fill-form.ts --user-id=<uuid>
-
 # With a real user profile + a real application URL
 npx tsx toy-job-app/fill-form.ts --user-id=<uuid> --url=<application-url>
+
+# With a real user profile (uses local toy form)
+npx tsx toy-job-app/fill-form.ts --user-id=<uuid>
 
 # With built-in sample profile (no Supabase needed, uses local toy form)
 npx tsx toy-job-app/fill-form.ts
 ```
 
-This launches a browser directly, fills the form with the DOM filler, then uses the Magnitude visual agent (blue cursor) for any remaining tricky fields.
+**What happens:** The script launches its own Magnitude browser agent, navigates to the URL, fills the form, and exits. Nothing is written to the database.
+
+### Worker Mode (`apply.ts` + `main.ts`)
+
+Production workflow. Two separate processes communicate via the database:
+
+```
+Terminal 1 (worker)                     Terminal 2 (submit job)
+─────────────────────                   ─────────────────────
+main.ts starts, registers in DB,        apply.ts inserts a job row
+polls for pending jobs...               into gh_automation_jobs
+                                        (status = 'pending')
+Worker picks up job within ~5s
+SmartApplyHandler.execute() runs
+  → formFiller fills the form
+  → clicks Next, detects review
+  → updates job status in DB
+```
+
+**Why use this?** The worker mode is what runs in production. It supports job tracking, timeouts, retries, status reporting back to VALET, and can be scaled horizontally (multiple workers polling the same queue).
 
 ---
 
-## What the Worker Does
+## How Form Filling Works
 
-When a job is picked up, the worker runs `SmartApplyHandler`:
+Both direct mode and worker mode use the same form-filling approach (via `formFiller.ts`):
 
-1. **Navigates** to the application URL
-2. **Detects** the platform and loads platform-specific config
-3. **Clicks Apply** (if on a job listing page)
-4. **formFiller** takes over for each form page:
-   - Injects browser-side helpers and extracts all form fields via `data-ff-id` tagging
-   - Discovers dropdown options by briefly opening custom dropdowns
-   - Asks **Claude Haiku 4.5** for answers (single LLM call for all fields — requires `ANTHROPIC_API_KEY`)
-   - Iteratively fills fields via Playwright DOM manipulation (fast, near-$0)
-   - Re-extracts after each round to catch conditional fields that appeared
-   - **MagnitudeHand fallback** — for tricky fields the DOM filler can't handle (typeaheads, cascading dropdowns, custom widgets), micro-scoped `adapter.act()` calls use the real Magnitude visual agent (blue cursor)
-5. **Clicks Next** / advances to the next page (handled by `genericConfig.clickNextButton`)
-6. **Stops** at the review/summary page (does NOT submit)
+1. **Injects browser-side helpers** — tags every interactive element with a `data-ff-id` attribute
+2. **Extracts all form fields** — discovers labels, types, current values, dropdown options
+3. **Discovers dropdown options** — briefly opens custom dropdowns/comboboxes to read their choices
+4. **Generates answers via LLM** — single Claude Haiku 4.5 call for ALL fields at once (requires `ANTHROPIC_API_KEY`)
+5. **Iterative DOM fill** — fills fields via Playwright DOM manipulation (fast, near-$0). Re-extracts after each round to catch conditional fields that appeared. Repeats up to 10 rounds.
+6. **MagnitudeHand fallback** — for tricky fields the DOM filler can't handle (typeaheads, cascading dropdowns, custom widgets), micro-scoped `adapter.act()` calls use the Magnitude visual agent (blue cursor) one field at a time
 
-> **Note:** The form-filling approach is the same proven logic used by `toy-job-app/fill-form.ts`, adapted as a production module (`src/workers/taskHandlers/formFiller.ts`).
+### Worker Mode Additionally Handles:
+
+- **Page navigation** — detects page type (job listing, form, review, login)
+- **Clicks Apply** — if starting from a job listing page
+- **SPA guard** — for sites like Greenhouse where the URL doesn't change after clicking Apply
+- **Clicks Next** — advances through multi-page forms (via `genericConfig.clickNextButton`)
+- **Review detection** — stops at the review/summary page (does NOT submit)
+- **Cookie/popup dismissal** — handles consent banners and overlays
 
 ---
 
@@ -179,7 +203,7 @@ npx tsx --env-file=.env src/scripts/nuke-workers.ts
 
 ---
 
-## Typical Workflow
+## Typical Workflow (Worker Mode)
 
 ```
 Terminal 1                              Terminal 2
@@ -191,13 +215,40 @@ Start worker:
                                         Submit job:
   Worker picks up job...                  npx tsx --env-file=.env \
   [SmartApply] Platform: greenhouse       src/scripts/apply.ts -- \
-  [formFiller] Found 15 visible fields    --user-id=<uuid> \
-  [formFiller] LLM provided 15 answers    --url=<url> \
-  [formFiller] DOM fill done: 13/15       --worker-id=dev-1
+  [SmartApply] Navigating to URL...       --user-id=<uuid> \
+  [SmartApply] Detected: job_listing      --url=<url> \
+  [SmartApply] Clicking Apply...          --worker-id=dev-1
+  [formFiller] Found 15 visible fields
+  [formFiller] LLM provided 15 answers
+  [formFiller] DOM fill round 1: 13/15
   [formFiller] [MagnitudeHand] 2 unfilled
   [SmartApply] formFiller: 13 DOM + 2 Mag
   [SmartApply] Clicked Next via DOM.
+  [SmartApply] Detected: review_page
+  [SmartApply] Done — stopped at review.
+                                        Check status:
+                                          npx tsx --env-file=.env \
+                                            src/scripts/check-jobs.ts
+
                                         If something goes wrong:
                                           npx tsx --env-file=.env \
                                             src/scripts/kill-jobs.ts
+```
+
+## Typical Workflow (Direct Mode)
+
+```bash
+npx tsx toy-job-app/fill-form.ts \
+  --user-id=<uuid> \
+  --url=https://boards.greenhouse.io/company/jobs/123
+
+# Output:
+# [fill-form] Loading user profile...
+# [fill-form] Launching browser agent...
+# [fill-form] Navigating to URL...
+# [fill-form] Found 15 visible fields
+# [fill-form] LLM provided 15 answers
+# [fill-form] DOM fill round 1: 13/15
+# [fill-form] [MagnitudeHand] 2 unfilled fields — using visual agent
+# [fill-form] Done. 13 DOM + 2 Magnitude filled.
 ```
