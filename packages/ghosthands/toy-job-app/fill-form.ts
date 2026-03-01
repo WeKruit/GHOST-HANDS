@@ -66,9 +66,9 @@ function defaultValue(field: FormField): string {
   }
 }
 
-/** Normalize a field name for matching: strip trailing *, trim whitespace. */
+/** Normalize a field name for matching: strip * markers, trim whitespace. */
 function normalizeName(s: string): string {
-  return s.replace(/\s*\*+\s*$/, "").trim().toLowerCase();
+  return s.replace(/\*/g, "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
 /** Look up an answer for a field, case-insensitive, ignoring trailing * markers. */
@@ -787,7 +787,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
         try {
           // Open the dropdown ONCE — don't reopen per value (toggling closes it)
           await clickComboboxTrigger(page, field.id);
-          await page.waitForTimeout(300);
+          await page.waitForTimeout(600);
 
           for (const val of values) {
             try {
@@ -817,6 +817,142 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
           console.error(`  multi-select ${tag} → ${clicked}/${values.length} options`);
           return true;
         }
+
+        // Fallback: typeahead/autocomplete inputs (e.g., Workday "Type to Add Skills")
+        // Flow: type skill → Enter to search → wait for dropdown → click result → dismiss → repeat
+        try {
+          await page.keyboard.press("Escape").catch(() => {});
+          await page.waitForTimeout(200);
+          await page.click(sel, { timeout: 2000 });
+          await page.waitForTimeout(200);
+          let added = 0;
+          for (const val of values) {
+            // Type the skill name
+            await page.keyboard.type(val, { delay: 30 });
+            await page.waitForTimeout(300);
+            // Press Enter to trigger search
+            await page.keyboard.press("Enter");
+            // Wait for search results to load
+            await page.waitForTimeout(3000);
+
+            // Try to click matching result from dropdown using Playwright clicks
+            // (Workday needs proper mousedown/mouseup/click events, not DOM .click())
+            let picked = false;
+            try {
+              // First try clickActiveListOption (works for Workday activeListContainer)
+              picked = await clickActiveListOption(page, val);
+            } catch { /* no active list */ }
+
+            if (!picked) {
+              // Tag matching option and click with Playwright locator
+              try {
+                const tagged = await page.evaluate((searchText) => {
+                  document.querySelectorAll('[data-ff-click-target="skill"]').forEach(el => el.removeAttribute('data-ff-click-target'));
+                  const containers = document.querySelectorAll(
+                    '[role="listbox"], [data-automation-id="activeListContainer"], ' +
+                    '[class*="dropdown"], [class*="suggestions"], [class*="autocomplete"]'
+                  );
+                  const lower = searchText.toLowerCase().trim();
+                  for (const c of containers) {
+                    const items = c.querySelectorAll('[role="option"], li, [class*="option"], [class*="item"]');
+                    for (const item of items) {
+                      const r = (item as HTMLElement).getBoundingClientRect();
+                      if (r.height === 0) continue;
+                      const t = (item.textContent || "").trim().toLowerCase();
+                      if (t === lower || t.includes(lower) || lower.includes(t)) {
+                        (item as HTMLElement).setAttribute('data-ff-click-target', 'skill');
+                        return true;
+                      }
+                    }
+                  }
+                  return false;
+                }, val);
+                if (tagged) {
+                  await page.locator('[data-ff-click-target="skill"]').first().click({ timeout: 2000 });
+                  await page.evaluate(() => document.querySelectorAll('[data-ff-click-target="skill"]').forEach(el => el.removeAttribute('data-ff-click-target')));
+                  picked = true;
+                }
+              } catch { /* no dropdown */ }
+            }
+
+            // If no match, retry with shorter/broader search term (first word only)
+            if (!picked && val.includes(" ")) {
+              // Clear input and try shorter term
+              await page.click(sel, { clickCount: 3, timeout: 2000 }).catch(() => {});
+              await page.waitForTimeout(100);
+              await page.keyboard.press("Backspace");
+              await page.waitForTimeout(200);
+
+              const shortTerm = val.split(" ")[0];
+              await page.keyboard.type(shortTerm, { delay: 30 });
+              await page.waitForTimeout(300);
+              await page.keyboard.press("Enter");
+              await page.waitForTimeout(3000);
+
+              // Try clickActiveListOption first, then tag-and-click
+              try {
+                picked = await clickActiveListOption(page, val);
+              } catch { /* no active list */ }
+              if (!picked) {
+                try {
+                  const tagged = await page.evaluate((searchText) => {
+                    document.querySelectorAll('[data-ff-click-target="skill"]').forEach(el => el.removeAttribute('data-ff-click-target'));
+                    const containers = document.querySelectorAll(
+                      '[role="listbox"], [data-automation-id="activeListContainer"], ' +
+                      '[class*="dropdown"], [class*="suggestions"], [class*="autocomplete"]'
+                    );
+                    const lower = searchText.toLowerCase().trim();
+                    for (const c of containers) {
+                      const items = c.querySelectorAll('[role="option"], li, [class*="option"], [class*="item"]');
+                      for (const item of items) {
+                        const r = (item as HTMLElement).getBoundingClientRect();
+                        if (r.height === 0) continue;
+                        const t = (item.textContent || "").trim().toLowerCase();
+                        if (t === lower || t.includes(lower) || lower.includes(t)) {
+                          (item as HTMLElement).setAttribute('data-ff-click-target', 'skill');
+                          return true;
+                        }
+                      }
+                    }
+                    return false;
+                  }, val);
+                  if (tagged) {
+                    await page.locator('[data-ff-click-target="skill"]').first().click({ timeout: 2000 });
+                    await page.evaluate(() => document.querySelectorAll('[data-ff-click-target="skill"]').forEach(el => el.removeAttribute('data-ff-click-target')));
+                    picked = true;
+                  }
+                } catch { /* no dropdown */ }
+              }
+            }
+
+            if (!picked) {
+              // Last resort — press Enter again to select top result
+              await page.keyboard.press("Enter");
+              await page.waitForTimeout(500);
+            }
+
+            // Dismiss any remaining dropdown
+            await page.evaluate(() => {
+              const body = document.querySelector('body');
+              if (body) body.click();
+            });
+            await page.waitForTimeout(300);
+
+            // Clear the input in case text wasn't auto-cleared
+            // Use triple-click to select all text, then delete
+            await page.click(sel, { clickCount: 3, timeout: 2000 }).catch(() => {});
+            await page.waitForTimeout(100);
+            await page.keyboard.press("Backspace");
+            await page.waitForTimeout(200);
+
+            added++;
+          }
+          if (added > 0) {
+            console.error(`  multi-select ${tag} → ${added}/${values.length} tags (type+enter)`);
+            return true;
+          }
+        } catch { /* typeahead failed */ }
+
         await page.keyboard.press("Escape").catch(() => {});
         console.error(`  skip ${tag} (multi-select failed)`);
         return false;
@@ -835,7 +971,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
         // Use Playwright locator clicks, not DOM el.click()
         try {
           await clickComboboxTrigger(page, field.id);
-          await page.waitForTimeout(300);
+          await page.waitForTimeout(600);
           const options = await readActiveListOptions(page);
           if (options.length > 0) {
             const clicked = await clickActiveListOption(page, options[0]);
@@ -858,7 +994,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
       // el.click(). Workday's UXI framework requires proper mouse events.
       try {
         await clickComboboxTrigger(page, field.id);
-        await page.waitForTimeout(300);
+        await page.waitForTimeout(600);
 
         // Try direct Playwright locator click with exact option text
         let clicked = await clickActiveListOption(page, opt);
@@ -880,7 +1016,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
           }, field.id);
           if (hasSearch) {
             await page.keyboard.type(opt.slice(0, 30), { delay: 50 });
-            await page.waitForTimeout(500);
+            await page.waitForTimeout(800);
             clicked = await clickActiveListOption(page, opt);
             if (clicked) {
               await dismissDropdown(page);
@@ -1234,13 +1370,94 @@ async function detectRepeaters(page: Page): Promise<RepeaterInfo[]> {
       if (!ADD_RE.test(text)) continue;
 
       // Figure out what section this Add button belongs to
-      const card = btn.closest('.card, .section, [class*="section"], [class*="card"]');
-      const heading = card?.querySelector('h2, h3, h4, [class*="heading"], [class*="title"]');
-      const label = heading?.textContent?.trim() || text;
+      // Walk up from the button to find the containing section
+      const card = btn.closest(
+        '.card, .section, [class*="section"], [class*="card"], ' +
+        '[data-automation-id*="Section"], [data-automation-id*="panel"], ' +
+        '[class*="Panel"], [class*="panel"]'
+      );
+
+      // Find section heading — try multiple strategies
+      let label = "";
+      if (card) {
+        const heading = card.querySelector(
+          'h2, h3, h4, [class*="heading"], [class*="title"], ' +
+          '[data-automation-id*="sectionHeader"], [data-automation-id*="Title"], ' +
+          'legend, [class*="legend"]'
+        );
+        label = heading?.textContent?.trim() || "";
+      }
+
+      // If no heading found, look at preceding siblings/headings above the button
+      if (!label) {
+        let el: Element | null = btn.parentElement;
+        while (el && !label) {
+          const prev = el.previousElementSibling;
+          if (prev) {
+            const tag = prev.tagName;
+            if (tag === "H2" || tag === "H3" || tag === "H4" || tag === "LEGEND") {
+              label = prev.textContent?.trim() || "";
+            }
+            // Workday pattern: section header div before content
+            const hdr = prev.querySelector('[data-automation-id*="sectionHeader"], [data-automation-id*="Title"]');
+            if (hdr) label = hdr.textContent?.trim() || "";
+          }
+          el = el.parentElement;
+          if (el === card) break;
+        }
+      }
+
+      if (!label) label = text; // fallback to button text
 
       // Count existing repeater items in this section
-      const list = card?.querySelector('.repeater-list, [class*="repeater"], [class*="entries"]');
-      const currentCount = list ? list.children.length : 0;
+      // Strategy 1: look for numbered entries like "Work Experience 1", "Work Experience 2"
+      // Strategy 2: look for repeater-list children
+      // Strategy 3: count fieldsets or form groups within the section
+      let currentCount = 0;
+
+      if (card) {
+        // Workday pattern: items labeled "SectionName 1", "SectionName 2", etc.
+        // These show up as sub-sections or fieldsets with numbered headings
+        const allText = card.textContent || "";
+        const sectionBase = label.replace(/\s*\d+$/, "").trim(); // strip trailing number
+        if (sectionBase) {
+          const numberedRe = new RegExp(sectionBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + "\\s+\\d+", "gi");
+          const matches = allText.match(numberedRe);
+          if (matches) {
+            // Deduplicate (same heading text can appear multiple times in DOM)
+            const unique = new Set(matches.map(m => m.trim().toLowerCase()));
+            currentCount = unique.size;
+          }
+        }
+
+        // Fallback: look for repeater-list or entry containers
+        if (currentCount === 0) {
+          const list = card.querySelector(
+            '.repeater-list, [class*="repeater"], [class*="entries"], ' +
+            '[data-automation-id*="itemList"], [data-automation-id*="entryList"]'
+          );
+          if (list) currentCount = list.children.length;
+        }
+
+        // Fallback: count fieldsets or distinct form groups (excluding the Add button area)
+        if (currentCount === 0) {
+          const fieldsets = card.querySelectorAll('fieldset, [class*="entry"], [class*="item-group"]');
+          if (fieldsets.length > 0) currentCount = fieldsets.length;
+        }
+
+        // Fallback: count filled input groups — if there are inputs with values, entries exist
+        if (currentCount === 0) {
+          const inputs = card.querySelectorAll('input[type="text"], textarea');
+          let filledGroups = 0;
+          for (const inp of inputs) {
+            if ((inp as HTMLInputElement).value.trim()) {
+              filledGroups++;
+              break; // at least 1 entry exists
+            }
+          }
+          if (filledGroups > 0) currentCount = 1; // conservative: know at least 1 exists
+        }
+      }
 
       // Tag the button for Playwright to click
       const marker = `ff-add-${repeaters.length}`;
@@ -1365,6 +1582,9 @@ async function fillCurrentPage(page: Page, existingAnswers: AnswerMap = {}, exis
 
   // Iterative fill loop
   const filled = new Set<string>();
+  // Track filled field names to detect re-rendered DOM nodes (React re-renders
+  // can replace elements, stripping data-ff-id — new IDs appear for the same field).
+  const filledNames = new Set<string>();
   let round = 0;
 
   while (round < 10) {
@@ -1374,7 +1594,50 @@ async function fillCurrentPage(page: Page, existingAnswers: AnswerMap = {}, exis
     const toFill = visible.filter((f) => !filled.has(f.id));
     if (toFill.length === 0) break;
 
-    const unseen = toFill.filter((f) => {
+    // Filter out re-rendered fields that already have values in the DOM.
+    // Workday (React) can re-render DOM nodes after filling, creating new elements
+    // without data-ff-id. These get new IDs and appear as "new" fields, but they
+    // already have the correct value — re-filling them would overwrite with the
+    // wrong disambiguated answer (always the #1 entry).
+    const genuinelyNew: typeof toFill = [];
+    for (const f of toFill) {
+      const hasValue = await page.evaluate((ffId) => {
+        const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+        if (!el) return false;
+        // Input/textarea: check .value
+        if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
+          return !!(el as HTMLInputElement).value.trim();
+        }
+        // Select: check if non-default option selected
+        if (el.tagName === "SELECT") {
+          const sel = el as HTMLSelectElement;
+          return sel.selectedIndex > 0;
+        }
+        // Checkbox/toggle: check if checked
+        if ((el as HTMLInputElement).type === "checkbox" || el.getAttribute("role") === "checkbox") {
+          return (el as HTMLInputElement).checked || el.getAttribute("aria-checked") === "true";
+        }
+        // Custom dropdown/combobox: check for selected text or pills
+        const pills = el.closest('[data-automation-id]')
+          ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
+        if (pills && pills.textContent?.trim()) return true;
+        // Input inside a wrapper (Workday pattern)
+        const innerInput = el.querySelector('input');
+        if (innerInput && innerInput.value.trim()) return true;
+        return false;
+      }, f.id);
+
+      if (hasValue && round > 1) {
+        // Field already has a value — skip it, mark as filled
+        filled.add(f.id);
+      } else {
+        genuinelyNew.push(f);
+      }
+    }
+
+    if (genuinelyNew.length === 0) break;
+
+    const unseen = genuinelyNew.filter((f) => {
       if (f.type === "file") return false;
       const key = fieldIdMap[f.id];
       if (key && answers[key] !== undefined) return false;
@@ -1387,9 +1650,10 @@ async function fillCurrentPage(page: Page, existingAnswers: AnswerMap = {}, exis
       Object.assign(fieldIdMap, result.fieldIdToKey);
     }
 
-    console.error(`\nRound ${round}: ${toFill.length} new fields to fill…`);
-    for (const field of toFill) {
+    console.error(`\nRound ${round}: ${genuinelyNew.length} new fields to fill…`);
+    for (const field of genuinelyNew) {
       filled.add(field.id);
+      filledNames.add(normalizeName(field.name));
       // For repeater fields, build a field-specific answer map using the disambiguated key.
       // Use normalizeName to match LLM keys that may differ by trailing * markers.
       const key = fieldIdMap[field.id];
