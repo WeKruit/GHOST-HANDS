@@ -514,12 +514,61 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
 
       const val = getAnswer(answers, field) ?? defaultValue(field);
       try {
+        // Workday date components (Month/Year): the tagged element may be a div
+        // with dateSectionMonth-display or dateSectionYear-display. Need to click
+        // to activate the hidden input, then type the value.
+        const isWorkdayDate = await page.evaluate((ffId) => {
+          const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+          if (!el) return false;
+          const auto = el.getAttribute("data-automation-id") || "";
+          if (auto.includes("dateSection")) return true;
+          // Check parent/nearby for dateSection
+          const parent = el.closest('[data-automation-id*="dateSection"]');
+          return !!parent;
+        }, field.id);
+
+        if (isWorkdayDate) {
+          // Workday date spinbuttons: the input is hidden, click the parent
+          // container div to activate it, then focus the input and type.
+          await page.evaluate((ffId) => {
+            const el = document.querySelector(`[data-ff-id="${ffId}"]`) as HTMLElement;
+            if (!el) return;
+            // Click the parent section div (e.g., dateSectionMonth container)
+            const section = el.closest('[data-automation-id*="dateSection"]:not([data-automation-id*="-input"]):not([data-automation-id*="-display"])') as HTMLElement;
+            if (section) section.click();
+            else el.parentElement?.click();
+          }, field.id);
+          await page.waitForTimeout(300);
+          // Now focus the actual input and type
+          await page.focus(sel).catch(() => {});
+          await page.waitForTimeout(100);
+          await page.keyboard.press("Home");
+          await page.keyboard.press("Shift+End");
+          await page.keyboard.type(val, { delay: 30 });
+          await page.keyboard.press("Tab");
+          await page.waitForTimeout(200);
+          console.error(`  fill ${tag} = "${val}"`);
+          return true;
+        }
+
         await page.fill(sel, val, { timeout: 2000 });
         console.error(`  fill ${tag} = "${val}"`);
         return true;
       } catch {
-        console.error(`  skip ${tag} (not fillable)`);
-        return false;
+        // Fallback: try click + type for elements that don't support fill
+        try {
+          await page.click(sel, { timeout: 2000 });
+          await page.waitForTimeout(100);
+          await page.keyboard.press("Home");
+          await page.keyboard.press("Shift+End");
+          await page.keyboard.type(val, { delay: 30 });
+          await page.keyboard.press("Tab");
+          console.error(`  fill ${tag} = "${val}" (click+type)`);
+          return true;
+        } catch {
+          console.error(`  skip ${tag} (not fillable)`);
+          return false;
+        }
       }
     }
 
@@ -1478,14 +1527,26 @@ async function main() {
     await fillCurrentPage(page);
   }
 
-  console.error("\nDone! Browser left open for inspection. Close the tab or press Ctrl+C to exit.");
+  // Interactive loop: press Enter to re-fill current page, type "end" to quit
+  console.error("\nDone! Press Enter to re-fill current page, or type 'end' to quit.\n");
 
-  // Exit when the user closes the page/tab or after 5 minutes
-  await Promise.race([
-    page.waitForEvent("close").catch(() => {}),
-    new Promise((resolve) => setTimeout(resolve, 300_000)),
-  ]);
-  await browser.close().catch(() => {});
+  page.on("close", () => process.exit(0));
+
+  const rl = (await import("readline")).createInterface({ input: process.stdin });
+  for await (const line of rl) {
+    if (line.trim().toLowerCase() === "end") {
+      await browser.close().catch(() => {});
+      process.exit(0);
+    }
+    try {
+      await page.waitForTimeout(500);
+      await injectHelpers(page);
+      await fillCurrentPage(page);
+      console.error("\nDone! Press Enter to re-fill, or type 'end' to quit.\n");
+    } catch (e: any) {
+      console.error(`Error: ${e.message}`);
+    }
+  }
 }
 
 main().catch((err) => {
