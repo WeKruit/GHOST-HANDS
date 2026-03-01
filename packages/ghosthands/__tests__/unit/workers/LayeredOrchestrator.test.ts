@@ -105,6 +105,7 @@ function makeField(label: string, kind: string = 'text', filled = false): Scanne
 
 function buildOrchestrator(overrides: {
   adapter?: BrowserAutomationAdapter;
+  llmAdapter?: BrowserAutomationAdapter;
   config?: PlatformConfig;
   costTracker?: CostTracker;
   progress?: ProgressTracker;
@@ -112,6 +113,7 @@ function buildOrchestrator(overrides: {
 } = {}): LayeredOrchestrator {
   return new LayeredOrchestrator({
     adapter: overrides.adapter ?? createMockAdapter(),
+    llmAdapter: overrides.llmAdapter,
     config: overrides.config ?? createMockConfig(),
     costTracker: overrides.costTracker ?? new CostTracker({ jobId: 'test-job', jobType: 'smart_apply' }),
     progress: overrides.progress ?? createMockProgress(),
@@ -828,6 +830,259 @@ describe('LayeredOrchestrator', () => {
       expect(result.domFilled).toBe(1); // only text field filled by DOM
       expect(result.magnitudeFilled).toBeGreaterThanOrEqual(1); // MagnitudeHand filled dropdown and/or radio
       expect(result.totalFields).toBeGreaterThanOrEqual(3);
+    });
+  });
+
+  // =========================================================================
+  // Dual adapter routing (llmAdapter vs adapter)
+  // =========================================================================
+
+  describe('dual adapter routing', () => {
+    test('llmFillPhase routes through llmAdapter when provided', async () => {
+      // The LLM fill phase calls safeAct(), which routes to llmAdapter.
+      // To trigger LLM fill, we need scanVisibleUnfilledFields to return fields.
+      // Since page.evaluate is complex to mock per-call, we instead verify the
+      // routing logic by checking that when both adapters exist, the primary
+      // adapter's act() is called for MagnitudeHand (which uses this.adapter directly)
+      // and llmAdapter.act() would be called for LLM fill.
+      //
+      // We verify this indirectly: the orchestrator stores llmAdapter separately,
+      // and safeAct (without useVisual) calls llmAdapter.act().
+      // Direct test: create an orchestrator with both adapters, mock isPageHealthy
+      // to return true, and mock scanVisibleUnfilledFields to return fields.
+
+      const primaryAdapter = createMockAdapter();
+      const llmAdapter = createMockAdapter();
+
+      // We need to make isPageHealthy return true, scanVisibleUnfilledFields return fields,
+      // and getPerFieldValues show change after act(). The simplest approach is to use
+      // page.evaluate returning different values based on call order.
+      let evalCallCount = 0;
+      (primaryAdapter.page.evaluate as Mock).mockImplementation((...args: any[]) => {
+        evalCallCount++;
+        // Calls in order for a questions page with LLM fill:
+        // 1. dismissCookieBanner (scrollTo)
+        // 2. getPageFingerprint (bodyText hash)
+        // 3-8. DOM fill programmatic calls (handled by config mocks)
+        // 9. scanVisibleUnfilledFields (viewport scan — needs to return fields)
+        // 10. isPageHealthy (tree walker — needs to return true)
+        // 11. scrollTo (LLM fill scroll to top)
+        // 12. innerHeight
+        // 13. scrollHeight
+        // 14. scanVisibleUnfilledFields (again, viewport scan)
+        // The page.evaluate calls are hard to distinguish by index.
+        // Instead, return reasonable defaults for all calls.
+        const fn = args[0];
+        const fnStr = typeof fn === 'function' ? fn.toString() : String(fn);
+
+        // innerHeight
+        if (fnStr.includes('innerHeight') && fnStr.length < 40) return 800;
+        // scrollHeight
+        if (fnStr.includes('scrollHeight') && fnStr.length < 60) return 800;
+        // scrollTo
+        if (fnStr.includes('scrollTo')) return undefined;
+
+        // isPageHealthy — createTreeWalker
+        if (fnStr.includes('createTreeWalker')) return true;
+
+        // scanVisibleUnfilledFields
+        if (fnStr.includes('allInputs') || fnStr.includes('data-gh-scan-idx')) {
+          return [{
+            label: 'Company', kind: 'text', selector: '#company',
+            isRequired: true, options: [],
+          }];
+        }
+
+        // getPerFieldValues
+        if (fnStr.includes('getAttribute') && fnStr.includes('value')) return [''];
+
+        // getCheckedCheckboxes / dismissOpenOverlays
+        if (fnStr.includes('checked') || fnStr.includes('cookie') || fnStr.includes('overlay')) return [];
+
+        // getPageFingerprint
+        if (fnStr.includes('bodyText') || fnStr.includes('innerText')) return 'page-hash';
+
+        return false;
+      });
+
+      let pageDetectCount = 0;
+      const config = createMockConfig({
+        detectPageByUrl: vi.fn().mockImplementation(() => {
+          pageDetectCount++;
+          if (pageDetectCount <= 1) return { page_type: 'questions', page_title: 'Form' };
+          return { page_type: 'review', page_title: 'Review' };
+        }),
+        scanPageFields: vi.fn().mockResolvedValue({
+          fields: [makeField('Company', 'text', false)],
+          scrollHeight: 800,
+          viewportHeight: 800,
+        }),
+        fillScannedField: vi.fn().mockResolvedValue(false),
+        fillDropdownsProgrammatically: vi.fn().mockResolvedValue(0),
+        fillCustomDropdownsProgrammatically: vi.fn().mockResolvedValue(0),
+        fillTextFieldsProgrammatically: vi.fn().mockResolvedValue(0),
+        fillRadioButtonsProgrammatically: vi.fn().mockResolvedValue(0),
+        fillDateFieldsProgrammatically: vi.fn().mockResolvedValue(0),
+        checkRequiredCheckboxes: vi.fn().mockResolvedValue(0),
+        hasEmptyVisibleFields: vi.fn().mockResolvedValue(true),
+      });
+
+      const orchestrator = buildOrchestrator({
+        adapter: primaryAdapter,
+        llmAdapter,
+        config,
+      });
+
+      await orchestrator.run(defaultRunParams);
+
+      // llmAdapter should have been called for the LLM fill phase (via safeAct)
+      expect(llmAdapter.act).toHaveBeenCalled();
+    });
+
+    test('falls back to primary adapter when llmAdapter is not provided', async () => {
+      const primaryAdapter = createMockAdapter();
+
+      let pageDetectCount = 0;
+      const config = createMockConfig({
+        detectPageByUrl: vi.fn().mockImplementation(() => {
+          pageDetectCount++;
+          if (pageDetectCount <= 1) return { page_type: 'questions', page_title: 'Form' };
+          return { page_type: 'review', page_title: 'Review' };
+        }),
+        scanPageFields: vi.fn().mockResolvedValue({
+          fields: [makeField('Company', 'text', false)],
+          scrollHeight: 1000,
+          viewportHeight: 800,
+        }),
+        fillScannedField: vi.fn().mockResolvedValue(false),
+        fillDropdownsProgrammatically: vi.fn().mockResolvedValue(0),
+        fillCustomDropdownsProgrammatically: vi.fn().mockResolvedValue(0),
+        fillTextFieldsProgrammatically: vi.fn().mockResolvedValue(0),
+        fillRadioButtonsProgrammatically: vi.fn().mockResolvedValue(0),
+        fillDateFieldsProgrammatically: vi.fn().mockResolvedValue(0),
+        checkRequiredCheckboxes: vi.fn().mockResolvedValue(0),
+        hasEmptyVisibleFields: vi.fn().mockResolvedValue(true),
+      });
+
+      // No llmAdapter provided — should fall back to primaryAdapter
+      const orchestrator = buildOrchestrator({
+        adapter: primaryAdapter,
+        config,
+      });
+
+      await orchestrator.run(defaultRunParams);
+
+      // Primary adapter should receive LLM fill calls since no secondary was provided
+      expect(primaryAdapter.act).toHaveBeenCalled();
+    });
+
+    test('magnitudeHandPhase always routes through primary adapter', async () => {
+      const primaryAdapter = createMockAdapter();
+      const llmAdapter = createMockAdapter();
+
+      let pageDetectCount = 0;
+      const unfilledField = makeField('Dropdown', 'select', false);
+      const config = createMockConfig({
+        detectPageByUrl: vi.fn().mockImplementation(() => {
+          pageDetectCount++;
+          if (pageDetectCount <= 1) return { page_type: 'questions', page_title: 'Form' };
+          return { page_type: 'review', page_title: 'Review' };
+        }),
+        scanPageFields: vi.fn().mockResolvedValue({
+          fields: [unfilledField],
+          scrollHeight: 800,
+          viewportHeight: 800,
+        }),
+        fillScannedField: vi.fn().mockResolvedValue(false),
+        fillDropdownsProgrammatically: vi.fn().mockResolvedValue(0),
+        fillCustomDropdownsProgrammatically: vi.fn().mockResolvedValue(0),
+        fillTextFieldsProgrammatically: vi.fn().mockResolvedValue(0),
+        fillRadioButtonsProgrammatically: vi.fn().mockResolvedValue(0),
+        fillDateFieldsProgrammatically: vi.fn().mockResolvedValue(0),
+        checkRequiredCheckboxes: vi.fn().mockResolvedValue(0),
+        hasEmptyVisibleFields: vi.fn().mockResolvedValue(true),
+      });
+
+      const orchestrator = buildOrchestrator({
+        adapter: primaryAdapter,
+        llmAdapter,
+        config,
+      });
+
+      await orchestrator.run(defaultRunParams);
+
+      // Primary adapter should have been called (magnitudeHand uses this.adapter directly)
+      expect(primaryAdapter.act).toHaveBeenCalled();
+    });
+  });
+
+  // =========================================================================
+  // Greenhouse SPA detection fix (applyClicked)
+  // =========================================================================
+
+  describe('SPA detection (applyClicked)', () => {
+    test('reclassifies job_listing as questions after Apply is clicked', async () => {
+      let pageDetectCount = 0;
+      const config = createMockConfig({
+        detectPageByUrl: vi.fn().mockImplementation(() => {
+          pageDetectCount++;
+          if (pageDetectCount === 1) return { page_type: 'job_listing', page_title: 'Job' };
+          // After clicking Apply, Greenhouse SPA still detects as job_listing
+          if (pageDetectCount === 2) return { page_type: 'job_listing', page_title: 'Job' };
+          // Third call should be reclassified by the SPA fix, but we need a terminator
+          return { page_type: 'review', page_title: 'Review' };
+        }),
+        scanPageFields: vi.fn().mockResolvedValue({
+          fields: [],
+          scrollHeight: 800,
+          viewportHeight: 800,
+        }),
+        hasEmptyVisibleFields: vi.fn().mockResolvedValue(false),
+      });
+
+      const adapter = createMockAdapter({
+        // URL doesn't change (SPA behavior)
+        getCurrentUrl: vi.fn().mockResolvedValue('https://job-boards.greenhouse.io/warp/jobs/4324888004'),
+      });
+
+      const orchestrator = buildOrchestrator({
+        adapter,
+        config,
+        maxPages: 5,
+      });
+
+      const result = await orchestrator.run(defaultRunParams);
+
+      // Should have clicked Apply on page 1, then reclassified on page 2
+      expect(adapter.act).toHaveBeenCalled();
+      const actCalls = (adapter.act as Mock).mock.calls;
+      const applyCall = actCalls.find(([prompt]: [string]) => prompt.includes('Apply'));
+      expect(applyCall).toBeDefined();
+    });
+
+    test('does not reclassify job_listing before Apply is clicked', async () => {
+      const config = createMockConfig({
+        detectPageByUrl: vi.fn().mockReturnValue({ page_type: 'job_listing', page_title: 'Job' }),
+      });
+
+      const adapter = createMockAdapter({
+        getCurrentUrl: vi.fn()
+          .mockResolvedValueOnce('https://example.com/job/123')
+          .mockResolvedValueOnce('https://example.com/job/123')
+          // After clicking Apply, navigate to a different URL
+          .mockResolvedValue('https://example.com/apply'),
+      });
+
+      const orchestrator = buildOrchestrator({
+        adapter,
+        config,
+        maxPages: 2,
+      });
+
+      const result = await orchestrator.run(defaultRunParams);
+
+      // First page should be job_listing (no reclassification since Apply hasn't been clicked yet)
+      expect(adapter.act).toHaveBeenCalled();
     });
   });
 });

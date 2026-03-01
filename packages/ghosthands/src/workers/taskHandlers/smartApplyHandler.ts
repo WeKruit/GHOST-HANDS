@@ -73,6 +73,7 @@ export class SmartApplyHandler implements TaskHandler {
     // Create orchestrator and run
     const orchestrator = new LayeredOrchestrator({
       adapter,
+      llmAdapter: ctx.llmAdapter,
       config,
       costTracker,
       progress,

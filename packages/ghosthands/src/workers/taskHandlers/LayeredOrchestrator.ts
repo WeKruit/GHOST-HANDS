@@ -25,6 +25,8 @@ const MAGNITUDE_HAND_MIN_REMAINING_BUDGET = 0.02;
 
 export interface OrchestratorParams {
   adapter: BrowserAutomationAdapter;
+  /** Secondary LLM adapter (Stagehand) for cheap Phase 2 fill — shares Magnitude's browser via CDP */
+  llmAdapter?: BrowserAutomationAdapter;
   config: PlatformConfig;
   costTracker: CostTracker;
   progress: ProgressTracker;
@@ -71,6 +73,8 @@ export interface OrchestratorResult {
  */
 export class LayeredOrchestrator {
   private readonly adapter: BrowserAutomationAdapter;
+  /** Secondary adapter for cheap LLM fill (Stagehand). Falls back to primary adapter if not provided. */
+  private readonly llmAdapter: BrowserAutomationAdapter;
   private readonly config: PlatformConfig;
   private readonly costTracker: CostTracker;
   private readonly progress: ProgressTracker;
@@ -78,6 +82,8 @@ export class LayeredOrchestrator {
 
   private lastLlmCallTime = 0;
   private loginAttempted = false;
+  /** Tracks whether we already clicked Apply — prevents SPA re-detection as job_listing */
+  private applyClicked = false;
 
   // Cumulative stats across all pages
   private totalDomFilled = 0;
@@ -87,6 +93,7 @@ export class LayeredOrchestrator {
 
   constructor(params: OrchestratorParams) {
     this.adapter = params.adapter;
+    this.llmAdapter = params.llmAdapter ?? params.adapter;
     this.config = params.config;
     this.costTracker = params.costTracker;
     this.progress = params.progress;
@@ -269,7 +276,15 @@ export class LayeredOrchestrator {
 
     // Tier 1: URL-based
     const urlResult = config.detectPageByUrl(currentUrl);
-    if (urlResult) return urlResult;
+    if (urlResult) {
+      // SPA override: if we already clicked Apply and detection says job_listing,
+      // the page scrolled to an inline form (e.g. Greenhouse). Reclassify.
+      if (this.applyClicked && urlResult.page_type === 'job_listing') {
+        console.log('[Orchestrator] Apply already clicked — reclassifying job_listing as questions (SPA)');
+        return { page_type: 'questions' as PageType, page_title: 'Application Form' };
+      }
+      return urlResult;
+    }
 
     // Tier 2: Minimal DOM checks
     const obviousResult = await this.detectObviousPage(currentUrl);
@@ -278,6 +293,11 @@ export class LayeredOrchestrator {
     // Tier 2.5: Platform-specific DOM detection
     const domResult = await config.detectPageByDOM(adapter);
     if (domResult) {
+      // SPA override: prevent re-detection as job_listing after Apply click
+      if (this.applyClicked && domResult.page_type === 'job_listing') {
+        console.log('[Orchestrator] Apply already clicked — reclassifying job_listing as questions (SPA)');
+        return { page_type: 'questions' as PageType, page_title: 'Application Form' };
+      }
       console.log(`[Orchestrator] DOM detection classified page as: ${domResult.page_type}`);
       return domResult;
     }
@@ -309,6 +329,12 @@ export class LayeredOrchestrator {
       await this.throttleLlm();
       const llmResult = await adapter.extract(classificationPrompt, config.pageStateSchema);
       console.log(`[Orchestrator] LLM classified page as: ${llmResult.page_type}`);
+
+      // SPA override: prevent re-detection as job_listing after Apply click
+      if (this.applyClicked && llmResult.page_type === 'job_listing') {
+        console.log('[Orchestrator] Apply already clicked — reclassifying job_listing as questions (SPA)');
+        return { page_type: 'questions' as PageType, page_title: 'Application Form' };
+      }
 
       // SAFETY: account_creation override — if 5+ form fields, it's a form page
       if (llmResult.page_type === 'account_creation') {
@@ -442,6 +468,7 @@ export class LayeredOrchestrator {
       }
     }
 
+    this.applyClicked = true;
     await this.waitForPageSettled();
   }
 
@@ -1028,12 +1055,16 @@ ${dataPrompt}`,
       // ── PHASE 1: DOM FILL ──
       let domFills = 0;
       const unfilled = scan.fields.filter(f => !f.filled && (!f.currentValue || f.currentValue.trim() === ''));
+      console.log(`[Orchestrator] [${pageLabel}] Phase 1 (DOM fill): ${unfilled.length} unfilled fields, qaMap has ${Object.keys(qaMap).length} keys`);
 
       for (const field of unfilled) {
         if (field.kind === 'file' || field.kind === 'upload_button') continue;
 
         const answer = findBestAnswer(field.label, qaMap);
-        if (!answer) continue;
+        if (!answer) {
+          console.log(`[Orchestrator] [${pageLabel}]   DOM skip: no QA match for "${field.label}"`);
+          continue;
+        }
 
         field.matchedAnswer = answer;
 
@@ -1055,10 +1086,11 @@ ${dataPrompt}`,
         console.log(`[Orchestrator] [${pageLabel}] DOM filled ${domFills} field(s)`);
       }
 
-      // ── PHASE 2: LLM FILL ──
+      // ── PHASE 2: LLM FILL (Stagehand) ──
       const initialUnfilled = scan.fields.filter(f => !f.filled && (!f.currentValue || f.currentValue.trim() === '') && f.kind !== 'file' && f.kind !== 'upload_button');
 
       if (initialUnfilled.length > 0 && llmCalls < MAX_LLM_CALLS) {
+        console.log(`[Orchestrator] [${pageLabel}] Phase 2 (LLM fill): ${initialUnfilled.length} fields remain, using ${this.llmAdapter === this.adapter ? 'Magnitude (fallback)' : 'Stagehand'}`);
         const llmFilled = await this.llmFillPhase(scan, fillPrompt, qaMap, pageLabel, llmCalls, MAX_LLM_CALLS);
         llmCalls += llmFilled.callsMade;
         this.totalLlmFilled += llmFilled.fieldsFilled;
@@ -1131,8 +1163,194 @@ ${dataPrompt}`,
     currentLlmCalls: number,
     maxLlmCalls: number,
   ): Promise<{ callsMade: number; fieldsFilled: number }> {
+    // If Stagehand is available (separate from Magnitude), use per-field mode.
+    // Stagehand act() handles ONE atomic action per call, so batch prompts don't work.
+    if (this.llmAdapter !== this.adapter) {
+      return this.llmFillPhasePerField(scan, qaMap, pageLabel, currentLlmCalls, maxLlmCalls);
+    }
+
+    // Fallback: Magnitude handles its own decomposition, so batch viewport walk is fine.
+    return this.llmFillPhaseBatch(scan, fillPrompt, qaMap, pageLabel, currentLlmCalls, maxLlmCalls);
+  }
+
+  /**
+   * Per-field LLM fill — designed for Stagehand which performs one action per act() call.
+   * Scrolls each unfilled field into view and sends a focused single-field instruction.
+   */
+  private async llmFillPhasePerField(
+    scan: ScanResult,
+    qaMap: Record<string, string>,
+    pageLabel: string,
+    currentLlmCalls: number,
+    maxLlmCalls: number,
+  ): Promise<{ callsMade: number; fieldsFilled: number }> {
     const adapter = this.adapter;
-    const config = this.config;
+    let callsMade = 0;
+    let fieldsFilled = 0;
+
+    const unfilled = scan.fields.filter(f =>
+      !f.filled &&
+      (!f.currentValue || f.currentValue.trim() === '') &&
+      f.kind !== 'file' && f.kind !== 'upload_button'
+    );
+
+    // Dedup by normalized label — scanner may return duplicates for nested dropdown elements
+    const attemptedLabels = new Set<string>();
+    // Bail out to MagnitudeHand after consecutive failures
+    const MAX_CONSECUTIVE_FAILURES = 3;
+    let consecutiveFailures = 0;
+
+    for (const field of unfilled) {
+      if ((currentLlmCalls + callsMade) >= maxLlmCalls) break;
+
+      // Too many consecutive failures → bail out, let MagnitudeHand handle the rest
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        console.log(`[Orchestrator] [${pageLabel}] Stagehand: ${MAX_CONSECUTIVE_FAILURES} consecutive failures — handing off to MagnitudeHand`);
+        break;
+      }
+
+      // Skip duplicate labels (e.g., "Country" appears 4x from nested dropdown elements)
+      const normLabel = field.label.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (normLabel && attemptedLabels.has(normLabel)) {
+        field.filled = true; // mark so MagnitudeHand also skips it
+        continue;
+      }
+      attemptedLabels.add(normLabel);
+
+      const answer = field.matchedAnswer || findBestAnswer(field.label, qaMap);
+      if (!answer && !field.isRequired) continue; // skip optional fields with no answer
+
+      // Scroll field into view
+      if (field.selector) {
+        try {
+          await adapter.page.evaluate(
+            (sel: string) => document.querySelector(sel)?.scrollIntoView({ block: 'center' }),
+            field.selector,
+          );
+          await adapter.page.waitForTimeout(300);
+        } catch {}
+      }
+
+      // Build a focused single-field instruction
+      const instruction = this.buildPerFieldPrompt(field, answer || undefined);
+      console.log(`[Orchestrator] [${pageLabel}] Stagehand fill ${currentLlmCalls + callsMade + 1}/${maxLlmCalls}: "${field.label}" (${field.kind})${answer ? ` → "${answer}"` : ' → best judgment'}`);
+
+      // Get value before
+      let valueBefore = '';
+      if (field.selector) {
+        try {
+          valueBefore = await adapter.page.evaluate((sel: string) => {
+            const el = document.querySelector(sel);
+            if (!el) return '';
+            if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return el.value;
+            return el.textContent || '';
+          }, field.selector) || '';
+        } catch {}
+      }
+
+      try {
+        const ok = await this.safeAct(instruction, pageLabel);
+        callsMade++;
+
+        if (!ok) {
+          console.warn(`[Orchestrator] [${pageLabel}] Stagehand act() failed for "${field.label}"`);
+          consecutiveFailures++;
+          continue;
+        }
+
+        // Wait briefly for value to settle (dropdowns, async)
+        await adapter.page.waitForTimeout(500);
+
+        // Check if value changed
+        let valueAfter = '';
+        if (field.selector) {
+          try {
+            valueAfter = await adapter.page.evaluate((sel: string) => {
+              const el = document.querySelector(sel);
+              if (!el) return '';
+              if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return el.value;
+              return el.textContent || '';
+            }, field.selector) || '';
+          } catch {}
+        }
+
+        if (valueAfter !== valueBefore && valueAfter.trim() !== '') {
+          field.filled = true;
+          fieldsFilled++;
+          consecutiveFailures = 0; // reset on success
+          console.log(`[Orchestrator] [${pageLabel}] Stagehand filled "${field.label}" ✓`);
+        } else {
+          consecutiveFailures++;
+          console.log(`[Orchestrator] [${pageLabel}] Stagehand: no value change for "${field.label}" (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES} failures)`);
+        }
+      } catch (err) {
+        callsMade++;
+        consecutiveFailures++;
+        console.warn(`[Orchestrator] [${pageLabel}] Stagehand error on "${field.label}": ${err instanceof Error ? err.message : err}`);
+      }
+
+      await this.dismissOpenOverlays();
+    }
+
+    return { callsMade, fieldsFilled };
+  }
+
+  /**
+   * Build a focused single-field instruction for Stagehand.
+   */
+  private buildPerFieldPrompt(field: ScannedField, answer?: string): string {
+    const kindAction: Record<string, string> = {
+      text: 'Type',
+      select: 'Select',
+      custom_dropdown: 'Select',
+      radio: 'Select',
+      aria_radio: 'Select',
+      checkbox: 'Check',
+      date: 'Type',
+      contenteditable: 'Type',
+    };
+
+    const action = kindAction[field.kind] || 'Fill in';
+
+    if (field.kind === 'custom_dropdown' || field.kind === 'select') {
+      if (answer) {
+        return `${action} "${answer}" from the "${field.label}" dropdown. Click the dropdown to open it, then find and click the option "${answer}". If it has a search input, type "${answer}" first, wait for matching options to appear, then click the match. Do NOT scroll the page.`;
+      }
+      const optionsHint = field.options?.length ? ` Available options: ${field.options.slice(0, 8).join(', ')}` : '';
+      return `${action} the most reasonable option from the "${field.label}" dropdown.${optionsHint} Click the dropdown to open it, then click the best option. Do NOT scroll the page.`;
+    }
+
+    if (field.kind === 'radio' || field.kind === 'aria_radio') {
+      if (answer) {
+        return `Click the "${answer}" radio button for the "${field.label}" question. Do NOT scroll the page.`;
+      }
+      const optionsHint = field.options?.length ? ` Options: ${field.options.slice(0, 6).join(', ')}` : '';
+      return `Select the most appropriate radio button for "${field.label}".${optionsHint} Do NOT scroll the page.`;
+    }
+
+    if (field.kind === 'checkbox') {
+      return `Check the "${field.label}" checkbox. Do NOT scroll the page.`;
+    }
+
+    // Text, date, contenteditable
+    if (answer) {
+      return `Click on the "${field.label}" input field and type "${answer}". Make sure to clear any existing text first. Do NOT scroll the page.`;
+    }
+    return `Fill in the "${field.label}" input field with a reasonable value. Do NOT scroll the page.`;
+  }
+
+  /**
+   * Batch viewport-walk LLM fill — used when Magnitude is the LLM adapter (handles its own decomposition).
+   */
+  private async llmFillPhaseBatch(
+    scan: ScanResult,
+    fillPrompt: string,
+    qaMap: Record<string, string>,
+    pageLabel: string,
+    currentLlmCalls: number,
+    maxLlmCalls: number,
+  ): Promise<{ callsMade: number; fieldsFilled: number }> {
+    const adapter = this.adapter;
     let callsMade = 0;
     let fieldsFilled = 0;
 
@@ -1247,38 +1465,89 @@ ${dataPrompt}`,
       }
     }
 
-    // Targeted LLM call for remaining unfilled fields (strict cap)
+    // Targeted LLM call(s) for remaining unfilled fields
     const stillUnfilled = postWalkUnfilled.filter(f => !f.filled);
-    if (stillUnfilled.length > 0 && llmCalls < maxLlmCalls) {
-      const target = stillUnfilled[0];
-      if (target.selector) {
-        try {
-          await adapter.page.evaluate(
-            (sel: string) => document.querySelector(sel)?.scrollIntoView({ block: 'center' }),
-            target.selector,
-          );
-          await adapter.page.waitForTimeout(300);
-        } catch (scrollErr) {
-          console.warn(`[Orchestrator] [${pageLabel}] Scroll to field failed: ${scrollErr}`);
+    if (stillUnfilled.length === 0 || llmCalls >= maxLlmCalls) return 0;
+
+    // Per-field mode for Stagehand
+    if (this.llmAdapter !== this.adapter) {
+      let cleanupCalls = 0;
+      const maxCleanupCalls = Math.min(5, maxLlmCalls - llmCalls);
+      for (const field of stillUnfilled) {
+        if (cleanupCalls >= maxCleanupCalls) break;
+        const answer = field.matchedAnswer || findBestAnswer(field.label, qaMap);
+        if (!answer && !field.isRequired) continue;
+
+        if (field.selector) {
+          try {
+            await adapter.page.evaluate(
+              (sel: string) => document.querySelector(sel)?.scrollIntoView({ block: 'center' }),
+              field.selector,
+            );
+            await adapter.page.waitForTimeout(300);
+          } catch {}
         }
-      }
 
-      const visibleFields = await this.scanVisibleUnfilledFields(qaMap);
-      if (visibleFields.length > 0) {
-        const groupContext = this.buildScanContextForLLM(visibleFields);
-        const cleanupPrompt = `${fillPrompt}\n\nFIELDS VISIBLE IN CURRENT VIEWPORT (${visibleFields.length} field(s) detected by scan):\n${groupContext}\n\nFill the fields listed above. They are currently visible and empty. Use the expected values shown where provided.\n\nCRITICAL: NEVER skip a [REQUIRED] field (marked with * or [REQUIRED]). If no exact data is available, use your best judgment to pick the most reasonable answer.\n\nDo NOT scroll the page or click Next.`;
-
-        console.log(`[Orchestrator] [${pageLabel}] Post-walk LLM cleanup for ${visibleFields.length} remaining field(s)`);
+        const instruction = this.buildPerFieldPrompt(field, answer || undefined);
+        console.log(`[Orchestrator] [${pageLabel}] Post-walk Stagehand: "${field.label}"`);
         try {
-          const ok = await this.safeAct(cleanupPrompt, pageLabel);
-          if (!ok) {
-            console.warn(`[Orchestrator] [${pageLabel}] Post-walk LLM call reported failure`);
+          const ok = await this.safeAct(instruction, pageLabel);
+          cleanupCalls++;
+          if (ok) {
+            await adapter.page.waitForTimeout(500);
+            // Check if value changed
+            if (field.selector) {
+              const val = await adapter.page.evaluate((sel: string) => {
+                const el = document.querySelector(sel);
+                if (!el) return '';
+                if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return el.value;
+                return el.textContent || '';
+              }, field.selector) || '';
+              if (val.trim()) {
+                field.filled = true;
+                this.totalLlmFilled++;
+                console.log(`[Orchestrator] [${pageLabel}] Post-walk Stagehand filled "${field.label}" ✓`);
+              }
+            }
           }
         } catch (err) {
-          console.warn(`[Orchestrator] [${pageLabel}] Post-walk LLM call failed: ${err instanceof Error ? err.message : err}`);
+          cleanupCalls++;
+          console.warn(`[Orchestrator] [${pageLabel}] Post-walk Stagehand error: ${err instanceof Error ? err.message : err}`);
         }
-        return 1;
+        await this.dismissOpenOverlays();
       }
+      return cleanupCalls;
+    }
+
+    // Batch mode for Magnitude fallback
+    const target = stillUnfilled[0];
+    if (target.selector) {
+      try {
+        await adapter.page.evaluate(
+          (sel: string) => document.querySelector(sel)?.scrollIntoView({ block: 'center' }),
+          target.selector,
+        );
+        await adapter.page.waitForTimeout(300);
+      } catch (scrollErr) {
+        console.warn(`[Orchestrator] [${pageLabel}] Scroll to field failed: ${scrollErr}`);
+      }
+    }
+
+    const visibleFields = await this.scanVisibleUnfilledFields(qaMap);
+    if (visibleFields.length > 0) {
+      const groupContext = this.buildScanContextForLLM(visibleFields);
+      const cleanupPrompt = `${fillPrompt}\n\nFIELDS VISIBLE IN CURRENT VIEWPORT (${visibleFields.length} field(s) detected by scan):\n${groupContext}\n\nFill the fields listed above. They are currently visible and empty. Use the expected values shown where provided.\n\nCRITICAL: NEVER skip a [REQUIRED] field (marked with * or [REQUIRED]). If no exact data is available, use your best judgment to pick the most reasonable answer.\n\nDo NOT scroll the page or click Next.`;
+
+      console.log(`[Orchestrator] [${pageLabel}] Post-walk LLM cleanup for ${visibleFields.length} remaining field(s)`);
+      try {
+        const ok = await this.safeAct(cleanupPrompt, pageLabel);
+        if (!ok) {
+          console.warn(`[Orchestrator] [${pageLabel}] Post-walk LLM call reported failure`);
+        }
+      } catch (err) {
+        console.warn(`[Orchestrator] [${pageLabel}] Post-walk LLM call failed: ${err instanceof Error ? err.message : err}`);
+      }
+      return 1;
     }
     return 0;
   }
@@ -1749,7 +2018,11 @@ Set is_final_review to true ONLY if this is genuinely the last page before submi
    * Retries once on 429/rate-limit errors (30s backoff).
    * Re-throws all other exceptions (budget exceeded, action limit, browser crash).
    */
-  private async safeAct(prompt: string, label: string): Promise<boolean> {
+  /**
+   * Execute an LLM action via the appropriate adapter.
+   * @param useVisual - When true, forces the primary (Magnitude) adapter. Default false uses llmAdapter (Stagehand).
+   */
+  private async safeAct(prompt: string, label: string, useVisual = false): Promise<boolean> {
     const healthy = await this.isPageHealthy();
     if (!healthy) {
       console.warn(`[Orchestrator] [${label}] Page appears broken — skipping LLM call.`);
@@ -1758,8 +2031,10 @@ Set is_final_review to true ONLY if this is genuinely the last page before submi
 
     await this.throttleLlm();
 
+    const target = useVisual ? this.adapter : this.llmAdapter;
+
     try {
-      const result = await this.adapter.act(prompt);
+      const result = await target.act(prompt);
       if (!result.success) {
         console.warn(`[Orchestrator] [${label}] act() reported failure: ${result.message}`);
         return false;
@@ -1771,7 +2046,7 @@ Set is_final_review to true ONLY if this is genuinely the last page before submi
         console.warn(`[Orchestrator] [${label}] Rate limited (429) — waiting 30s before retry...`);
         await this.adapter.page.waitForTimeout(30_000);
         this.lastLlmCallTime = Date.now();
-        const retryResult = await this.adapter.act(prompt);
+        const retryResult = await target.act(prompt);
         return retryResult.success;
       }
       throw error;
