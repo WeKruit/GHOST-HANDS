@@ -1,0 +1,103 @@
+import { z } from 'zod';
+import type { SupabaseClient } from '@supabase/supabase-js';
+import type { BrowserAutomationAdapter, HitlCapableAdapter } from '../../adapters/types.js';
+import type { CostTracker } from '../../workers/costControl.js';
+import type { ProgressTracker } from '../../workers/progressTracker.js';
+import type { TaskHandler, AutomationJob } from '../../workers/taskHandlers/types.js';
+
+// ---------------------------------------------------------------------------
+// Serializable Workflow State (persisted by Mastra in PostgresStore)
+// ---------------------------------------------------------------------------
+
+export const workflowState = z.object({
+  jobId: z.string().uuid(),
+  userId: z.string().uuid(),
+  targetUrl: z.string().url(),
+  platform: z.string().default('other'),
+  qualityPreset: z.enum(['speed', 'balanced', 'quality']),
+  budgetUsd: z.number(),
+
+  cookbook: z.object({
+    attempted: z.boolean().default(false),
+    success: z.boolean().default(false),
+    manualId: z.string().nullable().default(null),
+    steps: z.number().default(0),
+    error: z.string().nullable().default(null),
+  }),
+
+  handler: z.object({
+    attempted: z.boolean().default(false),
+    success: z.boolean().default(false),
+    taskResult: z.object({
+      success: z.boolean(),
+      data: z.record(z.unknown()).optional(),
+      error: z.string().optional(),
+      screenshotUrl: z.string().optional(),
+      keepBrowserOpen: z.boolean().optional(),
+      awaitingUserReview: z.boolean().optional(),
+    }).nullable().default(null),
+  }),
+
+  hitl: z.object({
+    blocked: z.boolean().default(false),
+    blockerType: z.string().nullable().default(null),
+    resumeNonce: z.string().nullable().default(null),
+    checkpoint: z.string().nullable().default(null),
+  }),
+
+  metrics: z.object({
+    costUsd: z.number().default(0),
+    pagesProcessed: z.number().default(0),
+  }),
+
+  status: z.enum([
+    'running',
+    'suspended',
+    'awaiting_user_review',
+    'completed',
+    'failed',
+  ]).default('running'),
+});
+
+export type WorkflowState = z.infer<typeof workflowState>;
+
+// ---------------------------------------------------------------------------
+// Runtime Context (closure-injected, NEVER serialized into workflow schemas)
+// ---------------------------------------------------------------------------
+
+export interface RuntimeContext {
+  job: AutomationJob;
+  handler: TaskHandler;
+  adapter: HitlCapableAdapter;
+  costTracker: CostTracker;
+  progress: ProgressTracker;
+  credentials: Record<string, string> | null;
+  dataPrompt: string;
+  resumeFilePath: string | null;
+  supabase: SupabaseClient;
+  logEvent: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Resume schema for check_blockers_checkpoint step
+// ---------------------------------------------------------------------------
+
+export const blockerResumeSchema = z.object({
+  resolutionType: z.enum(['manual', 'code_entry', 'credentials', 'skip']),
+  resumeNonce: z.string().uuid(),
+});
+
+export type BlockerResumeData = z.infer<typeof blockerResumeSchema>;
+
+// ---------------------------------------------------------------------------
+// Forbidden keys in workflow schemas (security guard)
+// ---------------------------------------------------------------------------
+
+export const FORBIDDEN_SCHEMA_KEYS = [
+  'password',
+  'resolution_data',
+  'otp',
+  'credential',
+  'secret',
+  'token',
+] as const;
