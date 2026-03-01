@@ -26,7 +26,6 @@ import type { ZodSchema } from 'zod';
 import EventEmitter from 'eventemitter3';
 import { loadModelConfig, type ResolvedModel } from '../config/models';
 import { getLogger } from '../monitoring/logger';
-import { createActMutex, acquireActMutex, releaseActMutex, poisonActMutex, type ActMutexState } from './actMutex';
 
 // ── Method mapping (reused from StagehandObserver) ──────────────────────
 
@@ -90,8 +89,6 @@ export class StagehandAdapter implements HitlCapableAdapter {
   private _pauseGateResolve: (() => void) | null = null;
   private _pauseGate: Promise<void> | null = null;
   private _lastResolutionContext: ResolutionContext | null = null;
-  /** Mutex to prevent concurrent act() calls when a previous one timed out */
-  private _actMutex: ActMutexState = createActMutex();
 
   // ── Lifecycle ───────────────────────────────────────────────────────
 
@@ -211,14 +208,6 @@ export class StagehandAdapter implements HitlCapableAdapter {
   // ── Core Actions ──────────────────────────────────────────────────────
 
   async act(instruction: string, context?: ActionContext): Promise<ActionResult> {
-    // Mutex guard — throw if a previous act() timed out and is still running.
-    // Throwing (not returning { success: false }) ensures ALL callers see the failure,
-    // including smartApplyHandler.safeAct() which ignores ActionResult.success.
-    const blocked = await acquireActMutex(this._actMutex);
-    if (blocked) {
-      throw new Error(blocked);
-    }
-
     const stagehand = this._requireStagehand();
     const logger = getLogger();
     const start = Date.now();
@@ -232,17 +221,14 @@ export class StagehandAdapter implements HitlCapableAdapter {
     this.emitter.emit('actionStarted', { variant: instruction });
 
     try {
-      const actPromise = stagehand.act(instruction, {
-        timeout: ACT_TIMEOUT_MS,
-      });
-      this._actMutex.pendingAct = actPromise;
       const result = await Promise.race([
-        actPromise,
+        stagehand.act(instruction, {
+          timeout: ACT_TIMEOUT_MS,
+        }),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error(`act() timed out after ${ACT_TIMEOUT_MS}ms`)), ACT_TIMEOUT_MS),
         ),
       ]);
-      releaseActMutex(this._actMutex);
 
       // After an action, check if a new tab was opened and switch to it
       await this._syncActivePage(logger);
@@ -267,43 +253,13 @@ export class StagehandAdapter implements HitlCapableAdapter {
         tokens: delta,
       });
 
-      // Throw on soft failure so callers see the failure instead of silently no-oping.
-      if (!result.success) {
-        throw new Error(result.message || `act() failed: ${instruction}`);
-      }
-
       return {
-        success: true,
+        success: result.success,
         message: result.message || `Completed: ${instruction}`,
         durationMs,
       };
     } catch (error) {
       const durationMs = Date.now() - start;
-      const msg = (error as Error).message;
-
-      if (msg.includes('timed out')) {
-        // Timeout — poison the mutex and THROW so ALL callers see the failure.
-        // Returning { success: false } is silently ignored by smartApplyHandler.safeAct()
-        // and bare adapter.act() call sites. Throwing propagates through every code path.
-        poisonActMutex(this._actMutex, this._actMutex.pendingAct!);
-
-        // Still try to emit token usage for partial work before throwing
-        try {
-          const metricsAfter = snapshotMetrics(stagehand);
-          const delta = deltaMetrics(metricsBefore, metricsAfter);
-          this._emitTokenUsage(delta);
-        } catch { /* best effort */ }
-
-        this.emitter.emit('actionDone', {
-          variant: instruction,
-          success: false,
-          message: msg,
-        });
-
-        throw error;
-      }
-
-      releaseActMutex(this._actMutex);
 
       // Still try to emit token usage for partial work
       try {
@@ -315,19 +271,20 @@ export class StagehandAdapter implements HitlCapableAdapter {
       this.emitter.emit('actionDone', {
         variant: instruction,
         success: false,
-        message: msg,
+        message: (error as Error).message,
       });
 
       logger.warn('[Stagehand] act() failed', {
         instruction: instruction.slice(0, 200),
-        error: msg,
+        error: (error as Error).message,
         durationMs,
       });
 
-      // Non-timeout failure — throw so callers see the failure.
-      // Same rationale as timeout: returning { success: false } is silently
-      // ignored by smartApplyHandler.safeAct() and bare adapter.act() call sites.
-      throw error;
+      return {
+        success: false,
+        message: (error as Error).message,
+        durationMs,
+      };
     }
   }
 

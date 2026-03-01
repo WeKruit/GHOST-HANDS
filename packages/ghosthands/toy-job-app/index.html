@@ -1,0 +1,2411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Acme Corp — Job Application</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #f0f2f5;
+      color: #1a1a2e;
+      line-height: 1.6;
+    }
+    header {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      color: white;
+      padding: 2rem;
+      text-align: center;
+    }
+    header h1 { font-size: 1.8rem; margin-bottom: 0.25rem; }
+    header p { opacity: 0.8; font-size: 0.95rem; }
+
+    .container { max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+    .card {
+      background: white;
+      border-radius: 12px;
+      padding: 2rem;
+      margin-bottom: 1.5rem;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    }
+    .card h2 {
+      font-size: 1.2rem;
+      margin-bottom: 1.25rem;
+      padding-bottom: 0.75rem;
+      border-bottom: 2px solid #e8e8e8;
+      color: #16213e;
+    }
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+    }
+    .form-group { margin-bottom: 1.25rem; }
+    .form-group.full-width { grid-column: 1 / -1; }
+    label {
+      display: block;
+      font-weight: 600;
+      font-size: 0.875rem;
+      margin-bottom: 0.35rem;
+      color: #333;
+    }
+    label .required { color: #e74c3c; margin-left: 2px; }
+    .help-text { font-size: 0.78rem; color: #888; margin-top: 0.2rem; }
+
+    input[type="text"],
+    input[type="email"],
+    input[type="tel"],
+    input[type="url"],
+    input[type="number"],
+    input[type="date"],
+    input[type="password"],
+    textarea {
+      width: 100%;
+      padding: 0.6rem 0.75rem;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      font-size: 0.925rem;
+      font-family: inherit;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      background: #fafafa;
+    }
+    input:focus, textarea:focus {
+      outline: none;
+      border-color: #4361ee;
+      box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.15);
+      background: white;
+    }
+    textarea { resize: vertical; min-height: 100px; }
+
+    /* ── Custom dropdown ── */
+    .custom-select {
+      position: relative;
+      width: 100%;
+    }
+    .custom-select-trigger {
+      width: 100%;
+      padding: 0.6rem 2rem 0.6rem 0.75rem;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      font-size: 0.925rem;
+      font-family: inherit;
+      background: #fafafa;
+      cursor: pointer;
+      user-select: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      text-align: left;
+      min-height: 2.5rem;
+      display: flex;
+      align-items: center;
+    }
+    .custom-select-trigger::after {
+      content: '';
+      position: absolute;
+      right: 0.75rem;
+      top: 50%;
+      transform: translateY(-50%);
+      border: 5px solid transparent;
+      border-top-color: #666;
+    }
+    .custom-select-trigger:focus,
+    .custom-select.open .custom-select-trigger {
+      outline: none;
+      border-color: #4361ee;
+      box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.15);
+      background: white;
+    }
+    .custom-select-trigger .placeholder { color: #9ca3af; }
+    .custom-select-dropdown {
+      display: none;
+      position: absolute;
+      top: calc(100% + 4px);
+      left: 0;
+      right: 0;
+      background: white;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+      z-index: 100;
+      max-height: 260px;
+      overflow-y: auto;
+    }
+    .custom-select.open .custom-select-dropdown { display: block; }
+    .custom-select-search {
+      width: 100%;
+      padding: 0.5rem 0.75rem;
+      border: none;
+      border-bottom: 1px solid #e8e8e8;
+      font-size: 0.85rem;
+      font-family: inherit;
+      outline: none;
+    }
+    .custom-select-option {
+      padding: 0.5rem 0.75rem;
+      cursor: pointer;
+      font-size: 0.9rem;
+      transition: background 0.1s;
+    }
+    .custom-select-option:hover,
+    .custom-select-option[aria-selected="true"] { background: #eef1ff; }
+    .custom-select-option.hidden { display: none; }
+    .custom-select-group-label {
+      padding: 0.4rem 0.75rem 0.2rem;
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #888;
+      cursor: default;
+    }
+    .custom-select-option .option-desc {
+      display: block;
+      font-size: 0.75rem;
+      color: #888;
+      margin-top: 1px;
+    }
+
+    /* ── Nested dropdown (submenu) ── */
+    .nested-select {
+      position: relative;
+      width: 100%;
+    }
+    .nested-select-trigger {
+      width: 100%;
+      padding: 0.6rem 2rem 0.6rem 0.75rem;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      font-size: 0.925rem;
+      font-family: inherit;
+      background: #fafafa;
+      cursor: pointer;
+      user-select: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      text-align: left;
+      min-height: 2.5rem;
+      display: flex;
+      align-items: center;
+    }
+    .nested-select-trigger::after {
+      content: '';
+      position: absolute;
+      right: 0.75rem;
+      top: 50%;
+      transform: translateY(-50%);
+      border: 5px solid transparent;
+      border-top-color: #666;
+    }
+    .nested-select-trigger:focus,
+    .nested-select.open .nested-select-trigger {
+      outline: none;
+      border-color: #4361ee;
+      box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.15);
+      background: white;
+    }
+    .nested-select-trigger .placeholder { color: #9ca3af; }
+    .nested-select-dropdown {
+      display: none;
+      position: absolute;
+      top: calc(100% + 4px);
+      left: 0;
+      width: 220px;
+      background: white;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+      z-index: 100;
+      overflow: visible;
+    }
+    .nested-select.open .nested-select-dropdown { display: block; }
+    .nested-select-parent {
+      padding: 0.55rem 0.75rem;
+      cursor: pointer;
+      font-size: 0.9rem;
+      transition: background 0.1s;
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .nested-select-parent:first-child { border-radius: 7px 7px 0 0; }
+    .nested-select-parent:last-child { border-radius: 0 0 7px 7px; }
+    .nested-select-parent:hover,
+    .nested-select-parent.active {
+      background: #eef1ff;
+    }
+    .nested-select-parent::after {
+      content: '';
+      border: 4px solid transparent;
+      border-left-color: #999;
+      margin-left: 0.5rem;
+      flex-shrink: 0;
+    }
+    .nested-select-parent:hover::after,
+    .nested-select-parent.active::after {
+      border-left-color: #4361ee;
+    }
+    .nested-select-submenu {
+      display: none;
+      position: absolute;
+      left: calc(100% + 4px);
+      top: -1.5px;
+      width: 200px;
+      background: white;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+      z-index: 101;
+      overflow: hidden;
+    }
+    .nested-select-parent.active .nested-select-submenu { display: block; }
+    .nested-select-child {
+      padding: 0.5rem 0.75rem;
+      cursor: pointer;
+      font-size: 0.875rem;
+      transition: background 0.1s;
+    }
+    .nested-select-child:hover {
+      background: #eef1ff;
+      color: #4361ee;
+    }
+    .nested-select-child[aria-selected="true"] {
+      background: #dce3ff;
+      color: #3a0ca3;
+      font-weight: 600;
+    }
+
+    /* ── Multi-select (tag-style) ── */
+    .multi-select { position: relative; }
+    .multi-select-trigger {
+      width: 100%;
+      min-height: 2.5rem;
+      padding: 0.35rem 2rem 0.35rem 0.5rem;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      font-size: 0.925rem;
+      background: #fafafa;
+      cursor: pointer;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.25rem;
+      align-items: center;
+      position: relative;
+    }
+    .multi-select-trigger::after {
+      content: '';
+      position: absolute;
+      right: 0.75rem;
+      top: 50%;
+      transform: translateY(-50%);
+      border: 5px solid transparent;
+      border-top-color: #666;
+    }
+    .multi-select-trigger .placeholder { color: #9ca3af; padding: 0.25rem; }
+    .multi-tag {
+      background: #4361ee;
+      color: white;
+      padding: 0.15rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.8rem;
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+    }
+    .multi-tag-remove {
+      cursor: pointer;
+      font-size: 1rem;
+      line-height: 1;
+      opacity: 0.8;
+    }
+    .multi-tag-remove:hover { opacity: 1; }
+    .multi-select-dropdown {
+      display: none;
+      position: absolute;
+      top: calc(100% + 4px);
+      left: 0;
+      right: 0;
+      background: white;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+      z-index: 100;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+    .multi-select.open .multi-select-dropdown { display: block; }
+    .multi-select-option {
+      padding: 0.45rem 0.75rem;
+      cursor: pointer;
+      font-size: 0.9rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .multi-select-option:hover { background: #eef1ff; }
+    .multi-select-option .ms-check {
+      width: 16px;
+      height: 16px;
+      border: 1.5px solid #d1d5db;
+      border-radius: 3px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.7rem;
+      color: white;
+      flex-shrink: 0;
+    }
+    .multi-select-option[aria-selected="true"] .ms-check {
+      background: #4361ee;
+      border-color: #4361ee;
+    }
+
+    /* ── Radio card group ── */
+    .radio-cards {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .radio-card {
+      flex: 1;
+      min-width: 120px;
+      border: 1.5px solid #d1d5db;
+      border-radius: 10px;
+      padding: 0.75rem 1rem;
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.15s;
+      background: #fafafa;
+    }
+    .radio-card:hover { border-color: #4361ee; background: #f0f3ff; }
+    .radio-card.selected { border-color: #4361ee; background: #eef1ff; box-shadow: 0 0 0 3px rgba(67,97,238,0.15); }
+    .radio-card input[type="radio"] { display: none; }
+    .radio-card .rc-label { font-weight: 600; font-size: 0.9rem; }
+    .radio-card .rc-desc { font-size: 0.75rem; color: #666; margin-top: 0.15rem; }
+
+    /* ── Toggle switch ── */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.5rem 0;
+    }
+    .toggle-label { font-size: 0.9rem; }
+    .toggle-switch {
+      position: relative;
+      width: 44px;
+      height: 24px;
+      cursor: pointer;
+    }
+    .toggle-switch input { display: none; }
+    .toggle-track {
+      width: 100%;
+      height: 100%;
+      background: #d1d5db;
+      border-radius: 12px;
+      transition: background 0.2s;
+    }
+    .toggle-switch input:checked + .toggle-track { background: #4361ee; }
+    .toggle-thumb {
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 20px;
+      height: 20px;
+      background: white;
+      border-radius: 50%;
+      transition: left 0.2s;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+    .toggle-switch input:checked ~ .toggle-thumb { left: 22px; }
+
+    /* ── Compound phone field ── */
+    .phone-compound {
+      display: flex;
+      gap: 0.5rem;
+    }
+    .phone-compound .custom-select { width: 140px; flex-shrink: 0; }
+    .phone-compound input { flex: 1; }
+
+    /* ── Repeater (add another) ── */
+    .repeater-list { }
+    .repeater-item {
+      background: #f8f9ff;
+      border: 1px solid #e8e8e8;
+      border-radius: 8px;
+      padding: 1rem;
+      margin-bottom: 0.75rem;
+      position: relative;
+    }
+    .repeater-item .remove-btn {
+      position: absolute;
+      top: 0.5rem;
+      right: 0.5rem;
+      background: none;
+      border: none;
+      color: #999;
+      cursor: pointer;
+      font-size: 1.2rem;
+      line-height: 1;
+      padding: 0.2rem;
+    }
+    .repeater-item .remove-btn:hover { color: #e74c3c; }
+    .add-btn {
+      background: none;
+      border: 1.5px dashed #c5cae9;
+      border-radius: 8px;
+      padding: 0.6rem 1rem;
+      color: #4361ee;
+      cursor: pointer;
+      font-size: 0.875rem;
+      font-family: inherit;
+      font-weight: 600;
+      width: 100%;
+      transition: all 0.15s;
+    }
+    .add-btn:hover { background: #f0f3ff; border-color: #4361ee; }
+
+    /* ── Stepper / progress ── */
+    .stepper {
+      display: flex;
+      justify-content: center;
+      gap: 0;
+      margin-bottom: 1.5rem;
+    }
+    .step {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .step-circle {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: #e8e8e8;
+      color: #888;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.85rem;
+      font-weight: 700;
+      transition: all 0.2s;
+    }
+    .step.active .step-circle { background: #4361ee; color: white; }
+    .step.completed .step-circle { background: #2ecc71; color: white; }
+    .step-label { font-size: 0.8rem; color: #888; font-weight: 500; }
+    .step.active .step-label { color: #4361ee; font-weight: 600; }
+    .step.completed .step-label { color: #2ecc71; }
+    .step-connector {
+      width: 40px;
+      height: 2px;
+      background: #e8e8e8;
+      margin: 0 0.5rem;
+      align-self: center;
+    }
+    .step.completed + .step-connector { background: #2ecc71; }
+
+    /* ── Sections ── */
+    .form-section { display: none; }
+    .form-section.active { display: block; }
+    .section-nav {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 1.5rem;
+      padding-top: 1rem;
+      border-top: 1px solid #e8e8e8;
+    }
+    .nav-btn {
+      padding: 0.6rem 1.5rem;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+      transition: all 0.15s;
+    }
+    .nav-btn.prev {
+      background: white;
+      border: 1.5px solid #d1d5db;
+      color: #333;
+    }
+    .nav-btn.prev:hover { border-color: #4361ee; color: #4361ee; }
+    .nav-btn.next {
+      background: #4361ee;
+      border: none;
+      color: white;
+    }
+    .nav-btn.next:hover { background: #3a0ca3; }
+
+    /* ── File upload area ── */
+    .upload-area {
+      border: 2px dashed #c5cae9;
+      border-radius: 12px;
+      padding: 2rem;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      background: #f8f9ff;
+    }
+    .upload-area:hover, .upload-area.dragover { border-color: #4361ee; background: #eef1ff; }
+    .upload-area.has-file { border-color: #2ecc71; background: #f0faf4; }
+    .upload-area svg { width: 48px; height: 48px; margin-bottom: 0.75rem; color: #7986cb; }
+    .upload-area.has-file svg { color: #2ecc71; }
+    .upload-area p { font-size: 0.9rem; color: #666; }
+    .upload-area .file-name { font-weight: 600; color: #1a1a2e; margin-top: 0.5rem; }
+    .upload-area input[type="file"] { display: none; }
+
+    /* ── Conditional fields ── */
+    .conditional { display: none; animation: slideDown 0.3s ease; }
+    .conditional.visible { display: block; }
+    .conditional-grid { display: none; animation: slideDown 0.3s ease; }
+    .conditional-grid.visible { display: grid; }
+    @keyframes slideDown {
+      from { opacity: 0; transform: translateY(-8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ── Checkbox / radio groups ── */
+    .checkbox-group label, .radio-group label {
+      display: flex;
+      align-items: center;
+      font-weight: 400;
+      cursor: pointer;
+      padding: 0.3rem 0;
+    }
+    .checkbox-group input, .radio-group input { margin-right: 0.5rem; width: auto; }
+
+    /* ── Submit ── */
+    .submit-section { text-align: center; padding: 1rem 0; }
+    button[type="submit"] {
+      background: linear-gradient(135deg, #4361ee, #3a0ca3);
+      color: white;
+      border: none;
+      padding: 0.85rem 3rem;
+      font-size: 1rem;
+      font-weight: 600;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: transform 0.15s, box-shadow 0.15s;
+    }
+    button[type="submit"]:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(67, 97, 238, 0.4);
+    }
+
+    /* ── Toast ── */
+    .toast {
+      position: fixed;
+      bottom: 2rem;
+      left: 50%;
+      transform: translateX(-50%) translateY(100px);
+      background: #2ecc71;
+      color: white;
+      padding: 1rem 2rem;
+      border-radius: 10px;
+      font-weight: 600;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+      transition: transform 0.4s ease;
+      z-index: 1000;
+    }
+    .toast.show { transform: translateX(-50%) translateY(0); }
+
+    /* ── Workday-style selectinput (hierarchical dropdown) ── */
+    .wd-selectinput {
+      position: relative;
+      width: 100%;
+      display: flex;
+      align-items: center;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      background: #fafafa;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .wd-selectinput:focus-within {
+      border-color: #4361ee;
+      box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.15);
+      background: white;
+    }
+    .wd-selectinput-search {
+      flex: 1;
+      border: none;
+      background: transparent;
+      padding: 0.6rem 0.75rem;
+      font-size: 0.925rem;
+      font-family: inherit;
+      outline: none;
+    }
+    .wd-selectinput-trigger {
+      padding: 0 0.75rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+    }
+    /* Portal — rendered at body level like Workday */
+    .wd-active-list-container {
+      display: none;
+      position: absolute;
+      background: white;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+      z-index: 200;
+      max-height: 280px;
+      overflow-y: auto;
+      min-width: 250px;
+    }
+    .wd-active-list-container.open { display: block; }
+    .wd-active-list-container .wd-option {
+      padding: 0.5rem 0.75rem;
+      cursor: pointer;
+      font-size: 0.9rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      transition: background 0.1s;
+    }
+    .wd-active-list-container .wd-option:hover { background: #eef1ff; }
+    .wd-active-list-container .wd-option[aria-selected="true"] { background: #e0e7ff; }
+    .wd-active-list-container .wd-option .wd-chevron {
+      margin-left: 0.5rem;
+      opacity: 0.5;
+    }
+
+    @media (max-width: 600px) {
+      .form-row { grid-template-columns: 1fr; }
+      .card { padding: 1.25rem; }
+      .radio-cards { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Acme Corp</h1>
+  <p>Join our team — Submit your application below</p>
+</header>
+
+<div class="container">
+
+  <!-- Stepper -->
+  <div class="stepper" id="stepper">
+    <div class="step active" data-step="0">
+      <div class="step-circle">1</div>
+      <span class="step-label">Basics</span>
+    </div>
+    <div class="step-connector"></div>
+    <div class="step" data-step="1">
+      <div class="step-circle">2</div>
+      <span class="step-label">Position</span>
+    </div>
+    <div class="step-connector"></div>
+    <div class="step" data-step="2">
+      <div class="step-circle">3</div>
+      <span class="step-label">Experience</span>
+    </div>
+    <div class="step-connector"></div>
+    <div class="step" data-step="3">
+      <div class="step-circle">4</div>
+      <span class="step-label">Review</span>
+    </div>
+  </div>
+
+  <form id="applicationForm" novalidate>
+
+    <!-- ══════════════════════════════════════════════════════════
+         STEP 1: Basics (Personal Info + Resume)
+         ══════════════════════════════════════════════════════════ -->
+    <div class="form-section active" data-section="0">
+
+      <!-- Resume Upload -->
+      <div class="card">
+        <h2>Resume / CV</h2>
+        <div class="upload-area" id="uploadArea">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 16V4m0 0l-4 4m4-4l4 4M4 20h16"/>
+          </svg>
+          <p>Drag & drop your resume here, or <strong>click to browse</strong></p>
+          <p style="font-size:0.8rem;color:#999;margin-top:0.25rem">PDF, DOC, or DOCX — Max 5 MB</p>
+          <div class="file-name" id="fileName"></div>
+          <input type="file" id="resumeFile" name="resume" accept=".pdf,.doc,.docx">
+        </div>
+      </div>
+
+      <!-- Personal Information -->
+      <div class="card">
+        <h2>Personal Information</h2>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="firstName">First Name <span class="required">*</span></label>
+            <input type="text" id="firstName" name="firstName" required placeholder="Jane">
+          </div>
+          <div class="form-group">
+            <label for="lastName">Last Name <span class="required">*</span></label>
+            <input type="text" id="lastName" name="lastName" required placeholder="Doe">
+          </div>
+          <div class="form-group">
+            <label for="email">Email <span class="required">*</span></label>
+            <input type="email" id="email" name="email" required placeholder="jane.doe@email.com">
+          </div>
+          <div class="form-group">
+            <label for="phoneNumber">Phone</label>
+            <div class="phone-compound">
+              <!-- Custom country code dropdown -->
+              <div class="custom-select" id="phoneCountryCode" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Country Code" tabindex="0">
+                <div class="custom-select-trigger"><span class="placeholder">+1</span></div>
+                <div class="custom-select-dropdown" role="listbox">
+                  <div class="custom-select-option" role="option" data-value="+1">+1 (US)</div>
+                  <div class="custom-select-option" role="option" data-value="+44">+44 (UK)</div>
+                  <div class="custom-select-option" role="option" data-value="+91">+91 (India)</div>
+                  <div class="custom-select-option" role="option" data-value="+86">+86 (China)</div>
+                  <div class="custom-select-option" role="option" data-value="+81">+81 (Japan)</div>
+                  <div class="custom-select-option" role="option" data-value="+49">+49 (Germany)</div>
+                  <div class="custom-select-option" role="option" data-value="+33">+33 (France)</div>
+                  <div class="custom-select-option" role="option" data-value="+55">+55 (Brazil)</div>
+                </div>
+              </div>
+              <input type="tel" id="phoneNumber" name="phone" placeholder="(555) 123-4567">
+            </div>
+          </div>
+
+          <!-- Searchable country dropdown -->
+          <div class="form-group">
+            <label for="country">Country <span class="required">*</span></label>
+            <div class="custom-select" id="country" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Country" tabindex="0" data-required="true">
+              <div class="custom-select-trigger"><span class="placeholder">Select country…</span></div>
+              <div class="custom-select-dropdown" role="listbox">
+                <input type="text" class="custom-select-search" placeholder="Search countries…" aria-label="Search countries">
+                <div class="custom-select-option" role="option" data-value="us">United States</div>
+                <div class="custom-select-option" role="option" data-value="ca">Canada</div>
+                <div class="custom-select-option" role="option" data-value="uk">United Kingdom</div>
+                <div class="custom-select-option" role="option" data-value="de">Germany</div>
+                <div class="custom-select-option" role="option" data-value="fr">France</div>
+                <div class="custom-select-option" role="option" data-value="jp">Japan</div>
+                <div class="custom-select-option" role="option" data-value="au">Australia</div>
+                <div class="custom-select-option" role="option" data-value="in">India</div>
+                <div class="custom-select-option" role="option" data-value="br">Brazil</div>
+                <div class="custom-select-option" role="option" data-value="mx">Mexico</div>
+                <div class="custom-select-option" role="option" data-value="kr">South Korea</div>
+                <div class="custom-select-option" role="option" data-value="sg">Singapore</div>
+                <div class="custom-select-option" role="option" data-value="other">Other</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Cascading: State/Province depends on Country -->
+          <div class="form-group conditional" id="stateField">
+            <label for="stateProvince">State / Province</label>
+            <div class="custom-select" id="stateProvince" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="State / Province" tabindex="0">
+              <div class="custom-select-trigger"><span class="placeholder">Select state…</span></div>
+              <div class="custom-select-dropdown" role="listbox" id="stateOptions">
+                <!-- Populated dynamically -->
+              </div>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="city">City</label>
+            <input type="text" id="city" name="city" placeholder="San Francisco">
+          </div>
+
+          <div class="form-group">
+            <label for="linkedin">LinkedIn URL</label>
+            <input type="url" id="linkedin" name="linkedin" placeholder="https://linkedin.com/in/janedoe">
+          </div>
+          <div class="form-group">
+            <label for="portfolio">Portfolio / Website</label>
+            <input type="url" id="portfolio" name="portfolio" placeholder="https://janedoe.dev">
+          </div>
+        </div>
+      </div>
+
+      <div class="section-nav">
+        <div></div>
+        <button type="button" class="nav-btn next" onclick="goToStep(1)">Next: Position Details</button>
+      </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════════════
+         STEP 2: Position Details
+         ══════════════════════════════════════════════════════════ -->
+    <div class="form-section" data-section="1">
+      <div class="card">
+        <h2>Position Details</h2>
+        <div class="form-row">
+
+          <!-- Custom dropdown: Department (with grouped options) -->
+          <div class="form-group">
+            <label for="department">Department <span class="required">*</span></label>
+            <div class="custom-select" id="department" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Department" tabindex="0" data-required="true">
+              <div class="custom-select-trigger"><span class="placeholder">Select department…</span></div>
+              <div class="custom-select-dropdown" role="listbox">
+                <div class="custom-select-group-label">Technical</div>
+                <div class="custom-select-option" role="option" data-value="engineering">Engineering</div>
+                <div class="custom-select-option" role="option" data-value="data-science">Data Science</div>
+                <div class="custom-select-option" role="option" data-value="security">Security</div>
+                <div class="custom-select-group-label">Creative</div>
+                <div class="custom-select-option" role="option" data-value="design">Design</div>
+                <div class="custom-select-option" role="option" data-value="marketing">Marketing</div>
+                <div class="custom-select-group-label">Business</div>
+                <div class="custom-select-option" role="option" data-value="sales">Sales</div>
+                <div class="custom-select-option" role="option" data-value="operations">Operations</div>
+                <div class="custom-select-option" role="option" data-value="finance">Finance</div>
+                <div class="custom-select-group-label">Other</div>
+                <div class="custom-select-option" role="option" data-value="other">Other (specify below)</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Custom dropdown: Experience Level (with descriptions) -->
+          <div class="form-group">
+            <label for="experienceLevel">Experience Level <span class="required">*</span></label>
+            <div class="custom-select" id="experienceLevel" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Experience Level" tabindex="0" data-required="true">
+              <div class="custom-select-trigger"><span class="placeholder">Select level…</span></div>
+              <div class="custom-select-dropdown" role="listbox">
+                <div class="custom-select-option" role="option" data-value="intern">Intern<span class="option-desc">Currently enrolled in school</span></div>
+                <div class="custom-select-option" role="option" data-value="entry">Entry Level<span class="option-desc">0–2 years experience</span></div>
+                <div class="custom-select-option" role="option" data-value="mid">Mid Level<span class="option-desc">3–5 years experience</span></div>
+                <div class="custom-select-option" role="option" data-value="senior">Senior<span class="option-desc">6–10 years experience</span></div>
+                <div class="custom-select-option" role="option" data-value="lead">Lead / Staff<span class="option-desc">10+ years experience</span></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Conditional: Engineering sub-specialty (dropdown in dropdown) -->
+          <div class="form-group full-width conditional" id="engineeringFields">
+            <label for="engSpecialty">Engineering Specialty</label>
+            <div class="custom-select" id="engSpecialty" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Engineering Specialty" tabindex="0">
+              <div class="custom-select-trigger"><span class="placeholder">Select specialty…</span></div>
+              <div class="custom-select-dropdown" role="listbox">
+                <div class="custom-select-option" role="option" data-value="frontend">Frontend</div>
+                <div class="custom-select-option" role="option" data-value="backend">Backend</div>
+                <div class="custom-select-option" role="option" data-value="fullstack">Full Stack</div>
+                <div class="custom-select-option" role="option" data-value="devops">DevOps / Infrastructure</div>
+                <div class="custom-select-option" role="option" data-value="ml">Machine Learning / AI</div>
+                <div class="custom-select-option" role="option" data-value="mobile">Mobile</div>
+                <div class="custom-select-option" role="option" data-value="embedded">Embedded Systems</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Conditional: ML frameworks (3 levels deep: Dept→Specialty→Frameworks) -->
+          <div class="form-group full-width conditional" id="mlFields">
+            <label>ML Framework Experience</label>
+            <div class="checkbox-group">
+              <label><input type="checkbox" name="mlFrameworks" value="pytorch"> PyTorch</label>
+              <label><input type="checkbox" name="mlFrameworks" value="tensorflow"> TensorFlow</label>
+              <label><input type="checkbox" name="mlFrameworks" value="jax"> JAX</label>
+              <label><input type="checkbox" name="mlFrameworks" value="sklearn"> scikit-learn</label>
+              <label><input type="checkbox" name="mlFrameworks" value="huggingface"> Hugging Face Transformers</label>
+            </div>
+          </div>
+
+          <!-- Conditional: ML → GPU cloud preference (4 levels deep!) -->
+          <div class="form-group full-width conditional" id="mlGpuFields">
+            <label for="gpuCloud">Preferred GPU Cloud</label>
+            <div class="custom-select" id="gpuCloud" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Preferred GPU Cloud" tabindex="0">
+              <div class="custom-select-trigger"><span class="placeholder">Select provider…</span></div>
+              <div class="custom-select-dropdown" role="listbox">
+                <div class="custom-select-option" role="option" data-value="aws">AWS (SageMaker / EC2)</div>
+                <div class="custom-select-option" role="option" data-value="gcp">GCP (Vertex AI / TPU)</div>
+                <div class="custom-select-option" role="option" data-value="azure">Azure ML</div>
+                <div class="custom-select-option" role="option" data-value="lambda">Lambda Labs</div>
+                <div class="custom-select-option" role="option" data-value="none">No preference</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Conditional: Frontend → framework preference -->
+          <div class="form-group full-width conditional" id="frontendFields">
+            <label>Frontend Framework</label>
+            <div class="radio-cards" role="radiogroup" aria-label="Frontend Framework">
+              <label class="radio-card" role="radio" aria-checked="false" tabindex="0">
+                <input type="radio" name="frontendFramework" value="react">
+                <div class="rc-label">React</div>
+              </label>
+              <label class="radio-card" role="radio" aria-checked="false" tabindex="0">
+                <input type="radio" name="frontendFramework" value="vue">
+                <div class="rc-label">Vue</div>
+              </label>
+              <label class="radio-card" role="radio" aria-checked="false" tabindex="0">
+                <input type="radio" name="frontendFramework" value="angular">
+                <div class="rc-label">Angular</div>
+              </label>
+              <label class="radio-card" role="radio" aria-checked="false" tabindex="0">
+                <input type="radio" name="frontendFramework" value="svelte">
+                <div class="rc-label">Svelte</div>
+              </label>
+            </div>
+          </div>
+
+          <!-- Conditional: Data Science sub-specialty -->
+          <div class="form-group full-width conditional" id="dataScienceFields">
+            <label for="dsSpecialty">Data Science Focus</label>
+            <div class="custom-select" id="dsSpecialty" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Data Science Focus" tabindex="0">
+              <div class="custom-select-trigger"><span class="placeholder">Select focus area…</span></div>
+              <div class="custom-select-dropdown" role="listbox">
+                <div class="custom-select-option" role="option" data-value="analytics">Analytics & BI</div>
+                <div class="custom-select-option" role="option" data-value="ml-engineering">ML Engineering</div>
+                <div class="custom-select-option" role="option" data-value="nlp">NLP / LLMs</div>
+                <div class="custom-select-option" role="option" data-value="cv">Computer Vision</div>
+                <div class="custom-select-option" role="option" data-value="data-engineering">Data Engineering</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Conditional: Design → tools (multi-select) -->
+          <div class="form-group full-width conditional" id="designFields">
+            <label>Design Tools</label>
+            <div class="multi-select" id="designTools" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Design Tools" tabindex="0">
+              <div class="multi-select-trigger"><span class="placeholder">Select tools…</span></div>
+              <div class="multi-select-dropdown" role="listbox">
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="figma"><div class="ms-check"></div> Figma</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="sketch"><div class="ms-check"></div> Sketch</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="adobe"><div class="ms-check"></div> Adobe Creative Suite</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="framer"><div class="ms-check"></div> Framer</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="principle"><div class="ms-check"></div> Principle</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="invision"><div class="ms-check"></div> InVision</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Conditional: Security → clearance level -->
+          <div class="form-group full-width conditional" id="securityFields">
+            <label for="clearanceLevel">Security Clearance</label>
+            <div class="custom-select" id="clearanceLevel" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Security Clearance" tabindex="0">
+              <div class="custom-select-trigger"><span class="placeholder">Select clearance…</span></div>
+              <div class="custom-select-dropdown" role="listbox">
+                <div class="custom-select-option" role="option" data-value="none">None</div>
+                <div class="custom-select-option" role="option" data-value="public-trust">Public Trust</div>
+                <div class="custom-select-option" role="option" data-value="secret">Secret</div>
+                <div class="custom-select-option" role="option" data-value="top-secret">Top Secret</div>
+                <div class="custom-select-option" role="option" data-value="ts-sci">TS/SCI</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Conditional: Other department freetext -->
+          <div class="form-group full-width conditional" id="otherDeptField">
+            <label for="otherDepartment">Please specify department <span class="required">*</span></label>
+            <input type="text" id="otherDepartment" name="otherDepartment" placeholder="e.g. Legal, HR, Product…">
+          </div>
+
+          <!-- Conditional: Intern → school info -->
+          <div class="form-group conditional" id="internGradField">
+            <label for="graduationDate">Expected Graduation Date</label>
+            <input type="date" id="graduationDate" name="graduationDate">
+          </div>
+          <div class="form-group conditional" id="internSchoolField">
+            <label for="school">University / School</label>
+            <input type="text" id="school" name="school" placeholder="MIT">
+          </div>
+
+          <!-- Radio card: Employment Type -->
+          <div class="form-group full-width">
+            <label>Employment Type <span class="required">*</span></label>
+            <div class="radio-cards" role="radiogroup" aria-label="Employment Type">
+              <label class="radio-card" role="radio" aria-checked="false" tabindex="0">
+                <input type="radio" name="employmentType" value="fulltime" required>
+                <div class="rc-label">Full-Time</div>
+                <div class="rc-desc">Permanent position</div>
+              </label>
+              <label class="radio-card" role="radio" aria-checked="false" tabindex="0">
+                <input type="radio" name="employmentType" value="parttime">
+                <div class="rc-label">Part-Time</div>
+                <div class="rc-desc">Flexible hours</div>
+              </label>
+              <label class="radio-card" role="radio" aria-checked="false" tabindex="0">
+                <input type="radio" name="employmentType" value="contract">
+                <div class="rc-label">Contract</div>
+                <div class="rc-desc">Fixed-term engagement</div>
+              </label>
+              <label class="radio-card" role="radio" aria-checked="false" tabindex="0">
+                <input type="radio" name="employmentType" value="freelance">
+                <div class="rc-label">Freelance</div>
+                <div class="rc-desc">Project-based</div>
+              </label>
+            </div>
+          </div>
+
+          <!-- Conditional: Contract → duration -->
+          <div class="form-group full-width conditional" id="contractFields">
+            <label for="contractDuration">Contract Duration</label>
+            <div class="custom-select" id="contractDuration" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Contract Duration" tabindex="0">
+              <div class="custom-select-trigger"><span class="placeholder">Select duration…</span></div>
+              <div class="custom-select-dropdown" role="listbox">
+                <div class="custom-select-option" role="option" data-value="3months">3 months</div>
+                <div class="custom-select-option" role="option" data-value="6months">6 months</div>
+                <div class="custom-select-option" role="option" data-value="12months">12 months</div>
+                <div class="custom-select-option" role="option" data-value="other">Other</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Custom dropdown: Work Authorization -->
+          <div class="form-group">
+            <label for="workAuth">Work Authorization <span class="required">*</span></label>
+            <div class="custom-select" id="workAuth" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Work Authorization" tabindex="0" data-required="true">
+              <div class="custom-select-trigger"><span class="placeholder">Select…</span></div>
+              <div class="custom-select-dropdown" role="listbox">
+                <div class="custom-select-option" role="option" data-value="citizen">US Citizen</div>
+                <div class="custom-select-option" role="option" data-value="permanent">Permanent Resident</div>
+                <div class="custom-select-option" role="option" data-value="visa">Work Visa (H-1B, L-1, etc.)</div>
+                <div class="custom-select-option" role="option" data-value="needSponsorship">Need Sponsorship</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="salary">Desired Salary (USD)</label>
+            <input type="number" id="salary" name="salary" placeholder="95000" min="0" step="1000">
+          </div>
+
+          <!-- Conditional: Visa details -->
+          <div class="form-group full-width conditional" id="visaFields">
+            <label for="visaDetails">Visa Type / Details</label>
+            <input type="text" id="visaDetails" name="visaDetails" placeholder="e.g. H-1B, valid through 2027">
+          </div>
+
+          <!-- Conditional: Sponsorship → timeline -->
+          <div class="form-group full-width conditional" id="sponsorshipFields">
+            <label for="sponsorTimeline">Sponsorship Timeline Needed</label>
+            <div class="custom-select" id="sponsorTimeline" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Sponsorship Timeline Needed" tabindex="0">
+              <div class="custom-select-trigger"><span class="placeholder">When do you need sponsorship?</span></div>
+              <div class="custom-select-dropdown" role="listbox">
+                <div class="custom-select-option" role="option" data-value="immediately">Immediately (before start)</div>
+                <div class="custom-select-option" role="option" data-value="within6months">Within 6 months</div>
+                <div class="custom-select-option" role="option" data-value="within1year">Within 1 year</div>
+                <div class="custom-select-option" role="option" data-value="future">Sometime in the future</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="startDate">Earliest Start Date</label>
+            <input type="date" id="startDate" name="startDate">
+          </div>
+
+          <!-- Workday-style hierarchical dropdown: Referral source -->
+          <div class="form-group">
+            <label for="referralSource">How did you hear about us? <span class="required">*</span></label>
+            <div class="wd-selectinput" id="referralSource"
+                 data-uxi-widget-type="selectinput"
+                 role="combobox" aria-expanded="false" aria-haspopup="listbox"
+                 aria-label="How did you hear about us?" tabindex="0" data-required="true">
+              <input type="text" class="wd-selectinput-search"
+                     role="combobox" data-automation-id="searchBox"
+                     autocomplete="off" aria-controls="referralPortal"
+                     placeholder="Select…">
+              <div class="wd-selectinput-trigger">
+                <svg class="wd-icon-caret" width="12" height="12" viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" stroke="#666" stroke-width="1.5" fill="none"/></svg>
+              </div>
+            </div>
+          </div>
+
+          <!-- Conditional: Referral name -->
+          <div class="form-group conditional" id="referralNameField">
+            <label for="referralName">Referring Employee Name</label>
+            <input type="text" id="referralName" name="referralName" placeholder="John Smith">
+          </div>
+
+          <!-- Conditional: Other referral -->
+          <div class="form-group conditional" id="otherReferralField">
+            <label for="otherReferral">Please specify</label>
+            <input type="text" id="otherReferral" name="otherReferral" placeholder="Podcast, blog, etc.">
+          </div>
+        </div>
+      </div>
+
+      <div class="section-nav">
+        <button type="button" class="nav-btn prev" onclick="goToStep(0)">Back</button>
+        <button type="button" class="nav-btn next" onclick="goToStep(2)">Next: Experience</button>
+      </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════════════
+         STEP 3: Experience (Repeater sections + skills)
+         ══════════════════════════════════════════════════════════ -->
+    <div class="form-section" data-section="2">
+
+      <!-- Work Experience (repeater) -->
+      <div class="card">
+        <h2>Work Experience</h2>
+        <div class="repeater-list" id="workExperienceList">
+          <div class="repeater-item" data-index="0">
+            <button type="button" class="remove-btn" title="Remove" onclick="removeRepeaterItem(this)">&times;</button>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Job Title <span class="required">*</span></label>
+                <input type="text" name="work[0].title" required placeholder="Software Engineer">
+              </div>
+              <div class="form-group">
+                <label>Company <span class="required">*</span></label>
+                <input type="text" name="work[0].company" required placeholder="Acme Inc.">
+              </div>
+              <div class="form-group">
+                <label>Start Date</label>
+                <input type="date" name="work[0].startDate">
+              </div>
+              <div class="form-group">
+                <label>End Date</label>
+                <input type="date" name="work[0].endDate">
+              </div>
+            </div>
+            <div class="form-group">
+              <div class="toggle-row">
+                <span class="toggle-label">I currently work here</span>
+                <label class="toggle-switch" role="switch" aria-label="I currently work here" aria-checked="false">
+                  <input type="checkbox" name="work[0].current">
+                  <div class="toggle-track"></div>
+                  <div class="toggle-thumb"></div>
+                </label>
+              </div>
+            </div>
+          </div>
+        </div>
+        <button type="button" class="add-btn" onclick="addWorkExperience()">+ Add another position</button>
+      </div>
+
+      <!-- Education (repeater) -->
+      <div class="card">
+        <h2>Education</h2>
+        <div class="repeater-list" id="educationList">
+          <div class="repeater-item" data-index="0">
+            <button type="button" class="remove-btn" title="Remove" onclick="removeRepeaterItem(this)">&times;</button>
+            <div class="form-row">
+              <div class="form-group">
+                <label>School / University <span class="required">*</span></label>
+                <input type="text" name="edu[0].school" required placeholder="MIT">
+              </div>
+              <div class="form-group">
+                <label>Degree</label>
+                <div class="custom-select edu-degree" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Degree" tabindex="0">
+                  <div class="custom-select-trigger"><span class="placeholder">Select degree…</span></div>
+                  <div class="custom-select-dropdown" role="listbox">
+                    <div class="custom-select-option" role="option" data-value="hs">High School Diploma</div>
+                    <div class="custom-select-option" role="option" data-value="associate">Associate's</div>
+                    <div class="custom-select-option" role="option" data-value="bachelor">Bachelor's</div>
+                    <div class="custom-select-option" role="option" data-value="master">Master's</div>
+                    <div class="custom-select-option" role="option" data-value="phd">PhD / Doctorate</div>
+                    <div class="custom-select-option" role="option" data-value="bootcamp">Bootcamp / Certificate</div>
+                  </div>
+                </div>
+              </div>
+              <div class="form-group">
+                <label>Field of Study</label>
+                <input type="text" name="edu[0].field" placeholder="Computer Science">
+              </div>
+              <div class="form-group">
+                <label>Graduation Year</label>
+                <input type="number" name="edu[0].gradYear" placeholder="2024" min="1950" max="2035">
+              </div>
+            </div>
+          </div>
+        </div>
+        <button type="button" class="add-btn" onclick="addEducation()">+ Add another school</button>
+      </div>
+
+      <!-- Skills (multi-select) -->
+      <div class="card">
+        <h2>Skills & Languages</h2>
+        <div class="form-row">
+          <div class="form-group full-width">
+            <label>Programming Languages</label>
+            <div class="multi-select" id="programmingLanguages" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Programming Languages" tabindex="0">
+              <div class="multi-select-trigger"><span class="placeholder">Select languages…</span></div>
+              <div class="multi-select-dropdown" role="listbox">
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="js"><div class="ms-check"></div> JavaScript / TypeScript</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="python"><div class="ms-check"></div> Python</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="java"><div class="ms-check"></div> Java</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="csharp"><div class="ms-check"></div> C#</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="cpp"><div class="ms-check"></div> C / C++</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="go"><div class="ms-check"></div> Go</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="rust"><div class="ms-check"></div> Rust</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="ruby"><div class="ms-check"></div> Ruby</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="swift"><div class="ms-check"></div> Swift</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="kotlin"><div class="ms-check"></div> Kotlin</div>
+              </div>
+            </div>
+          </div>
+          <div class="form-group full-width">
+            <label>Spoken Languages</label>
+            <div class="multi-select" id="spokenLanguages" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Spoken Languages" tabindex="0">
+              <div class="multi-select-trigger"><span class="placeholder">Select languages…</span></div>
+              <div class="multi-select-dropdown" role="listbox">
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="en"><div class="ms-check"></div> English</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="es"><div class="ms-check"></div> Spanish</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="zh"><div class="ms-check"></div> Mandarin Chinese</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="hi"><div class="ms-check"></div> Hindi</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="fr"><div class="ms-check"></div> French</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="de"><div class="ms-check"></div> German</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="ja"><div class="ms-check"></div> Japanese</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="ko"><div class="ms-check"></div> Korean</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="pt"><div class="ms-check"></div> Portuguese</div>
+                <div class="multi-select-option" role="option" aria-selected="false" data-value="ar"><div class="ms-check"></div> Arabic</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-nav">
+        <button type="button" class="nav-btn prev" onclick="goToStep(1)">Back</button>
+        <button type="button" class="nav-btn next" onclick="goToStep(3)">Next: Review</button>
+      </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════════════
+         STEP 4: Additional Info & Review
+         ══════════════════════════════════════════════════════════ -->
+    <div class="form-section" data-section="3">
+
+      <div class="card">
+        <h2>Additional Information</h2>
+        <div class="form-group">
+          <label for="coverLetter">Cover Letter / Why do you want to work here?</label>
+          <textarea id="coverLetter" name="coverLetter" rows="5" placeholder="Tell us about yourself and why you're interested in this role…"></textarea>
+        </div>
+        <div class="form-group">
+          <label for="additionalInfo">Is there anything else you'd like us to know?</label>
+          <textarea id="additionalInfo" name="additionalInfo" rows="3" placeholder="Any other relevant information…"></textarea>
+        </div>
+
+        <!-- Toggle: willing to relocate -->
+        <div class="form-group">
+          <div class="toggle-row">
+            <span class="toggle-label">Willing to relocate?</span>
+            <label class="toggle-switch" role="switch" aria-label="Willing to relocate" aria-checked="false">
+              <input type="checkbox" name="willingToRelocate" id="willingToRelocate">
+              <div class="toggle-track"></div>
+              <div class="toggle-thumb"></div>
+            </label>
+          </div>
+        </div>
+
+        <!-- Conditional: Relocation preference -->
+        <div class="form-group conditional" id="relocateFields">
+          <label for="relocatePreference">Preferred Relocation City</label>
+          <div class="custom-select" id="relocatePreference" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Preferred Relocation City" tabindex="0">
+            <div class="custom-select-trigger"><span class="placeholder">Select city…</span></div>
+            <div class="custom-select-dropdown" role="listbox">
+              <div class="custom-select-option" role="option" data-value="sf">San Francisco, CA</div>
+              <div class="custom-select-option" role="option" data-value="nyc">New York, NY</div>
+              <div class="custom-select-option" role="option" data-value="seattle">Seattle, WA</div>
+              <div class="custom-select-option" role="option" data-value="austin">Austin, TX</div>
+              <div class="custom-select-option" role="option" data-value="remote">Remote / No preference</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Toggle: remote preference -->
+        <div class="form-group">
+          <div class="toggle-row">
+            <span class="toggle-label">Open to remote work?</span>
+            <label class="toggle-switch" role="switch" aria-label="Open to remote work" aria-checked="false">
+              <input type="checkbox" name="openToRemote" id="openToRemote">
+              <div class="toggle-track"></div>
+              <div class="toggle-thumb"></div>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <!-- EEO -->
+      <div class="card">
+        <h2>Voluntary Self-Identification <span style="font-weight:400;font-size:0.8rem;color:#888">(Optional)</span></h2>
+        <p style="font-size:0.85rem;color:#666;margin-bottom:1rem">This information is voluntary and will not affect your application.</p>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="gender">Gender</label>
+            <div class="custom-select" id="gender" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Gender" tabindex="0">
+              <div class="custom-select-trigger"><span class="placeholder">Prefer not to say</span></div>
+              <div class="custom-select-dropdown" role="listbox">
+                <div class="custom-select-option" role="option" data-value="male">Male</div>
+                <div class="custom-select-option" role="option" data-value="female">Female</div>
+                <div class="custom-select-option" role="option" data-value="nonbinary">Non-binary</div>
+                <div class="custom-select-option" role="option" data-value="other">Other</div>
+                <div class="custom-select-option" role="option" data-value="prefer-not">Prefer not to say</div>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="ethnicity">Ethnicity</label>
+            <div class="custom-select" id="ethnicity" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Ethnicity" tabindex="0">
+              <div class="custom-select-trigger"><span class="placeholder">Prefer not to say</span></div>
+              <div class="custom-select-dropdown" role="listbox">
+                <div class="custom-select-option" role="option" data-value="asian">Asian</div>
+                <div class="custom-select-option" role="option" data-value="black">Black or African American</div>
+                <div class="custom-select-option" role="option" data-value="hispanic">Hispanic or Latino</div>
+                <div class="custom-select-option" role="option" data-value="native">Native American or Alaska Native</div>
+                <div class="custom-select-option" role="option" data-value="pacific">Native Hawaiian or Pacific Islander</div>
+                <div class="custom-select-option" role="option" data-value="white">White</div>
+                <div class="custom-select-option" role="option" data-value="two-or-more">Two or More Races</div>
+                <div class="custom-select-option" role="option" data-value="prefer-not">Prefer not to say</div>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="veteranStatus">Veteran Status</label>
+            <div class="custom-select" id="veteranStatus" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Veteran Status" tabindex="0">
+              <div class="custom-select-trigger"><span class="placeholder">Prefer not to say</span></div>
+              <div class="custom-select-dropdown" role="listbox">
+                <div class="custom-select-option" role="option" data-value="yes">Yes, I am a veteran</div>
+                <div class="custom-select-option" role="option" data-value="no">No</div>
+                <div class="custom-select-option" role="option" data-value="prefer-not">Prefer not to say</div>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="disability">Disability Status</label>
+            <div class="custom-select" id="disability" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Disability Status" tabindex="0">
+              <div class="custom-select-trigger"><span class="placeholder">Prefer not to say</span></div>
+              <div class="custom-select-dropdown" role="listbox">
+                <div class="custom-select-option" role="option" data-value="yes">Yes, I have a disability</div>
+                <div class="custom-select-option" role="option" data-value="no">No</div>
+                <div class="custom-select-option" role="option" data-value="prefer-not">Prefer not to say</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ═══════════════════════════════════════════════════════════
+           TRICKY FIELDS — These are designed to stump DOM-based fillers
+           and require a general GUI agent (MagnitudeHand) to handle.
+           ═══════════════════════════════════════════════════════════ -->
+      <div class="card">
+        <h2>Additional Questions</h2>
+
+        <!-- 1. Cascading / nested dropdowns: pick region → city appears -->
+        <div class="form-group">
+          <label>Preferred Office Region <span class="required">*</span></label>
+          <div class="custom-select" id="officeRegion" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Preferred Office Region" tabindex="0">
+            <div class="custom-select-trigger"><span class="placeholder">Select region…</span></div>
+            <div class="custom-select-dropdown" role="listbox">
+              <div class="custom-select-option" role="option" data-value="west">West Coast</div>
+              <div class="custom-select-option" role="option" data-value="east">East Coast</div>
+              <div class="custom-select-option" role="option" data-value="central">Central</div>
+              <div class="custom-select-option" role="option" data-value="intl">International</div>
+            </div>
+          </div>
+        </div>
+        <!-- Nested child dropdown — hidden until region is selected -->
+        <div class="form-group conditional" id="officeCityGroup">
+          <label>Preferred Office City <span class="required">*</span></label>
+          <div class="custom-select" id="officeCity" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Preferred Office City" tabindex="0">
+            <div class="custom-select-trigger"><span class="placeholder">Select city…</span></div>
+            <div class="custom-select-dropdown" role="listbox" id="officeCityOptions">
+              <!-- Options are populated dynamically by JS based on region -->
+            </div>
+          </div>
+        </div>
+
+        <!-- 2. Autocomplete / typeahead: type to search, pick from filtered results -->
+        <div class="form-group">
+          <label for="universitySearch">University Attended (type to search)</label>
+          <div class="autocomplete-wrapper" style="position:relative">
+            <input type="text" id="universitySearch" name="university" placeholder="Start typing a university name…" autocomplete="off"
+                   aria-label="University Attended" aria-autocomplete="list" aria-expanded="false" aria-controls="universityResults" role="combobox">
+            <div class="autocomplete-results" id="universityResults" role="listbox" style="
+              display:none; position:absolute; top:100%; left:0; right:0; background:white;
+              border:1.5px solid #d1d5db; border-radius:0 0 8px 8px; box-shadow:0 8px 24px rgba(0,0,0,0.12);
+              z-index:100; max-height:200px; overflow-y:auto;
+            "></div>
+          </div>
+          <div class="help-text">Search from our database of 50+ universities</div>
+        </div>
+
+        <!-- 3. Contenteditable rich-text area (not a real <textarea>) -->
+        <div class="form-group">
+          <label>Why do you want to work at Acme Corp?</label>
+          <div class="rich-text-toolbar" style="display:flex;gap:4px;padding:0.4rem 0.5rem;border:1.5px solid #d1d5db;border-bottom:none;border-radius:8px 8px 0 0;background:#f5f5f5;">
+            <button type="button" class="rt-btn" data-cmd="bold" title="Bold" style="padding:2px 8px;border:1px solid #ccc;border-radius:4px;background:white;cursor:pointer;font-weight:700;">B</button>
+            <button type="button" class="rt-btn" data-cmd="italic" title="Italic" style="padding:2px 8px;border:1px solid #ccc;border-radius:4px;background:white;cursor:pointer;font-style:italic;">I</button>
+            <button type="button" class="rt-btn" data-cmd="insertUnorderedList" title="Bullet List" style="padding:2px 8px;border:1px solid #ccc;border-radius:4px;background:white;cursor:pointer;">•</button>
+          </div>
+          <div class="rich-text-editor" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Why do you want to work at Acme Corp?"
+               data-placeholder="Share your motivation…"
+               style="min-height:120px;padding:0.75rem;border:1.5px solid #d1d5db;border-radius:0 0 8px 8px;font-size:0.925rem;font-family:inherit;outline:none;background:#fafafa;"></div>
+        </div>
+
+        <!-- 4. Custom rating slider — hidden real input behind a visual slider -->
+        <div class="form-group">
+          <label>How would you rate your proficiency in our tech stack? <span id="sliderValue" style="color:#4361ee;font-weight:700;">5</span>/10</label>
+          <div class="custom-slider" style="position:relative;height:36px;display:flex;align-items:center;padding:0 8px;">
+            <div class="slider-track" style="position:absolute;left:8px;right:8px;height:6px;background:#e0e0e0;border-radius:3px;">
+              <div class="slider-fill" id="sliderFill" style="width:50%;height:100%;background:linear-gradient(90deg,#4361ee,#3a0ca3);border-radius:3px;"></div>
+            </div>
+            <input type="range" id="techRating" name="techRating" min="1" max="10" value="5" aria-label="Tech stack proficiency rating"
+                   style="width:100%;opacity:0;position:absolute;left:0;right:0;cursor:pointer;height:36px;z-index:2;">
+            <div class="slider-thumb" id="sliderThumb" style="
+              position:absolute; left:calc(50% - 10px); width:20px; height:20px;
+              background:white; border:2px solid #4361ee; border-radius:50%;
+              box-shadow:0 2px 6px rgba(0,0,0,0.15); pointer-events:none; z-index:1;
+            "></div>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:0.75rem;color:#888;padding:0 8px;">
+            <span>Beginner</span><span>Expert</span>
+          </div>
+        </div>
+
+        <!-- 5. Cascading level 2: nested dropdown that depends on first nested -->
+        <div class="form-group conditional" id="officeFloorGroup">
+          <label>Preferred Floor</label>
+          <div class="custom-select" id="officeFloor" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Preferred Floor" tabindex="0">
+            <div class="custom-select-trigger"><span class="placeholder">Select floor…</span></div>
+            <div class="custom-select-dropdown" role="listbox" id="officeFloorOptions">
+              <!-- Populated by JS when city is selected -->
+            </div>
+          </div>
+        </div>
+
+        <!-- 6. Nested submenu dropdown: hover/click parent to reveal child submenu -->
+        <div class="form-group">
+          <label>Preferred Team <span class="required">*</span></label>
+          <p class="help-text" style="margin-bottom:0.35rem">Select a department, then pick your sub-team from the submenu</p>
+          <div class="nested-select" id="preferredTeam" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Preferred Team" tabindex="0">
+            <div class="nested-select-trigger"><span class="placeholder">Select team…</span></div>
+            <div class="nested-select-dropdown" role="listbox">
+              <div class="nested-select-parent" data-parent="engineering">
+                Engineering
+                <div class="nested-select-submenu">
+                  <div class="nested-select-child" role="option" data-value="engineering>frontend" data-parent-label="Engineering" data-child-label="Frontend">Frontend</div>
+                  <div class="nested-select-child" role="option" data-value="engineering>backend" data-parent-label="Engineering" data-child-label="Backend">Backend</div>
+                  <div class="nested-select-child" role="option" data-value="engineering>infrastructure" data-parent-label="Engineering" data-child-label="Infrastructure">Infrastructure</div>
+                  <div class="nested-select-child" role="option" data-value="engineering>ml-ai" data-parent-label="Engineering" data-child-label="ML/AI">ML/AI</div>
+                  <div class="nested-select-child" role="option" data-value="engineering>mobile" data-parent-label="Engineering" data-child-label="Mobile">Mobile</div>
+                </div>
+              </div>
+              <div class="nested-select-parent" data-parent="design">
+                Design
+                <div class="nested-select-submenu">
+                  <div class="nested-select-child" role="option" data-value="design>ui-ux" data-parent-label="Design" data-child-label="UI/UX">UI/UX</div>
+                  <div class="nested-select-child" role="option" data-value="design>visual-design" data-parent-label="Design" data-child-label="Visual Design">Visual Design</div>
+                  <div class="nested-select-child" role="option" data-value="design>design-systems" data-parent-label="Design" data-child-label="Design Systems">Design Systems</div>
+                </div>
+              </div>
+              <div class="nested-select-parent" data-parent="product">
+                Product
+                <div class="nested-select-submenu">
+                  <div class="nested-select-child" role="option" data-value="product>product-management" data-parent-label="Product" data-child-label="Product Management">Product Management</div>
+                  <div class="nested-select-child" role="option" data-value="product>product-analytics" data-parent-label="Product" data-child-label="Product Analytics">Product Analytics</div>
+                  <div class="nested-select-child" role="option" data-value="product>growth" data-parent-label="Product" data-child-label="Growth">Growth</div>
+                </div>
+              </div>
+              <div class="nested-select-parent" data-parent="operations">
+                Operations
+                <div class="nested-select-submenu">
+                  <div class="nested-select-child" role="option" data-value="operations>people-ops" data-parent-label="Operations" data-child-label="People Ops">People Ops</div>
+                  <div class="nested-select-child" role="option" data-value="operations>finance" data-parent-label="Operations" data-child-label="Finance">Finance</div>
+                  <div class="nested-select-child" role="option" data-value="operations>legal" data-parent-label="Operations" data-child-label="Legal">Legal</div>
+                  <div class="nested-select-child" role="option" data-value="operations>it" data-parent-label="Operations" data-child-label="IT">IT</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Agreement checkboxes -->
+      <div class="card">
+        <h2>Agreements</h2>
+        <div class="form-group">
+          <label style="display:flex;align-items:flex-start;font-weight:400;gap:0.5rem;cursor:pointer">
+            <input type="checkbox" name="agreeTerms" required style="margin-top:0.25rem;width:auto">
+            <span>I certify that the information provided is accurate and complete. I understand that any misrepresentation may disqualify me from employment. <span class="required">*</span></span>
+          </label>
+        </div>
+        <div class="form-group">
+          <label style="display:flex;align-items:flex-start;font-weight:400;gap:0.5rem;cursor:pointer">
+            <input type="checkbox" name="agreePrivacy" style="margin-top:0.25rem;width:auto">
+            <span>I agree to the processing of my personal data in accordance with the Privacy Policy.</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="section-nav">
+        <button type="button" class="nav-btn prev" onclick="goToStep(2)">Back</button>
+        <button type="submit" class="nav-btn next">Submit Application</button>
+      </div>
+    </div>
+
+  </form>
+</div>
+
+<div class="toast" id="toast">Application submitted successfully!</div>
+
+<!-- Workday-style portal for hierarchical dropdown (rendered at body level) -->
+<div class="wd-active-list-container" id="referralPortal"
+     data-automation-id="activeListContainer">
+  <!-- Options injected dynamically by JS -->
+</div>
+
+<script>
+  // ═══════════════════════════════════════════════════════════
+  // Stepper navigation
+  // ═══════════════════════════════════════════════════════════
+  let currentStep = 0;
+
+  function goToStep(n) {
+    const sections = document.querySelectorAll('.form-section');
+    const steps = document.querySelectorAll('.step');
+
+    sections.forEach((s, i) => s.classList.toggle('active', i === n));
+    steps.forEach((s, i) => {
+      s.classList.remove('active', 'completed');
+      if (i === n) s.classList.add('active');
+      else if (i < n) s.classList.add('completed');
+    });
+    currentStep = n;
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Custom single-select dropdown
+  // ═══════════════════════════════════════════════════════════
+  function initCustomSelect(el) {
+    // Abort any previous event listeners from a prior init call on this element.
+    // This prevents duplicate handlers when initCustomSelect is called again
+    // (e.g., after dynamically populating cascading dropdown options).
+    if (el._customSelectAC) {
+      el._customSelectAC.abort();
+    }
+    const ac = new AbortController();
+    el._customSelectAC = ac;
+    const sig = { signal: ac.signal };
+
+    const trigger = el.querySelector('.custom-select-trigger');
+    const dropdown = el.querySelector('.custom-select-dropdown');
+    const options = el.querySelectorAll('.custom-select-option');
+    const searchInput = el.querySelector('.custom-select-search');
+
+    function open() {
+      // Close all others first
+      document.querySelectorAll('.custom-select.open, .multi-select.open').forEach(s => {
+        if (s !== el) close(s);
+      });
+      el.classList.add('open');
+      el.setAttribute('aria-expanded', 'true');
+      if (searchInput) { searchInput.value = ''; filterOptions(''); searchInput.focus(); }
+    }
+
+    function close(target) {
+      target = target || el;
+      target.classList.remove('open');
+      target.setAttribute('aria-expanded', 'false');
+    }
+
+    function select(opt) {
+      options.forEach(o => o.setAttribute('aria-selected', 'false'));
+      opt.setAttribute('aria-selected', 'true');
+      // Get just the main text (not the description)
+      const mainText = opt.childNodes[0].textContent.trim();
+      trigger.innerHTML = mainText;
+      el.dataset.value = opt.dataset.value;
+      close();
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function filterOptions(query) {
+      query = query.toLowerCase();
+      options.forEach(opt => {
+        opt.classList.toggle('hidden', query && !opt.textContent.toLowerCase().includes(query));
+      });
+    }
+
+    trigger.addEventListener('click', (e) => {
+      e.stopPropagation();
+      el.classList.contains('open') ? close() : open();
+    }, sig);
+
+    options.forEach(opt => {
+      opt.addEventListener('click', (e) => {
+        e.stopPropagation();
+        select(opt);
+      }, sig);
+    });
+
+    if (searchInput) {
+      searchInput.addEventListener('input', () => filterOptions(searchInput.value), sig);
+      searchInput.addEventListener('click', (e) => e.stopPropagation(), sig);
+    }
+
+    // Keyboard
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+      if (e.key === 'Escape') close();
+    }, sig);
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Multi-select dropdown
+  // ═══════════════════════════════════════════════════════════
+  function initMultiSelect(el) {
+    const trigger = el.querySelector('.multi-select-trigger');
+    const dropdown = el.querySelector('.multi-select-dropdown');
+    const options = el.querySelectorAll('.multi-select-option');
+    const selected = new Set();
+
+    function open() {
+      document.querySelectorAll('.custom-select.open, .multi-select.open').forEach(s => {
+        if (s !== el) { s.classList.remove('open'); s.setAttribute('aria-expanded', 'false'); }
+      });
+      el.classList.add('open');
+      el.setAttribute('aria-expanded', 'true');
+    }
+
+    function close() {
+      el.classList.remove('open');
+      el.setAttribute('aria-expanded', 'false');
+    }
+
+    function updateTrigger() {
+      if (selected.size === 0) {
+        trigger.innerHTML = '<span class="placeholder">Select…</span>';
+      } else {
+        trigger.innerHTML = '';
+        selected.forEach(val => {
+          const opt = el.querySelector(`[data-value="${val}"]`);
+          const label = opt ? opt.textContent.trim() : val;
+          const tag = document.createElement('span');
+          tag.className = 'multi-tag';
+          tag.innerHTML = `${label} <span class="multi-tag-remove" data-val="${val}">&times;</span>`;
+          trigger.appendChild(tag);
+        });
+      }
+    }
+
+    function toggle(opt) {
+      const val = opt.dataset.value;
+      if (selected.has(val)) {
+        selected.delete(val);
+        opt.setAttribute('aria-selected', 'false');
+      } else {
+        selected.add(val);
+        opt.setAttribute('aria-selected', 'true');
+      }
+      updateTrigger();
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    trigger.addEventListener('click', (e) => {
+      if (e.target.classList.contains('multi-tag-remove')) {
+        e.stopPropagation();
+        const val = e.target.dataset.val;
+        selected.delete(val);
+        const opt = el.querySelector(`[data-value="${val}"]`);
+        if (opt) opt.setAttribute('aria-selected', 'false');
+        updateTrigger();
+        return;
+      }
+      e.stopPropagation();
+      el.classList.contains('open') ? close() : open();
+    });
+
+    options.forEach(opt => {
+      opt.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggle(opt);
+      });
+    });
+
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') close();
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Radio card groups
+  // ═══════════════════════════════════════════════════════════
+  document.querySelectorAll('.radio-card').forEach(card => {
+    card.addEventListener('click', () => {
+      const group = card.closest('.radio-cards');
+      group.querySelectorAll('.radio-card').forEach(c => {
+        c.classList.remove('selected');
+        c.setAttribute('aria-checked', 'false');
+      });
+      card.classList.add('selected');
+      card.setAttribute('aria-checked', 'true');
+      const radio = card.querySelector('input[type="radio"]');
+      if (radio) radio.checked = true;
+      group.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Toggle switches
+  // ═══════════════════════════════════════════════════════════
+  document.querySelectorAll('.toggle-switch').forEach(sw => {
+    const input = sw.querySelector('input');
+    sw.addEventListener('click', () => {
+      input.checked = !input.checked;
+      sw.setAttribute('aria-checked', String(input.checked));
+      sw.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Init all custom selects and multi-selects
+  // ═══════════════════════════════════════════════════════════
+  document.querySelectorAll('.custom-select').forEach(initCustomSelect);
+  document.querySelectorAll('.multi-select').forEach(initMultiSelect);
+
+  // Close dropdowns on outside click
+  document.addEventListener('click', () => {
+    document.querySelectorAll('.custom-select.open, .multi-select.open, .nested-select.open').forEach(s => {
+      s.classList.remove('open');
+      s.setAttribute('aria-expanded', 'false');
+      // Also deactivate nested parent items
+      s.querySelectorAll('.nested-select-parent.active').forEach(p => p.classList.remove('active'));
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // File upload
+  // ═══════════════════════════════════════════════════════════
+  const uploadArea = document.getElementById('uploadArea');
+  const fileInput = document.getElementById('resumeFile');
+  const fileNameEl = document.getElementById('fileName');
+
+  uploadArea.addEventListener('click', () => fileInput.click());
+  uploadArea.addEventListener('dragover', (e) => { e.preventDefault(); uploadArea.classList.add('dragover'); });
+  uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('dragover'));
+  uploadArea.addEventListener('drop', (e) => {
+    e.preventDefault();
+    uploadArea.classList.remove('dragover');
+    if (e.dataTransfer.files.length) {
+      fileInput.files = e.dataTransfer.files;
+      showFile(e.dataTransfer.files[0]);
+    }
+  });
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files.length) showFile(fileInput.files[0]);
+  });
+  function showFile(file) {
+    fileNameEl.textContent = file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)';
+    uploadArea.classList.add('has-file');
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Conditional field logic
+  // ═══════════════════════════════════════════════════════════
+  function toggle(el, show) {
+    el.classList.toggle('visible', show);
+  }
+
+  // Country → State (cascading dropdown)
+  const countrySelect = document.getElementById('country');
+  const statesByCountry = {
+    us: ['California','New York','Texas','Washington','Massachusetts','Illinois','Colorado','Florida','Georgia','Oregon'],
+    ca: ['Ontario','British Columbia','Quebec','Alberta','Manitoba'],
+    uk: ['England','Scotland','Wales','Northern Ireland'],
+    de: ['Bavaria','Berlin','Hamburg','Hesse','Saxony'],
+    au: ['New South Wales','Victoria','Queensland','Western Australia'],
+    in: ['Maharashtra','Karnataka','Tamil Nadu','Delhi','Telangana'],
+  };
+  countrySelect.addEventListener('change', () => {
+    const val = countrySelect.dataset.value;
+    const states = statesByCountry[val];
+    const stateField = document.getElementById('stateField');
+    const stateOpts = document.getElementById('stateOptions');
+
+    if (states) {
+      stateOpts.innerHTML = states.map(s => `<div class="custom-select-option" role="option" data-value="${s.toLowerCase().replace(/\s+/g,'-')}">${s}</div>`).join('');
+      // Reinit the select
+      const stateSelect = document.getElementById('stateProvince');
+      stateSelect.querySelector('.custom-select-trigger').innerHTML = '<span class="placeholder">Select state…</span>';
+      delete stateSelect.dataset.value;
+      initCustomSelect(stateSelect);
+      toggle(stateField, true);
+    } else {
+      toggle(stateField, false);
+    }
+  });
+
+  // Department conditionals
+  const deptSelect = document.getElementById('department');
+  deptSelect.addEventListener('change', () => {
+    const val = deptSelect.dataset.value;
+    toggle(document.getElementById('engineeringFields'), val === 'engineering');
+    toggle(document.getElementById('dataScienceFields'), val === 'data-science');
+    toggle(document.getElementById('designFields'), val === 'design');
+    toggle(document.getElementById('securityFields'), val === 'security');
+    toggle(document.getElementById('otherDeptField'), val === 'other');
+    // Reset deeper conditionals when leaving
+    if (val !== 'engineering') {
+      toggle(document.getElementById('mlFields'), false);
+      toggle(document.getElementById('mlGpuFields'), false);
+      toggle(document.getElementById('frontendFields'), false);
+    }
+  });
+
+  // Engineering Specialty → sub-fields
+  const engSpecSelect = document.getElementById('engSpecialty');
+  engSpecSelect.addEventListener('change', () => {
+    const val = engSpecSelect.dataset.value;
+    toggle(document.getElementById('mlFields'), val === 'ml');
+    toggle(document.getElementById('mlGpuFields'), val === 'ml');
+    toggle(document.getElementById('frontendFields'), val === 'frontend');
+  });
+
+  // Experience Level → Intern fields
+  const expSelect = document.getElementById('experienceLevel');
+  expSelect.addEventListener('change', () => {
+    const val = expSelect.dataset.value;
+    toggle(document.getElementById('internGradField'), val === 'intern');
+    toggle(document.getElementById('internSchoolField'), val === 'intern');
+  });
+
+  // Employment Type (radio cards) → Contract duration
+  document.querySelector('[aria-label="Employment Type"]').addEventListener('change', () => {
+    const checked = document.querySelector('input[name="employmentType"]:checked');
+    toggle(document.getElementById('contractFields'), checked && checked.value === 'contract');
+  });
+
+  // Work Auth → Visa / Sponsorship
+  const workAuthSelect = document.getElementById('workAuth');
+  workAuthSelect.addEventListener('change', () => {
+    const val = workAuthSelect.dataset.value;
+    toggle(document.getElementById('visaFields'), val === 'visa');
+    toggle(document.getElementById('sponsorshipFields'), val === 'needSponsorship');
+  });
+
+  // Referral Source (hierarchical — value is "Category > SubOption")
+  const refSelect = document.getElementById('referralSource');
+  refSelect.addEventListener('change', () => {
+    const val = refSelect.dataset.value || '';
+    toggle(document.getElementById('referralNameField'), val.startsWith('Referral >'));
+    toggle(document.getElementById('otherReferralField'), val === 'Other > Other');
+  });
+
+  // Willing to relocate toggle → relocation city
+  document.getElementById('willingToRelocate').closest('.toggle-switch').addEventListener('change', () => {
+    toggle(document.getElementById('relocateFields'), document.getElementById('willingToRelocate').checked);
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Workday-style hierarchical dropdown (referral source)
+  // ═══════════════════════════════════════════════════════════
+  (function() {
+    const REFERRAL_DATA = {
+      'Job Board':     ['Indeed', 'Glassdoor', 'Agefiph', 'Monster', 'ZipRecruiter'],
+      'Social Media':  ['LinkedIn', 'Twitter/X', 'Facebook', 'Instagram'],
+      'Event':         ['Careers Fair', 'Tech Conference', 'University Event', 'Meetup'],
+      'Website':       ['Company Website', 'Blog Post', 'Press Article'],
+      'Referral':      ['Employee Referral', 'Recruiter', 'Friend/Family'],
+      'Other':         ['Other'],
+    };
+
+    const widget = document.getElementById('referralSource');
+    const searchInput = widget.querySelector('.wd-selectinput-search');
+    const trigger = widget.querySelector('.wd-selectinput-trigger');
+    const portal = document.getElementById('referralPortal');
+    let currentLevel = 'top'; // 'top' or a category name
+    let selectedValue = '';
+
+    function positionPortal() {
+      const rect = widget.getBoundingClientRect();
+      portal.style.left = rect.left + 'px';
+      portal.style.top = (rect.bottom + 4) + 'px';
+      portal.style.width = rect.width + 'px';
+    }
+
+    function renderTopLevel() {
+      currentLevel = 'top';
+      const categories = Object.keys(REFERRAL_DATA);
+      portal.innerHTML = categories.map((cat, i) =>
+        `<div class="wd-option" role="option"
+              aria-setsize="${categories.length}" aria-posinset="${i + 1}"
+              data-uxi-multiselectlistitem-hassidecharm="true"
+              data-category="${cat}">
+          <span>${cat}</span>
+          <svg class="wd-chevron wd-icon-chevron-right-small" width="12" height="12" viewBox="0 0 12 12">
+            <path d="M4 2l4 4-4 4" stroke="#666" stroke-width="1.5" fill="none"/>
+          </svg>
+        </div>`
+      ).join('');
+      attachCategoryListeners();
+    }
+
+    function renderSubOptions(category) {
+      currentLevel = category;
+      const subs = REFERRAL_DATA[category] || [];
+      portal.innerHTML = subs.map((sub, i) =>
+        `<div class="wd-option" role="option"
+              aria-setsize="${subs.length}" aria-posinset="${i + 1}"
+              data-value="${category} > ${sub}">
+          <span>${sub}</span>
+        </div>`
+      ).join('');
+      attachSubListeners();
+      portal.scrollTop = 0;
+    }
+
+    function attachCategoryListeners() {
+      portal.querySelectorAll('.wd-option').forEach(opt => {
+        opt.addEventListener('click', (e) => {
+          e.stopPropagation();
+          renderSubOptions(opt.dataset.category);
+        });
+      });
+    }
+
+    function attachSubListeners() {
+      portal.querySelectorAll('.wd-option').forEach(opt => {
+        opt.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const val = opt.dataset.value; // "Category > SubOption"
+          selectedValue = val;
+          const displayText = val.split(' > ')[1] || val;
+          searchInput.value = displayText;
+          widget.dataset.value = val;
+          closePortal();
+          widget.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+      });
+    }
+
+    function openPortal() {
+      positionPortal();
+      renderTopLevel();
+      portal.classList.add('open');
+      widget.setAttribute('aria-expanded', 'true');
+    }
+
+    function closePortal() {
+      portal.classList.remove('open');
+      widget.setAttribute('aria-expanded', 'false');
+    }
+
+    function isPortalOpen() {
+      return portal.classList.contains('open');
+    }
+
+    // Open on click
+    trigger.addEventListener('click', (e) => {
+      e.stopPropagation();
+      isPortalOpen() ? closePortal() : openPortal();
+    });
+    searchInput.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!isPortalOpen()) openPortal();
+    });
+    searchInput.addEventListener('focus', () => {
+      if (!isPortalOpen()) openPortal();
+    });
+
+    // Keyboard
+    widget.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closePortal();
+      if (e.key === 'Enter' && !isPortalOpen()) openPortal();
+    });
+
+    // Close on outside click
+    document.addEventListener('click', (e) => {
+      if (!widget.contains(e.target) && !portal.contains(e.target)) {
+        closePortal();
+      }
+    });
+
+    // Reposition on scroll/resize
+    window.addEventListener('scroll', () => { if (isPortalOpen()) positionPortal(); });
+    window.addEventListener('resize', () => { if (isPortalOpen()) positionPortal(); });
+  })();
+
+  // ═══════════════════════════════════════════════════════════
+  // Repeater: Work Experience
+  // ═══════════════════════════════════════════════════════════
+  let workCount = 1;
+  function addWorkExperience() {
+    const list = document.getElementById('workExperienceList');
+    const idx = workCount++;
+    const item = document.createElement('div');
+    item.className = 'repeater-item';
+    item.dataset.index = idx;
+    item.innerHTML = `
+      <button type="button" class="remove-btn" title="Remove" onclick="removeRepeaterItem(this)">&times;</button>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Job Title <span class="required">*</span></label>
+          <input type="text" name="work[${idx}].title" required placeholder="Software Engineer">
+        </div>
+        <div class="form-group">
+          <label>Company <span class="required">*</span></label>
+          <input type="text" name="work[${idx}].company" required placeholder="Acme Inc.">
+        </div>
+        <div class="form-group">
+          <label>Start Date</label>
+          <input type="date" name="work[${idx}].startDate">
+        </div>
+        <div class="form-group">
+          <label>End Date</label>
+          <input type="date" name="work[${idx}].endDate">
+        </div>
+      </div>
+      <div class="form-group">
+        <div class="toggle-row">
+          <span class="toggle-label">I currently work here</span>
+          <label class="toggle-switch" role="switch" aria-label="I currently work here" aria-checked="false">
+            <input type="checkbox" name="work[${idx}].current">
+            <div class="toggle-track"></div>
+            <div class="toggle-thumb"></div>
+          </label>
+        </div>
+      </div>
+    `;
+    list.appendChild(item);
+    // Reinit toggles
+    item.querySelectorAll('.toggle-switch').forEach(sw => {
+      const input = sw.querySelector('input');
+      sw.addEventListener('click', () => {
+        input.checked = !input.checked;
+        sw.setAttribute('aria-checked', String(input.checked));
+      });
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Repeater: Education
+  // ═══════════════════════════════════════════════════════════
+  let eduCount = 1;
+  function addEducation() {
+    const list = document.getElementById('educationList');
+    const idx = eduCount++;
+    const item = document.createElement('div');
+    item.className = 'repeater-item';
+    item.dataset.index = idx;
+    item.innerHTML = `
+      <button type="button" class="remove-btn" title="Remove" onclick="removeRepeaterItem(this)">&times;</button>
+      <div class="form-row">
+        <div class="form-group">
+          <label>School / University <span class="required">*</span></label>
+          <input type="text" name="edu[${idx}].school" required placeholder="MIT">
+        </div>
+        <div class="form-group">
+          <label>Degree</label>
+          <div class="custom-select edu-degree" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="Degree" tabindex="0">
+            <div class="custom-select-trigger"><span class="placeholder">Select degree…</span></div>
+            <div class="custom-select-dropdown" role="listbox">
+              <div class="custom-select-option" role="option" data-value="hs">High School Diploma</div>
+              <div class="custom-select-option" role="option" data-value="associate">Associate's</div>
+              <div class="custom-select-option" role="option" data-value="bachelor">Bachelor's</div>
+              <div class="custom-select-option" role="option" data-value="master">Master's</div>
+              <div class="custom-select-option" role="option" data-value="phd">PhD / Doctorate</div>
+              <div class="custom-select-option" role="option" data-value="bootcamp">Bootcamp / Certificate</div>
+            </div>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Field of Study</label>
+          <input type="text" name="edu[${idx}].field" placeholder="Computer Science">
+        </div>
+        <div class="form-group">
+          <label>Graduation Year</label>
+          <input type="number" name="edu[${idx}].gradYear" placeholder="2024" min="1950" max="2035">
+        </div>
+      </div>
+    `;
+    list.appendChild(item);
+    item.querySelectorAll('.custom-select').forEach(initCustomSelect);
+  }
+
+  function removeRepeaterItem(btn) {
+    const item = btn.closest('.repeater-item');
+    const list = item.parentElement;
+    if (list.children.length > 1) {
+      item.remove();
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // TRICKY FIELDS — JS logic
+  // ═══════════════════════════════════════════════════════════
+
+  // ── 1. Cascading dropdowns: Region → City → Floor ──
+  const regionCities = {
+    west: ['San Francisco', 'Los Angeles', 'Seattle', 'Portland'],
+    east: ['New York', 'Boston', 'Washington DC', 'Miami'],
+    central: ['Chicago', 'Austin', 'Denver', 'Minneapolis'],
+    intl: ['London', 'Tokyo', 'Berlin', 'Sydney'],
+  };
+  const cityFloors = {
+    'San Francisco': ['Floor 1 — Engineering', 'Floor 2 — Design', 'Floor 3 — Executive'],
+    'Los Angeles': ['Floor 1 — Media', 'Floor 2 — Marketing'],
+    'Seattle': ['Floor 1 — Cloud Ops', 'Floor 2 — Research'],
+    'Portland': ['Floor 1 — Open Office'],
+    'New York': ['Floor 10 — Trading', 'Floor 11 — Analytics', 'Floor 12 — Legal'],
+    'Boston': ['Floor 1 — R&D', 'Floor 2 — Lab'],
+    'Washington DC': ['Floor 1 — Government Relations'],
+    'Miami': ['Floor 1 — Sales', 'Floor 2 — Support'],
+    'Chicago': ['Floor 1 — Finance', 'Floor 2 — Operations'],
+    'Austin': ['Floor 1 — Startup Hub'],
+    'Denver': ['Floor 1 — Remote Ops'],
+    'Minneapolis': ['Floor 1 — Midwest HQ'],
+    'London': ['Floor 1 — EMEA', 'Floor 2 — Compliance'],
+    'Tokyo': ['Floor 1 — APAC'],
+    'Berlin': ['Floor 1 — EU Engineering'],
+    'Sydney': ['Floor 1 — ANZ'],
+  };
+
+  // Watch the region dropdown for selections
+  const regionSelect = document.getElementById('officeRegion');
+  const cityGroup = document.getElementById('officeCityGroup');
+  const citySelect = document.getElementById('officeCity');
+  const cityOptContainer = document.getElementById('officeCityOptions');
+  const floorGroup = document.getElementById('officeFloorGroup');
+  const floorSelect = document.getElementById('officeFloor');
+  const floorOptContainer = document.getElementById('officeFloorOptions');
+
+  // Use a MutationObserver to detect when a region is selected
+  // (the custom-select code updates the trigger text)
+  const regionTrigger = regionSelect.querySelector('.custom-select-trigger');
+  new MutationObserver(() => {
+    const selected = regionTrigger.textContent.trim();
+    const regionKey = Object.keys(regionCities).find(k => {
+      const labels = { west: 'West Coast', east: 'East Coast', central: 'Central', intl: 'International' };
+      return labels[k] === selected;
+    });
+    if (regionKey) {
+      // Populate city options
+      cityOptContainer.innerHTML = '';
+      regionCities[regionKey].forEach(city => {
+        const opt = document.createElement('div');
+        opt.className = 'custom-select-option';
+        opt.setAttribute('role', 'option');
+        opt.dataset.value = city.toLowerCase().replace(/\s+/g, '-');
+        opt.textContent = city;
+        cityOptContainer.appendChild(opt);
+      });
+      cityGroup.classList.add('visible');
+      // Reset city trigger
+      citySelect.querySelector('.custom-select-trigger').innerHTML = '<span class="placeholder">Select city…</span>';
+      // Re-init the city custom select
+      initCustomSelect(citySelect);
+      // Hide floor until city is picked
+      floorGroup.classList.remove('visible');
+    } else {
+      cityGroup.classList.remove('visible');
+      floorGroup.classList.remove('visible');
+    }
+  }).observe(regionTrigger, { childList: true, subtree: true, characterData: true });
+
+  // Watch city dropdown for selections → populate floor
+  const cityTrigger = citySelect.querySelector('.custom-select-trigger');
+  new MutationObserver(() => {
+    const selectedCity = cityTrigger.textContent.trim();
+    const floors = cityFloors[selectedCity];
+    if (floors) {
+      floorOptContainer.innerHTML = '';
+      floors.forEach(floor => {
+        const opt = document.createElement('div');
+        opt.className = 'custom-select-option';
+        opt.setAttribute('role', 'option');
+        opt.dataset.value = floor.toLowerCase().replace(/\s+/g, '-');
+        opt.textContent = floor;
+        floorOptContainer.appendChild(opt);
+      });
+      floorGroup.classList.add('visible');
+      floorSelect.querySelector('.custom-select-trigger').innerHTML = '<span class="placeholder">Select floor…</span>';
+      initCustomSelect(floorSelect);
+    } else {
+      floorGroup.classList.remove('visible');
+    }
+  }).observe(cityTrigger, { childList: true, subtree: true, characterData: true });
+
+  // ── 2. Autocomplete / typeahead ──
+  const universities = [
+    'MIT', 'Stanford University', 'Harvard University', 'UC Berkeley',
+    'Caltech', 'Princeton University', 'Yale University', 'Columbia University',
+    'University of Chicago', 'University of Michigan', 'Georgia Tech',
+    'Carnegie Mellon University', 'Cornell University', 'UCLA', 'UIUC',
+    'University of Washington', 'Duke University', 'Northwestern University',
+    'Brown University', 'University of Pennsylvania', 'Rice University',
+    'Purdue University', 'University of Texas at Austin', 'Virginia Tech',
+    'Ohio State University', 'Penn State University', 'University of Wisconsin',
+    'University of Florida', 'Arizona State University', 'NYU',
+    'University of Southern California', 'Boston University', 'Northeastern University',
+    'University of Maryland', 'University of Minnesota', 'UC San Diego',
+    'UC Davis', 'UC Irvine', 'University of Colorado Boulder',
+    'University of North Carolina', 'Emory University', 'Vanderbilt University',
+    'Washington University in St. Louis', 'Tufts University', 'University of Virginia',
+    'Georgetown University', 'Johns Hopkins University', 'University of Rochester',
+    'Case Western Reserve University', 'Rensselaer Polytechnic Institute',
+  ];
+  const uniInput = document.getElementById('universitySearch');
+  const uniResults = document.getElementById('universityResults');
+  let uniDebounce;
+
+  uniInput.addEventListener('input', () => {
+    clearTimeout(uniDebounce);
+    uniDebounce = setTimeout(() => {
+      const q = uniInput.value.trim().toLowerCase();
+      if (q.length < 2) {
+        uniResults.style.display = 'none';
+        uniInput.setAttribute('aria-expanded', 'false');
+        return;
+      }
+      const matches = universities.filter(u => u.toLowerCase().includes(q)).slice(0, 8);
+      uniResults.innerHTML = '';
+      if (matches.length === 0) {
+        uniResults.innerHTML = '<div style="padding:0.5rem 0.75rem;color:#888;font-size:0.85rem;">No results found</div>';
+      } else {
+        matches.forEach(m => {
+          const opt = document.createElement('div');
+          opt.setAttribute('role', 'option');
+          opt.style.cssText = 'padding:0.5rem 0.75rem;cursor:pointer;font-size:0.9rem;';
+          opt.textContent = m;
+          opt.addEventListener('mouseenter', () => opt.style.background = '#eef1ff');
+          opt.addEventListener('mouseleave', () => opt.style.background = '');
+          opt.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            uniInput.value = m;
+            uniResults.style.display = 'none';
+            uniInput.setAttribute('aria-expanded', 'false');
+          });
+          uniResults.appendChild(opt);
+        });
+      }
+      uniResults.style.display = 'block';
+      uniInput.setAttribute('aria-expanded', 'true');
+    }, 250); // 250ms debounce — forces agent to wait
+  });
+
+  uniInput.addEventListener('blur', () => {
+    setTimeout(() => {
+      uniResults.style.display = 'none';
+      uniInput.setAttribute('aria-expanded', 'false');
+    }, 200);
+  });
+
+  // ── 3. Rich text toolbar ──
+  document.querySelectorAll('.rt-btn').forEach(btn => {
+    btn.addEventListener('mousedown', (e) => {
+      e.preventDefault(); // Don't steal focus from contenteditable
+      document.execCommand(btn.dataset.cmd, false, null);
+    });
+  });
+
+  // Placeholder behavior for contenteditable
+  const richEditor = document.querySelector('.rich-text-editor');
+  richEditor.addEventListener('focus', () => {
+    if (richEditor.textContent.trim() === '') richEditor.innerHTML = '';
+    richEditor.style.borderColor = '#4361ee';
+    richEditor.style.boxShadow = '0 0 0 3px rgba(67, 97, 238, 0.15)';
+    richEditor.style.background = 'white';
+  });
+  richEditor.addEventListener('blur', () => {
+    richEditor.style.borderColor = '#d1d5db';
+    richEditor.style.boxShadow = 'none';
+    richEditor.style.background = '#fafafa';
+  });
+
+  // ── 4. Custom slider ──
+  const sliderInput = document.getElementById('techRating');
+  const sliderFill = document.getElementById('sliderFill');
+  const sliderThumb = document.getElementById('sliderThumb');
+  const sliderValueLabel = document.getElementById('sliderValue');
+
+  sliderInput.addEventListener('input', () => {
+    const pct = ((sliderInput.value - 1) / 9) * 100;
+    sliderFill.style.width = pct + '%';
+    sliderThumb.style.left = 'calc(' + pct + '% - 10px)';
+    sliderValueLabel.textContent = sliderInput.value;
+  });
+
+  // ── 6. Nested submenu dropdown: Preferred Team ──
+  function initNestedSelect(el) {
+    const trigger = el.querySelector('.nested-select-trigger');
+    const dropdown = el.querySelector('.nested-select-dropdown');
+    const parents = el.querySelectorAll('.nested-select-parent');
+    const children = el.querySelectorAll('.nested-select-child');
+
+    function openDropdown() {
+      // Close all other open selects first
+      document.querySelectorAll('.custom-select.open, .multi-select.open, .nested-select.open').forEach(s => {
+        if (s !== el) {
+          s.classList.remove('open');
+          s.setAttribute('aria-expanded', 'false');
+        }
+      });
+      el.classList.add('open');
+      el.setAttribute('aria-expanded', 'true');
+    }
+
+    function closeDropdown() {
+      el.classList.remove('open');
+      el.setAttribute('aria-expanded', 'false');
+      // Deactivate all parent items
+      parents.forEach(p => p.classList.remove('active'));
+    }
+
+    function selectChild(child) {
+      // Deselect all children
+      children.forEach(c => c.setAttribute('aria-selected', 'false'));
+      // Select this child
+      child.setAttribute('aria-selected', 'true');
+      // Update trigger text to "Parent > Child" format
+      const parentLabel = child.dataset.parentLabel;
+      const childLabel = child.dataset.childLabel;
+      trigger.textContent = parentLabel + ' > ' + childLabel;
+      // Store value
+      el.dataset.value = child.dataset.value;
+      closeDropdown();
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    // Toggle dropdown on trigger click
+    trigger.addEventListener('click', (e) => {
+      e.stopPropagation();
+      el.classList.contains('open') ? closeDropdown() : openDropdown();
+    });
+
+    // Parent hover: show submenu (desktop-friendly)
+    parents.forEach(parent => {
+      parent.addEventListener('mouseenter', () => {
+        parents.forEach(p => p.classList.remove('active'));
+        parent.classList.add('active');
+      });
+
+      // Parent click: toggle submenu (mobile/click-friendly fallback)
+      parent.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const wasActive = parent.classList.contains('active');
+        parents.forEach(p => p.classList.remove('active'));
+        if (!wasActive) parent.classList.add('active');
+      });
+    });
+
+    // Child click: select the value
+    children.forEach(child => {
+      child.addEventListener('click', (e) => {
+        e.stopPropagation();
+        selectChild(child);
+      });
+    });
+
+    // Keyboard support
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDropdown(); }
+      if (e.key === 'Escape') closeDropdown();
+    });
+
+    // Close submenu when mouse leaves the dropdown entirely
+    dropdown.addEventListener('mouseleave', () => {
+      parents.forEach(p => p.classList.remove('active'));
+    });
+  }
+
+  // Init all nested selects
+  document.querySelectorAll('.nested-select').forEach(initNestedSelect);
+
+  // ═══════════════════════════════════════════════════════════
+  // Form submission
+  // ═══════════════════════════════════════════════════════════
+  document.getElementById('applicationForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const toast = document.getElementById('toast');
+    toast.classList.add('show');
+    setTimeout(() => toast.classList.remove('show'), 3000);
+  });
+</script>
+
+</body>
+</html>

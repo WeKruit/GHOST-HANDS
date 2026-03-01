@@ -19,6 +19,7 @@
         "apply:simple": "bun src/scripts/apply-simple.ts",
         "apply:web": "bun src/scripts/apply-web.ts",
         "apply:workday": "bun src/scripts/apply-workday.ts",
+        "apply:amazon": "bun src/scripts/apply-amazon.ts",
         "release-stuck-jobs": "bun src/scripts/release-stuck-jobs.ts",
         "test-shutdown": "bun src/scripts/test-shutdown-cleanup.ts",
         "delete-jobs": "bun src/scripts/delete-all-jobs.ts",
@@ -30,6 +31,7 @@
     },
     "dependencies": {
         "@actionbookdev/sdk": "^0.3.0",
+        "@anthropic-ai/sdk": "^0.78.0",
         "@browserbasehq/stagehand": "3.1.0",
         "@supabase/supabase-js": "^2.95.3",
         "eventemitter3": "^5.0.1",
