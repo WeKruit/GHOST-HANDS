@@ -74,7 +74,7 @@ aws ec2 run-instances \
 2. SSH in and install dependencies:
 
 ```bash
-ssh -i ~/.ssh/valet-worker.pem ec2-user@<instance-ip>
+ssh -i ~/.ssh/wekruit-atm-server.pem ec2-user@<instance-ip>
 
 # Update system
 sudo dnf update -y
@@ -737,7 +737,7 @@ WHERE status != 'offline'
 ORDER BY last_heartbeat DESC;
 
 # Check cloud-init logs on an instance
-ssh -i ~/.ssh/valet-worker.pem ec2-user@<instance-ip> \
+ssh -i ~/.ssh/wekruit-atm-server.pem ec2-user@<instance-ip> \
   "sudo cat /var/log/cloud-init-output.log | tail -50"
 ```
 

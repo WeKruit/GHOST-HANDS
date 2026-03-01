@@ -10,6 +10,15 @@
 # Required: DATABASE_URL, GH_SERVICE_SECRET, GH_CREDENTIAL_KEY, etc.
 # ──────────────────────────────────────────────────
 
+# Auto-detect public IP from EC2 IMDS if KASM_SESSION_URL not set
+if [ -z "${KASM_SESSION_URL:-}" ]; then
+  EC2_IP=$(curl -sf --connect-timeout 2 http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
+  if [ -n "$EC2_IP" ]; then
+    export KASM_SESSION_URL="https://${EC2_IP}:6901"
+    echo "[kasm-startup] Auto-detected KASM_SESSION_URL=${KASM_SESSION_URL}"
+  fi
+fi
+
 LOG="/tmp/gh-startup.log"
 API_LOG="/tmp/gh-api.log"
 WORKER_LOG="/tmp/gh-worker.log"
@@ -46,4 +55,4 @@ echo "[kasm-startup] API server PID=$API_PID" | tee -a "$LOG"
 
 # Start GH worker (foreground — Kasm monitors this process)
 echo "[kasm-startup] $(date -u +%FT%TZ) Starting worker..." | tee -a "$LOG"
-exec bun packages/ghosthands/src/workers/main.ts 2>&1 | tee -a "$WORKER_LOG"
+exec bun packages/ghosthands/src/workers/workerLauncher.ts 2>&1 | tee -a "$WORKER_LOG"

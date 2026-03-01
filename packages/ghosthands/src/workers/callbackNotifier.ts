@@ -59,7 +59,7 @@ export interface CallbackPayload {
   } | null;
   /** Kasm session URL for live browser view (WEK-162) */
   kasm_url?: string;
-  completed_at: string;
+  completed_at?: string;
 }
 
 const MAX_RETRIES = 3;
@@ -105,7 +105,7 @@ export class CallbackNotifier {
       valet_task_id: job.valet_task_id || null,
       status: job.status === 'completed' ? 'completed' : 'failed',
       ...(job.worker_id && { worker_id: job.worker_id }),
-      completed_at: new Date().toISOString(),
+      ...((job.status === 'completed' || job.status === 'failed') && { completed_at: new Date().toISOString() }),
     };
 
     if (job.status === 'completed') {
@@ -171,7 +171,6 @@ export class CallbackNotifier {
       valet_task_id: valetTaskId || null,
       status: 'running',
       ...(workerId && { worker_id: workerId }),
-      completed_at: new Date().toISOString(),
       ...(metadata?.execution_mode && { execution_mode: metadata.execution_mode }),
       ...(kasmUrl && { kasm_url: kasmUrl }),
     };
@@ -199,7 +198,6 @@ export class CallbackNotifier {
       interaction: interactionData,
       ...(cost && { cost }),
       ...(resolvedKasmUrl && { kasm_url: resolvedKasmUrl }),
-      completed_at: new Date().toISOString(),
     };
     return this.sendWithRetry(callbackUrl, payload);
   }
@@ -221,7 +219,6 @@ export class CallbackNotifier {
       status: 'resumed',
       ...(workerId && { worker_id: workerId }),
       ...(resolvedKasmUrl && { kasm_url: resolvedKasmUrl }),
-      completed_at: new Date().toISOString(),
     };
     return this.sendWithRetry(callbackUrl, payload);
   }
@@ -233,12 +230,21 @@ export class CallbackNotifier {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
+        const serviceSecret = process.env.GH_SERVICE_SECRET;
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'User-Agent': 'GhostHands-Callback/1.0',
+        };
+        // Send auth via header (preferred) in addition to URL token (backward compat).
+        // TODO: Remove URL token (?token=...) from callback URLs after VALET is updated
+        // to authenticate callbacks via X-GH-Service-Key header instead.
+        if (serviceSecret) {
+          headers['X-GH-Service-Key'] = serviceSecret;
+        }
+
         const response = await fetch(url, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'User-Agent': 'GhostHands-Callback/1.0',
-          },
+          headers,
           body: JSON.stringify(payload),
           signal: controller.signal,
         });
