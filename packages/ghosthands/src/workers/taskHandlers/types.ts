@@ -37,6 +37,8 @@ export interface TaskHandler {
 export interface TaskContext {
   job: AutomationJob;
   adapter: BrowserAutomationAdapter;
+  /** Secondary LLM adapter (Stagehand) for cheap Phase 2 fill — shares Magnitude's browser via CDP */
+  llmAdapter?: BrowserAutomationAdapter;
   costTracker: CostTracker;
   progress: ProgressTracker;
   credentials: Record<string, string> | null;

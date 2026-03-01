@@ -476,6 +476,8 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
     if (profile.linkedin_url) {
       map['LinkedIn'] = profile.linkedin_url;
       map['LinkedIn URL'] = profile.linkedin_url;
+      map['LinkedIn Profile'] = profile.linkedin_url;
+      map['LinkedIn Profile URL'] = profile.linkedin_url;
     }
     if (profile.portfolio_url || profile.website_url) {
       map['Website'] = profile.portfolio_url || profile.website_url;
@@ -517,10 +519,22 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
 
     // Common screening questions with generic defaults
     map['Are you legally authorized to work in the United States?'] = profile.work_authorization || 'Yes';
+    map['Do you require work authorization'] = profile.work_authorization || 'Yes';
+    map['Work Authorization'] = profile.work_authorization || 'Yes';
     map['Will you now or in the future require sponsorship?'] = profile.visa_sponsorship || 'No';
     map['Are you at least 18 years of age?'] = 'Yes';
     map['How did you hear about this position?'] = 'Other';
     map['Are you willing to relocate?'] = 'Yes';
+
+    // Voluntary EEO / self-identification (provide "Decline to self-identify" unless user specifies)
+    if (profile.gender) map['Gender'] = profile.gender;
+    if (profile.race_ethnicity) {
+      map['Race'] = profile.race_ethnicity;
+      map['Ethnicity'] = profile.race_ethnicity;
+      map['Are you Hispanic/Latino?'] = profile.hispanic_latino || 'Decline to self-identify';
+    }
+    if (profile.veteran_status) map['Veteran Status'] = profile.veteran_status;
+    if (profile.disability_status) map['Disability Status'] = profile.disability_status;
 
     // User overrides take priority
     Object.assign(map, qaOverrides);
@@ -593,8 +607,22 @@ ${dataBlock}`;
     // Sort by page position (top to bottom)
     allFields.sort((a, b) => a.absoluteY - b.absoluteY);
 
-    console.log(`[GenericConfig] Scan complete: ${allFields.length} field(s) found across ${steps + 1} viewport(s)`);
-    return { fields: allFields, scrollHeight, viewportHeight };
+    // Dedup by normalized label + kind: Greenhouse and similar sites have nested
+    // dropdown elements that produce multiple entries for the same field (e.g.,
+    // "Country" appears 4x from [role="combobox"], [aria-expanded], [class*="select"]).
+    // Keep the first occurrence (highest in DOM = outermost container).
+    const seenLabelKind = new Set<string>();
+    const dedupedFields = allFields.filter(f => {
+      const norm = f.label.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (!norm) return true; // keep fields with empty labels (rare, handled by LLM)
+      const key = `${norm}:${f.kind}`;
+      if (seenLabelKind.has(key)) return false;
+      seenLabelKind.add(key);
+      return true;
+    });
+
+    console.log(`[GenericConfig] Scan complete: ${dedupedFields.length} field(s) found across ${steps + 1} viewport(s)${dedupedFields.length < allFields.length ? ` (${allFields.length - dedupedFields.length} duplicates removed)` : ''}`);
+    return { fields: dedupedFields, scrollHeight, viewportHeight };
   }
 
   /**
@@ -1354,15 +1382,30 @@ ${dataBlock}`;
       return this.fillAriaRadioBySelector(adapter, field, answer);
     }
     if (field.kind === 'custom_dropdown') {
-      // Reuse existing searchable/clickable dropdown logic
-      const hasInput = await adapter.page.evaluate(
-        (sel: string) => !!document.querySelector(sel)?.querySelector('input'),
-        field.selector,
-      );
-      if (hasInput) {
-        return (await this.fillSearchableDropdown(adapter, field.selector, answer)) > 0;
+      // Reuse existing searchable/clickable dropdown logic.
+      // Wrap in a timeout to prevent hanging on tricky dropdowns — let LLM handle them.
+      const DROPDOWN_TIMEOUT_MS = 8000;
+      try {
+        const hasInput = await adapter.page.evaluate(
+          (sel: string) => !!document.querySelector(sel)?.querySelector('input'),
+          field.selector,
+        );
+        const result = await Promise.race([
+          hasInput
+            ? this.fillSearchableDropdown(adapter, field.selector, answer)
+            : this.fillClickableDropdown(adapter, field.selector, answer),
+          new Promise<number>((_, reject) =>
+            setTimeout(() => reject(new Error('Dropdown fill timeout')), DROPDOWN_TIMEOUT_MS),
+          ),
+        ]);
+        return result > 0;
+      } catch (err) {
+        console.warn(`[GenericConfig] Dropdown fill failed for "${field.label}": ${err instanceof Error ? err.message : err}`);
+        // Press Escape to close any open dropdown before moving on
+        try { await adapter.page.keyboard.press('Escape'); } catch { /* best effort */ }
+        await adapter.page.waitForTimeout(200);
+        return false;
       }
-      return (await this.fillClickableDropdown(adapter, field.selector, answer)) > 0;
     }
     return false;
   }
@@ -1823,14 +1866,14 @@ ${dataBlock}`;
     answer: string,
   ): Promise<number> {
     const trigger = adapter.page.locator(triggerSelector).first();
-    await trigger.click();
+    await trigger.click({ timeout: 3000 });
     await adapter.page.waitForTimeout(300);
 
     // Find and clear the input inside
     const input = trigger.locator('input').first();
-    await input.fill('');
+    await input.fill('', { timeout: 3000 });
     await adapter.page.waitForTimeout(100);
-    await input.fill(answer);
+    await input.fill(answer, { timeout: 3000 });
     await adapter.page.waitForTimeout(800); // Wait for search/filter
 
     // Find the best matching option in any open listbox/menu
@@ -1899,7 +1942,7 @@ ${dataBlock}`;
   ): Promise<number> {
     // Click to open
     const trigger = adapter.page.locator(triggerSelector).first();
-    await trigger.click();
+    await trigger.click({ timeout: 3000 });
     await adapter.page.waitForTimeout(500);
 
     // Find and click the best matching option
@@ -1918,14 +1961,14 @@ ${dataBlock}`;
 
     for (const optSel of optionSelectors) {
       const options = adapter.page.locator(optSel);
-      const count = await options.count();
+      const count = await options.count().catch(() => 0);
       if (count === 0) continue;
 
       let bestIdx = -1;
       let bestScore = 0;
 
       for (let i = 0; i < count; i++) {
-        const text = (await options.nth(i).textContent() || '').trim().toLowerCase();
+        const text = (await options.nth(i).textContent({ timeout: 2000 }).catch(() => '') || '').trim().toLowerCase();
         if (!text) continue;
 
         if (text === normAnswer) { bestIdx = i; bestScore = 100; break; }
@@ -1941,7 +1984,7 @@ ${dataBlock}`;
 
       if (bestIdx >= 0) {
         // Playwright's .click() auto-scrolls within scroll containers — no page scroll needed
-        await options.nth(bestIdx).click({ force: true });
+        await options.nth(bestIdx).click({ force: true, timeout: 3000 });
         await adapter.page.waitForTimeout(300);
         return 1;
       }

@@ -1,5 +1,6 @@
 import { SupabaseClient } from '@supabase/supabase-js';
 import pg from 'pg';
+import net from 'node:net';
 import { createAdapter, type BrowserAutomationAdapter, type TokenUsage, type AdapterType, type LLMConfig } from '../adapters';
 import {
   CostTracker,
@@ -175,6 +176,7 @@ export class JobExecutor {
     this._executionAttemptId = crypto.randomUUID();
     const heartbeat = this.startHeartbeat(job.id);
     let adapter: BrowserAutomationAdapter | null = null;
+    let llmAdapter: BrowserAutomationAdapter | undefined;
     let observer: StagehandObserver | undefined;
     let blockerCheckInterval: ReturnType<typeof setInterval> | null = null;
     let resumeFilePath: string | null = null;
@@ -416,40 +418,118 @@ export class JobExecutor {
       adapter = createAdapter(adapterType);
       this._activeAdapter = adapter;
       const headless = process.env.GH_HEADLESS !== 'false'; // default true
+
+      // Find a free port for Chrome's CDP remote debugging.
+      // This lets Stagehand and the observer attach to Magnitude's browser.
+      let debugPort: number | undefined;
+      let sharedCdpUrl: string | undefined;
+      if (adapterType === 'magnitude') {
+        try {
+          debugPort = await new Promise<number>((resolve, reject) => {
+            const srv = net.createServer();
+            srv.listen(0, () => {
+              const port = (srv.address() as net.AddressInfo).port;
+              srv.close(() => resolve(port));
+            });
+            srv.on('error', reject);
+          });
+        } catch {
+          debugPort = undefined;
+        }
+      }
+
+      // Magnitude's default args (from magnitude-core browserProvider.js).
+      // Its launchOptions are shallow-merged, so providing `args` replaces defaults entirely.
+      const MAGNITUDE_DEFAULT_ARGS = ['--disable-gpu', '--disable-blink-features=AutomationControlled'];
+
       await adapter.start({
         url: job.target_url,
         llm: llmSetup.llm,
         ...(llmSetup.imageLlm && { imageLlm: llmSetup.imageLlm }),
         ...(storedSession ? { storageState: storedSession } : {}),
         systemPrompt: 'You are a form-filling agent. RULES: (1) ONE action at a time. (2) TOP TO BOTTOM — start at the topmost unanswered field, never skip ahead. (3) DO NOT TOUCH any question that is even slightly cut off at the bottom of the screen. (4) Before reporting done, scan top to bottom and confirm every 100% visible question is answered. (5) When done with all fully visible fields, IMMEDIATELY report done. Do NOT use the wait action. Reporting done IS what triggers scrolling. (6) NEVER scroll or navigate.',
-        browserOptions: { headless },
+        browserOptions: {
+          headless,
+          ...(debugPort ? {
+            args: [
+              ...MAGNITUDE_DEFAULT_ARGS,
+              `--remote-debugging-port=${debugPort}`,
+              ...(headless ? [] : ['--start-maximized']),
+            ],
+          } : {}),
+        },
       });
 
       console.log(`[JobExecutor] Adapter started for job ${job.id}`);
 
-      // 7a. Attach StagehandObserver for enriched blocker detection (optional)
-      if (adapter.type === 'magnitude' && 'setObserver' in adapter) {
-        try {
-          const cdpUrl = (adapter.page?.context()?.browser() as any)?.wsEndpoint?.();
-          if (cdpUrl) {
-            const observerModel = llmSetup.imageLlm
-              ? `${llmSetup.imageLlm.provider}/${llmSetup.imageLlm.options.model}`
-              : `${llmSetup.llm.provider}/${llmSetup.llm.options.model}`;
-            observer = new StagehandObserver({
-              cdpUrl,
-              model: observerModel,
-              verbose: 0,
-              logEvent: (eventType: string, metadata?: Record<string, any>) =>
-                this.logJobEvent(job.id, eventType, metadata || {}),
-            });
-            await observer.init();
-            (adapter as MagnitudeAdapter).setObserver(observer);
-            await this.logJobEvent(job.id, 'observer_attached', { model: observerModel });
+      // Discover the CDP WebSocket URL from Chrome's remote debugging endpoint
+      if (debugPort) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const resp = await fetch(`http://127.0.0.1:${debugPort}/json/version`);
+            const info = await resp.json() as { webSocketDebuggerUrl?: string };
+            if (info.webSocketDebuggerUrl) {
+              sharedCdpUrl = info.webSocketDebuggerUrl;
+              break;
+            }
+          } catch {
+            if (attempt < 2) await new Promise(r => setTimeout(r, 500));
           }
+        }
+        if (sharedCdpUrl) {
+          console.log(`[JobExecutor] Chrome CDP discovered (port ${debugPort})`);
+        } else {
+          getLogger().warn('CDP URL discovery failed — Stagehand will not be available', { jobId: job.id, debugPort });
+        }
+      }
+
+      // Stagehand requires a Vercel AI SDK-compatible provider (not openai-generic/BAML).
+      // Default to Anthropic Haiku for cheap, fast text-only LLM calls.
+      const stagehandModel = process.env.GH_STAGEHAND_MODEL || 'anthropic/claude-haiku-4-5-20251001';
+      const stagehandLlm: LLMConfig = {
+        provider: stagehandModel.split('/')[0],
+        options: {
+          model: stagehandModel,
+          apiKey: process.env.ANTHROPIC_API_KEY || '',
+        },
+      };
+      const hasStagehandKey = !!stagehandLlm.options.apiKey;
+
+      // 7a. Attach StagehandObserver for enriched blocker detection (optional)
+      if (adapter.type === 'magnitude' && 'setObserver' in adapter && sharedCdpUrl && hasStagehandKey) {
+        try {
+          observer = new StagehandObserver({
+            cdpUrl: sharedCdpUrl,
+            model: stagehandModel,
+            verbose: 0,
+            logEvent: (eventType: string, metadata?: Record<string, any>) =>
+              this.logJobEvent(job.id, eventType, metadata || {}),
+          });
+          await observer.init();
+          (adapter as MagnitudeAdapter).setObserver(observer);
+          await this.logJobEvent(job.id, 'observer_attached', { model: stagehandModel });
+          console.log(`[JobExecutor] StagehandObserver attached (${stagehandModel})`);
         } catch (err) {
           // Observer is optional — don't fail the job if it can't attach
           getLogger().warn('StagehandObserver init failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           observer = undefined;
+        }
+      }
+
+      // 7b. Create Stagehand LLM adapter for cheap Phase 2 fill (shares Magnitude's browser via CDP)
+      if (adapter.type === 'magnitude' && sharedCdpUrl && hasStagehandKey) {
+        try {
+          llmAdapter = createAdapter('stagehand');
+          await llmAdapter.start({
+            cdpUrl: sharedCdpUrl,
+            llm: stagehandLlm,
+          });
+          console.log(`[JobExecutor] Stagehand LLM adapter attached via CDP (${stagehandModel})`);
+        } catch (err) {
+          getLogger().warn('Stagehand LLM adapter init failed — falling back to Magnitude for Phase 2', {
+            jobId: job.id, error: err instanceof Error ? err.message : String(err),
+          });
+          llmAdapter = undefined;
         }
       }
 
@@ -713,6 +793,7 @@ export class JobExecutor {
         const ctx: TaskContext = {
           job,
           adapter: adapter!,
+          llmAdapter,
           costTracker,
           progress,
           credentials,
@@ -754,33 +835,17 @@ export class JobExecutor {
 
           adapter = recovered;
 
-          // Re-attach StagehandObserver to the new adapter after crash recovery
+          // Crash recovery creates a new browser — old CDP URL is stale.
+          // Clean up secondary adapters; they'll be unavailable for the rest of this job.
           if (observer) {
             try { await observer.stop(); } catch { /* old observer cleanup */ }
             observer = undefined;
           }
-          if (adapter.type === 'magnitude' && 'setObserver' in adapter) {
-            try {
-              const cdpUrl = (adapter.page?.context()?.browser() as any)?.wsEndpoint?.();
-              if (cdpUrl) {
-                const observerModel = llmSetup.imageLlm
-                  ? `${llmSetup.imageLlm.provider}/${llmSetup.imageLlm.options.model}`
-                  : `${llmSetup.llm.provider}/${llmSetup.llm.options.model}`;
-                observer = new StagehandObserver({
-                  cdpUrl,
-                  model: observerModel,
-                  verbose: 0,
-                  logEvent: (eventType: string, metadata?: Record<string, any>) =>
-                    this.logJobEvent(job.id, eventType, metadata || {}),
-                });
-                await observer.init();
-                (adapter as MagnitudeAdapter).setObserver(observer);
-              }
-            } catch (err) {
-              getLogger().warn('StagehandObserver re-attach failed after crash recovery', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
-              observer = undefined;
-            }
+          if (llmAdapter) {
+            try { await llmAdapter.stop(); } catch { /* old llmAdapter cleanup */ }
+            llmAdapter = undefined;
           }
+          sharedCdpUrl = undefined;
 
           // Re-wire event handlers on the new adapter
           thoughtThrottle.reset();
@@ -1140,6 +1205,10 @@ export class JobExecutor {
       }
       if (observer) {
         try { await observer.stop(); } catch { /* best-effort cleanup */ }
+      }
+      // Stop secondary Stagehand adapter before primary (it only disconnects CDP, doesn't close browser)
+      if (llmAdapter) {
+        try { await llmAdapter.stop(); } catch { /* best-effort cleanup */ }
       }
       if (adapter) {
         try {
