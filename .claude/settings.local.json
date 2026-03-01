@@ -2,7 +2,21 @@
   "permissions": {
     "allow": [
       "Bash(find C:\\\\Users\\\\spenc\\\\Documents\\\\GitHub\\\\GHOST-HANDS\\\\packages\\\\ghosthands:*)",
-      "Bash(find C:\\\\Users\\\\spenc\\\\Documents\\\\GitHub\\\\GHOST-HANDS\\\\packages\\\\ghosthands\\\\src:*)"
+      "Bash(find C:\\\\Users\\\\spenc\\\\Documents\\\\GitHub\\\\GHOST-HANDS\\\\packages\\\\ghosthands\\\\src:*)",
+      "Bash(npx tsc:*)",
+      "Bash(find:*)",
+      "Bash(npm view:*)",
+      "Bash(bun pm:*)",
+      "Bash(bun add:*)",
+      "Bash(npx patch-package:*)",
+      "Bash(bun patch:*)",
+      "Bash(done)",
+      "Bash(ls:*)",
+      "Bash(grep:*)",
+      "Bash(bun install:*)",
+      "Bash(bun run:*)",
+      "Bash(bun -e:*)",
+      "Bash(bun:*)"
     ]
   }
 }

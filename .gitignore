@@ -18,6 +18,8 @@ build-err.txt
 .env.local
 .env.*.local
 .env.deploy
+.env.staging
+.env.production
 
 # IDE
 .vscode/
@@ -41,6 +43,9 @@ tmp/
 # Playwright
 playwright-report/
 test-results/
+
+#Stagehand output
+packages/ghosthands/inference_summary/
 
 # Bun
 .bun/

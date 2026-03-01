@@ -162,7 +162,7 @@ app.get('/api/status/:id', async (c) => {
 
 const port = parsePort();
 console.log(`\n  Apply Web UI running at http://localhost:${port}\n`);
-console.log('  Make sure a worker is running:  bun run worker -- --worker-id=<name>\n');
+console.log('  Make sure a worker is running:  bun run worker\n');
 
 export default {
   port,
@@ -282,13 +282,13 @@ const PAGE_HTML = `<!DOCTYPE html>
     <!-- URL -->
     <div class="field url-field">
       <label>Job Application URL *</label>
-      <input type="url" id="targetUrl" placeholder="https://company.wd5.myworkdayjobs.com/..." required />
+      <input type="url" id="targetUrl" placeholder="https://careers.google.com/jobs/..." required />
     </div>
 
     <!-- Worker ID -->
     <div class="field">
       <label>Worker ID (optional — leave empty for any worker)</label>
-      <input type="text" id="workerId" placeholder="e.g. test" />
+      <input type="text" id="workerId" placeholder="e.g. adam" />
     </div>
 
     <!-- Profile -->
@@ -321,7 +321,7 @@ const PAGE_HTML = `<!DOCTYPE html>
         <div class="row">
           <div class="field">
             <label>Current Company</label>
-            <input type="text" id="currentCompany" value="Acme Corp" />
+            <input type="text" id="currentCompany" value="WeKruit" />
           </div>
           <div class="field">
             <label>Current Title</label>
@@ -330,7 +330,7 @@ const PAGE_HTML = `<!DOCTYPE html>
         </div>
         <div class="field">
           <label>LinkedIn URL</label>
-          <input type="text" id="linkedin" value="https://www.linkedin.com/in/example" />
+          <input type="text" id="linkedin" value="www.linkedin.com/in/spencerwang1" />
         </div>
 
         <!-- Address -->
@@ -377,22 +377,22 @@ const PAGE_HTML = `<!DOCTYPE html>
           </div>
           <div class="field">
             <label>Graduation Year</label>
-            <input type="text" id="gradYear" value="2025" />
+            <input type="text" id="gradYear" value="2023" />
           </div>
           <div class="field">
             <label>Years of Experience</label>
-            <input type="number" id="yearsExp" value="2" />
+            <input type="number" id="yearsExp" value="3" />
           </div>
         </div>
 
         <div class="field">
           <label>Skills (comma-separated)</label>
-          <input type="text" id="skills" value="Python, TypeScript, Java, React, SQL" />
+          <input type="text" id="skills" value="Python, TypeScript, Go, Distributed Systems, Cloud Infrastructure" />
         </div>
 
         <div class="field">
           <label>Resume File Path</label>
-          <input type="text" id="resumePath" value="" placeholder="Path to resume PDF (optional)" />
+          <input type="text" id="resumePath" value="resumeTemp.pdf" placeholder="Path to resume PDF" />
         </div>
       </div>
     </div>

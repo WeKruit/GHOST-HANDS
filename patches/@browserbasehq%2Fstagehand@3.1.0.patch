@@ -1,3 +1,12 @@
+diff --git a/node_modules/@browserbasehq/stagehand/.bun-tag-6670a05df0098229 b/.bun-tag-6670a05df0098229
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@browserbasehq/stagehand/.bun-tag-8a39a66b09cf9fed b/.bun-tag-8a39a66b09cf9fed
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@browserbasehq/stagehand/.bun-tag-c3780e6135f14eeb b/.bun-tag-c3780e6135f14eeb
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
 diff --git a/dist/cjs/lib/inference.js b/dist/cjs/lib/inference.js
 index d12bc5790bee7e8f4427d913af8341235ad6c3a5..65f62bebda48f0943c44008ae0b23db961e73728 100644
 --- a/dist/cjs/lib/inference.js

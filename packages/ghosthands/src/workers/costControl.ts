@@ -82,6 +82,7 @@ export const TASK_BUDGET: Record<QualityPreset, number> = {
 /** Per-job-type budget overrides (in USD) — bypasses quality preset when present */
 export const JOB_TYPE_BUDGET_OVERRIDES: Record<string, number> = {
   workday_apply: 2.00,
+  smart_apply: 2.00,
 };
 
 /** Per-user monthly budget (in USD) by subscription tier */
@@ -103,6 +104,7 @@ export const JOB_TYPE_ACTION_LIMITS: Record<string, number> = {
   fill_form: 40,
   custom: 50,
   workday_apply: 10000,
+  smart_apply: 10000,
 };
 
 // ---------------------------------------------------------------------------
@@ -226,6 +228,11 @@ export class CostTracker {
   /** The action limit for this task. */
   getActionLimit(): number {
     return this.actionLimit;
+  }
+
+  /** How much budget remains for this task. */
+  getRemainingBudget(): number {
+    return Math.max(0, this.taskBudget - (this.inputCost + this.outputCost));
   }
 }
 

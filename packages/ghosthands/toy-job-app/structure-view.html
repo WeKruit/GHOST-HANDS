@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Form Structure Visualizer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    header {
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      padding: 1.25rem 2rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    header h1 { font-size: 1.2rem; font-weight: 600; }
+    header .subtitle { color: #8b949e; font-size: 0.85rem; }
+    header .stats {
+      margin-left: auto;
+      display: flex;
+      gap: 1.5rem;
+    }
+    .stat { text-align: center; }
+    .stat-value { font-size: 1.4rem; font-weight: 700; color: #58a6ff; }
+    .stat-label { font-size: 0.7rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
+
+    .layout {
+      display: flex;
+      height: calc(100vh - 65px);
+    }
+
+    /* Sidebar */
+    .sidebar {
+      width: 280px;
+      min-width: 280px;
+      background: #161b22;
+      border-right: 1px solid #30363d;
+      overflow-y: auto;
+      padding: 1rem 0;
+    }
+    .sidebar h3 {
+      padding: 0.25rem 1rem 0.5rem;
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #8b949e;
+    }
+    .section-btn {
+      display: block;
+      width: 100%;
+      text-align: left;
+      background: none;
+      border: none;
+      color: #e6edf3;
+      padding: 0.5rem 1rem;
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-family: inherit;
+      border-left: 3px solid transparent;
+      transition: all 0.15s;
+    }
+    .section-btn:hover { background: #1c2128; }
+    .section-btn.active {
+      background: #1c2128;
+      border-left-color: #58a6ff;
+      color: #58a6ff;
+    }
+    .section-btn .count {
+      float: right;
+      background: #30363d;
+      color: #8b949e;
+      border-radius: 10px;
+      padding: 0 0.5rem;
+      font-size: 0.75rem;
+    }
+    .filter-bar {
+      padding: 0.5rem 1rem;
+      margin-bottom: 0.5rem;
+    }
+    .filter-bar input {
+      width: 100%;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 0.4rem 0.6rem;
+      color: #e6edf3;
+      font-size: 0.85rem;
+      font-family: inherit;
+      outline: none;
+    }
+    .filter-bar input:focus { border-color: #58a6ff; }
+    .filter-bar input::placeholder { color: #484f58; }
+
+    /* Main content */
+    .main {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1.5rem 2rem;
+    }
+
+    .view-toggle {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 1.5rem;
+    }
+    .view-btn {
+      background: #21262d;
+      border: 1px solid #30363d;
+      color: #8b949e;
+      padding: 0.35rem 0.75rem;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.8rem;
+      font-family: inherit;
+      transition: all 0.15s;
+    }
+    .view-btn:hover { color: #e6edf3; border-color: #484f58; }
+    .view-btn.active { background: #58a6ff22; color: #58a6ff; border-color: #58a6ff; }
+
+    /* Tree view */
+    .tree { }
+    .tree-section {
+      margin-bottom: 1.5rem;
+    }
+    .tree-section-header {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: #8b949e;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.75rem;
+      padding-bottom: 0.4rem;
+      border-bottom: 1px solid #21262d;
+    }
+
+    .field-node {
+      position: relative;
+      margin-bottom: 2px;
+    }
+    .field-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.45rem 0.75rem;
+      border-radius: 8px;
+      cursor: default;
+      transition: background 0.1s;
+    }
+    .field-row:hover { background: #161b22; }
+    .field-row.expanded { background: #161b22; }
+    .field-row.conditional { }
+
+    .type-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      font-size: 0.7rem;
+      font-weight: 600;
+      padding: 0.15rem 0.5rem;
+      border-radius: 4px;
+      min-width: 70px;
+      justify-content: center;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .type-text      { background: #1f6feb22; color: #58a6ff; }
+    .type-email     { background: #1f6feb22; color: #58a6ff; }
+    .type-tel       { background: #1f6feb22; color: #58a6ff; }
+    .type-url       { background: #1f6feb22; color: #58a6ff; }
+    .type-password  { background: #1f6feb22; color: #58a6ff; }
+    .type-textarea  { background: #8957e522; color: #bc8cff; }
+    .type-select    { background: #f0883e22; color: #f0883e; }
+    .type-number    { background: #3fb95022; color: #56d364; }
+    .type-date      { background: #3fb95022; color: #56d364; }
+    .type-file      { background: #da368822; color: #f47067; }
+    .type-checkbox  { background: #db61a222; color: #db61a2; }
+    .type-radio     { background: #db61a222; color: #db61a2; }
+    .type-checkbox-group { background: #db61a222; color: #db61a2; }
+    .type-radio-group    { background: #db61a222; color: #db61a2; }
+    .type-search    { background: #1f6feb22; color: #58a6ff; }
+    .type-range     { background: #3fb95022; color: #56d364; }
+    .type-toggle    { background: #db61a222; color: #db61a2; }
+
+    .field-name {
+      font-size: 0.9rem;
+      font-weight: 500;
+    }
+    .field-required {
+      color: #f47067;
+      font-size: 0.7rem;
+      font-weight: 600;
+    }
+    .field-meta {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .cond-badge {
+      font-size: 0.7rem;
+      padding: 0.1rem 0.4rem;
+      border-radius: 4px;
+      background: #f0883e22;
+      color: #f0883e;
+    }
+    .expand-btn {
+      background: none;
+      border: none;
+      color: #8b949e;
+      cursor: pointer;
+      font-size: 0.8rem;
+      padding: 0.1rem 0.3rem;
+      border-radius: 4px;
+      transition: all 0.15s;
+    }
+    .expand-btn:hover { background: #30363d; color: #e6edf3; }
+
+    .field-details {
+      margin-left: 1.5rem;
+      padding: 0.5rem 0.75rem;
+      border-left: 2px solid #30363d;
+      margin-bottom: 0.25rem;
+    }
+    .detail-row {
+      font-size: 0.8rem;
+      color: #8b949e;
+      padding: 0.15rem 0;
+    }
+    .detail-row strong { color: #e6edf3; font-weight: 500; }
+    .option-tag {
+      display: inline-block;
+      background: #21262d;
+      padding: 0.1rem 0.4rem;
+      border-radius: 4px;
+      margin: 0.1rem 0.15rem;
+      font-size: 0.75rem;
+      color: #e6edf3;
+    }
+    .option-tag.has-children {
+      background: #f0883e22;
+      color: #f0883e;
+      cursor: pointer;
+    }
+
+    /* Conditions tree */
+    .cond-tree {
+      margin-left: 2rem;
+      padding: 0.5rem 0;
+    }
+    .cond-branch {
+      position: relative;
+      padding-left: 1.5rem;
+      margin-bottom: 0.5rem;
+    }
+    .cond-branch::before {
+      content: '';
+      position: absolute;
+      left: 0.5rem;
+      top: 0;
+      bottom: 0.75rem;
+      width: 1px;
+      background: #30363d;
+    }
+    .cond-branch::after {
+      content: '';
+      position: absolute;
+      left: 0.5rem;
+      top: 0.75rem;
+      width: 0.75rem;
+      height: 1px;
+      background: #30363d;
+    }
+    .cond-label {
+      font-size: 0.8rem;
+      color: #f0883e;
+    }
+    .cond-label .field-ref { color: #58a6ff; font-weight: 500; }
+    .cond-label .value-ref { color: #56d364; }
+
+    .child-field {
+      margin-left: 1.5rem;
+      padding: 0.25rem 0;
+    }
+
+    /* Dependency graph view */
+    .dep-graph {
+      display: none;
+    }
+    .dep-graph.active { display: block; }
+    .tree.active { display: block; }
+    .tree:not(.active) { display: none; }
+
+    .dep-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 1rem;
+    }
+    .dep-card-header {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 0.75rem;
+    }
+    .dep-card-title {
+      font-size: 1rem;
+      font-weight: 600;
+    }
+    .dep-card-type { font-size: 0.75rem; }
+
+    .dep-options {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+    .dep-option {
+      background: #0d1117;
+      border: 1px solid #21262d;
+      border-radius: 8px;
+      padding: 0.6rem 0.75rem;
+    }
+    .dep-option-header {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.85rem;
+    }
+    .dep-option-value {
+      color: #56d364;
+      font-weight: 500;
+    }
+    .dep-arrow {
+      color: #484f58;
+      font-size: 0.7rem;
+    }
+    .dep-reveals {
+      margin-top: 0.4rem;
+      padding-left: 1rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+    }
+    .dep-reveal-tag {
+      background: #21262d;
+      padding: 0.15rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+    }
+    .dep-no-deps {
+      color: #484f58;
+      font-size: 0.8rem;
+      font-style: italic;
+    }
+
+    /* Empty / loading */
+    .empty-state {
+      text-align: center;
+      padding: 4rem 2rem;
+      color: #484f58;
+    }
+    .empty-state h2 { font-size: 1.2rem; margin-bottom: 0.5rem; color: #8b949e; }
+    .empty-state p { font-size: 0.9rem; }
+    .empty-state code {
+      display: inline-block;
+      background: #161b22;
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      margin-top: 1rem;
+      font-size: 0.85rem;
+      color: #58a6ff;
+    }
+
+    .drop-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(13,17,23,0.9);
+      z-index: 100;
+      justify-content: center;
+      align-items: center;
+    }
+    .drop-overlay.active { display: flex; }
+    .drop-box {
+      border: 2px dashed #58a6ff;
+      border-radius: 16px;
+      padding: 3rem 4rem;
+      text-align: center;
+      color: #58a6ff;
+      font-size: 1.2rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Form Structure Visualizer</h1>
+      <div class="subtitle" id="pageTitle">Drop a JSON file or load from script</div>
+    </div>
+    <div class="stats" id="stats"></div>
+  </header>
+
+  <div class="layout">
+    <nav class="sidebar">
+      <div class="filter-bar">
+        <input type="text" id="search" placeholder="Filter fields..." />
+      </div>
+      <h3>Sections</h3>
+      <div id="sectionList"></div>
+    </nav>
+
+    <div class="main">
+      <div class="view-toggle">
+        <button class="view-btn active" data-view="tree">Field Tree</button>
+        <button class="view-btn" data-view="deps">Dependency Graph</button>
+      </div>
+
+      <div id="emptyState" class="empty-state">
+        <h2>No form data loaded</h2>
+        <p>Run the extraction script and drag the output JSON here, or load it via URL param.</p>
+        <code>bun toy-job-app/extract-form-structure.ts > structure.json</code>
+      </div>
+
+      <div class="tree active" id="treeView"></div>
+      <div class="dep-graph" id="depsView"></div>
+    </div>
+  </div>
+
+  <div class="drop-overlay" id="dropOverlay">
+    <div class="drop-box">Drop JSON file here</div>
+  </div>
+
+  <script>
+    let formData = null;
+    let activeSection = 'all';
+    let activeView = 'tree';
+    let expandedFields = new Set();
+    let searchQuery = '';
+
+    // ── Data loading ──────────────────────────────────
+
+    // Check for inline data (injected by script)
+    window.__FORM_DATA__ = {"url":"https://thales.wd3.myworkdayjobs.com/en-US/Careers/job/Pennsylvania/Software-Development-Intern_R0317650-1/apply/applyManually?utm_source=Simplify&ref=Simplify","title":"Software Development Intern","fields":[{"name":"How Did You Hear About Us?*","type":"select","section":"My Information","required":true,"visibleByDefault":true,"options":["Careers Fair > Careers Fair","Job Board > Aeroemploiformation.com","Job Board > Agefiph","Job Board > Apec","Job Board > Atouts Pour Tous","Job Board > Bumeran","Job Board > Defence Connect Jobs","Job Board > Engagement Jeunes","Job Board > Google Jobs","Job Board > Grad Connection","Job Board > GulfTalent","Job Board > Handicap.fr","Job Board > Hanploi","Job Board > HelloWork","Job Board > Indeed","Job Board > Jobs Bank","Job Board > JobsCentral","Job Board > JobStreet","Job Board > JobTeaser","Job Board > L'Etudiant","Job Board > LinkedIn Jobs","Job Board > Meteojob","Job Board > Monster","Job Board > NAUKRI","Job Board > Other Job Board","Job Board > Pays de la Loire","Job Board > Pôle Emploi","Job Board > pracuj.pl","Job Board > Stepstone","Job Board > Tekkit.io","Job Board > WebEngineering","Job Board > Welcome to the jungle","Job Board > Yupeek","Job Board > Zhaopin.com","Newspaper/Magazine > Newspaper / Magazine Advert","Professional Association > Professional Association","Referral > Request referral from a Thales Employee","Social Media > Blog","Social Media > Email","Social Media > Facebook","Social Media > Github","Social Media > GlassDoor","Social Media > Instagram","Social Media > kununu","Social Media > LinkedIn","Social Media > Maimai","Social Media > Other Social Media","Social Media > Twitter","Social Media > Viadeo","Social Media > Wechat","Social Media > Xing","Social Media > YouTube","University / Polytechnic > Graduate Recruitment Event","University / Polytechnic > University / Polytechnic","Website > Thales Corporate Website"]},{"name":"Country","type":"select","section":"My Information","required":true,"visibleByDefault":true,"options":["Select One","Afghanistan","Åland Islands","Albania","Algeria","American Samoa","Andorra","Angola","Anguilla","Antigua and Barbuda","Argentina","Armenia","Aruba","Australia","Austria","Azerbaijan","Bahamas","Bahrain","Bangladesh","Barbados","Belarus","Belgium","Belize","Benin","Bermuda","Bhutan","Bolivia","Bonaire, Sint Eustatius, and Saba","Bosnia and Herzegovina","Botswana","Bouvet Island","Brazil","British Indian Ocean Territory","British Virgin Islands","Brunei","Bulgaria","Burkina Faso","Burundi","Cabo Verde","Cambodia","Cameroon","Canada","Cayman Islands","Central African Republic","Chad","Chile","China","Christmas Island","Cocos (Keeling) Islands","Colombia","Comoros","Congo","Congo, Democratic Republic of the","Cook Islands","Costa Rica","Côte d'Ivoire","Croatia","Cuba","Curaçao","Cyprus","Czechia","Denmark","Djibouti","Dominica","Dominican Republic","Ecuador","Egypt","El Salvador","Equatorial Guinea","Eritrea","Estonia","Eswatini","Ethiopia","Falkland Islands","Faroe Islands","Fiji","Finland","France","French Guiana","French Polynesia","French Southern Territories","Gabon","Gambia","Georgia","Germany","Ghana","Gibraltar","Greece","Greenland","Grenada","Guadeloupe","Guam","Guatemala","Guernsey","Guinea","Guinea-Bissau","Guyana","Haiti","Heard Island and McDonald Islands","Holy See (Vatican City State)","Honduras","Hong Kong","Hungary","Iceland","India","Indonesia","Iran","Iraq","Ireland","Isle of Man","Israel","Italy","Jamaica","Japan","Jersey","Jordan","Kazakhstan","Kenya","Kiribati","Korea, Democratic People's Republic of","Korea, Republic of","Kosovo","Kuwait","Kyrgyzstan","Laos","Latvia","Lebanon","Lesotho","Liberia","Libya","Liechtenstein","Lithuania","Luxembourg","Macao","Madagascar","Malawi","Malaysia","Maldives","Mali","Malta","Marshall Islands","Martinique","Mauritania","Mauritius","Mayotte","Mexico","Micronesia, Federated States of","Moldova","Monaco","Mongolia","Montenegro","Montserrat","Morocco","Mozambique","Myanmar","Namibia","Nauru","Nepal","Netherlands","New Caledonia","New Zealand","Nicaragua","Niger","Nigeria","Niue","Norfolk Island","Northern Mariana Islands","North Macedonia","Norway","Oman","Pakistan","Palau","Panama","Papua New Guinea","Paraguay","Peru","Philippines","Pitcairn Islands","Poland","Portugal","Puerto Rico","Qatar","Reunion","Romania","Russian Federation","Rwanda","Saint Barthelemy","Saint Helena, Ascension and Tristan da Cunha","Saint Kitts and Nevis","Saint Lucia","Saint Martin","Saint Pierre and Miquelon","Saint Vincent and the Grenadines","Samoa","San Marino","Sao Tome and Principe","Saudi Arabia","Senegal","Serbia","Seychelles","Sierra Leone","Singapore","Sint Maarten","Slovakia","Slovenia","Solomon Islands","Somalia","South Africa","South Georgia and the South Sandwich Islands","South Sudan","Spain","Sri Lanka","State of Palestine","Sudan","Suriname","Svalbard and Jan Mayen","Sweden","Switzerland","Syria","Taiwan","Tajikistan","Tanzania","Thailand","Timor-Leste","Togo","Tokelau","Tonga","Trinidad and Tobago","Tunisia","Türkiye","Turkmenistan","Turks and Caicos Islands","Tuvalu","U. S. Virgin Islands","Uganda","Ukraine","United Arab Emirates","United Kingdom","United States Minor Outlying Islands","United States of America","Uruguay","Uzbekistan","Vanuatu","Venezuela","Vietnam","Wallis and Futuna","Western Sahara","Yemen","Zambia","Zimbabwe"]},{"name":"First Name*","type":"text","section":"Legal Name","required":true,"visibleByDefault":true},{"name":"Last Name*","type":"text","section":"Legal Name","required":true,"visibleByDefault":true},{"name":"I have a preferred name","type":"checkbox","section":"Legal Name","required":false,"visibleByDefault":true},{"name":"Address Line 1","type":"text","section":"Address","required":false,"visibleByDefault":true},{"name":"City","type":"text","section":"Address","required":false,"visibleByDefault":true},{"name":"State","type":"select","section":"Address","required":false,"visibleByDefault":true,"options":["Select One","Alabama","Alaska","American Samoa","Arizona","Arkansas","Armed Forces Americas","Armed Forces Europe","Armed Forces Pacific","California","Colorado","Connecticut","Delaware","District of Columbia","Florida","Georgia","Guam","Hawaii","Idaho","Illinois","Indiana","Iowa","Kansas","Kentucky","Louisiana","Maine","Maryland","Massachusetts","Michigan","Minnesota","Mississippi","Missouri","Montana","Nebraska","Nevada","New Hampshire","New Jersey","New Mexico","New York","North Carolina","North Dakota","Northern Mariana Islands","Ohio","Oklahoma","Oregon","Pennsylvania","Puerto Rico","Rhode Island","South Carolina","South Dakota","Tennessee","Texas","United States Minor Outlying Islands","Utah","Vermont","Virginia","Virgin Islands, U.S.","Washington","West Virginia","Wisconsin","Wyoming"]},{"name":"Postal Code","type":"text","section":"Address","required":false,"visibleByDefault":true},{"name":"Email*","type":"text","section":"Email Address","required":true,"visibleByDefault":true},{"name":"Phone Device Type","type":"select","section":"Phone","required":true,"visibleByDefault":false,"visibleWhen":[[{"field":"Country","equals":"*"}]],"options":["Select One","Landline","Mobile"]},{"name":"Country Phone Code*","type":"select","section":"Phone","required":true,"visibleByDefault":false,"visibleWhen":[[{"field":"Country","equals":"*"}]],"options":["Afghanistan (+93)","Åland Islands (+358)","Albania (+355)","Algeria (+213)","American Samoa (+1)","Andorra (+376)","Angola (+244)","Anguilla (+1)","Antigua and Barbuda (+1)","Argentina (+54)","Armenia (+374)","Aruba (+297)","Australia (+61)","Austria (+43)","Azerbaijan (+994)","Bahamas (+1)","Bahrain (+973)","Bangladesh (+880)","Barbados (+1)"]},{"name":"Phone Number*","type":"text","section":"Phone","required":true,"visibleByDefault":false,"visibleWhen":[[{"field":"Country","equals":"*"}]]},{"name":"Phone Extension","type":"text","section":"Phone","required":false,"visibleByDefault":false,"visibleWhen":[[{"field":"Country","equals":"*"}]]},{"name":"Local Given Name(s)","type":"text","section":"Legal Name","required":true,"visibleByDefault":false,"visibleWhen":[[{"field":"Country","equals":"*"}]]},{"name":"Local Family Name","type":"text","section":"Legal Name","required":false,"visibleByDefault":false,"visibleWhen":[[{"field":"Country","equals":"*"}]]},{"name":"Dzongkha Given Name(s)","type":"text","section":"Legal Name","required":true,"visibleByDefault":false,"visibleWhen":[[{"field":"Country","equals":"*"}]]},{"name":"Dzongkha Family Name","type":"text","section":"Legal Name","required":true,"visibleByDefault":false,"visibleWhen":[[{"field":"Country","equals":"*"}]]},{"name":"Mother's Family Name","type":"text","section":"Legal Name","required":false,"visibleByDefault":false,"visibleWhen":[[{"field":"Country","equals":"*"}]]},{"name":"Mother's Family Name","type":"text","section":"Legal Name","required":false,"visibleByDefault":false,"visibleWhen":[[{"field":"Country","equals":"*"}]]},{"name":"Neighborhood","type":"text","section":"Address","required":false,"visibleByDefault":false,"visibleWhen":[[{"field":"Country","equals":"*"}]]},{"name":"Arabic Given Name(s)","type":"text","section":"Legal Name","required":true,"visibleByDefault":false,"visibleWhen":[[{"field":"Country","equals":"*"}]]},{"name":"Arabic Family Name","type":"text","section":"Legal Name","required":true,"visibleByDefault":false,"visibleWhen":[[{"field":"Country","equals":"*"}]]},{"name":"First Name*","type":"text","section":"Preferred Name","required":true,"visibleByDefault":false,"visibleWhen":[[{"field":"I have a preferred name","equals":"checked"}]]},{"name":"Last Name*","type":"text","section":"Preferred Name","required":true,"visibleByDefault":false,"visibleWhen":[[{"field":"I have a preferred name","equals":"checked"}]]}]};
+    if (window.__FORM_DATA__) {
+      loadData(window.__FORM_DATA__);
+    }
+
+    // Drag & drop
+    document.addEventListener('dragover', e => {
+      e.preventDefault();
+      document.getElementById('dropOverlay').classList.add('active');
+    });
+    document.getElementById('dropOverlay').addEventListener('dragleave', () => {
+      document.getElementById('dropOverlay').classList.remove('active');
+    });
+    document.addEventListener('drop', e => {
+      e.preventDefault();
+      document.getElementById('dropOverlay').classList.remove('active');
+      const file = e.dataTransfer.files[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          try { loadData(JSON.parse(reader.result)); }
+          catch(e) { alert('Invalid JSON file'); }
+        };
+        reader.readAsText(file);
+      }
+    });
+
+    // Search
+    document.getElementById('search').addEventListener('input', e => {
+      searchQuery = e.target.value.toLowerCase();
+      render();
+    });
+
+    // View toggle
+    document.querySelectorAll('.view-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.view-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        activeView = btn.dataset.view;
+        document.getElementById('treeView').classList.toggle('active', activeView === 'tree');
+        document.getElementById('depsView').classList.toggle('active', activeView === 'deps');
+      });
+    });
+
+    // ── Load & render ─────────────────────────────────
+
+    function loadData(data) {
+      formData = data;
+      document.getElementById('emptyState').style.display = 'none';
+      document.getElementById('pageTitle').textContent = data.title || data.url || 'Form';
+
+      const totalFields = data.fields.length;
+      const conditionalFields = data.fields.filter(f => f.visibleWhen?.length).length;
+      const sections = new Set(data.fields.map(f => f.section || 'Other'));
+
+      document.getElementById('stats').innerHTML = `
+        <div class="stat"><div class="stat-value">${totalFields}</div><div class="stat-label">Fields</div></div>
+        <div class="stat"><div class="stat-value">${conditionalFields}</div><div class="stat-label">Conditional</div></div>
+        <div class="stat"><div class="stat-value">${sections.size}</div><div class="stat-label">Sections</div></div>
+      `;
+
+      renderSidebar(sections);
+      render();
+    }
+
+    function renderSidebar(sections) {
+      const list = document.getElementById('sectionList');
+      list.innerHTML = '';
+
+      const allBtn = document.createElement('button');
+      allBtn.className = 'section-btn active';
+      allBtn.innerHTML = `All <span class="count">${formData.fields.length}</span>`;
+      allBtn.onclick = () => { activeSection = 'all'; activateSidebar(allBtn); render(); };
+      list.appendChild(allBtn);
+
+      for (const sec of sections) {
+        const count = formData.fields.filter(f => (f.section || 'Other') === sec).length;
+        const btn = document.createElement('button');
+        btn.className = 'section-btn';
+        btn.innerHTML = `${esc(sec)} <span class="count">${count}</span>`;
+        btn.onclick = () => { activeSection = sec; activateSidebar(btn); render(); };
+        list.appendChild(btn);
+      }
+    }
+
+    function activateSidebar(active) {
+      document.querySelectorAll('.section-btn').forEach(b => b.classList.remove('active'));
+      active.classList.add('active');
+    }
+
+    function render() {
+      if (!formData) return;
+      renderTree();
+      renderDeps();
+    }
+
+    // ── Tree view ─────────────────────────────────────
+
+    function renderTree() {
+      const container = document.getElementById('treeView');
+      container.innerHTML = '';
+
+      const fields = getFilteredFields();
+      const sections = groupBySection(fields);
+
+      // Build a map: for each dropdown field, which options reveal which child fields
+      const dropdownChildren = buildDropdownChildMap(formData.fields);
+
+      for (const [section, sectionFields] of sections) {
+        const topLevel = sectionFields.filter(f => !f.visibleWhen?.length);
+        const conditional = sectionFields.filter(f => f.visibleWhen?.length);
+
+        const secEl = document.createElement('div');
+        secEl.className = 'tree-section';
+        secEl.innerHTML = `<div class="tree-section-header">${esc(section)}</div>`;
+
+        for (const field of topLevel) {
+          secEl.appendChild(buildFieldNode(field, dropdownChildren, conditional));
+        }
+
+        // Render orphan conditionals (whose parent dropdown is in another section)
+        const renderedConditionals = new Set();
+        secEl.querySelectorAll('[data-field-name]').forEach(el => {
+          renderedConditionals.add(el.dataset.fieldName);
+        });
+        const orphans = conditional.filter(f => !renderedConditionals.has(f.name));
+        if (orphans.length > 0) {
+          for (const field of orphans) {
+            secEl.appendChild(buildFieldNode(field, dropdownChildren, []));
+          }
+        }
+
+        container.appendChild(secEl);
+      }
+    }
+
+    function buildFieldNode(field, dropdownChildren, allConditional) {
+      const node = document.createElement('div');
+      node.className = 'field-node';
+      node.dataset.fieldName = field.name;
+
+      const hasDetails = field.options?.length || field.choices?.length || field.accept || field.visibleWhen?.length;
+      const childMap = dropdownChildren.get(field.name);
+      const hasChildren = childMap && childMap.size > 0;
+      const isExpandable = hasDetails || hasChildren;
+      const isExpanded = expandedFields.has(field.name);
+
+      // Main row
+      const row = document.createElement('div');
+      row.className = 'field-row' + (isExpanded ? ' expanded' : '') + (field.visibleWhen?.length ? ' conditional' : '');
+      row.innerHTML = `
+        <span class="type-badge type-${field.type}">${typeIcon(field.type)} ${esc(field.type)}</span>
+        <span class="field-name">${esc(field.name)}</span>
+        ${field.required ? '<span class="field-required">required</span>' : ''}
+        <span class="field-meta">
+          ${field.visibleWhen?.length ? `<span class="cond-badge">conditional</span>` : ''}
+          ${isExpandable ? `<button class="expand-btn">${isExpanded ? '&#9660;' : '&#9654;'}</button>` : ''}
+        </span>
+      `;
+
+      if (isExpandable) {
+        row.style.cursor = 'pointer';
+        row.onclick = () => {
+          if (expandedFields.has(field.name)) expandedFields.delete(field.name);
+          else expandedFields.add(field.name);
+          render();
+        };
+      }
+
+      node.appendChild(row);
+
+      // Details (expanded)
+      if (isExpanded) {
+        const details = document.createElement('div');
+        details.className = 'field-details';
+
+        // Show conditions
+        if (field.visibleWhen?.length) {
+          details.innerHTML += `<div class="detail-row"><strong>Visible when:</strong></div>`;
+          for (const chain of field.visibleWhen) {
+            const parts = chain.map(c => `<span class="field-ref">${esc(c.field)}</span> = <span class="value-ref">"${esc(c.equals)}"</span>`);
+            details.innerHTML += `<div class="detail-row cond-label">&nbsp;&nbsp;${parts.join(' AND ')}</div>`;
+          }
+        }
+
+        // Show options with child indicators
+        if (field.options?.length) {
+          details.innerHTML += `<div class="detail-row"><strong>Options:</strong></div><div class="detail-row">`;
+          for (const opt of field.options) {
+            const reveals = childMap?.get(opt);
+            if (reveals?.length) {
+              details.innerHTML += `<span class="option-tag has-children" title="Reveals: ${reveals.map(f=>f.name).join(', ')}">${esc(opt)} &#8594; ${reveals.length}</span>`;
+            } else {
+              details.innerHTML += `<span class="option-tag">${esc(opt)}</span>`;
+            }
+          }
+          details.innerHTML += `</div>`;
+        }
+
+        // Show choices
+        if (field.choices?.length) {
+          details.innerHTML += `<div class="detail-row"><strong>Choices:</strong></div><div class="detail-row">`;
+          for (const c of field.choices) {
+            details.innerHTML += `<span class="option-tag">${esc(c)}</span>`;
+          }
+          details.innerHTML += `</div>`;
+        }
+
+        if (field.accept) {
+          details.innerHTML += `<div class="detail-row"><strong>Accepts:</strong> ${esc(field.accept)}</div>`;
+        }
+
+        node.appendChild(details);
+
+        // Render child conditional fields grouped by option
+        if (hasChildren) {
+          const childTree = document.createElement('div');
+          childTree.className = 'cond-tree';
+
+          for (const [optValue, childFields] of childMap) {
+            const branch = document.createElement('div');
+            branch.className = 'cond-branch';
+            branch.innerHTML = `<div class="cond-label">when <span class="field-ref">${esc(field.name)}</span> = <span class="value-ref">"${esc(optValue)}"</span></div>`;
+
+            for (const child of childFields) {
+              const childNode = buildFieldNode(child, dropdownChildren, []);
+              childNode.style.marginLeft = '0.5rem';
+              branch.appendChild(childNode);
+            }
+
+            childTree.appendChild(branch);
+          }
+
+          node.appendChild(childTree);
+        }
+      }
+
+      return node;
+    }
+
+    function buildDropdownChildMap(allFields) {
+      // Map: parentFieldName -> Map<optionValue, childField[]>
+      const map = new Map();
+
+      const conditionalFields = allFields.filter(f => f.visibleWhen?.length);
+      for (const field of conditionalFields) {
+        for (const chain of field.visibleWhen) {
+          // Use the last condition in the chain as the "direct parent"
+          const directParent = chain[chain.length - 1];
+          if (!map.has(directParent.field)) map.set(directParent.field, new Map());
+          const optMap = map.get(directParent.field);
+          if (!optMap.has(directParent.equals)) optMap.set(directParent.equals, []);
+          const list = optMap.get(directParent.equals);
+          if (!list.find(f => f.name === field.name)) {
+            list.push(field);
+          }
+        }
+      }
+
+      return map;
+    }
+
+    // ── Dependency graph view ─────────────────────────
+
+    function renderDeps() {
+      const container = document.getElementById('depsView');
+      container.innerHTML = '';
+
+      const fields = getFilteredFields();
+      const dropdownChildren = buildDropdownChildMap(formData.fields);
+
+      // Only show dropdowns that have conditional children
+      const dropdownsWithDeps = fields.filter(f => f.type === 'select' && dropdownChildren.has(f.name));
+      const standaloneDropdowns = fields.filter(f => f.type === 'select' && !dropdownChildren.has(f.name));
+
+      if (dropdownsWithDeps.length === 0) {
+        container.innerHTML = '<div class="empty-state"><p>No conditional dependencies found.</p></div>';
+        return;
+      }
+
+      for (const field of dropdownsWithDeps) {
+        const card = document.createElement('div');
+        card.className = 'dep-card';
+
+        const optMap = dropdownChildren.get(field.name);
+
+        card.innerHTML = `
+          <div class="dep-card-header">
+            <span class="type-badge type-select">${typeIcon('select')} select</span>
+            <span class="dep-card-title">${esc(field.name)}</span>
+            ${field.required ? '<span class="field-required">required</span>' : ''}
+          </div>
+          <div class="dep-options"></div>
+        `;
+
+        const optContainer = card.querySelector('.dep-options');
+        const allOptions = field.options || [];
+
+        for (const opt of allOptions) {
+          const reveals = optMap?.get(opt);
+          const optEl = document.createElement('div');
+          optEl.className = 'dep-option';
+
+          if (reveals?.length) {
+            optEl.innerHTML = `
+              <div class="dep-option-header">
+                <span class="dep-option-value">"${esc(opt)}"</span>
+                <span class="dep-arrow">reveals ${reveals.length} field${reveals.length > 1 ? 's' : ''} &#8595;</span>
+              </div>
+              <div class="dep-reveals">
+                ${reveals.map(f => `<span class="dep-reveal-tag"><span class="type-badge type-${f.type}" style="font-size:0.65rem;min-width:auto;padding:0 0.3rem;">${typeIcon(f.type)}</span> ${esc(f.name)}</span>`).join('')}
+              </div>
+            `;
+          } else {
+            optEl.innerHTML = `
+              <div class="dep-option-header">
+                <span class="dep-option-value">"${esc(opt)}"</span>
+                <span class="dep-no-deps">no conditional fields</span>
+              </div>
+            `;
+          }
+
+          optContainer.appendChild(optEl);
+        }
+
+        container.appendChild(card);
+      }
+
+      // Standalone dropdowns
+      if (standaloneDropdowns.length > 0) {
+        const heading = document.createElement('div');
+        heading.style.cssText = 'color:#484f58;font-size:0.8rem;margin:1.5rem 0 0.5rem;';
+        heading.textContent = `${standaloneDropdowns.length} dropdown${standaloneDropdowns.length > 1 ? 's' : ''} with no conditional fields`;
+        container.appendChild(heading);
+      }
+    }
+
+    // ── Utility ───────────────────────────────────────
+
+    function getFilteredFields() {
+      if (!formData) return [];
+      return formData.fields.filter(f => {
+        if (activeSection !== 'all' && (f.section || 'Other') !== activeSection) return false;
+        if (searchQuery && !f.name.toLowerCase().includes(searchQuery) && !f.type.toLowerCase().includes(searchQuery)) return false;
+        return true;
+      });
+    }
+
+    function groupBySection(fields) {
+      const map = new Map();
+      for (const f of fields) {
+        const sec = f.section || 'Other';
+        if (!map.has(sec)) map.set(sec, []);
+        map.get(sec).push(f);
+      }
+      return map;
+    }
+
+    function typeIcon(type) {
+      const icons = {
+        text: 'Aa', email: '@', tel: '#', url: '///', textarea: '&#182;',
+        select: '&#9662;', number: '123', date: '&#128197;', file: '&#128206;',
+        checkbox: '&#9744;', radio: '&#9673;', 'checkbox-group': '&#9744;', 'radio-group': '&#9673;',
+        search: '&#128269;', range: '&#8596;', toggle: '&#9675;', password: '&#8226;&#8226;',
+      };
+      return icons[type] || '?';
+    }
+
+    function esc(str) {
+      if (!str) return '';
+      const d = document.createElement('div');
+      d.textContent = str;
+      return d.innerHTML;
+    }
+  </script>
+</body>
+</html>

@@ -1,5 +1,6 @@
 import { SupabaseClient } from '@supabase/supabase-js';
 import pg from 'pg';
+import net from 'node:net';
 import { createAdapter, type BrowserAutomationAdapter, type TokenUsage, type AdapterType, type LLMConfig } from '../adapters';
 import {
   CostTracker,
@@ -12,7 +13,7 @@ import { ProgressTracker, ProgressStep } from './progressTracker.js';
 import { loadModelConfig } from '../config/models.js';
 import { taskHandlerRegistry } from './taskHandlers/registry.js';
 import { callbackNotifier } from './callbackNotifier.js';
-import type { TaskHandler, TaskContext, TaskResult } from './taskHandlers/types.js';
+import type { TaskContext, TaskResult } from './taskHandlers/types.js';
 import { SessionManager } from '../sessions/SessionManager.js';
 import { BlockerDetector, type BlockerResult, type BlockerType } from '../detection/BlockerDetector.js';
 import { ExecutionEngine } from '../engine/ExecutionEngine.js';
@@ -25,7 +26,6 @@ import { ThoughtThrottle, JOB_EVENT_TYPES } from '../events/JobEventTypes.js';
 import { ResumeDownloader, type ResumeRef } from './resumeDownloader.js';
 import { ResumeProfileLoader } from '../db/resumeProfileLoader.js';
 import { getLogger } from '../monitoring/logger.js';
-import { AgentApplyHandler } from './taskHandlers/agentApplyHandler.js';
 
 const logger = getLogger({ service: 'job-executor' });
 
@@ -88,7 +88,6 @@ const BLOCKER_CONFIDENCE_THRESHOLD = 0.6;
 const MAX_POST_RESUME_CHECKS = 3;
 const BLOCKER_CHECK_INTERVAL_MS = 15_000; // Minimum interval between action-triggered blocker checks
 const PERIODIC_BLOCKER_CHECK_MS = 30_000; // Periodic timer-based blocker check interval
-const BLOCKER_CHECK_TIMEOUT_MS = 20_000; // Timeout for any single blocker check call
 const CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK = 3; // Check for blockers after this many consecutive action failures
 
 /** Error codes that should trigger HITL instead of immediate retry */
@@ -113,6 +112,7 @@ function detectPlatform(url: string): string {
   if (url.includes('linkedin.com')) return 'linkedin';
   if (url.includes('lever.co')) return 'lever';
   if (url.includes('myworkdayjobs.com') || url.includes('workday.com')) return 'workday';
+  if (url.includes('amazon.jobs') || url.includes('www.amazon.jobs')) return 'amazon';
   if (url.includes('icims.com')) return 'icims';
   if (url.includes('taleo.net')) return 'taleo';
   if (url.includes('smartrecruiters.com')) return 'smartrecruiters';
@@ -176,6 +176,7 @@ export class JobExecutor {
     this._executionAttemptId = crypto.randomUUID();
     const heartbeat = this.startHeartbeat(job.id);
     let adapter: BrowserAutomationAdapter | null = null;
+    let llmAdapter: BrowserAutomationAdapter | undefined;
     let observer: StagehandObserver | undefined;
     let blockerCheckInterval: ReturnType<typeof setInterval> | null = null;
     let resumeFilePath: string | null = null;
@@ -322,19 +323,8 @@ export class JobExecutor {
       // 1b. Auto-populate user_data from VALET's resumes table if not provided
       await this.enrichJobFromResumeProfile(job);
 
-      // 2. Resolve task handler — execution_mode can override the default handler
-      let handler: TaskHandler = taskHandlerRegistry.getOrThrow(job.job_type);
-      if (job.execution_mode === 'agent_apply') {
-        handler = new AgentApplyHandler();
-        logger.info('execution_mode override: using AgentApplyHandler', { jobId: job.id });
-      } else if (job.execution_mode === 'smart_apply') {
-        // SmartApplyHandler is already registered in the registry as 'smart_apply'.
-        // If the job_type doesn't match, override with SmartApplyHandler.
-        if (handler.type !== 'smart_apply') {
-          handler = taskHandlerRegistry.getOrThrow('smart_apply');
-          logger.info('execution_mode override: using SmartApplyHandler', { jobId: job.id });
-        }
-      }
+      // 2. Resolve task handler
+      const handler = taskHandlerRegistry.getOrThrow(job.job_type);
 
       // 3. Validate input if handler supports it
       if (handler.validate) {
@@ -424,64 +414,101 @@ export class JobExecutor {
       }
 
       // 7. Create and start adapter
-      logger.debug('[exec] Step 7: Creating adapter', { jobId: job.id });
       const adapterType = (process.env.GH_BROWSER_ENGINE || 'magnitude') as AdapterType;
       adapter = createAdapter(adapterType);
       this._activeAdapter = adapter;
       const headless = process.env.GH_HEADLESS !== 'false'; // default true
+
+      // Find a free port for Chrome's CDP remote debugging.
+      // This lets Stagehand and the observer attach to Magnitude's browser.
+      let debugPort: number | undefined;
+      let sharedCdpUrl: string | undefined;
+      if (adapterType === 'magnitude') {
+        try {
+          debugPort = await new Promise<number>((resolve, reject) => {
+            const srv = net.createServer();
+            srv.listen(0, () => {
+              const port = (srv.address() as net.AddressInfo).port;
+              srv.close(() => resolve(port));
+            });
+            srv.on('error', reject);
+          });
+        } catch {
+          debugPort = undefined;
+        }
+      }
+
+      // Magnitude's default args (from magnitude-core browserProvider.js).
+      // Its launchOptions are shallow-merged, so providing `args` replaces defaults entirely.
+      const MAGNITUDE_DEFAULT_ARGS = ['--disable-gpu', '--disable-blink-features=AutomationControlled'];
+
       await adapter.start({
         url: job.target_url,
         llm: llmSetup.llm,
         ...(llmSetup.imageLlm && { imageLlm: llmSetup.imageLlm }),
         ...(storedSession ? { storageState: storedSession } : {}),
-        browserOptions: { headless },
+        systemPrompt: 'You are a form-filling agent. RULES: (1) ONE action at a time. (2) TOP TO BOTTOM — start at the topmost unanswered field, never skip ahead. (3) DO NOT TOUCH any question that is even slightly cut off at the bottom of the screen. (4) Before reporting done, scan top to bottom and confirm every 100% visible question is answered. (5) When done with all fully visible fields, IMMEDIATELY report done. Do NOT use the wait action. Reporting done IS what triggers scrolling. (6) NEVER scroll or navigate.',
+        browserOptions: {
+          headless,
+          ...(debugPort ? {
+            args: [
+              ...MAGNITUDE_DEFAULT_ARGS,
+              `--remote-debugging-port=${debugPort}`,
+              ...(headless ? [] : ['--start-maximized']),
+            ],
+          } : {}),
+        },
       });
 
-      logger.debug('[exec] Step 7: Adapter started, waiting for page load', { jobId: job.id, adapterType });
+      console.log(`[JobExecutor] Adapter started for job ${job.id}`);
 
-      // 7b. Wait for page to be ready before any interactions (SPA pages like Greenhouse need this)
-      try {
-        await Promise.race([
-          adapter.page.waitForLoadState('domcontentloaded'),
-          new Promise((resolve) => setTimeout(resolve, 10_000)),
-        ]);
-        logger.debug('[exec] Step 7: Page domcontentloaded', { jobId: job.id });
-      } catch {
-        logger.debug('[exec] Step 7: Page load wait skipped', { jobId: job.id });
-      }
-
-      // 7c. For SPA platforms (non-Workday), wait for networkidle to let React/JS finish rendering
-      if (platform !== 'workday') {
-        try {
-          await Promise.race([
-            adapter.page.waitForLoadState('networkidle'),
-            new Promise((resolve) => setTimeout(resolve, 15_000)),
-          ]);
-          logger.debug('[exec] Step 7c: Page networkidle (SPA ready)', { jobId: job.id });
-        } catch {
-          logger.debug('[exec] Step 7c: networkidle wait skipped (timeout ok)', { jobId: job.id });
+      // Discover the CDP WebSocket URL from Chrome's remote debugging endpoint
+      if (debugPort) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const resp = await fetch(`http://127.0.0.1:${debugPort}/json/version`);
+            const info = await resp.json() as { webSocketDebuggerUrl?: string };
+            if (info.webSocketDebuggerUrl) {
+              sharedCdpUrl = info.webSocketDebuggerUrl;
+              break;
+            }
+          } catch {
+            if (attempt < 2) await new Promise(r => setTimeout(r, 500));
+          }
+        }
+        if (sharedCdpUrl) {
+          console.log(`[JobExecutor] Chrome CDP discovered (port ${debugPort})`);
+        } else {
+          getLogger().warn('CDP URL discovery failed — Stagehand will not be available', { jobId: job.id, debugPort });
         }
       }
 
+      // Stagehand requires a Vercel AI SDK-compatible provider (not openai-generic/BAML).
+      // Default to Anthropic Haiku for cheap, fast text-only LLM calls.
+      const stagehandModel = process.env.GH_STAGEHAND_MODEL || 'anthropic/claude-haiku-4-5-20251001';
+      const stagehandLlm: LLMConfig = {
+        provider: stagehandModel.split('/')[0],
+        options: {
+          model: stagehandModel,
+          apiKey: process.env.ANTHROPIC_API_KEY || '',
+        },
+      };
+      const hasStagehandKey = !!stagehandLlm.options.apiKey;
+
       // 7a. Attach StagehandObserver for enriched blocker detection (optional)
-      if (adapter.type === 'magnitude' && 'setObserver' in adapter) {
+      if (adapter.type === 'magnitude' && 'setObserver' in adapter && sharedCdpUrl && hasStagehandKey) {
         try {
-          const cdpUrl = (adapter.page?.context()?.browser() as any)?.wsEndpoint?.();
-          if (cdpUrl) {
-            const observerModel = llmSetup.imageLlm
-              ? `${llmSetup.imageLlm.provider}/${llmSetup.imageLlm.options.model}`
-              : `${llmSetup.llm.provider}/${llmSetup.llm.options.model}`;
-            observer = new StagehandObserver({
-              cdpUrl,
-              model: observerModel,
-              verbose: 0,
-              logEvent: (eventType: string, metadata?: Record<string, any>) =>
-                this.logJobEvent(job.id, eventType, metadata || {}),
-            });
-            await observer.init();
-            (adapter as MagnitudeAdapter).setObserver(observer);
-            await this.logJobEvent(job.id, 'observer_attached', { model: observerModel });
-          }
+          observer = new StagehandObserver({
+            cdpUrl: sharedCdpUrl,
+            model: stagehandModel,
+            verbose: 0,
+            logEvent: (eventType: string, metadata?: Record<string, any>) =>
+              this.logJobEvent(job.id, eventType, metadata || {}),
+          });
+          await observer.init();
+          (adapter as MagnitudeAdapter).setObserver(observer);
+          await this.logJobEvent(job.id, 'observer_attached', { model: stagehandModel });
+          console.log(`[JobExecutor] StagehandObserver attached (${stagehandModel})`);
         } catch (err) {
           // Observer is optional — don't fail the job if it can't attach
           getLogger().warn('StagehandObserver init failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
@@ -489,13 +516,28 @@ export class JobExecutor {
         }
       }
 
-      logger.debug('[exec] Step 8: Registering credentials', { jobId: job.id, hasCredentials: !!credentials });
+      // 7b. Create Stagehand LLM adapter for cheap Phase 2 fill (shares Magnitude's browser via CDP)
+      if (adapter.type === 'magnitude' && sharedCdpUrl && hasStagehandKey) {
+        try {
+          llmAdapter = createAdapter('stagehand');
+          await llmAdapter.start({
+            cdpUrl: sharedCdpUrl,
+            llm: stagehandLlm,
+          });
+          console.log(`[JobExecutor] Stagehand LLM adapter attached via CDP (${stagehandModel})`);
+        } catch (err) {
+          getLogger().warn('Stagehand LLM adapter init failed — falling back to Magnitude for Phase 2', {
+            jobId: job.id, error: err instanceof Error ? err.message : String(err),
+          });
+          llmAdapter = undefined;
+        }
+      }
+
       // 8. Register credentials if available
       if (credentials) {
         adapter.registerCredentials(credentials);
       }
 
-      logger.debug('[exec] Step 8.5: Injecting browser session', { jobId: job.id, hasSessionManager: !!this.sessionManager });
       // 8.5. Inject stored browser session (e.g. Google auth cookies)
       if (this.sessionManager) try {
         // Load Google session for Sign-in-with-Google flows
@@ -528,17 +570,13 @@ export class JobExecutor {
         // Reload page after cookie injection so Workday SSO picks up the Google session
         if (googleSessionInjected) {
           getLogger().info('Reloading page after session injection');
-          logger.debug('[exec] Step 8.5: Reloading page (networkidle)...', { jobId: job.id });
           await adapter.page.reload({ waitUntil: 'networkidle' }).catch(() => {});
           await adapter.page.waitForTimeout(2000);
-          logger.debug('[exec] Step 8.5: Page reload complete', { jobId: job.id });
         }
       } catch (err) {
         // Session injection failure is non-fatal — worker can still try fresh login
         getLogger().warn('Session injection failed (non-fatal)', { error: err instanceof Error ? err.message : String(err) });
       }
-
-      logger.debug('[exec] Step 8.5: Session injection done', { jobId: job.id });
 
       // 8a. Auto-attach resume to file inputs via Playwright filechooser event.
       // This covers ALL execution paths (handlers, cookbook, crash recovery).
@@ -554,35 +592,15 @@ export class JobExecutor {
         adapter.page.on('filechooser', fileChooserHandler);
       }
 
-      // 8.6. Check for blockers after initial page navigation (with timeout)
-      // Skip for non-Workday platforms — SPA pages (Greenhouse) cause page.evaluate() to hang
-      const skipInitialBlockerCheck = platform !== 'workday';
-      if (skipInitialBlockerCheck) {
-        logger.debug('[exec] Step 8.6: Skipping initial blocker check (non-workday platform)', { jobId: job.id, platform });
-      } else {
-        logger.debug('[exec] Step 8.6: Checking for blockers', { jobId: job.id });
-        let initiallyBlocked = false;
-        try {
-          initiallyBlocked = await Promise.race([
-            this.checkForBlockers(job, adapter, costTracker),
-            new Promise<false>((resolve) =>
-              setTimeout(() => {
-                logger.warn('[exec] Step 8.6: Blocker check timed out, skipping', { jobId: job.id });
-                resolve(false);
-              }, BLOCKER_CHECK_TIMEOUT_MS),
-            ),
-          ]);
-        } catch (err) {
-          logger.warn('[exec] Step 8.6: Blocker check error, skipping', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
-        }
-        if (initiallyBlocked) {
-          throw new Error('Page blocked after initial navigation and HITL resolution failed');
-        }
-        logger.debug('[exec] Step 8.6: Blocker check passed', { jobId: job.id });
+      // 8.6. Check for blockers after initial page navigation
+      console.log(`[JobExecutor] Checking for blockers...`);
+      const initiallyBlocked = await this.checkForBlockers(job, adapter, costTracker);
+      if (initiallyBlocked) {
+        throw new Error('Page blocked after initial navigation and HITL resolution failed');
       }
+      console.log(`[JobExecutor] Blocker check complete — clear`);
 
       // 9. Try ExecutionEngine (cookbook replay) before Magnitude handler
-      logger.debug('[exec] Step 9: Trying cookbook engine', { jobId: job.id });
       await progress.setStep(ProgressStep.NAVIGATING);
 
       const logEventFn = (eventType: string, metadata: Record<string, any>) =>
@@ -595,6 +613,7 @@ export class JobExecutor {
         }),
       });
 
+      console.log(`[JobExecutor] Checking for cookbook...`);
       const engineResult = await executionEngine.execute({
         job,
         adapter,
@@ -603,8 +622,6 @@ export class JobExecutor {
         logEvent: logEventFn,
         resumeFilePath,
       });
-
-      logger.debug('[exec] Step 9: Engine result', { jobId: job.id, success: engineResult.success, mode: engineResult.mode });
 
       // Track TraceRecorder for Magnitude path (manual training)
       let traceRecorder: TraceRecorder | null = null;
@@ -744,27 +761,29 @@ export class JobExecutor {
       });
 
       // Start periodic blocker check timer (catches blockers even when adapter is stuck)
-      // Only for workday_apply — SPA platforms (Greenhouse) cause page.evaluate() to hang,
-      // creating contention with Magnitude's own evaluate calls
-      if (handler.type === 'workday_apply') {
-        blockerCheckInterval = setInterval(async () => {
-          if (!adapter || adapter.isPaused?.()) return; // Don't check while paused
-          try {
-            await Promise.race([
-              this.checkForBlockers(job, adapter, costTracker),
-              new Promise<false>((resolve) => setTimeout(() => resolve(false), BLOCKER_CHECK_TIMEOUT_MS)),
-            ]);
-          } catch {
-            // Non-fatal
+      blockerCheckInterval = setInterval(async () => {
+        if (!adapter || adapter.isPaused?.()) return; // Don't check while paused
+        try {
+          const blocked = await this.checkForBlockers(job, adapter, costTracker);
+          if (blocked) {
+            // Already handled internally — the job will be paused
           }
-        }, PERIODIC_BLOCKER_CHECK_MS);
-      } else {
-        logger.debug('[exec] Periodic blocker checks disabled for non-workday handler', { jobId: job.id, handler: handler.type });
-      }
+        } catch {
+          // Non-fatal
+        }
+      }, PERIODIC_BLOCKER_CHECK_MS);
 
       // 10. Build TaskContext and delegate to handler (with crash recovery)
-      logger.debug('[exec] Step 10: Delegating to handler', { jobId: job.id, handler: handler.type, timeoutSeconds: job.timeout_seconds });
-      const timeoutMs = job.timeout_seconds * 1000;
+      const rawTimeout = job.timeout_seconds;
+      const MIN_TIMEOUT_SECONDS = 1800; // 30 minutes minimum — agent needs time for multi-step forms
+      const timeoutMs = Math.max(typeof rawTimeout === 'number' && rawTimeout > 0 ? rawTimeout : MIN_TIMEOUT_SECONDS, MIN_TIMEOUT_SECONDS) * 1000;
+      getLogger().info('Job execution timeout configured', {
+        jobId: job.id,
+        raw_timeout_seconds: rawTimeout,
+        effective_timeout_seconds: timeoutMs / 1000,
+        timeoutMs,
+        handler: handler.type,
+      });
       await this.updateJobStatus(job.id, 'running', `Executing ${handler.type} handler (Magnitude mode)`);
 
       let taskResult: TaskResult | undefined;
@@ -774,6 +793,7 @@ export class JobExecutor {
         const ctx: TaskContext = {
           job,
           adapter: adapter!,
+          llmAdapter,
           costTracker,
           progress,
           credentials,
@@ -782,12 +802,10 @@ export class JobExecutor {
         };
 
         try {
-          logger.debug('[exec] Step 10: Calling handler.execute()', { jobId: job.id, handler: handler.type, attempt: crashRecoveryAttempts });
           taskResult = await Promise.race([
             handler.execute(ctx),
             this.createTimeout(timeoutMs),
           ]);
-          logger.debug('[exec] Step 10: Handler returned', { jobId: job.id, success: taskResult?.success });
           break; // Success -- exit retry loop
         } catch (execError) {
           const execMsg = execError instanceof Error ? execError.message : String(execError);
@@ -817,33 +835,17 @@ export class JobExecutor {
 
           adapter = recovered;
 
-          // Re-attach StagehandObserver to the new adapter after crash recovery
+          // Crash recovery creates a new browser — old CDP URL is stale.
+          // Clean up secondary adapters; they'll be unavailable for the rest of this job.
           if (observer) {
             try { await observer.stop(); } catch { /* old observer cleanup */ }
             observer = undefined;
           }
-          if (adapter.type === 'magnitude' && 'setObserver' in adapter) {
-            try {
-              const cdpUrl = (adapter.page?.context()?.browser() as any)?.wsEndpoint?.();
-              if (cdpUrl) {
-                const observerModel = llmSetup.imageLlm
-                  ? `${llmSetup.imageLlm.provider}/${llmSetup.imageLlm.options.model}`
-                  : `${llmSetup.llm.provider}/${llmSetup.llm.options.model}`;
-                observer = new StagehandObserver({
-                  cdpUrl,
-                  model: observerModel,
-                  verbose: 0,
-                  logEvent: (eventType: string, metadata?: Record<string, any>) =>
-                    this.logJobEvent(job.id, eventType, metadata || {}),
-                });
-                await observer.init();
-                (adapter as MagnitudeAdapter).setObserver(observer);
-              }
-            } catch (err) {
-              getLogger().warn('StagehandObserver re-attach failed after crash recovery', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
-              observer = undefined;
-            }
+          if (llmAdapter) {
+            try { await llmAdapter.stop(); } catch { /* old llmAdapter cleanup */ }
+            llmAdapter = undefined;
           }
+          sharedCdpUrl = undefined;
 
           // Re-wire event handlers on the new adapter
           thoughtThrottle.reset();
@@ -1204,6 +1206,10 @@ export class JobExecutor {
       if (observer) {
         try { await observer.stop(); } catch { /* best-effort cleanup */ }
       }
+      // Stop secondary Stagehand adapter before primary (it only disconnects CDP, doesn't close browser)
+      if (llmAdapter) {
+        try { await llmAdapter.stop(); } catch { /* best-effort cleanup */ }
+      }
       if (adapter) {
         try {
           await adapter.stop();
@@ -1316,8 +1322,7 @@ export class JobExecutor {
       }
     });
 
-    adapter.on('actionStarted', (action: { variant: string }) => {
-      logger.debug('[magnitude] actionStarted', { variant: action.variant, jobId: job.id });
+    adapter.on('actionStarted', async (action: { variant: string }) => {
       blockerState.consecutiveFailures++;
       costTracker.recordAction(); // throws ActionLimitExceededError if over limit
       costTracker.recordModeStep('magnitude');
@@ -1327,14 +1332,16 @@ export class JobExecutor {
         action_count: costTracker.getSnapshot().actionCount,
       });
 
-      // Fire-and-forget — never await in event handlers (blocks Magnitude's page.evaluate)
       if (blockerState.consecutiveFailures >= CONSECUTIVE_FAILURES_BEFORE_BLOCKER_CHECK && adapter) {
-        this.checkForBlockers(job, adapter, costTracker).catch(() => {});
+        try {
+          await this.checkForBlockers(job, adapter, costTracker);
+        } catch {
+          // Non-fatal
+        }
       }
     });
 
-    adapter.on('actionDone', (action: { variant: string }) => {
-      logger.debug('[magnitude] actionDone', { variant: action.variant, jobId: job.id });
+    adapter.on('actionDone', async (action: { variant: string }) => {
       progress.onActionDone(action.variant);
       blockerState.consecutiveFailures = 0;
       this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_COMPLETED, {
@@ -1345,29 +1352,27 @@ export class JobExecutor {
       const now = Date.now();
       if (now - blockerState.lastCheckTime >= BLOCKER_CHECK_INTERVAL_MS) {
         blockerState.lastCheckTime = now;
-        // Fire-and-forget — never await in event handlers (blocks Magnitude's page.evaluate)
-        (async () => {
-          try {
-            const currentUrl = await adapter.getCurrentUrl();
-            if (currentUrl !== blockerState.lastKnownUrl) {
-              blockerState.lastKnownUrl = currentUrl;
-              try {
-                const currentDomain = new URL(currentUrl).hostname;
-                if (currentDomain !== targetDomain) {
-                  this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
-                    from_domain: targetDomain,
-                    to_url: currentUrl,
-                  });
-                }
-              } catch {
-                // Invalid URL — skip domain comparison
+        try {
+          const currentUrl = await adapter.getCurrentUrl();
+          if (currentUrl !== blockerState.lastKnownUrl) {
+            blockerState.lastKnownUrl = currentUrl;
+            try {
+              const currentDomain = new URL(currentUrl).hostname;
+              if (currentDomain !== targetDomain) {
+                await this.logJobEvent(job.id, JOB_EVENT_TYPES.URL_CHANGE_DETECTED, {
+                  from_domain: targetDomain,
+                  to_url: currentUrl,
+                });
               }
+            } catch {
+              // Invalid URL — skip domain comparison
             }
-            this.checkForBlockers(job, adapter, costTracker).catch(() => {});
-          } catch {
-            // Detection errors are non-fatal
           }
-        })();
+          await this.checkForBlockers(job, adapter, costTracker);
+        } catch (err) {
+          if ((err as Error).message?.includes('Blocker detected')) throw err;
+          // Detection errors are non-fatal
+        }
       }
     });
 
@@ -1421,6 +1426,7 @@ export class JobExecutor {
     }
 
     if (!blockerResult || blockerResult.confidence < BLOCKER_CONFIDENCE_THRESHOLD) {
+      console.log(`[JobExecutor] Blocker check result: ${blockerResult ? `type=${blockerResult.type} confidence=${blockerResult.confidence} (below threshold ${BLOCKER_CONFIDENCE_THRESHOLD})` : 'no blocker detected'}`);
       await this.logJobEvent(job.id, JOB_EVENT_TYPES.OBSERVATION_COMPLETED, {
         result: 'clear',
         url: currentUrl,
@@ -1428,7 +1434,34 @@ export class JobExecutor {
       return false;
     }
 
+    // SAFETY: If the blocker is a captcha but the page has form inputs, it's a
+    // form-level captcha (e.g. hCaptcha on Lever) — not blocking page access.
+    // These captchas activate at submission time, not during form filling.
+    if (blockerResult.type === 'captcha' || blockerResult.type === 'verification') {
+      try {
+        const formInputCount = await adapter.page.evaluate(() => {
+          return document.querySelectorAll(
+            'input[type="text"], input[type="email"], input[type="tel"], ' +
+            'input[type="url"], input[type="number"], textarea, select, ' +
+            'input[type="file"], [role="combobox"], [role="listbox"]'
+          ).length;
+        });
+        if (formInputCount >= 2) {
+          console.log(`[JobExecutor] Captcha detected (${blockerResult.selector}) but page has ${formInputCount} form inputs — treating as form-level captcha, not a blocker`);
+          await this.logJobEvent(job.id, JOB_EVENT_TYPES.OBSERVATION_COMPLETED, {
+            result: 'clear',
+            url: currentUrl,
+            note: `Captcha present but page has ${formInputCount} form inputs — form-level captcha, not access blocker`,
+          });
+          return false;
+        }
+      } catch {
+        // page.evaluate failed — fall through to normal blocker handling
+      }
+    }
+
     // Blocker detected — emit event and trigger HITL
+    console.log(`[JobExecutor] BLOCKER DETECTED: type=${blockerResult.type} confidence=${blockerResult.confidence} source=${blockerResult.source} details="${blockerResult.details}" selector="${blockerResult.selector || 'N/A'}"`);
     await this.logJobEvent(job.id, JOB_EVENT_TYPES.BLOCKER_DETECTED, {
       blocker_type: blockerResult.type,
       confidence: blockerResult.confidence,
