@@ -16,15 +16,14 @@
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ── Mocks ──────────────────────────────────────────────────────────
+// NOTE: These are standalone vi.fn() stubs used directly by simulateDeployFlow.
+// We intentionally do NOT use vi.mock() here because bun runs all test files
+// in a single process and vi.mock leaks globally — replacing real modules in
+// other test files (container-configs.test.ts, ecr-auth.test.ts).
 
 // Mock ecr-auth
 const mockGetEcrAuth = vi.fn();
 const mockClearEcrAuthCache = vi.fn();
-
-vi.mock('../../../../scripts/lib/ecr-auth', () => ({
-  getEcrAuth: (...args: unknown[]) => mockGetEcrAuth(...args),
-  clearEcrAuthCache: () => mockClearEcrAuthCache(),
-}));
 
 // Mock docker-client
 const mockPullImage = vi.fn();
@@ -35,34 +34,9 @@ const mockStartContainer = vi.fn();
 const mockInspectContainer = vi.fn();
 const mockPruneImages = vi.fn();
 
-vi.mock('../../../../scripts/lib/docker-client', () => ({
-  pullImage: (...args: unknown[]) => mockPullImage(...args),
-  stopContainer: (...args: unknown[]) => mockStopContainer(...args),
-  removeContainer: (...args: unknown[]) => mockRemoveContainer(...args),
-  createContainer: (...args: unknown[]) => mockCreateContainer(...args),
-  startContainer: (...args: unknown[]) => mockStartContainer(...args),
-  inspectContainer: (...args: unknown[]) => mockInspectContainer(...args),
-  pruneImages: () => mockPruneImages(),
-  DockerApiError: class DockerApiError extends Error {
-    constructor(
-      message: string,
-      public readonly statusCode: number,
-      public readonly dockerMessage?: string,
-    ) {
-      super(message);
-      this.name = 'DockerApiError';
-    }
-  },
-}));
-
 // Mock container-configs
 const mockGetServiceConfigs = vi.fn();
 const mockGetEnvVarsFromProcess = vi.fn();
-
-vi.mock('../../../../scripts/lib/container-configs', () => ({
-  getServiceConfigs: (...args: unknown[]) => mockGetServiceConfigs(...args),
-  getEnvVarsFromProcess: (...args: unknown[]) => mockGetEnvVarsFromProcess(...args),
-}));
 
 // ── Types & Helpers ────────────────────────────────────────────────
 

@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Observe-Then-Act Architecture — GhostHands</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --orange: #d29922;
+      --red: #f85149;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      padding: 2rem;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    h1 { font-size: 2rem; margin-bottom: 0.25rem; }
+    .subtitle { color: var(--muted); font-size: 0.95rem; margin-bottom: 2rem; }
+    h2 {
+      font-size: 1.35rem;
+      margin: 2.5rem 0 0.5rem;
+      padding-bottom: 0.4rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .description {
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin-bottom: 1rem;
+      max-width: 90ch;
+    }
+    .diagram-container {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.5rem;
+      margin: 1rem 0 2rem;
+      overflow-x: auto;
+    }
+    .mermaid { display: flex; justify-content: center; }
+    .cost-table { border-collapse: collapse; margin: 1rem 0; font-size: 0.9rem; }
+    .cost-table th, .cost-table td { padding: 0.5rem 1rem; border: 1px solid var(--border); text-align: left; }
+    .cost-table th { background: var(--surface); color: var(--accent); }
+    .cost-table td:last-child { font-family: monospace; }
+    .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
+    .badge-green { background: #23312a; color: var(--green); }
+    .badge-orange { background: #312d1f; color: var(--orange); }
+    .badge-red { background: #31201f; color: var(--red); }
+    .legend { display: flex; gap: 1.5rem; flex-wrap: wrap; margin: 0.75rem 0 1.5rem; font-size: 0.85rem; color: var(--muted); }
+    .legend span { display: flex; align-items: center; gap: 0.35rem; }
+    .callout {
+      background: #1a2636;
+      border-left: 3px solid var(--accent);
+      padding: 0.75rem 1rem;
+      margin: 1rem 0;
+      font-size: 0.9rem;
+      border-radius: 0 6px 6px 0;
+    }
+    footer {
+      margin-top: 3rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+  </style>
+</head>
+<body>
+
+<h1>Observe-Then-Act Architecture</h1>
+<p class="subtitle">GhostHands Hybrid Execution Engine &mdash; Section-level cookbook matching with LLM fallback</p>
+
+<div class="callout">
+  <strong>Key idea:</strong> Always start by observing the page tree. Break it into sections. Match each section against
+  the cookbook library. Matched sections replay for free. Unmatched sections fall back to GUI/Screenshot + LLM.
+  The LLM runs are recorded so next time those sections are free too.
+</div>
+
+
+<!-- ===== DIAGRAM 1: CORE FLOW ===== -->
+<h2>1. Core Flow &mdash; Observe, Decompose, Match, Execute</h2>
+<p class="description">
+  This is the main execution loop. Stagehand reads the page tree first, then we decide per-section
+  whether to use a cookbook or the LLM. There is no site-level cookbook check &mdash; matching is always
+  at section granularity.
+</p>
+<div class="diagram-container">
+  <pre class="mermaid">
+flowchart TD
+  START(["Job arrives — navigate to page"])
+  START --> OBS
+
+  subgraph OBSERVE["1. OBSERVE — Stagehand reads page tree"]
+    direction TB
+    OBS["StagehandObserver.observe&#40;&#41;<br/><i>Accessibility tree → text-only LLM</i><br/><b>~$0.0005</b>"]
+    OBS --> TREE["Page tree: selectors, labels,<br/>field types, descriptions"]
+  end
+
+  TREE --> DECOMP
+
+  subgraph DECOMPOSE["2. DECOMPOSE — Break into sections"]
+    direction TB
+    DECOMP["SectionDecomposer.decompose&#40;&#41;<br/><i>Group by headings, fieldsets, proximity</i><br/><b>$0.00</b>"]
+    DECOMP --> SECS["Sections:<br/>Personal Info | Education | Experience | Resume | ..."]
+  end
+
+  SECS --> MATCH
+
+  subgraph MATCHBOX["3. MATCH — Check each section against cookbook"]
+    direction TB
+    MATCH["For EACH section:<br/>compute signature → query ManualStore<br/><b>$0.00</b>"]
+    MATCH --> DEC{"Section has<br/>cookbook match?"}
+  end
+
+  DEC -- "YES — cookbook found<br/>(health &gt; 0.3)" --> COOK
+  DEC -- "NO — no match" --> LLM
+
+  subgraph COOKBOOK["4a. COOKBOOK REPLAY — Free execution"]
+    direction TB
+    COOK["Locate elements: selector → boundingBox&#40;&#41;<br/>Execute via Magnitude exec&#40;&#41;:<br/>• mouse:click — 20-step interpolation<br/>• keyboard:type — real keydown/keyup<br/>• Template substitution: &#123;&#123;email&#125;&#125; → user data"]
+    COOK --> COOKR["<b>$0.00 per section</b>"]
+  end
+
+  subgraph LLMBOX["4b. LLM FALLBACK — Screenshot + Vision LLM"]
+    direction TB
+    LLM["Magnitude act&#40;&#41; for this section only:<br/>Screenshot → Vision LLM → Action → Repeat<br/><br/>TraceRecorder captures every action<br/>→ saved as new section cookbook"]
+    LLM --> LLMR["<b>~$0.01–0.02 per section</b><br/><i>But next time: $0.00 &#40;cookbook&#41;</i>"]
+  end
+
+  COOKR --> VERIFY
+  LLMR --> VERIFY
+
+  subgraph VERIFYBOX["5. VERIFY — Re-observe and check"]
+    direction TB
+    VERIFY["StagehandObserver.observe&#40;&#41;<br/>Check: fields filled? errors? new page?<br/>BlockerDetector: captcha? login wall?<br/><b>~$0.0005</b>"]
+    VERIFY --> VDEC{"Result?"}
+  end
+
+  VDEC -- "More sections<br/>on this page" --> MATCH
+  VDEC -- "New page loaded" --> OBS
+  VDEC -- "HITL blocker" --> PAUSE(["Pause for human"])
+  VDEC -- "All sections done<br/>+ submit visible" --> SUBMIT["Click submit"]
+  SUBMIT --> DONE(["Job Complete"])
+
+  style OBSERVE fill:#1a2636,stroke:#58a6ff,color:#e6edf3
+  style DECOMPOSE fill:#1a2636,stroke:#58a6ff,color:#e6edf3
+  style MATCHBOX fill:#1a2636,stroke:#58a6ff,color:#e6edf3
+  style COOKBOOK fill:#1a2e1a,stroke:#3fb950,color:#e6edf3
+  style LLMBOX fill:#2e2a1a,stroke:#d29922,color:#e6edf3
+  style VERIFYBOX fill:#1a2636,stroke:#58a6ff,color:#e6edf3
+  style DONE fill:#23312a,stroke:#3fb950,color:#3fb950
+  style PAUSE fill:#312d1f,stroke:#d29922,color:#d29922
+  style START fill:#161b22,stroke:#8b949e,color:#e6edf3
+  </pre>
+</div>
+<div class="legend">
+  <span><span class="badge badge-green">Cookbook replay</span> $0.00 — exec() with recorded steps</span>
+  <span><span class="badge badge-orange">LLM fallback</span> $0.01–0.02 — screenshot + vision model</span>
+  <span>Blue steps are free or ~$0.0005 (text-only observation)</span>
+</div>
+
+
+<!-- ===== DIAGRAM 2: SEQUENCE ===== -->
+<h2>2. Detailed Sequence — Components and Data Flow</h2>
+<p class="description">
+  Shows which component does what, what data passes between them, and where money is spent.
+</p>
+<div class="diagram-container">
+  <pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant JE as JobExecutor
+  participant OAE as ObserveAndActEngine
+  participant SO as StagehandObserver
+  participant SD as SectionDecomposer
+  participant MS as ManualStore
+  participant PW as Playwright Page
+  participant MA as MagnitudeAdapter
+  participant TR as TraceRecorder
+  participant BD as BlockerDetector
+
+  JE->>OAE: fillPage(userData, adapter, observer)
+
+  rect rgb(26, 38, 54)
+  Note over OAE,BD: PAGE LOOP — repeat for each page in multi-page form
+
+    OAE->>SO: observe("find all form elements")
+    Note right of SO: Reads accessibility tree (free)<br/>Text-only LLM interprets (~$0.0005)
+    SO-->>OAE: ObservedElement[] — selectors, labels, types
+
+    OAE->>SD: decompose(elements)
+    Note right of SD: Groups by headings/fieldsets ($0.00)<br/>Computes section signatures
+    SD-->>OAE: PageSection[] — name, elements, signature hash
+
+    loop For each section on this page
+      OAE->>MS: lookupSection(signature, platform)
+      MS-->>OAE: SectionManual or null
+
+      alt MATCH — cookbook found (health > 0.3)
+        Note over OAE,MA: COOKBOOK REPLAY PATH ($0.00)
+        loop For each step in cookbook
+          OAE->>PW: page.$(selector) → boundingBox()
+          PW-->>OAE: {x, y} coordinates
+          OAE->>MA: exec({variant: "mouse:click", x, y})
+          Note right of MA: 20-step mouse interpolation
+          OAE->>MA: exec({variant: "keyboard:type", content})
+          Note right of MA: Character-by-character typing<br/>Real keydown/keyup events
+        end
+        OAE->>MS: recordSuccess(sectionManualId)
+
+      else NO MATCH — section unknown
+        Note over OAE,TR: LLM FALLBACK PATH ($0.01-0.02)
+        OAE->>TR: start() — begin recording actions
+        OAE->>MA: act("Fill the [section name] section with user data")
+        Note right of MA: Screenshot → Vision LLM → Plan → Execute<br/>Repeats until section complete
+        MA-->>OAE: section filled
+        OAE->>TR: stopRecording() → getTrace()
+        TR-->>OAE: ManualStep[] for this section
+        OAE->>MS: saveSectionFromTrace(steps, signature)
+        Note right of MS: Saved! Next time this section<br/>pattern is seen → $0.00
+      end
+    end
+
+    OAE->>SO: observe("verify page state")
+    SO-->>OAE: current state
+    OAE->>BD: detectBlockers(page)
+    BD-->>OAE: blockers[]
+
+    alt New page loaded
+      Note over OAE: Restart page loop →
+    else HITL blocker (captcha/login)
+      OAE-->>JE: pause for human intervention
+    else All done + submit visible
+      OAE->>MA: exec({variant: "mouse:click", x, y})
+      Note right of MA: Click submit button
+      OAE-->>JE: success
+    end
+
+  end
+  </pre>
+</div>
+
+
+<!-- ===== DIAGRAM 3: SECTION MATCHING ===== -->
+<h2>3. Section Matching — How Signatures Work</h2>
+<p class="description">
+  Each section is fingerprinted by its field types and normalized labels. This enables
+  cross-platform reuse — a "Personal Info" section on Workday matches the same section on Greenhouse.
+</p>
+<div class="diagram-container">
+  <pre class="mermaid">
+flowchart LR
+  subgraph PAGE["Page Tree (from Stagehand)"]
+    direction TB
+    H1["Section heading:<br/>'Personal Information'"]
+    F1["text input: 'First Name'"]
+    F2["text input: 'Last Name'"]
+    F3["email input: 'Email Address'"]
+    F4["tel input: 'Phone Number'"]
+    H2["Section heading:<br/>'Work Experience'"]
+    F5["text input: 'Company Name'"]
+    F6["text input: 'Job Title'"]
+    F7["date input: 'Start Date'"]
+    F8["textarea: 'Description'"]
+  end
+
+  subgraph SIG["Computed Signatures"]
+    direction TB
+    S1["<b>Section: Personal Information</b><br/>────────────────<br/>text:first_name<br/>text:last_name<br/>email:email<br/>tel:phone<br/>────────────────<br/>hash: a3f8c2..."]
+    S2["<b>Section: Work Experience</b><br/>────────────────<br/>text:company_name<br/>text:job_title<br/>date:start_date<br/>textarea:description<br/>────────────────<br/>hash: 7b1d4e..."]
+  end
+
+  subgraph STORE["ManualStore Lookup"]
+    direction TB
+    Q1{"hash: a3f8c2...<br/>in cookbook?"}
+    Q2{"hash: 7b1d4e...<br/>in cookbook?"}
+    Q1 -- "YES<br/>health: 92/100" --> M1["Replay 4 steps<br/><b>$0.00</b>"]
+    Q1 -- "NO" --> M1X["Magnitude act&#40;&#41;<br/>+ record trace<br/><b>~$0.02</b>"]
+    Q2 -- "YES<br/>health: 85/100" --> M2["Replay 4 steps<br/><b>$0.00</b>"]
+    Q2 -- "NO" --> M2X["Magnitude act&#40;&#41;<br/>+ record trace<br/><b>~$0.02</b>"]
+  end
+
+  H1 --> S1
+  F1 --> S1
+  F2 --> S1
+  F3 --> S1
+  F4 --> S1
+  H2 --> S2
+  F5 --> S2
+  F6 --> S2
+  F7 --> S2
+  F8 --> S2
+  S1 --> Q1
+  S2 --> Q2
+
+  style PAGE fill:#161b22,stroke:#30363d,color:#e6edf3
+  style SIG fill:#1a2636,stroke:#58a6ff,color:#e6edf3
+  style STORE fill:#161b22,stroke:#30363d,color:#e6edf3
+  style M1 fill:#1a2e1a,stroke:#3fb950,color:#e6edf3
+  style M2 fill:#1a2e1a,stroke:#3fb950,color:#e6edf3
+  style M1X fill:#2e2a1a,stroke:#d29922,color:#e6edf3
+  style M2X fill:#2e2a1a,stroke:#d29922,color:#e6edf3
+  </pre>
+</div>
+
+
+<!-- ===== DIAGRAM 4: SELF-LEARNING ===== -->
+<h2>4. Self-Learning Loop — How Costs Drop Over Time</h2>
+<p class="description">
+  Every LLM-handled section is recorded and becomes a cookbook entry. After a few runs
+  across different sites, most sections are covered and steady-state cost approaches $0.002/job.
+</p>
+<div class="diagram-container">
+  <pre class="mermaid">
+flowchart TD
+  subgraph RUN1["Run 1 — New site, no cookbooks"]
+    direction LR
+    R1A["Personal Info<br/><span style='color:#d29922'>LLM $0.02</span>"]
+    R1B["Education<br/><span style='color:#d29922'>LLM $0.02</span>"]
+    R1C["Experience<br/><span style='color:#d29922'>LLM $0.02</span>"]
+    R1D["Resume Upload<br/><span style='color:#d29922'>LLM $0.01</span>"]
+    R1E["EEO/Voluntary<br/><span style='color:#d29922'>LLM $0.01</span>"]
+  end
+
+  RUN1 -->|"TraceRecorder saves<br/>5 section cookbooks"| CB1[("Cookbook DB<br/>5 sections stored")]
+
+  subgraph RUN2["Run 2 — Same site"]
+    direction LR
+    R2A["Personal Info<br/><span style='color:#3fb950'>Cookbook $0.00</span>"]
+    R2B["Education<br/><span style='color:#3fb950'>Cookbook $0.00</span>"]
+    R2C["Experience<br/><span style='color:#3fb950'>Cookbook $0.00</span>"]
+    R2D["Resume Upload<br/><span style='color:#3fb950'>Cookbook $0.00</span>"]
+    R2E["EEO/Voluntary<br/><span style='color:#3fb950'>Cookbook $0.00</span>"]
+  end
+
+  CB1 --> RUN2
+
+  RUN2 -->|"All matched!"| CB2[("Cookbook DB<br/>5 sections, health +2 each")]
+
+  subgraph RUN3["Run 3 — DIFFERENT site, same ATS platform"]
+    direction LR
+    R3A["Personal Info<br/><span style='color:#3fb950'>Cookbook $0.00</span>"]
+    R3B["Education<br/><span style='color:#3fb950'>Cookbook $0.00</span>"]
+    R3C["Experience<br/><span style='color:#3fb950'>Cookbook $0.00</span>"]
+    R3D["Resume Upload<br/><span style='color:#3fb950'>Cookbook $0.00</span>"]
+    R3E["Diversity Survey<br/><span style='color:#d29922'>LLM $0.01</span><br/><i>new section type!</i>"]
+  end
+
+  CB2 --> RUN3
+
+  RUN3 -->|"1 new section saved"| CB3[("Cookbook DB<br/>6 section types covered")]
+
+  subgraph STEADY["Steady State — Most sections covered"]
+    direction LR
+    SSA["$0.002/job average<br/><span style='color:#3fb950'>98% sections from cookbook</span>"]
+    SSB["Rare novel fields<br/><span style='color:#d29922'>2% use LLM → auto-recorded</span>"]
+  end
+
+  CB3 --> STEADY
+
+  style RUN1 fill:#2e2a1a,stroke:#d29922,color:#e6edf3
+  style RUN2 fill:#1a2e1a,stroke:#3fb950,color:#e6edf3
+  style RUN3 fill:#1a2e1a,stroke:#3fb950,color:#e6edf3
+  style STEADY fill:#1a2e1a,stroke:#3fb950,color:#e6edf3
+  style CB1 fill:#161b22,stroke:#58a6ff,color:#e6edf3
+  style CB2 fill:#161b22,stroke:#58a6ff,color:#e6edf3
+  style CB3 fill:#161b22,stroke:#58a6ff,color:#e6edf3
+  </pre>
+</div>
+
+
+<!-- ===== DIAGRAM 5: COMPONENT MAP ===== -->
+<h2>5. Component Dependency Map</h2>
+<p class="description">
+  How the new components connect to existing ones.
+  Green = already built. Blue = new code.
+</p>
+<div class="diagram-container">
+  <pre class="mermaid">
+flowchart LR
+  subgraph NEW["New Components"]
+    direction TB
+    OAE["<b>ObserveAndActEngine</b><br/><i>Orchestrator</i>"]
+    SD["<b>SectionDecomposer</b><br/><i>Page tree → sections</i>"]
+    EXEC["<b>adapter.exec&#40;&#41;</b><br/><i>Passthrough to Magnitude</i>"]
+    SECMS["<b>ManualStore extensions</b><br/><i>Section-level lookupSection&#40;&#41;<br/>+ saveSectionFromTrace&#40;&#41;</i>"]
+  end
+
+  subgraph EXISTING["Existing Components (reuse)"]
+    direction TB
+    SO["StagehandObserver<br/><i>engine/StagehandObserver.ts</i>"]
+    MA["MagnitudeAdapter<br/><i>adapters/magnitude.ts</i>"]
+    CE["CookbookExecutor<br/><i>engine/CookbookExecutor.ts</i>"]
+    MS["ManualStore<br/><i>engine/ManualStore.ts</i>"]
+    TR["TraceRecorder<br/><i>engine/TraceRecorder.ts</i>"]
+    BD["BlockerDetector<br/><i>detection/BlockerDetector.ts</i>"]
+    CC["CostControl<br/><i>workers/CostControl.ts</i>"]
+    JE["JobExecutor<br/><i>workers/JobExecutor.ts</i>"]
+  end
+
+  JE -->|"invokes"| OAE
+  OAE -->|"observe&#40;&#41;"| SO
+  OAE -->|"decompose&#40;&#41;"| SD
+  OAE -->|"lookupSection&#40;&#41;"| SECMS
+  SECMS -->|"extends"| MS
+  OAE -->|"replay matched"| CE
+  OAE -->|"exec&#40;&#41; for replay"| EXEC
+  EXEC -->|"passthrough"| MA
+  OAE -->|"act&#40;&#41; for unmatched"| MA
+  OAE -->|"record LLM runs"| TR
+  TR -->|"save section"| SECMS
+  OAE -->|"detectBlockers&#40;&#41;"| BD
+  OAE -->|"trackCost&#40;&#41;"| CC
+
+  style NEW fill:#1a2636,stroke:#58a6ff,color:#e6edf3
+  style EXISTING fill:#1a2e1a,stroke:#3fb950,color:#e6edf3
+  </pre>
+</div>
+
+
+<!-- ===== DIAGRAM 6: BOT DETECTION ===== -->
+<h2>6. Bot Detection Profile — Why Hybrid is Better</h2>
+<p class="description">
+  The exec()-based replay produces more human-like browser signals than either Stagehand or Magnitude alone.
+</p>
+<div class="diagram-container">
+  <pre class="mermaid">
+flowchart TB
+  subgraph SH["Stagehand Default"]
+    direction TB
+    SH_C["Click: CDP dispatchMouseEvent<br/><b>Teleport to target</b>"]
+    SH_T["Type: Input.insertText<br/><b>Zero key events — detectable</b>"]
+    SH_M["Mouse: Single point jump<br/><b>No trajectory</b>"]
+  end
+
+  subgraph MG["Magnitude act&#40;&#41; Default"]
+    direction TB
+    MG_C["Click: page.mouse.click<br/>20-step interpolation"]
+    MG_T["Type: page.fill&#40;&#41;<br/><b>Zero key events — detectable</b>"]
+    MG_M["Mouse: 20-step move<br/>Realistic trajectory"]
+  end
+
+  subgraph HY["Our Hybrid — exec&#40;&#41; Replay"]
+    direction TB
+    HY_C["Click: exec mouse:click<br/>20-step interpolation"]
+    HY_T["Type: exec keyboard:type<br/><b>Real keydown/keyup per char</b>"]
+    HY_M["Mouse: 20-step move<br/>Realistic trajectory"]
+  end
+
+  style SH fill:#2e1a1a,stroke:#f85149,color:#e6edf3
+  style MG fill:#2e2a1a,stroke:#d29922,color:#e6edf3
+  style HY fill:#1a2e1a,stroke:#3fb950,color:#e6edf3
+  </pre>
+</div>
+
+
+<!-- ===== COST TABLE ===== -->
+<h2>7. Cost Summary</h2>
+
+<h3 style="font-size: 1rem; margin: 1rem 0 0.5rem; color: var(--accent);">Per-Job Cost (Steady State — Most Sections Matched)</h3>
+<table class="cost-table">
+  <thead>
+    <tr><th>Step</th><th>Calls/Job</th><th>Cost/Call</th><th>Total</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Stagehand observe (page tree)</td><td>1</td><td>$0.0005</td><td>$0.0005</td></tr>
+    <tr><td>Section decomposition</td><td>1</td><td>$0.00</td><td>$0.00</td></tr>
+    <tr><td>Cookbook signature lookup</td><td>~5</td><td>$0.00</td><td>$0.00</td></tr>
+    <tr><td>Playwright boundingBox (locate)</td><td>~20</td><td>$0.00</td><td>$0.00</td></tr>
+    <tr><td>Magnitude exec (click/type)</td><td>~20</td><td>$0.00</td><td>$0.00</td></tr>
+    <tr><td>Re-observe (verify)</td><td>~3</td><td>$0.0005</td><td>$0.0015</td></tr>
+    <tr><td><b>Steady-state total</b></td><td></td><td></td><td><b>$0.002</b></td></tr>
+  </tbody>
+</table>
+
+<h3 style="font-size: 1rem; margin: 1.5rem 0 0.5rem; color: var(--orange);">Per-Job Cost (First Run — No Cookbooks)</h3>
+<table class="cost-table">
+  <tbody>
+    <tr><td>Observation + decomposition</td><td>1</td><td>$0.0005</td><td>$0.0005</td></tr>
+    <tr><td>Magnitude act() per section (all unmatched)</td><td>3-5</td><td>$0.01-0.02</td><td>$0.03-0.10</td></tr>
+    <tr><td>Verify + re-observe</td><td>~3</td><td>$0.0005</td><td>$0.0015</td></tr>
+    <tr><td><b>First-run total</b></td><td></td><td></td><td><b>$0.03 – $0.10</b></td></tr>
+    <tr><td colspan="4"><i>All sections auto-saved as cookbooks for next time</i></td></tr>
+  </tbody>
+</table>
+
+<h3 style="font-size: 1rem; margin: 1.5rem 0 0.5rem; color: var(--text);">Monthly Cost at Scale (Steady State)</h3>
+<table class="cost-table">
+  <thead>
+    <tr><th>Jobs/Month</th><th>Current ($0.50/job)</th><th>Hybrid</th><th>Savings</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>100</td><td>$50</td><td>$0.20 – $1</td><td>98–99%</td></tr>
+    <tr><td>1,000</td><td>$500</td><td>$2 – $10</td><td>98–99%</td></tr>
+    <tr><td>10,000</td><td>$5,000</td><td>$20 – $100</td><td>98–99%</td></tr>
+  </tbody>
+</table>
+
+
+<!-- ===== IMPLEMENTATION PHASES ===== -->
+<h2>8. Implementation Roadmap</h2>
+<div class="diagram-container">
+  <pre class="mermaid">
+gantt
+  title Implementation Phases (4–5 days)
+  dateFormat X
+  axisFormat Day %s
+
+  section Phase 1 — Foundations
+    Expose exec() on MagnitudeAdapter    :done, p1, 0, 1
+    Enhance StagehandObserver metadata   :active, p1b, 0, 2
+
+  section Phase 2 — Section Engine
+    Build SectionDecomposer              :p2, 1, 3
+    Section-level ManualStore + DB table :p3, 1, 3
+
+  section Phase 3 — Orchestrator
+    Build ObserveAndActEngine            :p4, 3, 5
+
+  section Phase 4 — Integration
+    Wire into JobExecutor                :p5, 5, 6
+  </pre>
+</div>
+
+
+<!-- ===== DIAGRAM 8: DATA TRANSFORMS ===== -->
+<h2>9. Data at Each Step</h2>
+<p class="description">
+  What data transforms at each stage — from raw accessibility tree through section signatures to executed actions.
+</p>
+<div class="diagram-container">
+  <pre class="mermaid">
+flowchart LR
+  A["<b>OBSERVE</b><br/>───────────<br/>Accessibility tree<br/>↓<br/>Text-only LLM<br/>↓<br/><i>ObservedElement[]<br/>selector, description,<br/>action, fieldType</i>"]
+  B["<b>DECOMPOSE</b><br/>───────────<br/>Group by headings<br/>+ fieldsets<br/>↓<br/><i>PageSection[]<br/>name, elements[],<br/>signature hash</i>"]
+  C["<b>MATCH</b><br/>───────────<br/>signature hash<br/>↓<br/>ManualStore lookup<br/>↓<br/><i>matched[] with<br/>cookbook steps<br/>unmatched[]</i>"]
+  D["<b>EXECUTE</b><br/>───────────<br/>Matched → exec&#40;&#41;<br/>Unmatched → act&#40;&#41;<br/>↓<br/><i>Human-like input<br/>on real page<br/>+ trace recorded</i>"]
+  E["<b>VERIFY</b><br/>───────────<br/>Re-observe page<br/>↓<br/>Compare expected<br/>vs actual state<br/>↓<br/><i>OK / retry /<br/>next page</i>"]
+
+  A -->|"$0.0005"| B -->|"$0.00"| C -->|"$0.00"| D -->|"$0.00 or $0.01+"| E
+  E -->|"loop if<br/>new page"| A
+
+  style A fill:#1a2636,stroke:#58a6ff,color:#e6edf3
+  style B fill:#1a2636,stroke:#58a6ff,color:#e6edf3
+  style C fill:#1a2636,stroke:#58a6ff,color:#e6edf3
+  style D fill:#1a2e1a,stroke:#3fb950,color:#e6edf3
+  style E fill:#1a2636,stroke:#58a6ff,color:#e6edf3
+  </pre>
+</div>
+
+
+<footer>
+  GhostHands — Observe-Then-Act Architecture (v2, section-level matching)<br>
+  Generated 2026-02-26 &bull; Open this file in any browser to view
+</footer>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    themeVariables: {
+      primaryColor: '#1a2636',
+      primaryTextColor: '#e6edf3',
+      primaryBorderColor: '#58a6ff',
+      lineColor: '#58a6ff',
+      secondaryColor: '#1a2e1a',
+      tertiaryColor: '#2e1a1a',
+      noteBkgColor: '#161b22',
+      noteTextColor: '#e6edf3',
+      noteBorderColor: '#30363d',
+      actorBkg: '#161b22',
+      actorBorder: '#58a6ff',
+      actorTextColor: '#e6edf3',
+      signalColor: '#e6edf3',
+      signalTextColor: '#e6edf3',
+      labelBoxBkgColor: '#161b22',
+      labelBoxBorderColor: '#30363d',
+      labelTextColor: '#e6edf3',
+      loopTextColor: '#8b949e',
+      activationBkgColor: '#1a2636',
+      activationBorderColor: '#58a6ff',
+      sequenceNumberColor: '#0d1117',
+      sectionBkgColor: '#161b22',
+      altSectionBkgColor: '#1a2636',
+      taskBkgColor: '#58a6ff',
+      taskTextColor: '#0d1117',
+      taskBorderColor: '#58a6ff',
+      doneTaskBkgColor: '#3fb950',
+      doneTaskBorderColor: '#3fb950',
+      activeTaskBkgColor: '#d29922',
+      activeTaskBorderColor: '#d29922',
+      gridColor: '#30363d',
+      todayLineColor: '#f85149'
+    },
+    flowchart: { curve: 'basis', padding: 20 },
+    sequence: { mirrorActors: false, messageMargin: 40, actorMargin: 40 }
+  });
+</script>
+</body>
+</html>

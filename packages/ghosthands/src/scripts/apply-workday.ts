@@ -25,8 +25,29 @@ import { TEST_QA_OVERRIDES } from '../../__tests__/fixtures/workdayTestData.js';
 
 // --- Config ---
 
-const DEFAULT_WORKDAY_URL =
-  'https://workday.wd5.myworkdayjobs.com/en-US/Workday/job/Canada%2C-BC%2C-Vancouver/Software-Engineer-III-Senior-Software-Engineer--Full-Stack-_JR-0103512/apply/applyManually?q=software+engineer';
+//const DEFAULT_WORKDAY_URL =
+//   'https://workday.wd5.myworkdayjobs.com/en-US/Workday/job/Canada%2C-BC%2C-Vancouver/Software-Engineer-III-Senior-Software-Engineer--Full-Stack-_JR-0103512/apply/applyManually?q=software+engineer';
+
+const DEFAULT_URL =
+  'https://job-boards.greenhouse.io/samsungsemiconductor/jobs/7641072003?utm_source=Simplify&ref=Simplify';
+
+// --- Platform detection ---
+
+function detectPlatform(url: string): { jobType: string; platform: string } {
+  if (url.includes('myworkdayjobs.com') || url.includes('workday.com')) {
+    return { jobType: 'workday_apply', platform: 'workday' };
+  }
+  if (url.includes('greenhouse.io')) {
+    return { jobType: 'apply', platform: 'greenhouse' };
+  }
+  if (url.includes('lever.co')) {
+    return { jobType: 'apply', platform: 'lever' };
+  }
+  if (url.includes('linkedin.com')) {
+    return { jobType: 'apply', platform: 'linkedin' };
+  }
+  return { jobType: 'apply', platform: 'other' };
+}
 
 // --- Parse args ---
 
@@ -126,20 +147,21 @@ async function main() {
 
   // 3. Build job input data
   const targetWorkerId = parseArg('worker-id') || null;
-  const targetUrl = parseArg('url') || DEFAULT_WORKDAY_URL;
+  const targetUrl = parseArg('url') || DEFAULT_URL;
+  const { jobType, platform } = detectPlatform(targetUrl);
 
   const inputData = {
     user_data: profile,
     qa_overrides: TEST_QA_OVERRIDES,
     tier: 'starter',
-    platform: 'workday',
+    platform,
   };
 
   // Build resume_ref from VALET's file_key (compatible with ResumeDownloader)
   const resumeRef = fileKey ? { storage_path: fileKey } : null;
 
   const taskDescription = [
-    'Fill out the entire Workday job application.',
+    `Fill out the entire ${platform} job application.`,
     'Sign in using "Sign in with Google" if prompted.',
     'Fill all required fields using the provided user data.',
     'For any optional self-identification questions, select "I do not wish to answer".',
@@ -150,7 +172,7 @@ async function main() {
   const client = new PgClient({ connectionString: dbUrl });
   await client.connect();
 
-  console.log('\nCreating Workday application job...\n');
+  console.log(`\nCreating ${platform} application job (handler: ${jobType})...\n`);
 
   try {
     const queryResult = await client.query(
@@ -161,35 +183,38 @@ async function main() {
         timeout_seconds, max_retries, priority,
         target_worker_id, tags, resume_ref
       ) VALUES (
-        'workday_apply',
         $1,
         $2,
-        $3::jsonb,
-        $4,
+        $3,
+        $4::jsonb,
+        $5,
         'pending',
         1800, 1, 1,
-        $5,
-        $6::jsonb,
-        $7::jsonb
+        $6,
+        $7::jsonb,
+        $8::jsonb
       )
       RETURNING id, status, target_url, target_worker_id
     `,
       [
+        jobType,
         targetUrl,
         taskDescription,
         JSON.stringify(inputData),
         userId,
         targetWorkerId,
-        JSON.stringify(['workday', 'test']),
+        JSON.stringify([platform, 'test']),
         resumeRef ? JSON.stringify(resumeRef) : null,
       ],
     );
 
     const job = queryResult.rows[0];
-    console.log('Workday application job created!\n');
+    console.log(`${platform} application job created!\n`);
     console.log(`   Job ID:     ${job.id}`);
     console.log(`   Status:     ${job.status}`);
     console.log(`   URL:        ${job.target_url}`);
+    console.log(`   Handler:    ${jobType}`);
+    console.log(`   Platform:   ${platform}`);
     console.log(`   Applicant:  ${profile.first_name} ${profile.last_name}`);
     console.log(`   Email:      ${profile.email}`);
     if (job.target_worker_id) {
@@ -200,7 +225,7 @@ async function main() {
     console.log(`   Resume:     ${fileKey ? 'attached' : 'none'}`);
     console.log(`   Timeout:    600s (10 minutes)`);
     console.log('\n   The worker will:');
-    console.log('     1. Navigate to the Workday listing');
+    console.log(`     1. Navigate to the ${platform} listing`);
     console.log('     2. Click Apply');
     console.log('     3. Sign in with Google (using stored session)');
     console.log('     4. Fill out all application pages');

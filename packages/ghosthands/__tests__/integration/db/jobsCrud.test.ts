@@ -8,35 +8,37 @@
  *   bun run test:integration -- __tests__/integration/db/jobsCrud.test.ts
  */
 
-import { describe, test, expect, beforeAll, afterAll } from 'vitest';
+import { describe, test, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import {
   getTestSupabase,
   buildJobRow,
   insertTestJobs,
-  cleanupByJobType,
-  TEST_USER_ID,
-  TEST_USER_ID_2,
 } from '../../e2e/helpers';
 
 const hasSupabase = !!process.env.SUPABASE_URL;
 
+// Unique user ID for this file — avoids cross-file interference when tests run in parallel
+const CRUD_TEST_USER_ID = '00000000-0000-0000-0000-000000000099';
+
 const JOB_TYPE = 'db_regression_test';
+const JOB_TYPE_FILTER = 'db_regression_test_filter';
+const JOB_TYPE_SCHEDULED = 'db_regression_test_scheduled';
+const ALL_JOB_TYPES = [JOB_TYPE, JOB_TYPE_FILTER, JOB_TYPE_SCHEDULED];
 
 describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
   const supabase = getTestSupabase();
 
-  beforeAll(async () => {
-    await cleanupByJobType(supabase, JOB_TYPE);
-    // Clean up ancillary tables for test user
-    await supabase.from('gh_user_usage').delete().eq('user_id', TEST_USER_ID);
-    await supabase.from('gh_browser_sessions').delete().eq('user_id', TEST_USER_ID);
-  });
+  // Batch cleanup: single DELETE per table using .in() instead of per-type loop.
+  // gh_job_events cascade-deletes when parent job is removed.
+  async function cleanAll() {
+    await supabase.from('gh_automation_jobs').delete().in('job_type', ALL_JOB_TYPES);
+    await supabase.from('gh_user_usage').delete().eq('user_id', CRUD_TEST_USER_ID);
+    await supabase.from('gh_browser_sessions').delete().eq('user_id', CRUD_TEST_USER_ID);
+  }
 
-  afterAll(async () => {
-    await cleanupByJobType(supabase, JOB_TYPE);
-    await supabase.from('gh_user_usage').delete().eq('user_id', TEST_USER_ID);
-    await supabase.from('gh_browser_sessions').delete().eq('user_id', TEST_USER_ID);
-  });
+  beforeAll(cleanAll);
+  beforeEach(cleanAll);
+  afterAll(cleanAll);
 
   // ── DB-001: gh_automation_jobs CRUD ──────────────────────────────────────
 
@@ -159,18 +161,14 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
   // ── DB-005: gh_user_usage cost accumulation ──────────────────────────────
 
   test('DB-005: gh_user_usage — cost accumulates on upsert', async () => {
-    const now = new Date();
-    const periodStart = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1),
-    ).toISOString();
-    const periodEnd = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1),
-    ).toISOString();
+    // Use fixed dates to avoid month-boundary flakiness
+    const periodStart = '2025-01-01T00:00:00.000Z';
+    const periodEnd = '2025-02-01T00:00:00.000Z';
 
     // First upsert — sets initial cost
     await supabase.from('gh_user_usage').upsert(
       {
-        user_id: TEST_USER_ID,
+        user_id: CRUD_TEST_USER_ID,
         tier: 'starter',
         period_start: periodStart,
         period_end: periodEnd,
@@ -185,7 +183,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     // Second upsert — accumulate cost
     await supabase.from('gh_user_usage').upsert(
       {
-        user_id: TEST_USER_ID,
+        user_id: CRUD_TEST_USER_ID,
         tier: 'starter',
         period_start: periodStart,
         period_end: periodEnd,
@@ -200,7 +198,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     const { data } = await supabase
       .from('gh_user_usage')
       .select('total_cost_usd, job_count')
-      .eq('user_id', TEST_USER_ID)
+      .eq('user_id', CRUD_TEST_USER_ID)
       .eq('period_start', periodStart)
       .single();
 
@@ -213,19 +211,15 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
   // ── DB-006: gh_user_usage upsert conflict ────────────────────────────────
 
   test('DB-006: gh_user_usage — upsert on (user_id, period_start) updates not duplicates', async () => {
-    const now = new Date();
-    const periodStart = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1),
-    ).toISOString();
-    const periodEnd = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1),
-    ).toISOString();
+    // Use fixed dates different from DB-005 to avoid cross-test interference
+    const periodStart = '2025-03-01T00:00:00.000Z';
+    const periodEnd = '2025-04-01T00:00:00.000Z';
 
     // Upsert twice with same user+period
     for (const cost of [1.0, 2.0]) {
       await supabase.from('gh_user_usage').upsert(
         {
-          user_id: TEST_USER_ID,
+          user_id: CRUD_TEST_USER_ID,
           tier: 'starter',
           period_start: periodStart,
           period_end: periodEnd,
@@ -242,7 +236,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     const { data } = await supabase
       .from('gh_user_usage')
       .select('*')
-      .eq('user_id', TEST_USER_ID)
+      .eq('user_id', CRUD_TEST_USER_ID)
       .eq('period_start', periodStart);
 
     expect(data).toHaveLength(1);
@@ -257,7 +251,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     // First upsert
     const { error: err1 } = await supabase.from('gh_browser_sessions').upsert(
       {
-        user_id: TEST_USER_ID,
+        user_id: CRUD_TEST_USER_ID,
         domain,
         session_data: 'encrypted-v1',
         encryption_key_id: 'test-key-v1',
@@ -270,7 +264,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     // Second upsert — same user+domain
     const { error: err2 } = await supabase.from('gh_browser_sessions').upsert(
       {
-        user_id: TEST_USER_ID,
+        user_id: CRUD_TEST_USER_ID,
         domain,
         session_data: 'encrypted-v2',
         encryption_key_id: 'test-key-v1',
@@ -284,7 +278,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     const { data } = await supabase
       .from('gh_browser_sessions')
       .select('*')
-      .eq('user_id', TEST_USER_ID)
+      .eq('user_id', CRUD_TEST_USER_ID)
       .eq('domain', domain);
 
     expect(data).toHaveLength(1);
@@ -294,20 +288,30 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     await supabase
       .from('gh_browser_sessions')
       .delete()
-      .eq('user_id', TEST_USER_ID)
+      .eq('user_id', CRUD_TEST_USER_ID)
       .eq('domain', domain);
   });
 
   // ── DB-008: Filter jobs by status ────────────────────────────────────────
 
   test('DB-008: filter jobs by status — returns only matching', async () => {
-    const inserted = await insertTestJobs(supabase, [
-      { job_type: JOB_TYPE, status: 'pending' },
-      { job_type: JOB_TYPE, status: 'completed' },
-      { job_type: JOB_TYPE, status: 'failed' },
-    ]);
+    // Insert one at a time to avoid batch issues, then update statuses
+    const [job1] = await insertTestJobs(supabase, { job_type: JOB_TYPE_FILTER, status: 'pending' });
+    const [job2] = await insertTestJobs(supabase, { job_type: JOB_TYPE_FILTER, status: 'pending' });
+    const [job3] = await insertTestJobs(supabase, { job_type: JOB_TYPE_FILTER, status: 'pending' });
 
-    const insertedIds = inserted.map((j) => j.id as string);
+    // Update statuses after insert to avoid any insert-time constraints
+    await supabase.from('gh_automation_jobs').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('id', job2.id as string);
+    await supabase.from('gh_automation_jobs').update({ status: 'failed', completed_at: new Date().toISOString(), error_code: 'test_error' }).eq('id', job3.id as string);
+
+    const insertedIds = [job1.id as string, job2.id as string, job3.id as string];
+
+    // Verify all 3 rows exist
+    const { data: allRows } = await supabase
+      .from('gh_automation_jobs')
+      .select('id, status')
+      .in('id', insertedIds);
+    expect(allRows).toHaveLength(3);
 
     // Query for pending jobs scoped to the rows we just inserted
     const { data: pending, error } = await supabase
@@ -319,8 +323,6 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     expect(error).toBeNull();
     expect(pending).not.toBeNull();
     expect(pending!.length).toBe(1);
-
-    // The single returned row should be the pending one
     expect(pending![0].status).toBe('pending');
   });
 
@@ -331,7 +333,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     const now = new Date().toISOString();
 
     const [futureJob] = await insertTestJobs(supabase, {
-      job_type: JOB_TYPE,
+      job_type: JOB_TYPE_SCHEDULED,
       scheduled_at: futureTime,
       status: 'pending',
     });
@@ -340,7 +342,7 @@ describe.skipIf(!hasSupabase)('DB Integration — gh_ tables CRUD', () => {
     const { data: ready } = await supabase
       .from('gh_automation_jobs')
       .select('id')
-      .eq('job_type', JOB_TYPE)
+      .eq('job_type', JOB_TYPE_SCHEDULED)
       .eq('status', 'pending')
       .or(`scheduled_at.is.null,scheduled_at.lte.${now}`);
 

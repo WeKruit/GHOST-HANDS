@@ -21,6 +21,7 @@ import type { Page } from 'playwright';
 import type { ZodSchema } from 'zod';
 import EventEmitter from 'eventemitter3';
 import { loadModelConfig, type ResolvedModel } from '../config/models';
+import { createActMutex, acquireActMutex, releaseActMutex, poisonActMutex, refreshActMutex, type ActMutexState } from './actMutex';
 
 export class MagnitudeAdapter implements HitlCapableAdapter {
   readonly type = 'magnitude' as const;
@@ -38,6 +39,8 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
   private _pauseGateResolve: (() => void) | null = null;
   private _pauseGate: Promise<void> | null = null;
   private _lastResolutionContext: ResolutionContext | null = null;
+  /** Mutex to prevent concurrent act() calls when a previous one timed out */
+  private _actMutex: ActMutexState = createActMutex();
 
   async start(options: AdapterStartOptions): Promise<void> {
     // Resolve model configs to get pricing info for cost calculation
@@ -152,34 +155,70 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
   }
 
   async act(instruction: string, context?: ActionContext): Promise<ActionResult> {
+    // Mutex guard — throw if a previous act() timed out and is still running.
+    // Throwing (not returning { success: false }) ensures ALL callers see the failure,
+    // including smartApplyHandler.safeAct() which ignores ActionResult.success.
+    const blocked = await acquireActMutex(this._actMutex);
+    if (blocked) {
+      throw new Error(blocked);
+    }
+
     const start = Date.now();
-    const ACT_TIMEOUT_MS = context?.timeoutMs ?? 60_000; // default 60s per act() call
+    const ACT_TIMEOUT_MS = context?.timeoutMs ?? 60_000;
     try {
+      const actPromise = this.requireAgent().act(instruction, {
+        prompt: context?.prompt,
+        data: context?.data,
+      });
+      this._actMutex.pendingAct = actPromise;
       await Promise.race([
-        this.requireAgent().act(instruction, {
-          prompt: context?.prompt,
-          data: context?.data,
-        }),
+        actPromise,
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error(`act() timed out after ${ACT_TIMEOUT_MS}ms`)), ACT_TIMEOUT_MS),
         ),
       ]);
+      releaseActMutex(this._actMutex);
       return {
         success: true,
         message: `Completed: ${instruction}`,
         durationMs: Date.now() - start,
       };
     } catch (error) {
-      return {
-        success: false,
-        message: (error as Error).message,
-        durationMs: Date.now() - start,
-      };
+      const msg = (error as Error).message;
+      if (msg.includes('timed out')) {
+        // Timeout — poison the mutex and THROW so ALL callers see the failure.
+        // Returning { success: false } is silently ignored by smartApplyHandler.safeAct()
+        // and bare adapter.act() call sites. Throwing propagates through every code path.
+        poisonActMutex(this._actMutex, this._actMutex.pendingAct!);
+        throw error;
+      }
+      releaseActMutex(this._actMutex);
+      // Non-timeout failure — throw so callers see the failure.
+      // Same rationale as timeout: returning { success: false } is silently
+      // ignored by smartApplyHandler.safeAct() and bare adapter.act() call sites.
+      throw error;
     }
   }
 
   async extract<T>(instruction: string, schema: ZodSchema<T>): Promise<T> {
     return this.requireAgent().extract(instruction, schema);
+  }
+
+  /**
+   * Execute a low-level action directly, bypassing the LLM planning loop.
+   * Used by v3 MagnitudeHand for individual click/type/scroll at known targets.
+   * This is dramatically cheaper than act() since it skips screenshot→LLM cycles.
+   */
+  async exec(action: { variant: string; [key: string]: unknown }): Promise<void> {
+    // Run recovery check — if a timed-out act() has since settled, clear the poison
+    // so the cheap exec() path isn't permanently blocked for the rest of the run.
+    await refreshActMutex(this._actMutex);
+    // Gate on the same mutex — exec() fires clicks/types against the same page,
+    // so it must not run while a previous act() is still in flight.
+    if (this._actMutex.poisoned || this._actMutex.actInFlight) {
+      throw new Error('adapter busy: cannot exec() while act() is in flight or poisoned');
+    }
+    await this.requireAgent().exec(action);
   }
 
   /** Attach a StagehandObserver to enable observe() support. */

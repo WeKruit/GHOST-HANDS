@@ -125,15 +125,36 @@ export class PgBossConsumer {
     const ghJobId = payload.ghJobId;
     const queueName = job.name;
 
-    // Concurrency guard: if already processing a job, re-enqueue and return
+    // Concurrency guard: if already processing a job, check before re-enqueueing
     if (this.processing) {
-      logger.warn('Worker busy, re-enqueueing job', {
+      logger.warn('Worker busy, checking if job should be re-enqueued', {
         pgBossJobId: job.id,
         ghJobId,
         queueName,
         workerId: this.workerId,
       });
+
+      // Check if the job is still claimable before re-enqueueing to avoid duplicates
+      try {
+        const statusCheck = await this.pgDirect.query(
+          `SELECT status FROM gh_automation_jobs WHERE id = $1 LIMIT 1`,
+          [ghJobId],
+        );
+        const currentStatus = statusCheck.rows?.[0]?.status;
+        if (currentStatus && !['pending', 'queued'].includes(currentStatus)) {
+          logger.info('Skipping re-enqueue — job already in non-claimable state', {
+            ghJobId, currentStatus, workerId: this.workerId,
+          });
+          return;
+        }
+      } catch (err) {
+        logger.warn('Status check failed, re-enqueueing anyway', {
+          ghJobId, error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
       await this.boss.send(queueName, payload);
+      logger.info('Re-enqueued job', { ghJobId, queueName, workerId: this.workerId });
       return;
     }
 
