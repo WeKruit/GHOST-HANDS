@@ -579,3 +579,87 @@ export async function finalizeHandlerResult(
 
   return { awaitingReview: false };
 }
+
+// ---------------------------------------------------------------------------
+// Side-effects-only finalization (for Mastra failure → retry path)
+// ---------------------------------------------------------------------------
+
+/**
+ * Perform handler finalization side effects WITHOUT writing job status.
+ *
+ * Used by the Mastra path when the handler failed, so that error classification
+ * and retry logic in JobExecutor.handleJobError() can run instead of the
+ * hardcoded 'failed' write in finalizeHandlerResult().
+ *
+ * Side effects performed:
+ * 1. Take final screenshot and upload
+ * 2. Save browser session
+ * 3. Save fresh session cookies
+ * 4. Persist final_mode and engine/cost metadata
+ */
+export async function finalizeHandlerSideEffects(
+  input: CommonFinalizationInput & {
+    taskResult: TaskResult;
+    finalMode: string;
+    engineResult: ExecutionResult;
+  },
+): Promise<{ screenshotUrls: string[]; finalCost: CostSnapshot }> {
+  const {
+    job,
+    adapter,
+    costTracker,
+    sessionManager,
+    supabase,
+    logEvent,
+    uploadScreenshot,
+    taskResult,
+    finalMode,
+    engineResult,
+  } = input;
+
+  // 1. Take final screenshot and upload
+  const screenshotUrls: string[] = [];
+  if (taskResult.screenshotUrl) {
+    screenshotUrls.push(taskResult.screenshotUrl);
+  }
+  const screenshotUrl = await captureAndUpload(adapter, job.id, 'final', uploadScreenshot);
+  if (screenshotUrl) {
+    screenshotUrls.push(screenshotUrl);
+  }
+
+  // 2. Save browser session
+  await saveBrowserSession(adapter, sessionManager, job.user_id, job.target_url, job.id, logEvent);
+
+  // 3. Get final cost snapshot
+  const finalCost = costTracker.getSnapshot();
+
+  // 4. Save fresh session cookies (Google + target domain)
+  await saveFreshSessionCookies(adapter, sessionManager, job.user_id, job.target_url);
+
+  // 5. Persist final_mode and engine/cost metadata
+  await supabase
+    .from('gh_automation_jobs')
+    .update({
+      final_mode: finalMode,
+      screenshot_urls: screenshotUrls,
+      metadata: {
+        ...(job.metadata || {}),
+        engine: {
+          manual_id: engineResult.manualId || null,
+          manual_status: engineResult.manualId ? 'cookbook_failed_fallback' : 'no_manual_available',
+          fallback_reason: engineResult.error || null,
+        },
+        cost_breakdown: {
+          cookbook_steps: engineResult.cookbookSteps,
+          magnitude_steps: finalCost.actionCount,
+          cookbook_cost_usd: 0,
+          magnitude_cost_usd: finalCost.totalCost,
+          image_cost_usd: finalCost.imageCost,
+          reasoning_cost_usd: finalCost.reasoningCost,
+        },
+      },
+    })
+    .eq('id', job.id);
+
+  return { screenshotUrls, finalCost };
+}

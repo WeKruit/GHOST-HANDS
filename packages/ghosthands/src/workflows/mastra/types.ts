@@ -76,6 +76,8 @@ export interface RuntimeContext {
   resumeFilePath: string | null;
   supabase: SupabaseClient;
   logEvent: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
+  workerId: string;
+  uploadScreenshot?: (jobId: string, name: string, buffer: Buffer) => Promise<string>;
 }
 
 // ---------------------------------------------------------------------------

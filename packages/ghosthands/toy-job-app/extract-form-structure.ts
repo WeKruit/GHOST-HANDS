@@ -59,6 +59,8 @@ export const INTERACTIVE_SELECTOR = [
   '[role="spinbutton"]',
   '[role="slider"]',
   '[role="searchbox"]',
+  '[data-uxi-widget-type="selectinput"]',
+  '[aria-haspopup="listbox"]',
 ].join(", ");
 
 export const PLACEHOLDER_RE = /^(select|choose|pick|--|—)/i;
@@ -174,6 +176,9 @@ export async function extractFields(page: Page): Promise<FormField[]> {
       // Skip elements inside intl-tel-input dropdown panels (country code picker internals)
       if (el.closest('.iti__dropdown-content'))
         return true;
+      // Skip elements inside Workday dropdown portals (activeListContainer)
+      if (el.closest('[data-automation-id="activeListContainer"]'))
+        return true;
       // Skip standalone role="listbox" inside a role="combobox" (it's the popup)
       if (
         el.getAttribute("role") === "listbox" &&
@@ -230,6 +235,9 @@ export async function extractFields(page: Page): Promise<FormField[]> {
         if (role === "textbox") return "text";
         if (role === "combobox") return "select";
         if (role === "listbox") return "select";
+        // Workday-style searchable dropdowns
+        if (el.getAttribute("data-uxi-widget-type") === "selectinput") return "select";
+        if (el.getAttribute("aria-haspopup") === "listbox") return "select";
         if (role === "radio") return "radio";
         if (role === "checkbox") return "checkbox";
         if (role === "spinbutton") return "number";
@@ -322,6 +330,15 @@ export async function extractFields(page: Page): Promise<FormField[]> {
             )
               .map((o: any) => getOptionMainText(o))
               .filter(Boolean);
+          }
+          // Workday portal fallback: options render in a reusable activeListContainer
+          if (!opts.length) {
+            const portal = document.querySelector('[data-automation-id="activeListContainer"]');
+            if (portal) {
+              opts = Array.from(portal.querySelectorAll('[role="option"], [data-automation-id*="promptOption"]'))
+                .map((o: any) => o.textContent?.trim() ?? '')
+                .filter(Boolean);
+            }
           }
         }
         if (opts.length) entry.options = opts;
@@ -738,6 +755,102 @@ export async function clickComboboxTrigger(page: Page, id: string): Promise<void
     }
   }
   await page.waitForTimeout(300);
+}
+
+// ── Workday activeListContainer helpers ──────────────────────
+
+/** Read de-duplicated option texts from any visible dropdown (Workday portal, ARIA listbox, or generic). */
+export async function readActiveListOptions(page: Page): Promise<string[]> {
+  const raw = await page.evaluate(() => {
+    const results: string[] = [];
+    function collect(items: Element[]) {
+      for (const o of items) {
+        const r = (o as HTMLElement).getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        const t = (o.textContent || "").trim();
+        if (t && t.length < 200) results.push(t);
+      }
+    }
+
+    // 1. Workday activeListContainer portal
+    const container = document.querySelector('[data-automation-id="activeListContainer"]');
+    if (container) {
+      let items = Array.from(container.querySelectorAll('[role="option"]'));
+      if (items.length === 0) {
+        items = Array.from(container.querySelectorAll(
+          '[data-automation-id="promptOption"], [data-automation-id="menuItem"]'
+        ));
+      }
+      collect(items);
+    }
+
+    // 2. Any visible [role="listbox"] on the page
+    if (results.length === 0) {
+      const listboxes = document.querySelectorAll('[role="listbox"]');
+      for (const lb of listboxes) {
+        const r = (lb as HTMLElement).getBoundingClientRect();
+        if (r.height > 0) {
+          collect(Array.from(lb.querySelectorAll('[role="option"]')));
+        }
+      }
+    }
+
+    // 3. Any visible standalone [role="option"] elements
+    if (results.length === 0) {
+      collect(Array.from(document.querySelectorAll('[role="option"]')).filter(el => {
+        const r = (el as HTMLElement).getBoundingClientRect();
+        return r.height > 0;
+      }));
+    }
+
+    return [...new Set(results)];
+  });
+  return raw;
+}
+
+/** Click an option inside a dropdown (Workday portal, ARIA listbox, or generic).
+ *  Uses Playwright locators since page.evaluate el.click() doesn't fire React handlers. */
+export async function clickActiveListOption(page: Page, text: string): Promise<boolean> {
+  const exactRe = new RegExp(`^\\s*${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i');
+  try {
+    // Try activeListContainer portal first (Workday searchable selectinput dropdowns)
+    const portal = page.locator('[data-automation-id="activeListContainer"]');
+    if (await portal.count() > 0) {
+      let option = portal.locator(`[role="option"]`).filter({ hasText: exactRe }).first();
+      if (await option.count() === 0) {
+        option = portal.locator(`[data-automation-id="promptOption"], [data-automation-id="menuItem"]`)
+          .filter({ hasText: exactRe }).first();
+      }
+      if (await option.count() > 0) {
+        await option.click({ timeout: 2000 });
+        return true;
+      }
+      // Substring fallback in portal
+      option = portal.locator(`[role="option"]`).filter({ hasText: text }).first();
+      if (await option.count() > 0) {
+        await option.click({ timeout: 2000 });
+        return true;
+      }
+    }
+
+    // Try visible [role="listbox"] [role="option"]
+    const listbox = page.locator('[role="listbox"]:visible [role="option"]').filter({ hasText: exactRe }).first();
+    if (await listbox.count() > 0) {
+      await listbox.click({ timeout: 2000 });
+      return true;
+    }
+
+    // Broader: any visible [role="option"]
+    const anyOption = page.locator('[role="option"]:visible').filter({ hasText: exactRe }).first();
+    if (await anyOption.count() > 0) {
+      await anyOption.click({ timeout: 2000 });
+      return true;
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 export async function selectOption(
