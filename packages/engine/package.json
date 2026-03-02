@@ -4,6 +4,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": ["dist", "MANIFEST.json"],
+  "description": "Job application automation engine for GH-Desktop-App",
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build"
