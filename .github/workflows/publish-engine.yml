@@ -146,7 +146,7 @@ jobs:
           else
             echo "has_previous=false" >> "$GITHUB_OUTPUT"
             echo "diff_stat=Initial publish (no previous version)" >> "$GITHUB_OUTPUT"
-            echo "diff_files=\"(initial publish)\"" >> "$GITHUB_OUTPUT"
+            echo 'diff_files="(initial publish)"' >> "$GITHUB_OUTPUT"
             echo "compare_url=" >> "$GITHUB_OUTPUT"
           fi
 
@@ -160,6 +160,7 @@ jobs:
       - name: Write traceability artifacts
         if: steps.check.outputs.skip == 'false'
         id: trace
+        continue-on-error: true
         working-directory: packages/engine
         run: |
           jq -n \
@@ -179,7 +180,7 @@ jobs:
             }' > /tmp/engine-trace.json
 
       - name: Upload traceability artifact
-        if: steps.check.outputs.skip == 'false'
+        if: steps.check.outputs.skip == 'false' && steps.trace.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: engine-trace-${{ steps.meta.outputs.version }}
