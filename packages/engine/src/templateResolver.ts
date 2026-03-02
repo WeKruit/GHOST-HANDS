@@ -1,6 +1,4 @@
-/**
- * templateResolver — Pure function for {{variable}} to value substitution.
- */
+/** templateResolver — Pure function for {{variable}} to value substitution. */
 
 export function resolveTemplate(template: string, data: Record<string, string>): string {
   return template.replace(/\{\{(\w+)\}\}/g, (match, key) => {

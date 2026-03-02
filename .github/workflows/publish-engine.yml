@@ -192,7 +192,7 @@ jobs:
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.DESKTOP_REPO_PAT }}
-          repository: WeKruit/GH-Desktop-App-1
+          repository: WeKruit/GH-Desktop-App
           event-type: engine-updated
           client-payload: >-
             {
