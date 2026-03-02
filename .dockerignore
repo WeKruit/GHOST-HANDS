@@ -11,8 +11,15 @@
 
 # Environment files (secrets set via Fly.io / env vars)
 .env
+.env.*
 .env.local
 .env.*.local
+
+# Secrets and local-only files
+api_key_secret
+*_secret
+*.pem
+*.key
 
 # IDE
 .vscode
@@ -31,6 +38,12 @@ test/
 test-*.ts
 __tests__/
 *.test.ts
+
+# Claude Code / tooling
+.claude/
+
+# GitHub Actions (not needed in image)
+.github/
 
 # OS files
 .DS_Store
