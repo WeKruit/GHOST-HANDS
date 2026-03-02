@@ -57,7 +57,7 @@ export async function claimResume(
     SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{resume_requested}', 'false'::jsonb, true)
     WHERE id = $1::uuid
       AND execution_mode = 'mastra'
-      AND status IN ('pending', 'queued')
+      AND status IN ('pending', 'queued', 'running')
       AND metadata->>'mastra_run_id' = $2
       AND COALESCE((metadata->>'resume_requested')::boolean, false) = true
     RETURNING metadata;

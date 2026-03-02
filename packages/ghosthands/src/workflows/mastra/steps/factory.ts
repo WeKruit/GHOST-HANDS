@@ -397,7 +397,18 @@ export function buildSteps(rt: RuntimeContext) {
         resumeFilePath: rt.resumeFilePath,
       };
 
-      const result = await rt.handler.execute(ctx);
+      let result: Awaited<ReturnType<typeof rt.handler.execute>>;
+      try {
+        result = await rt.handler.execute(ctx);
+      } catch (handlerError) {
+        const msg = handlerError instanceof Error ? handlerError.message : String(handlerError);
+        logger.error('Handler threw an unhandled exception', { jobId: state.jobId, error: msg });
+        result = {
+          success: false,
+          error: msg,
+          data: { unhandled_exception: true },
+        };
+      }
 
       // Map TaskResult to handler state fields
       state.handler = {

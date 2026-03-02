@@ -7,6 +7,7 @@
  * Exports a single entry point `fillFormOnPage()` that:
  *   1. Injects browser-side helpers and extracts all form fields
  *   2. Discovers dropdown options by briefly opening custom dropdowns
+ *      (including hierarchical Workday dropdowns with chevron sub-categories)
  *   3. Asks Claude Haiku 4.5 for answers (single LLM call for all fields)
  *   4. Iteratively fills fields via DOM, re-extracting after each round
  *   5. Falls back to MagnitudeHand (adapter.act()) for unfilled fields
@@ -62,6 +63,8 @@ const INTERACTIVE_SELECTOR = [
   '[role="textbox"]', '[role="combobox"]', '[role="listbox"]',
   '[role="checkbox"]', '[role="radio"]', '[role="switch"]',
   '[role="spinbutton"]', '[role="slider"]', '[role="searchbox"]',
+  '[data-uxi-widget-type="selectinput"]',
+  '[aria-haspopup="listbox"]',
 ].join(', ');
 
 const PLACEHOLDER_RE = /^(select|choose|pick|--|—)/i;
@@ -146,9 +149,9 @@ function defaultValue(field: FormField): string {
 
 function getAnswer(answers: AnswerMap, field: FormField): string | undefined {
   if (field.name in answers) return answers[field.name];
-  const lower = field.name.toLowerCase();
+  const norm = field.name.replace(/\*/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
   for (const [key, val] of Object.entries(answers)) {
-    if (key.toLowerCase() === lower) return val;
+    if (key.replace(/\*/g, '').replace(/\s+/g, ' ').trim().toLowerCase() === norm) return val;
   }
   return undefined;
 }
@@ -158,20 +161,44 @@ function getAnswer(answers: AnswerMap, field: FormField): string | undefined {
 async function injectHelpers(page: Page): Promise<void> {
   const selectorStr = JSON.stringify(INTERACTIVE_SELECTOR);
   await page.evaluate(`
-    if (typeof __name === 'undefined') var __name = function(fn) { return fn; };
+    if (typeof globalThis.__name === 'undefined') {
+      globalThis.__name = function(fn) { return fn; };
+    }
+    var _prevNextId = (window.__ff && window.__ff.nextId) || 0;
     window.__ff = {
       SELECTOR: ${selectorStr},
 
       getAccessibleName: function(el) {
         var lblBy = el.getAttribute('aria-labelledby');
         if (lblBy) {
+          var uxiC = el.closest('[data-uxi-widget-type]') || el.closest('[role="combobox"]');
           var t = lblBy.split(/\\s+/)
-            .map(function(id) { var r = document.getElementById(id); return r ? r.textContent.trim() : ''; })
+            .map(function(id) {
+              var r = document.getElementById(id);
+              if (!r) return '';
+              if (uxiC && uxiC.contains(r)) return '';
+              if (el.contains(r)) return '';
+              return r.textContent.trim();
+            })
             .filter(Boolean).join(' ');
           if (t) return t;
         }
         var al = el.getAttribute('aria-label');
-        if (al) return al.trim();
+        if (al) {
+          al = al.trim();
+          if (el.getAttribute('aria-haspopup') === 'listbox' && el.textContent) {
+            var val = el.textContent.trim();
+            if (val && al.includes(val)) {
+              al = al.replace(val, '');
+              if (/\\bRequired\\b/i.test(al)) {
+                el.dataset.ffRequired = 'true';
+                al = al.replace(/\\s*Required\\s*/gi, ' ');
+              }
+              al = al.replace(/\\s+/g, ' ').trim();
+            }
+          }
+          if (al) return al;
+        }
         if (el.id) {
           var lbl = document.querySelector('label[for="' + el.id + '"]');
           if (lbl) {
@@ -194,6 +221,17 @@ async function injectHelpers(page: Page): Promise<void> {
           c2.querySelectorAll('input, .required, span[aria-hidden]').forEach(function(x) { x.remove(); });
           var tx2 = c2.textContent.trim();
           if (tx2) return tx2;
+        }
+        if (el.type === 'file') {
+          var card = el.closest('.card, .section, [class*="upload"], [class*="drop"]');
+          if (card) {
+            var parent = card.closest('.card, .section') || card;
+            var hdr = parent.querySelector('h1, h2, h3, h4, legend, [class*="heading"], [class*="title"]');
+            if (hdr) {
+              var ht = hdr.textContent.trim();
+              if (ht) return ht;
+            }
+          }
         }
         return el.placeholder || el.getAttribute('title') || '';
       },
@@ -219,7 +257,7 @@ async function injectHelpers(page: Page): Promise<void> {
         return '';
       },
 
-      nextId: 0,
+      nextId: _prevNextId,
       tag: function(el) {
         if (!el.hasAttribute('data-ff-id')) {
           el.setAttribute('data-ff-id', 'ff-' + (window.__ff.nextId++));
@@ -241,6 +279,7 @@ async function extractFields(page: Page): Promise<FormField[]> {
     const shouldSkip = (el: any): boolean => {
       if (el.closest('[class*="select-dropdown"], [class*="select-option"]')) return true;
       if (el.closest('.iti__dropdown-content')) return true;
+      if (el.closest('[data-automation-id="activeListContainer"]')) return true;
       if (el.getAttribute('role') === 'listbox' && el.closest('[role="combobox"]')) return true;
       if (el.getAttribute('role') === 'listbox' && el.id) {
         const controller = document.querySelector('[role="combobox"][aria-controls="' + el.id + '"]');
@@ -269,6 +308,8 @@ async function extractFields(page: Page): Promise<FormField[]> {
         if (role === 'textbox') return 'text';
         if (role === 'combobox') return 'select';
         if (role === 'listbox') return 'select';
+        if (el.getAttribute('data-uxi-widget-type') === 'selectinput') return 'select';
+        if (el.getAttribute('aria-haspopup') === 'listbox') return 'select';
         if (role === 'radio') return 'radio';
         if (role === 'checkbox') return 'checkbox';
         if (role === 'spinbutton') return 'number';
@@ -299,7 +340,7 @@ async function extractFields(page: Page): Promise<FormField[]> {
 
       const entry: any = {
         id, name: ff.getAccessibleName(el), type, section: ff.getSection(el),
-        required: el.required || el.getAttribute('aria-required') === 'true' || el.dataset.required === 'true',
+        required: el.required || el.getAttribute('aria-required') === 'true' || el.dataset.required === 'true' || el.dataset.ffRequired === 'true',
         visible, isNative, isMultiSelect,
       };
 
@@ -391,7 +432,8 @@ async function extractFields(page: Page): Promise<FormField[]> {
     }
   }
 
-  return fields;
+  // Strip Workday internal elements
+  return fields.filter((f) => f.name !== 'items selected');
 }
 
 // ── Combobox interaction ─────────────────────────────────────
@@ -431,52 +473,306 @@ async function clickComboboxTrigger(page: Page, id: string): Promise<void> {
       await page.focus(`[data-ff-id="${id}"]`);
     }
   }
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(600);
+}
+
+// ── Workday portal helpers ───────────────────────────────────
+
+/** Read de-duplicated option texts from any visible dropdown portal. */
+async function readActiveListOptions(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const results: string[] = [];
+    function collect(items: Element[]) {
+      for (const o of items) {
+        const r = (o as HTMLElement).getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        const t = (o.textContent || '').trim();
+        if (t && t.length < 200) results.push(t);
+      }
+    }
+
+    // 1. Workday activeListContainer portal
+    const container = document.querySelector('[data-automation-id="activeListContainer"]');
+    if (container) {
+      let items = Array.from(container.querySelectorAll('[role="option"]'));
+      if (items.length === 0) {
+        items = Array.from(container.querySelectorAll(
+          '[data-automation-id="promptOption"], [data-automation-id="menuItem"]'
+        ));
+      }
+      collect(items);
+    }
+
+    // 2. Any visible [role="listbox"]
+    if (results.length === 0) {
+      const listboxes = document.querySelectorAll('[role="listbox"]');
+      for (const lb of listboxes) {
+        const r = (lb as HTMLElement).getBoundingClientRect();
+        if (r.height > 0) {
+          collect(Array.from(lb.querySelectorAll('[role="option"]')));
+        }
+      }
+    }
+
+    // 3. Any visible standalone [role="option"]
+    if (results.length === 0) {
+      collect(Array.from(document.querySelectorAll('[role="option"]')).filter(el => {
+        const r = (el as HTMLElement).getBoundingClientRect();
+        return r.height > 0;
+      }));
+    }
+
+    // 4. Generic dropdown li items
+    if (results.length === 0) {
+      const dropdowns = document.querySelectorAll(
+        '[class*="dropdown"]:not([style*="display: none"]), [class*="menu"]:not([style*="display: none"]), [class*="listbox"]:not([style*="display: none"])'
+      );
+      for (const dd of dropdowns) {
+        const r = (dd as HTMLElement).getBoundingClientRect();
+        if (r.height > 0) {
+          collect(Array.from(dd.querySelectorAll('li')));
+        }
+      }
+    }
+
+    return [...new Set(results)];
+  });
+}
+
+/** Click an option inside a dropdown using Playwright locators (proper events). */
+async function clickActiveListOption(page: Page, text: string): Promise<boolean> {
+  const exactRe = new RegExp(`^\\s*${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i');
+  try {
+    // Try activeListContainer portal first (Workday)
+    const portal = page.locator('[data-automation-id="activeListContainer"]');
+    if (await portal.count() > 0) {
+      let option = portal.locator(`[role="option"]`).filter({ hasText: exactRe }).first();
+      if (await option.count() === 0) {
+        option = portal.locator(`[data-automation-id="promptOption"], [data-automation-id="menuItem"]`)
+          .filter({ hasText: exactRe }).first();
+      }
+      if (await option.count() > 0) {
+        await option.click({ timeout: 2000 });
+        return true;
+      }
+      // Substring fallback in portal
+      option = portal.locator(`[role="option"]`).filter({ hasText: text }).first();
+      if (await option.count() > 0) {
+        await option.click({ timeout: 2000 });
+        return true;
+      }
+    }
+
+    // Visible [role="listbox"] [role="option"]
+    const listbox = page.locator('[role="listbox"]:visible [role="option"]').filter({ hasText: exactRe }).first();
+    if (await listbox.count() > 0) {
+      await listbox.click({ timeout: 2000 });
+      return true;
+    }
+
+    // Any visible [role="option"]
+    const anyOption = page.locator('[role="option"]:visible').filter({ hasText: exactRe }).first();
+    if (await anyOption.count() > 0) {
+      await anyOption.click({ timeout: 2000 });
+      return true;
+    }
+
+    // Generic dropdown li patterns
+    for (const containerSel of [
+      'ul:visible li',
+      '[class*="dropdown"]:visible li',
+      '[class*="menu"]:visible li',
+      '[class*="select"]:visible li',
+      '[class*="listbox"]:visible li',
+    ]) {
+      const li = page.locator(containerSel).filter({ hasText: exactRe }).first();
+      if (await li.count() > 0) {
+        await li.click({ timeout: 2000 });
+        return true;
+      }
+    }
+
+    // Substring fallback for non-portal
+    const subMatch = page.locator('[role="listbox"]:visible [role="option"]').filter({ hasText: text }).first();
+    if (await subMatch.count() > 0) {
+      await subMatch.click({ timeout: 2000 });
+      return true;
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** Dismiss any open Workday dropdown/popup. */
+async function dismissDropdown(page: Page): Promise<void> {
+  await page.waitForTimeout(200);
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.evaluate(() => {
+    (document.activeElement as HTMLElement)?.blur();
+    document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  }).catch(() => {});
+  await page.waitForTimeout(150);
 }
 
 // ── Dropdown option discovery ────────────────────────────────
 
+/** Open each custom dropdown briefly to discover its options at fill-time.
+ *  For hierarchical Workday dropdowns (with chevron sub-categories),
+ *  drills into each category and stores options as "Category > SubOption". */
 async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise<void> {
   for (const f of fields) {
     if (f.type !== 'select' || f.isNative || (f.options && f.options.length > 0)) continue;
+    if (!f.name) continue;
 
     try {
-      await clickComboboxTrigger(page, f.id);
+      // Dismiss any lingering dropdown portal before opening next
+      await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
       await page.waitForTimeout(300);
 
-      const options = await page.evaluate((ffId) => {
-        const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-        if (!el) return [];
-        const results: string[] = [];
+      await clickComboboxTrigger(page, f.id);
+      await page.waitForTimeout(500);
 
-        const collect = (container: Element) => {
-          const opts = container.querySelectorAll('[role="option"], [role="menuitem"], li');
-          for (const o of opts) {
-            const t = o.textContent?.trim();
-            if (t && t.length < 200) results.push(t);
+      // Check if activeListContainer appeared (Workday selectinput)
+      const topLevel = await readActiveListOptions(page);
+
+      if (topLevel.length > 0) {
+        // Detect chevrons indicating hierarchical sub-categories
+        const hasChevrons = await page.evaluate(() => {
+          const container = document.querySelector('[data-automation-id="activeListContainer"]');
+          if (!container) return false;
+          return container.querySelector('svg.wd-icon-chevron-right-small') !== null ||
+            container.querySelector('[data-uxi-multiselectlistitem-hassidecharm="true"]') !== null;
+        });
+
+        if (hasChevrons) {
+          // Hierarchical dropdown — drill into each category
+          const allOptions: string[] = [];
+
+          for (let i = 0; i < topLevel.length; i++) {
+            const category = topLevel[i];
+
+            if (i > 0) {
+              // Reopen dropdown for each category after the first
+              await clickComboboxTrigger(page, f.id);
+              await page.waitForTimeout(500);
+            }
+
+            // Click the category to drill into sub-options
+            await clickActiveListOption(page, category);
+            await page.waitForTimeout(800);
+
+            // Read sub-options, handling virtualized lists
+            const info = await page.evaluate(() => {
+              const c = document.querySelector('[data-automation-id="activeListContainer"]');
+              if (!c) return { setsize: 0, texts: [] as string[] };
+              const items = c.querySelectorAll('[role="option"]');
+              const setsize = parseInt(items[0]?.getAttribute('aria-setsize') || '0', 10);
+              const texts = Array.from(items)
+                .filter((o: any) => o.getBoundingClientRect().height > 0)
+                .map((o: any) => (o.textContent || '').trim())
+                .filter(Boolean);
+              return { setsize, texts: [...new Set(texts)] };
+            });
+
+            const allSubs: string[] = [...info.texts];
+
+            // If virtualized, scroll to load more items
+            if (info.setsize > info.texts.length) {
+              for (let scrollAttempt = 0; scrollAttempt < 20; scrollAttempt++) {
+                await page.evaluate(() => {
+                  const c = document.querySelector('[data-automation-id="activeListContainer"]') as HTMLElement;
+                  if (c) c.scrollTop += 300;
+                });
+                await page.waitForTimeout(200);
+
+                const moreTexts = await page.evaluate(() => {
+                  const c = document.querySelector('[data-automation-id="activeListContainer"]');
+                  if (!c) return [];
+                  return Array.from(c.querySelectorAll('[role="option"]'))
+                    .filter((o: any) => o.getBoundingClientRect().height > 0)
+                    .map((o: any) => (o.textContent || '').trim())
+                    .filter(Boolean);
+                });
+
+                let newCount = 0;
+                for (const t of moreTexts) {
+                  if (!allSubs.includes(t)) {
+                    allSubs.push(t);
+                    newCount++;
+                  }
+                }
+                if (newCount === 0) break;
+              }
+            }
+
+            for (const sub of allSubs) {
+              allOptions.push(`${category} > ${sub}`);
+            }
+
+            // Close and dismiss before next category
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(200);
+            await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
+            await page.waitForTimeout(200);
           }
-        };
 
-        collect(el);
-        const ctrlId = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
-        if (ctrlId) {
-          const popup = document.getElementById(ctrlId);
-          if (popup) collect(popup);
+          f.options = allOptions;
+          console.log(`[formFiller] discovered ${allOptions.length} hierarchical options for "${f.name}"`);
+        } else {
+          // Flat dropdown — use top-level options directly
+          f.options = topLevel;
+          console.log(`[formFiller] discovered ${topLevel.length} options for "${f.name}"`);
         }
-        if (el.tagName === 'INPUT') {
-          const container = el.closest('[class*="select"], [class*="combobox"], .form-group');
-          if (container) collect(container);
-        }
-        return results;
-      }, f.id);
+      } else {
+        // No activeListContainer — fall back to standard option extraction
+        const options = await page.evaluate((ffId) => {
+          const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+          if (!el) return [];
+          const ff = (window as any).__ff;
+          const results: string[] = [];
 
-      if (options.length > 0) {
-        f.options = options;
-        console.log(`[formFiller] discovered ${options.length} options for "${f.name}"`);
+          function collect(container: Element) {
+            const opts = container.querySelectorAll('[role="option"], [role="menuitem"], li');
+            for (const o of opts) {
+              const r = (o as HTMLElement).getBoundingClientRect();
+              if (r.width === 0 || r.height === 0) continue;
+              const t = o.textContent?.trim();
+              if (t && t.length < 200) results.push(t);
+            }
+          }
+
+          collect(el);
+          const ctrlId = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
+          if (ctrlId) {
+            const popup = document.getElementById(ctrlId);
+            if (popup) collect(popup);
+          }
+          if (el.tagName === 'INPUT') {
+            const container = el.closest('[class*="select"], [class*="combobox"], .form-group');
+            if (container) collect(container);
+          }
+          // Workday button dropdowns
+          const listboxes = document.querySelectorAll('[role="listbox"]');
+          for (const lb of listboxes) {
+            const r = (lb as HTMLElement).getBoundingClientRect();
+            if (r.height > 0) collect(lb);
+          }
+          return [...new Set(results)];
+        }, f.id);
+
+        if (options.length > 0) {
+          f.options = options;
+          console.log(`[formFiller] discovered ${options.length} options for "${f.name}" (fallback)`);
+        }
       }
 
+      // Ensure dropdown is fully closed
       await page.keyboard.press('Escape');
-      await page.waitForTimeout(150);
+      await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
+      await page.waitForTimeout(300);
     } catch {
       // Ignore — some fields won't open
     }
@@ -489,9 +785,7 @@ async function generateAnswers(fields: FormField[], profileText: string): Promis
   const client = new Anthropic();
 
   const fieldDescriptions = fields.map((f) => {
-    let desc = `- "${f.name}" (type: ${f.type}`;
-    if (f.isMultiSelect) desc += ', multi-select';
-    desc += ')';
+    let desc = `- "${f.name}" (type: ${f.isMultiSelect ? 'multi-select' : f.type})`;
     if (f.options?.length) desc += ` options: [${f.options.join(', ')}]`;
     if (f.choices?.length) desc += ` choices: [${f.choices.join(', ')}]`;
     if (f.section) desc += ` [section: ${f.section}]`;
@@ -515,6 +809,7 @@ Rules:
 - For each field, decide what value to put based on the profile.
 - If the profile doesn't have enough info, make up a plausible value.
 - For dropdowns/radio groups with listed options, you MUST pick the EXACT text of one of the available options.
+- For hierarchical dropdown options (format "Category > SubOption"), pick the EXACT full path including the " > " separator.
 - For dropdowns WITHOUT listed options, provide your best guess for the value.
 - For multi-select fields, return a JSON array of ALL matching options from the available list (e.g., ["Python", "Java", "Go"]). Select every option that matches the applicant's skills/background.
 - For checkboxes/toggles, respond with "checked"/"unchecked" or "on"/"off".
@@ -526,7 +821,7 @@ Rules:
 - You MUST respond with ONLY a valid JSON object. No explanation, no commentary, no markdown fences.
 
 Example response:
-{"First Name": "Alexander", "Last Name": "Chen", "Programming Languages": ["Python", "JavaScript / TypeScript", "Go"], "Cover Letter / Why do you want to work here?": "I am excited to apply because..."}`,
+{"First Name": "Alexander", "Last Name": "Chen", "How Did You Hear About Us?": "Employee Referral > Referral", "Programming Languages": ["Python", "JavaScript / TypeScript", "Go"], "Cover Letter / Why do you want to work here?": "I am excited to apply because..."}`,
     }],
   });
 
@@ -579,20 +874,144 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
     case 'number':
     case 'password':
     case 'search': {
-      const isCombobox = await page.evaluate((ffId) => {
+      // Detect searchable dropdowns (Workday selectinput, comboboxes, etc.)
+      const searchDropdown = await page.evaluate((ffId) => {
         const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-        return el?.getAttribute('role') === 'combobox';
+        if (!el) return false;
+        return (
+          el.getAttribute('role') === 'combobox' ||
+          el.getAttribute('data-uxi-widget-type') === 'selectinput' ||
+          el.getAttribute('data-automation-id') === 'searchBox' ||
+          (el.getAttribute('autocomplete') === 'off' && el.getAttribute('aria-controls'))
+        );
       }, field.id);
-      if (isCombobox) return false;
+
+      if (searchDropdown) {
+        const val = getAnswer(answers, field);
+        if (!val) {
+          console.log(`[formFiller]   skip ${tag} (searchable dropdown, no answer)`);
+          return false;
+        }
+        try {
+          // Click to open the dropdown
+          await page.click(sel, { timeout: 2000 });
+          await page.waitForTimeout(400);
+
+          // Type to search — this filters the dropdown
+          await page.fill(sel, '', { timeout: 1000 }).catch(() => {});
+          await page.type(sel, val, { delay: 30 });
+          await page.waitForTimeout(1500);
+
+          // Try to click a matching element
+          const clicked = await page.evaluate((text) => {
+            const lowerText = text.toLowerCase();
+
+            // Strategy 1: ARIA/role-based elements
+            const roleEls = document.querySelectorAll(
+              '[role="option"], [role="menuitem"], [role="treeitem"], ' +
+              '[data-automation-id*="promptOption"], [data-automation-id*="menuItem"]'
+            );
+            for (const o of roleEls) {
+              const rect = o.getBoundingClientRect();
+              if (rect.width === 0 || rect.height === 0) continue;
+              const t = (o.textContent || '').trim().toLowerCase();
+              if (t === lowerText || t.includes(lowerText)) {
+                (o as HTMLElement).click();
+                return (o.textContent || '').trim();
+              }
+            }
+
+            // Strategy 2: Any visible clickable element whose text matches
+            const allVisible = document.querySelectorAll(
+              'div[tabindex], div[data-automation-id], span[data-automation-id], ' +
+              'li, a, button, [role="button"]'
+            );
+            for (const o of allVisible) {
+              const rect = o.getBoundingClientRect();
+              if (rect.width === 0 || rect.height === 0) continue;
+              let directText = '';
+              for (const n of o.childNodes) {
+                if (n.nodeType === Node.TEXT_NODE) directText += n.textContent;
+                else if (n.nodeType === Node.ELEMENT_NODE) directText += (n as Element).textContent;
+              }
+              directText = directText.trim().toLowerCase();
+              if (directText && (directText === lowerText || directText.includes(lowerText))) {
+                (o as HTMLElement).click();
+                return directText;
+              }
+            }
+            return null;
+          }, val);
+
+          if (clicked) {
+            console.log(`[formFiller]   search-select ${tag} → "${clicked}"`);
+            await page.waitForTimeout(300);
+            return true;
+          }
+
+          // Last resort: press down + enter to select first result
+          await page.keyboard.press('ArrowDown');
+          await page.waitForTimeout(200);
+          await page.keyboard.press('Enter');
+          console.log(`[formFiller]   search-select ${tag} → first result (keyboard)`);
+          await page.waitForTimeout(300);
+          return true;
+        } catch (e: any) {
+          console.log(`[formFiller]   skip ${tag} (searchable dropdown failed: ${e.message?.slice(0, 60)})`);
+          return false;
+        }
+      }
 
       const val = getAnswer(answers, field) ?? defaultValue(field);
       try {
+        // Workday date components
+        const isWorkdayDate = await page.evaluate((ffId) => {
+          const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+          if (!el) return false;
+          const auto = el.getAttribute('data-automation-id') || '';
+          if (auto.includes('dateSection')) return true;
+          const parent = el.closest('[data-automation-id*="dateSection"]');
+          return !!parent;
+        }, field.id);
+
+        if (isWorkdayDate) {
+          await page.evaluate((ffId) => {
+            const el = document.querySelector(`[data-ff-id="${ffId}"]`) as HTMLElement;
+            if (!el) return;
+            const section = el.closest('[data-automation-id*="dateSection"]:not([data-automation-id*="-input"]):not([data-automation-id*="-display"])') as HTMLElement;
+            if (section) section.click();
+            else el.parentElement?.click();
+          }, field.id);
+          await page.waitForTimeout(300);
+          await page.focus(sel).catch(() => {});
+          await page.waitForTimeout(100);
+          await page.keyboard.press('Home');
+          await page.keyboard.press('Shift+End');
+          await page.keyboard.type(val, { delay: 30 });
+          await page.keyboard.press('Tab');
+          await page.waitForTimeout(200);
+          console.log(`[formFiller]   fill ${tag} = "${val}"`);
+          return true;
+        }
+
         await page.fill(sel, val, { timeout: 2000 });
         console.log(`[formFiller]   fill ${tag} = "${val}"`);
         return true;
       } catch {
-        console.log(`[formFiller]   skip ${tag} (not fillable)`);
-        return false;
+        // Fallback: click + type for elements that don't support fill
+        try {
+          await page.click(sel, { timeout: 2000 });
+          await page.waitForTimeout(100);
+          await page.keyboard.press('Home');
+          await page.keyboard.press('Shift+End');
+          await page.keyboard.type(val, { delay: 30 });
+          await page.keyboard.press('Tab');
+          console.log(`[formFiller]   fill ${tag} = "${val}" (click+type)`);
+          return true;
+        } catch {
+          console.log(`[formFiller]   skip ${tag} (not fillable)`);
+          return false;
+        }
       }
     }
 
@@ -649,6 +1068,30 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
     case 'select': {
       const answer = getAnswer(answers, field);
 
+      // Skip if already shows correct value
+      if (answer && !field.isNative) {
+        const currentDisplay = await page.evaluate((ffId) => {
+          const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+          if (!el) return '';
+          if (el.tagName === 'INPUT') return (el as HTMLInputElement).value.trim();
+          const searchInput = el.querySelector('[data-automation-id="searchBox"], .wd-selectinput-search');
+          if (searchInput) return (searchInput as HTMLInputElement).value.trim();
+          const pills = el.closest('[data-automation-id]')
+            ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
+          if (pills) return pills.textContent?.trim() || '';
+          const trigger = el.querySelector('.custom-select-trigger, .multi-select-trigger, [class*="select-trigger"]');
+          if (trigger) return trigger.textContent?.trim() || '';
+          const clone = el.cloneNode(true) as HTMLElement;
+          clone.querySelectorAll('[role="listbox"], [class*="dropdown"], [class*="select-dropdown"]').forEach((x: any) => x.remove());
+          return clone.textContent?.trim() || '';
+        }, field.id);
+        const isPlaceholder = !currentDisplay || /^(select|choose|pick|prefer not|--|—|\+\d{1,3}$)/i.test(currentDisplay);
+        if (!isPlaceholder && currentDisplay.toLowerCase().includes(answer.toLowerCase())) {
+          console.log(`[formFiller]   skip ${tag} (already has "${currentDisplay}")`);
+          return true;
+        }
+      }
+
       if (field.isNative) {
         try {
           if (answer) {
@@ -688,77 +1131,226 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
         }
       }
 
-      // Multi-select
-      if (field.isMultiSelect && answer) {
-        const valuesToSelect = answer.split(',').map((v: string) => v.trim()).filter(Boolean);
+      // Multi-select with comma-separated values
+      if (answer && answer.includes(',')) {
+        const values = answer.split(',').map(v => v.trim()).filter(Boolean);
+        let clicked = 0;
         try {
           await clickComboboxTrigger(page, field.id);
-          await page.waitForTimeout(200);
-          const clickedCount = await page.evaluate(
-            ({ ffId, values }) => {
-              const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-              if (!el) return 0;
-              let count = 0;
-              const allOpts = el.querySelectorAll('[role="option"], .multi-select-option');
-              for (const val of values) {
-                const lowerVal = val.toLowerCase();
-                for (const opt of allOpts) {
-                  const optText = opt.textContent?.trim().toLowerCase() || '';
-                  if (optText === lowerVal || optText.includes(lowerVal) || lowerVal.includes(optText)) {
-                    if (opt.getAttribute('aria-selected') !== 'true') {
-                      (opt as HTMLElement).click();
-                    }
-                    count++;
-                    break;
-                  }
+          await page.waitForTimeout(600);
+
+          for (const val of values) {
+            try {
+              const ok = await clickActiveListOption(page, val);
+              if (ok) {
+                clicked++;
+                await page.waitForTimeout(200);
+              } else {
+                // Try fuzzy match
+                const available = await readActiveListOptions(page);
+                const lv = val.toLowerCase();
+                const fuzzy = available.find(a => {
+                  const la = a.toLowerCase();
+                  return la.includes(lv) || lv.includes(la);
+                });
+                if (fuzzy) {
+                  const fok = await clickActiveListOption(page, fuzzy);
+                  if (fok) clicked++;
+                  await page.waitForTimeout(200);
                 }
               }
-              return count;
-            },
-            { ffId: field.id, values: valuesToSelect }
-          );
-          console.log(`[formFiller]   multi-select ${tag} → ${clickedCount}/${valuesToSelect.length}`);
-          await page.keyboard.press('Escape');
-          await page.waitForTimeout(150);
-          return clickedCount > 0;
-        } catch (e: any) {
-          console.log(`[formFiller]   skip ${tag} (multi-select failed: ${e.message?.slice(0, 50)})`);
-          return false;
+            } catch { /* keep going */ }
+          }
+        } catch { /* open failed */ }
+
+        if (clicked > 0) {
+          await dismissDropdown(page);
+          console.log(`[formFiller]   multi-select ${tag} → ${clicked}/${values.length} options`);
+          return true;
         }
+
+        // Fallback: typeahead/autocomplete inputs (e.g., Workday "Type to Add Skills")
+        try {
+          await page.keyboard.press('Escape').catch(() => {});
+          await page.waitForTimeout(200);
+          await page.click(sel, { timeout: 2000 });
+          await page.waitForTimeout(200);
+          let added = 0;
+          for (const val of values) {
+            await page.keyboard.type(val, { delay: 30 });
+            await page.waitForTimeout(300);
+            await page.keyboard.press('Enter');
+            await page.waitForTimeout(3000);
+
+            let picked = false;
+            try { picked = await clickActiveListOption(page, val); } catch { /* no active list */ }
+
+            if (!picked) {
+              // Tag matching option and click with Playwright locator
+              try {
+                const tagged = await page.evaluate((searchText) => {
+                  document.querySelectorAll('[data-ff-click-target="skill"]').forEach(el => el.removeAttribute('data-ff-click-target'));
+                  const containers = document.querySelectorAll(
+                    '[role="listbox"], [data-automation-id="activeListContainer"], ' +
+                    '[class*="dropdown"], [class*="suggestions"], [class*="autocomplete"]'
+                  );
+                  const lower = searchText.toLowerCase().trim();
+                  for (const c of containers) {
+                    const items = c.querySelectorAll('[role="option"], li, [class*="option"], [class*="item"]');
+                    for (const item of items) {
+                      const r = (item as HTMLElement).getBoundingClientRect();
+                      if (r.height === 0) continue;
+                      const t = (item.textContent || '').trim().toLowerCase();
+                      if (t === lower || t.includes(lower) || lower.includes(t)) {
+                        (item as HTMLElement).setAttribute('data-ff-click-target', 'skill');
+                        return true;
+                      }
+                    }
+                  }
+                  return false;
+                }, val);
+                if (tagged) {
+                  await page.locator('[data-ff-click-target="skill"]').first().click({ timeout: 2000 });
+                  await page.evaluate(() => document.querySelectorAll('[data-ff-click-target="skill"]').forEach(el => el.removeAttribute('data-ff-click-target')));
+                  picked = true;
+                }
+              } catch { /* no dropdown */ }
+            }
+
+            if (!picked) {
+              await page.keyboard.press('Enter');
+              await page.waitForTimeout(500);
+            }
+
+            await page.evaluate(() => { const body = document.querySelector('body'); if (body) body.click(); });
+            await page.waitForTimeout(300);
+            await page.click(sel, { clickCount: 3, timeout: 2000 }).catch(() => {});
+            await page.waitForTimeout(100);
+            await page.keyboard.press('Backspace');
+            await page.waitForTimeout(200);
+            added++;
+          }
+          if (added > 0) {
+            console.log(`[formFiller]   multi-select ${tag} → ${added}/${values.length} tags (type+enter)`);
+            return true;
+          }
+        } catch { /* typeahead failed */ }
+
+        await page.keyboard.press('Escape').catch(() => {});
+        console.log(`[formFiller]   skip ${tag} (multi-select failed)`);
+        return false;
       }
 
-      // Custom dropdown
-      const opt = answer ?? field.options?.find((o) => !PLACEHOLDER_RE.test(o)) ?? field.options?.[0];
+      // opt will be set by hierarchical fallthrough or below
+      let opt: string | undefined;
+
+      // Hierarchical dropdown: "Category > SubOption" path
+      if (answer && answer.includes(' > ')) {
+        const [category, value] = answer.split(' > ', 2);
+        try {
+          await page.keyboard.press('Escape').catch(() => {});
+          await page.waitForTimeout(300);
+
+          await clickComboboxTrigger(page, field.id);
+          await page.waitForTimeout(500);
+
+          const hasContainer = await page.evaluate(() =>
+            !!document.querySelector('[data-automation-id="activeListContainer"]')
+          );
+
+          if (hasContainer) {
+            const catClicked = await clickActiveListOption(page, category);
+            if (catClicked) {
+              await page.waitForTimeout(1000);
+
+              const portalOpen = await page.evaluate(() =>
+                !!document.querySelector('[data-automation-id="activeListContainer"]')
+              );
+
+              if (portalOpen) {
+                // Find and click sub-option, handling virtualized lists
+                const findAndTag = async (): Promise<boolean> => {
+                  return page.evaluate((searchText) => {
+                    const c = document.querySelector('[data-automation-id="activeListContainer"]');
+                    if (!c) return false;
+                    const items = Array.from(c.querySelectorAll('[role="option"]'));
+                    const lower = searchText.toLowerCase().trim();
+                    for (const item of items) {
+                      const r = (item as HTMLElement).getBoundingClientRect();
+                      if (r.height === 0) continue;
+                      const t = (item.textContent || '').trim().toLowerCase();
+                      if (t === lower || t.includes(lower) || lower.includes(t)) {
+                        (item as HTMLElement).setAttribute('data-ff-click-target', 'sub');
+                        return true;
+                      }
+                    }
+                    return false;
+                  }, value);
+                };
+
+                let foundSub = await findAndTag();
+
+                // Scroll through virtualized list to find the option
+                if (!foundSub) {
+                  for (let scrollAttempt = 0; scrollAttempt < 30; scrollAttempt++) {
+                    await page.evaluate(() => {
+                      const c = document.querySelector('[data-automation-id="activeListContainer"]') as HTMLElement;
+                      if (c) c.scrollTop += 300;
+                    });
+                    await page.waitForTimeout(150);
+                    foundSub = await findAndTag();
+                    if (foundSub) break;
+                  }
+                }
+
+                if (foundSub) {
+                  await page.locator('[data-ff-click-target="sub"]').first().click({ timeout: 2000 });
+                  await page.evaluate(() => document.querySelectorAll('[data-ff-click-target]').forEach(el => el.removeAttribute('data-ff-click-target')));
+                  await dismissDropdown(page);
+                  console.log(`[formFiller]   select ${tag} → "${category} > ${value}"`);
+                  return true;
+                }
+
+                // clickActiveListOption fallback
+                const subClicked = await clickActiveListOption(page, value);
+                if (subClicked) {
+                  await dismissDropdown(page);
+                  console.log(`[formFiller]   select ${tag} → "${category} > ${value}"`);
+                  return true;
+                }
+              }
+            }
+          }
+
+          // Hierarchical path didn't work — close and fall through
+          await page.keyboard.press('Escape').catch(() => {});
+          await dismissDropdown(page);
+        } catch {
+          await page.keyboard.press('Escape').catch(() => {});
+        }
+        opt = value; // try just the sub-option text as flat select
+      }
+
+      // Custom dropdown: use answer if provided, else first non-placeholder
+      if (!opt) {
+        opt = answer
+          ?? field.options?.find((o) => !PLACEHOLDER_RE.test(o))
+          ?? field.options?.[0];
+      }
 
       if (!opt) {
+        // No options known — try clicking to discover them on the fly
         try {
           await clickComboboxTrigger(page, field.id);
-          const clicked = await page.evaluate((ffId) => {
-            const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-            if (!el) return false;
-            const ff = (window as any).__ff;
-            const tryClick = (container: Element): boolean => {
-              const opts = container.querySelectorAll('[role="option"], [role="menuitem"]');
-              for (const o of opts) {
-                if (ff.isVisible(o)) { (o as HTMLElement).click(); return true; }
-              }
-              return false;
-            };
-            if (tryClick(el)) return true;
-            const ctrlId = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
-            if (ctrlId) {
-              const popup = document.getElementById(ctrlId);
-              if (popup && tryClick(popup)) return true;
+          await page.waitForTimeout(600);
+          const options = await readActiveListOptions(page);
+          if (options.length > 0) {
+            const clicked = await clickActiveListOption(page, options[0]);
+            if (clicked) {
+              await dismissDropdown(page);
+              console.log(`[formFiller]   select ${tag} → first available option`);
+              return true;
             }
-            if (el.tagName === 'INPUT') {
-              const container = el.closest('[class*="select"], [class*="combobox"], .form-group');
-              if (container && tryClick(container)) return true;
-            }
-            return false;
-          }, field.id);
-          if (clicked) {
-            console.log(`[formFiller]   select ${tag} → first available option`);
-            return true;
           }
           await page.keyboard.press('Escape');
           console.log(`[formFiller]   skip ${tag} (no options found)`);
@@ -769,62 +1361,150 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
         }
       }
 
+      // Use Playwright locator clicks (proper events for Workday UXI)
       try {
         await clickComboboxTrigger(page, field.id);
-        const hasAnswer = !!answer;
-        const clicked = await page.evaluate(
-          ({ ffId, text, strict }) => {
-            const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-            if (!el) return false;
-            const lowerText = text.toLowerCase();
+        await page.waitForTimeout(600);
 
-            const getOptionText = (o: Element): string => {
-              const clone = o.cloneNode(true) as HTMLElement;
-              clone.querySelectorAll('[class*="desc"], [class*="sub"], .option-desc, small').forEach((x: any) => x.remove());
-              return clone.textContent?.trim() || '';
-            };
-
-            const findAndClick = (container: Element): boolean => {
-              const opts = container.querySelectorAll('[role="option"], [role="menuitem"]');
-              for (const o of opts) { if (getOptionText(o) === text) { (o as HTMLElement).click(); return true; } }
-              for (const o of opts) {
-                const t = getOptionText(o).toLowerCase();
-                if (t.startsWith(lowerText) || lowerText.startsWith(t)) { (o as HTMLElement).click(); return true; }
-              }
-              for (const o of opts) {
-                const t = getOptionText(o).toLowerCase();
-                if (t.includes(lowerText) || lowerText.includes(t)) { (o as HTMLElement).click(); return true; }
-              }
-              if (!strict) {
-                for (const o of opts) {
-                  const s = window.getComputedStyle(o as HTMLElement);
-                  if (s.display !== 'none' && s.visibility !== 'hidden') { (o as HTMLElement).click(); return true; }
-                }
-              }
-              return false;
-            };
-
-            if (findAndClick(el)) return true;
-            const ctrlId = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
-            if (ctrlId) {
-              const popup = document.getElementById(ctrlId);
-              if (popup && findAndClick(popup)) return true;
-            }
-            const dropdown = el.querySelector('[class*="dropdown"], [role="listbox"]');
-            if (dropdown && findAndClick(dropdown)) return true;
-            return false;
-          },
-          { ffId: field.id, text: opt, strict: hasAnswer }
-        );
+        // Try direct Playwright locator click
+        let clicked = await clickActiveListOption(page, opt);
         if (clicked) {
+          await dismissDropdown(page);
           console.log(`[formFiller]   select ${tag} → "${opt}"`);
           return true;
         }
+
+        // Type-to-search: if selectinput has a search box, type to filter
+        try {
+          const hasSearch = await page.evaluate((ffId) => {
+            const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+            if (!el) return false;
+            const input = el.querySelector('input[type="text"], input:not([type])') as HTMLInputElement;
+            if (input && document.activeElement === input) return true;
+            return el.tagName === 'INPUT' && (el as HTMLInputElement).type !== 'hidden';
+          }, field.id);
+          if (hasSearch) {
+            await page.keyboard.type(opt.slice(0, 30), { delay: 50 });
+            await page.waitForTimeout(800);
+            clicked = await clickActiveListOption(page, opt);
+            if (clicked) {
+              await dismissDropdown(page);
+              console.log(`[formFiller]   select ${tag} → "${opt}" (typed)`);
+              return true;
+            }
+          }
+        } catch { /* type-to-search failed */ }
+
+        // Fuzzy matching: read available options and find best match
+        const available = await readActiveListOptions(page);
+        const lowerOpt = opt.toLowerCase();
+
+        let match = available.find(a => {
+          const la = a.toLowerCase();
+          return la.startsWith(lowerOpt) || lowerOpt.startsWith(la);
+        });
+
+        if (!match) {
+          match = available.find(a => {
+            const la = a.toLowerCase();
+            return la.includes(lowerOpt) || lowerOpt.includes(la);
+          });
+        }
+
+        if (!match && !answer) {
+          match = available[0];
+        }
+
+        if (match) {
+          clicked = await clickActiveListOption(page, match);
+          if (clicked) {
+            await dismissDropdown(page);
+            console.log(`[formFiller]   select ${tag} → "${match}"`);
+            return true;
+          }
+        }
+
+        // Last resort: re-open via trigger child, find option inside field's dropdown
+        try {
+          await page.keyboard.press('Escape').catch(() => {});
+          await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
+          await page.waitForTimeout(200);
+          const triggerChild = page.locator(`${sel} > [class*="trigger"], ${sel} > button, ${sel} > div`).first();
+          if (await triggerChild.count() > 0) {
+            await triggerChild.click({ timeout: 1000 });
+          } else {
+            await page.click(sel, { timeout: 1000 });
+          }
+          await page.waitForTimeout(300);
+          for (const optSel of [
+            `${sel} [role="option"]`,
+            `${sel} li`,
+            `${sel} [role="menuitem"]`,
+          ]) {
+            const directOption = page.locator(optSel).filter({ hasText: opt }).first();
+            if (await directOption.count() > 0) {
+              await directOption.click({ timeout: 2000 });
+              await dismissDropdown(page);
+              console.log(`[formFiller]   select ${tag} → "${opt}" (direct)`);
+              return true;
+            }
+          }
+        } catch { /* direct approach failed */ }
+
+        // Native <select> fallback: hidden native select inside/near element
+        try {
+          const nativeSelect = await page.evaluate((ffId) => {
+            const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+            if (!el) return null;
+            let sel = el.querySelector('select') as HTMLSelectElement | null;
+            if (!sel) {
+              const group = el.closest('.form-group, .field, .form-field, fieldset, .select-container');
+              if (group) sel = group.querySelector('select');
+            }
+            if (!sel && el.nextElementSibling?.tagName === 'SELECT') {
+              sel = el.nextElementSibling as HTMLSelectElement;
+            }
+            if (!sel) return null;
+            return sel.getAttribute('data-ff-id') || sel.id || null;
+          }, field.id);
+
+          if (nativeSelect) {
+            const nativeSel = nativeSelect.startsWith('ff-')
+              ? `[data-ff-id="${nativeSelect}"]`
+              : `#${nativeSelect}`;
+            try {
+              await page.selectOption(nativeSel, { label: opt }, { timeout: 2000 });
+              console.log(`[formFiller]   select ${tag} → "${opt}" (native fallback)`);
+              return true;
+            } catch {
+              const matched = await page.evaluate(
+                ({ selector, text }) => {
+                  const el = document.querySelector(selector) as HTMLSelectElement;
+                  if (!el) return null;
+                  const lower = text.toLowerCase();
+                  for (const o of el.options) {
+                    const t = o.textContent?.trim().toLowerCase() || '';
+                    if (t.includes(lower) || lower.includes(t)) return o.value;
+                  }
+                  return null;
+                },
+                { selector: nativeSel, text: opt }
+              );
+              if (matched) {
+                await page.selectOption(nativeSel, matched, { timeout: 2000 });
+                console.log(`[formFiller]   select ${tag} → "${opt}" (native fuzzy)`);
+                return true;
+              }
+            }
+          }
+        } catch { /* native fallback failed */ }
+
         await page.keyboard.press('Escape');
-        console.log(`[formFiller]   skip ${tag} (could not click option)`);
+        console.log(`[formFiller]   skip ${tag} (could not click option "${opt}", available: ${available.slice(0, 5).join(', ')})`);
         return false;
       } catch (e: any) {
         console.log(`[formFiller]   skip ${tag} (${e.message?.slice(0, 50)})`);
+        await page.keyboard.press('Escape').catch(() => {});
         return false;
       }
     }
@@ -965,13 +1645,29 @@ async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
       const text = selectedOpt.textContent?.trim() || '';
       return val !== '' && !/^(select|choose|pick|--|—)/i.test(text);
     }
+    // Custom combobox: check for selected value
     if (role === 'combobox' && tag !== 'INPUT' && tag !== 'SELECT') {
       const trigger = el.querySelector('.custom-select-trigger span');
       const text = trigger?.textContent?.trim() || '';
       if (text && !/^(select|choose|pick|--|—|start typing)/i.test(text)) return true;
+      // Check Workday pills
+      const pills = el.closest('[data-automation-id]')
+        ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
+      if (pills && pills.textContent?.trim()) return true;
+      // Check inner input value
+      const innerInput = el.querySelector('input');
+      if (innerInput && innerInput.value.trim()) return true;
       return !!el.querySelector('.custom-select-option.selected, [aria-selected="true"]');
     }
     if (role === 'combobox' && tag === 'INPUT') return ((el as HTMLInputElement).value?.trim() || '').length > 0;
+    // Workday selectinput/button: check for selected text
+    if (el.getAttribute('data-uxi-widget-type') === 'selectinput' || el.getAttribute('aria-haspopup') === 'listbox') {
+      const pills = el.closest('[data-automation-id]')
+        ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
+      if (pills && pills.textContent?.trim()) return true;
+      const innerInput = el.querySelector('input');
+      if (innerInput && innerInput.value.trim()) return true;
+    }
     return (el.textContent?.trim() || '').length > 0;
   }, ffId);
 }
@@ -1001,6 +1697,12 @@ export async function fillFormOnPage(
     llmCalls: 0,
   };
 
+  // 0. Ensure __name polyfill (esbuild/bun may inject __name into serialized
+  //    page.evaluate callbacks; define it in browser context and re-inject
+  //    on every navigation via addInitScript).
+  await page.addInitScript('if(typeof globalThis.__name==="undefined"){globalThis.__name=function(f){return f}}');
+  await page.evaluate('if(typeof globalThis.__name==="undefined"){globalThis.__name=function(f){return f}}');
+
   // 1. Inject browser-side helpers
   await injectHelpers(page);
 
@@ -1020,7 +1722,7 @@ export async function fillFormOnPage(
   // 3. Extract fields
   console.log('[formFiller] Extracting form fields…');
   const allFields = await extractFields(page);
-  const visibleFields = allFields.filter((f) => f.visibleByDefault);
+  const visibleFields = allFields.filter((f) => f.visibleByDefault && f.name);
   result.totalFields = visibleFields.length;
   console.log(`[formFiller] Found ${visibleFields.length} visible fields.`);
 
@@ -1029,7 +1731,7 @@ export async function fillFormOnPage(
     return result;
   }
 
-  // 4. Discover dropdown options
+  // 4. Discover dropdown options (including hierarchical Workday dropdowns)
   console.log('[formFiller] Discovering dropdown options…');
   await discoverDropdownOptions(page, allFields);
 
@@ -1047,8 +1749,15 @@ export async function fillFormOnPage(
 
   while (round < 10) {
     round++;
+    // Re-inject helpers in case a page interaction (e.g. dropdown click causing
+    // SPA navigation) wiped out window.__ff.
+    const hasHelpers = await page.evaluate(() => !!(window as any).__ff).catch(() => false);
+    if (!hasHelpers) {
+      console.log(`[formFiller] Re-injecting helpers (lost after page interaction)`);
+      await injectHelpers(page);
+    }
     const fields = await extractFields(page);
-    const visible = fields.filter((f) => f.visibleByDefault);
+    const visible = fields.filter((f) => f.visibleByDefault && f.name);
 
     const toFill = visible.filter((f) => !attempted.has(f.id));
     if (toFill.length === 0) break;
@@ -1072,6 +1781,9 @@ export async function fillFormOnPage(
       if (ok) domFilledOk.add(field.id);
     }
 
+    // Dismiss any leftover open dropdowns
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
     await page.waitForTimeout(400);
   }
 

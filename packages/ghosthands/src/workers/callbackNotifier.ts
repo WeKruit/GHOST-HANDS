@@ -4,6 +4,9 @@
  * After a job completes or fails, if a callback_url was provided,
  * POST the results back to VALET. Retries on failure (3 attempts).
  * Callback failures are logged but never fail the job.
+ *
+ * NOTE: The gh_callback_dedupe table (migration 019) exists but is not yet
+ * wired at runtime. Dedupe enforcement is deferred to Phase 2.
  */
 
 import { getLogger } from '../monitoring/logger.js';

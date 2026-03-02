@@ -30,12 +30,12 @@ const WorkdayPageStateSchema = z.object({
     'questions', 'voluntary_disclosure', 'self_identify',
     'review', 'confirmation', 'error', 'unknown',
   ]),
-  page_title: z.string().optional().default(''),
-  has_apply_button: z.boolean().optional().default(false),
-  has_next_button: z.boolean().optional().default(false),
-  has_submit_button: z.boolean().optional().default(false),
-  has_sign_in_with_google: z.boolean().optional().default(false),
-  error_message: z.string().optional().default(''),
+  page_title: z.string().catch(''),
+  has_apply_button: z.boolean().catch(false),
+  has_next_button: z.boolean().catch(false),
+  has_submit_button: z.boolean().catch(false),
+  has_sign_in_with_google: z.boolean().catch(false),
+  error_message: z.string().catch(''),
 });
 
 // ---------------------------------------------------------------------------
