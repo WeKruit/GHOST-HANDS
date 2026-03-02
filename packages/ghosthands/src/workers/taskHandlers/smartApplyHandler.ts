@@ -78,8 +78,12 @@ export class SmartApplyHandler implements TaskHandler {
     await adapter.page.evaluate(namePolyfill);
 
     // Resolve platform config from URL
-    const config = detectPlatformFromUrl(job.target_url);
-    console.log(`[SmartApply] Platform: ${config.displayName} (${config.platformId})`);
+    // When running under Mastra, force generic config — skip platform-specific
+    // logic (e.g. Workday skills/dropdown handlers) so the generic flow is exercised.
+    const config = job.execution_mode === 'mastra'
+      ? detectPlatformFromUrl('')   // empty URL → GenericPlatformConfig
+      : detectPlatformFromUrl(job.target_url);
+    console.log(`[SmartApply] Platform: ${config.displayName} (${config.platformId})${job.execution_mode === 'mastra' ? ' (forced generic for Mastra)' : ''}`);
     console.log(`[SmartApply] Starting application for ${job.target_url}`);
     console.log(`[SmartApply] Applicant: ${userProfile.first_name} ${userProfile.last_name}`);
 
