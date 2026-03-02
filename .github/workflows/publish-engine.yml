@@ -24,11 +24,14 @@ jobs:
           node-version: 20
           registry-url: https://npm.pkg.github.com
 
-      - name: Install and build
+      - name: Install dependencies (monorepo root for hoisted workspace deps)
+        run: npm install
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build engine
         working-directory: packages/engine
-        run: |
-          npm install
-          npm run build
+        run: npm run build
 
       - name: Determine version and target
         id: meta
