@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "instruction": "Click the \"Apply\" or \"Apply Now\" button to start the job application. Your ONLY task is to click the apply button — nothing else. After clicking, report the task as done immediately. The page will navigate away — that is expected.",
+  "url": "https://thales.wd3.myworkdayjobs.com/en-US/Careers/job/Pennsylvania/Software-Development-Intern_R0317650-1?utm_source=Simplify&ref=Simplify",
+  "variableKeys": [],
+  "actions": [
+    {
+      "selector": "xpath=/html[1]/body[1]/div[1]/div[1]/div[1]/div[3]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/a[1]",
+      "description": "Apply button for the Software Development Intern job position",
+      "method": "click",
+      "arguments": []
+    }
+  ],
+  "actionDescription": "Apply button for the Software Development Intern job position",
+  "message": "Action [click] performed successfully on selector: xpath=/html[1]/body[1]/div[1]/div[1]/div[1]/div[3]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/a[1]"
+}
