@@ -144,14 +144,14 @@ export function buildProfileText(p: WorkdayUserProfile): string {
 
 function defaultValue(field: FormField): string {
   switch (field.type) {
-    case 'email': return 'a@a.com';
+    case 'email': return 'a@gmail.com';
     case 'tel': return '1234567890';
     case 'url': return 'https://a.com';
     case 'number': return '1';
     case 'date': return '2025-01-01';
     case 'textarea':
       return 'I am excited about this opportunity and believe my skills and experience make me a strong candidate for this position.';
-    default: return 'A';
+    default: return '';
   }
 }
 
@@ -895,7 +895,8 @@ ${fieldDescriptions}
 
 Rules:
 - For each field, decide what value to put based on the profile.
-- If the profile doesn't have enough info, make up a plausible value.
+- If the profile doesn't have enough info for a REQUIRED field, make up a plausible value.
+- For OPTIONAL fields where the profile has no relevant info (e.g. phone extension, middle name), return "" (empty string) — do NOT make up values for optional fields.
 - For dropdowns/radio groups with listed options, you MUST pick the EXACT text of one of the available options.
 - For hierarchical dropdown options (format "Category > SubOption"), pick the EXACT full path including the " > " separator.
 - For dropdowns WITHOUT listed options, provide your best guess for the value.
@@ -1054,6 +1055,10 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
       }
 
       const val = getAnswer(answers, field) ?? defaultValue(field);
+      if (!val) {
+        console.log(`[formFiller]   skip ${tag} (no answer, optional)`);
+        return false;
+      }
       try {
         // Workday date components
         const isWorkdayDate = await page.evaluate((ffId) => {
