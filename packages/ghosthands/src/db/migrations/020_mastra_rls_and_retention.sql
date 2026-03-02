@@ -37,12 +37,12 @@ END $$;
 --    CONCURRENTLY avoids blocking writes to gh_automation_jobs during index build.
 --    NOTE: CONCURRENTLY cannot run inside a transaction block — run this
 --    migration outside of a multi-statement transaction if needed.
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_gh_jobs_mastra_run_id
+CREATE INDEX IF NOT EXISTS idx_gh_jobs_mastra_run_id
   ON gh_automation_jobs ((metadata->>'mastra_run_id'))
   WHERE metadata->>'mastra_run_id' IS NOT NULL;
 
 -- 4. Add index for resume discriminator queries
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_gh_jobs_mastra_resume
+CREATE INDEX IF NOT EXISTS idx_gh_jobs_mastra_resume
   ON gh_automation_jobs (execution_mode, status)
   WHERE execution_mode = 'mastra'
     AND status IN ('pending', 'queued');

@@ -52,6 +52,21 @@ export class SmartApplyHandler implements TaskHandler {
   async execute(ctx: TaskContext): Promise<TaskResult> {
     const { job, adapter, progress } = ctx;
     const userProfile = job.input_data.user_data as Record<string, any>;
+
+    // Normalize address: API route stores flat (city, state, country, zip)
+    // but platform configs expect nested address object
+    if (!userProfile.address && (userProfile.city || userProfile.state || userProfile.country || userProfile.zip)) {
+      userProfile.address = {
+        street: userProfile.street || '',
+        city: userProfile.city || '',
+        state: userProfile.state || '',
+        zip: userProfile.zip || '',
+        country: userProfile.country || 'United States of America',
+      };
+    } else if (!userProfile.address) {
+      userProfile.address = { street: '', city: '', state: '', zip: '', country: 'United States of America' };
+    }
+
     const qaOverrides = job.input_data.qa_overrides || {};
 
     // Resolve platform config from URL

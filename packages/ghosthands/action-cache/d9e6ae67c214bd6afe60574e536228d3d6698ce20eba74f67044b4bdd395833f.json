@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "instruction": "Click the \"Save and Continue\" button. Click ONLY that button and then STOP. Do absolutely nothing else. Do NOT click \"Submit\" or \"Submit Application\".",
+  "url": "https://thales.wd3.myworkdayjobs.com/en-US/Careers/job/Pennsylvania/Software-Development-Intern_R0317650-1?utm_source=Simplify&ref=Simplify",
+  "variableKeys": [],
+  "actions": [
+    {
+      "selector": "xpath=/html[1]/body[1]/div[2]/div[1]/div[1]/div[1]/div[2]/div[1]/div[1]/div[1]/div[4]/div[1]/div[1]/a[1]",
+      "description": "Apply Manually button - this will start the application process where \"Save and Continue\" button would appear",
+      "method": "click",
+      "arguments": []
+    }
+  ],
+  "actionDescription": "Apply Manually button - this will start the application process where \"Save and Continue\" button would appear",
+  "message": "Action [click] performed successfully on selector: xpath=/html[1]/body[1]/div[2]/div[1]/div[1]/div[1]/div[2]/div[1]/div[1]/div[1]/div[4]/div[1]/div[1]/a[1]"
+}
