@@ -50,7 +50,7 @@ export class SmartApplyHandler implements TaskHandler {
   }
 
   async execute(ctx: TaskContext): Promise<TaskResult> {
-    const { job, adapter, progress } = ctx;
+    const { job, adapter, progress, resumeFilePath: downloadedResumePath } = ctx;
     const userProfile = job.input_data.user_data as Record<string, any>;
 
     // Normalize address: API route stores flat (city, state, country, zip)
@@ -92,26 +92,46 @@ export class SmartApplyHandler implements TaskHandler {
     const qaMap = config.buildQAMap(userProfile, qaOverrides);
     const profileText = buildProfileText(userProfile as WorkdayUserProfile);
 
-    // Resolve resume file path (if provided)
+    // Resolve resume file path.
+    // Prefer ctx.resumeFilePath (downloaded by JobExecutor from resume_ref),
+    // then fall back to userProfile.resume_path if it points to a local file.
     let resumePath: string | null = null;
-    if (userProfile.resume_path) {
+    if (downloadedResumePath) {
+      const resolvedDownloaded = path.resolve(downloadedResumePath);
+      if (fs.existsSync(resolvedDownloaded)) {
+        resumePath = resolvedDownloaded;
+        console.log(`[SmartApply] Resume found (downloaded): ${resumePath}`);
+      } else {
+        console.warn(`[SmartApply] Downloaded resume missing at ${resolvedDownloaded} — falling back to profile path.`);
+      }
+    }
+    if (!resumePath && userProfile.resume_path) {
       const resolved = path.isAbsolute(userProfile.resume_path)
         ? userProfile.resume_path
         : path.resolve(process.cwd(), userProfile.resume_path);
       if (fs.existsSync(resolved)) {
         resumePath = resolved;
-        console.log(`[SmartApply] Resume found: ${resumePath}`);
+        console.log(`[SmartApply] Resume found (profile path): ${resumePath}`);
       } else {
         console.warn(`[SmartApply] Resume not found at ${resolved} — skipping upload.`);
       }
+    }
+    if (resumePath) {
+      // Keep platform-specific handlers (e.g. Workday custom experience handler)
+      // aligned with the concrete local file path.
+      userProfile.resume_path = resumePath;
     }
 
     // Auto-attach resume to any file dialog the LLM or DOM triggers
     if (resumePath) {
       const rp = resumePath;
       adapter.page.on('filechooser', async (chooser) => {
-        console.log(`[SmartApply] File chooser opened — attaching resume: ${rp}`);
-        await chooser.setFiles(rp);
+        try {
+          console.log(`[SmartApply] File chooser opened — attaching resume: ${rp}`);
+          await chooser.setFiles(rp);
+        } catch (err) {
+          console.warn(`[SmartApply] File chooser resume attach failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
       });
     }
 

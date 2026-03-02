@@ -18,6 +18,7 @@
 
 import type { Page } from 'playwright';
 import * as path from 'path';
+import * as fs from 'fs';
 import Anthropic from '@anthropic-ai/sdk';
 
 import type { BrowserAutomationAdapter } from '../../adapters/types.js';
@@ -152,6 +153,49 @@ function defaultValue(field: FormField): string {
       return 'I am excited about this opportunity and believe my skills and experience make me a strong candidate for this position.';
     default: return 'A';
   }
+}
+
+function isSkillLikeFieldName(name: string): boolean {
+  const n = normalizeName(name);
+  return /\bskills?\b/.test(n) || /\btechnolog(y|ies)\b/.test(n);
+}
+
+function parseProfileSkills(profileText: string): string[] {
+  const match = profileText.match(/^\s*Skills:\s*(.+)$/im);
+  if (!match) return [];
+  const deduped = new Set<string>();
+  for (const raw of match[1].split(/[;,|]/)) {
+    const skill = raw.trim();
+    if (!skill) continue;
+    deduped.add(skill);
+  }
+  return [...deduped];
+}
+
+function isExplicitFalse(value?: string): boolean {
+  if (!value) return false;
+  return /^(false|off|no|unchecked|0)$/i.test(value.trim());
+}
+
+async function readBinaryControlState(page: Page, ffId: string): Promise<boolean | null> {
+  return page.evaluate((id) => {
+    const el = document.querySelector(`[data-ff-id="${id}"]`) as HTMLElement | null;
+    if (!el) return null;
+
+    if (el.tagName === 'INPUT') {
+      const input = el as HTMLInputElement;
+      if (input.type === 'checkbox' || input.type === 'radio') return input.checked;
+    }
+
+    const nested = el.querySelector('input[type="checkbox"], input[type="radio"]') as HTMLInputElement | null;
+    if (nested) return nested.checked;
+
+    const ariaChecked = el.getAttribute('aria-checked');
+    if (ariaChecked === 'true') return true;
+    if (ariaChecked === 'false') return false;
+
+    return null;
+  }, ffId);
 }
 
 function normalizeName(s: string): string {
@@ -855,6 +899,7 @@ Rules:
 - For dropdowns/radio groups with listed options, you MUST pick the EXACT text of one of the available options.
 - For hierarchical dropdown options (format "Category > SubOption"), pick the EXACT full path including the " > " separator.
 - For dropdowns WITHOUT listed options, provide your best guess for the value.
+- For skill typeahead fields (labels containing "skill", e.g. "Type to Add Skills"), options are often partial/virtualized. Return an ARRAY of relevant skills from the applicant profile even if the options list is incomplete.
 - For multi-select fields, return a JSON array of ALL matching options from the available list (e.g., ["Python", "Java", "Go"]). Select every option that matches the applicant's skills/background.
 - For checkboxes/toggles, respond with "checked"/"unchecked" or "on"/"off".
 - For file upload fields, skip them (don't include in output).
@@ -1113,6 +1158,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
 
     case 'select': {
       const answer = getAnswer(answers, field);
+      const isSkillField = isSkillLikeFieldName(field.name);
 
       // Skip if already shows correct value
       if (answer && !field.isNative) {
@@ -1177,9 +1223,9 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
         }
       }
 
-      // Multi-select with comma-separated values
-      if (answer && answer.includes(',')) {
-        const values = answer.split(',').map(v => v.trim()).filter(Boolean);
+      // Multi-select values (comma-separated, or skill fields with single/multi values)
+      const values = answer ? answer.split(',').map(v => v.trim()).filter(Boolean) : [];
+      if ((answer && answer.includes(',')) || (isSkillField && values.length > 0)) {
         let clicked = 0;
         try {
           await clickComboboxTrigger(page, field.id);
@@ -1223,6 +1269,14 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
           await page.waitForTimeout(200);
           let added = 0;
           for (const val of values) {
+            const beforePillCount = await page.evaluate((ffId) => {
+              const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+              const scope = el?.closest('[data-automation-id], .form-group, .field, form') || document;
+              return scope.querySelectorAll(
+                '[data-automation-id="multiSelectPill"], [data-automation-id="selectedItem"], [class*="pill"]'
+              ).length;
+            }, field.id).catch(() => 0);
+
             await page.keyboard.type(val, { delay: 30 });
             await page.waitForTimeout(300);
             await page.keyboard.press('Enter');
@@ -1263,9 +1317,66 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
               } catch { /* no dropdown */ }
             }
 
+            // If no exact match, retry once with a broader term (first token)
+            if (!picked && val.includes(' ')) {
+              await page.click(sel, { clickCount: 3, timeout: 2000 }).catch(() => {});
+              await page.waitForTimeout(100);
+              await page.keyboard.press('Backspace');
+              await page.waitForTimeout(200);
+
+              const shortTerm = val.split(' ')[0];
+              await page.keyboard.type(shortTerm, { delay: 30 });
+              await page.waitForTimeout(300);
+              await page.keyboard.press('Enter');
+              await page.waitForTimeout(3000);
+
+              try { picked = await clickActiveListOption(page, val); } catch { /* no active list */ }
+              if (!picked) {
+                try {
+                  const tagged = await page.evaluate((searchText) => {
+                    document.querySelectorAll('[data-ff-click-target="skill"]').forEach(el => el.removeAttribute('data-ff-click-target'));
+                    const containers = document.querySelectorAll(
+                      '[role="listbox"], [data-automation-id="activeListContainer"], ' +
+                      '[class*="dropdown"], [class*="suggestions"], [class*="autocomplete"]'
+                    );
+                    const lower = searchText.toLowerCase().trim();
+                    for (const c of containers) {
+                      const items = c.querySelectorAll('[role="option"], li, [class*="option"], [class*="item"]');
+                      for (const item of items) {
+                        const r = (item as HTMLElement).getBoundingClientRect();
+                        if (r.height === 0) continue;
+                        const t = (item.textContent || '').trim().toLowerCase();
+                        if (t === lower || t.includes(lower) || lower.includes(t)) {
+                          (item as HTMLElement).setAttribute('data-ff-click-target', 'skill');
+                          return true;
+                        }
+                      }
+                    }
+                    return false;
+                  }, val);
+                  if (tagged) {
+                    await page.locator('[data-ff-click-target="skill"]').first().click({ timeout: 2000 });
+                    await page.evaluate(() => document.querySelectorAll('[data-ff-click-target="skill"]').forEach(el => el.removeAttribute('data-ff-click-target')));
+                    picked = true;
+                  }
+                } catch { /* no dropdown */ }
+              }
+            }
+
             if (!picked) {
               await page.keyboard.press('Enter');
               await page.waitForTimeout(500);
+            }
+
+            const afterPillCount = await page.evaluate((ffId) => {
+              const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+              const scope = el?.closest('[data-automation-id], .form-group, .field, form') || document;
+              return scope.querySelectorAll(
+                '[data-automation-id="multiSelectPill"], [data-automation-id="selectedItem"], [class*="pill"]'
+              ).length;
+            }, field.id).catch(() => beforePillCount);
+            if (!picked && afterPillCount > beforePillCount) {
+              picked = true;
             }
 
             await page.evaluate(() => { const body = document.querySelector('body'); if (body) body.click(); });
@@ -1274,7 +1385,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
             await page.waitForTimeout(100);
             await page.keyboard.press('Backspace');
             await page.waitForTimeout(200);
-            added++;
+            if (picked) added++;
           }
           if (added > 0) {
             console.log(`[formFiller]   multi-select ${tag} → ${added}/${values.length} tags (type+enter)`);
@@ -1284,6 +1395,11 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
 
         await page.keyboard.press('Escape').catch(() => {});
         console.log(`[formFiller]   skip ${tag} (multi-select failed)`);
+        return false;
+      }
+
+      if (isSkillField && !answer) {
+        console.log(`[formFiller]   skip ${tag} (skills field with no resolved answer)`);
         return false;
       }
 
@@ -1581,28 +1697,52 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
     }
 
     case 'checkbox-group': {
-      const clicked = await page.evaluate((ffId) => {
+      const val = getAnswer(answers, field);
+      if (isExplicitFalse(val)) {
+        console.log(`[formFiller]   check ${tag} → skip (answer=unchecked)`);
+        return true;
+      }
+      const status = await page.evaluate((ffId) => {
         const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-        if (!el) return false;
+        if (!el) return { clicked: false, alreadyChecked: false };
         const group = el.closest('.checkbox-group, [role="group"]') || el;
-        const cb = group.querySelector('input[type="checkbox"]') || group.querySelector('[role="checkbox"]');
-        if (cb) { (cb as HTMLElement).click(); return true; }
-        return false;
+        const cbs = Array.from(group.querySelectorAll('input[type="checkbox"], [role="checkbox"]')) as HTMLElement[];
+        if (cbs.length === 0) return { clicked: false, alreadyChecked: false };
+        for (const cb of cbs) {
+          const input = cb as HTMLInputElement;
+          if (input.checked) return { clicked: true, alreadyChecked: true };
+          if (cb.getAttribute('aria-checked') === 'true') return { clicked: true, alreadyChecked: true };
+        }
+        cbs[0].click();
+        return { clicked: true, alreadyChecked: false };
       }, field.id);
-      console.log(clicked ? `[formFiller]   check ${tag} → first` : `[formFiller]   skip ${tag}`);
-      return clicked;
+      if (status.clicked && status.alreadyChecked) {
+        console.log(`[formFiller]   skip ${tag} (already checked)`);
+        return true;
+      }
+      console.log(status.clicked ? `[formFiller]   check ${tag} → first` : `[formFiller]   skip ${tag}`);
+      return status.clicked;
     }
 
     case 'checkbox': {
       const val = getAnswer(answers, field);
-      if (val === 'false' || val === 'unchecked') {
+      const desiredChecked = !isExplicitFalse(val);
+      if (!desiredChecked) {
         console.log(`[formFiller]   check ${tag} → skip (answer=unchecked)`);
+        return true;
+      }
+      const before = await readBinaryControlState(page, field.id);
+      if (before === true) {
+        console.log(`[formFiller]   skip ${tag} (already checked)`);
         return true;
       }
       try {
         await page.click(sel, { timeout: 2000 });
-        console.log(`[formFiller]   check ${tag}`);
-        return true;
+        const after = await readBinaryControlState(page, field.id);
+        if (after === true || after === null) {
+          console.log(`[formFiller]   check ${tag}`);
+          return true;
+        }
       } catch {
         const clicked = await page.evaluate((ffId) => {
           const el = document.querySelector(`[data-ff-id="${ffId}"]`);
@@ -1611,38 +1751,109 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
           (label as HTMLElement).click();
           return true;
         }, field.id);
-        console.log(clicked ? `[formFiller]   check ${tag}` : `[formFiller]   skip ${tag}`);
-        return clicked;
+        if (!clicked) {
+          console.log(`[formFiller]   skip ${tag}`);
+          return false;
+        }
+        const after = await readBinaryControlState(page, field.id);
+        if (after === true || after === null) {
+          console.log(`[formFiller]   check ${tag}`);
+          return true;
+        }
       }
+      console.log(`[formFiller]   skip ${tag} (did not remain checked)`);
+      return false;
     }
 
     case 'toggle': {
       const val = getAnswer(answers, field);
-      if (val === 'off' || val === 'false') {
+      const desiredOn = !isExplicitFalse(val);
+      if (!desiredOn) {
         console.log(`[formFiller]   toggle ${tag} → skip (answer=off)`);
+        return true;
+      }
+      const before = await readBinaryControlState(page, field.id);
+      if (before === true) {
+        console.log(`[formFiller]   skip ${tag} (already on)`);
         return true;
       }
       await page.evaluate((ffId) => {
         const el = document.querySelector(`[data-ff-id="${ffId}"]`) as any;
         if (el) el.click();
       }, field.id);
-      console.log(`[formFiller]   toggle ${tag} → on`);
-      return true;
+      const after = await readBinaryControlState(page, field.id);
+      if (after === true || after === null) {
+        console.log(`[formFiller]   toggle ${tag} → on`);
+        return true;
+      }
+      console.log(`[formFiller]   skip ${tag} (did not remain on)`);
+      return false;
     }
 
     case 'file': {
-      const filePath = getAnswer(answers, field)
-        ? path.resolve(getAnswer(answers, field)!)
-        : (resumePath || '');
+      const llmPath = getAnswer(answers, field)?.trim();
+      let filePath = '';
+
+      if (resumePath) {
+        const resolvedResume = path.resolve(resumePath);
+        if (fs.existsSync(resolvedResume) && fs.statSync(resolvedResume).isFile()) {
+          filePath = resolvedResume;
+        }
+      }
+      if (!filePath && llmPath) {
+        const resolvedLlm = path.resolve(llmPath);
+        if (fs.existsSync(resolvedLlm) && fs.statSync(resolvedLlm).isFile()) {
+          filePath = resolvedLlm;
+        }
+      }
+
       if (!filePath) {
         console.log(`[formFiller]   skip ${tag} (no resume path)`);
         return false;
       }
+
       try {
         await page.setInputFiles(sel, filePath, { timeout: 2000 });
         console.log(`[formFiller]   upload ${tag} → ${path.basename(filePath)}`);
         return true;
       } catch {
+        try {
+          const fallbackSelector = await page.evaluate((ffId) => {
+            const root = document.querySelector(`[data-ff-id="${ffId}"]`);
+            const candidates: HTMLInputElement[] = [];
+
+            if (root instanceof HTMLInputElement && root.type === 'file') {
+              candidates.push(root);
+            }
+
+            const container = root?.closest('form, .form-group, .field, .form-field, [data-automation-id]') || document;
+            container.querySelectorAll('input[type="file"]').forEach((el) => {
+              candidates.push(el as HTMLInputElement);
+            });
+
+            if (candidates.length === 0) {
+              document.querySelectorAll('input[type="file"]').forEach((el) => {
+                candidates.push(el as HTMLInputElement);
+              });
+            }
+
+            for (const cand of candidates) {
+              const marker = cand.getAttribute('data-ff-file-fallback') || `ff-file-${Math.random().toString(36).slice(2)}`;
+              cand.setAttribute('data-ff-file-fallback', marker);
+              return `[data-ff-file-fallback="${marker}"]`;
+            }
+
+            return null;
+          }, field.id);
+
+          if (fallbackSelector) {
+            await page.setInputFiles(fallbackSelector, filePath, { timeout: 2500 });
+            console.log(`[formFiller]   upload ${tag} → ${path.basename(filePath)} (fallback)`);
+            return true;
+          }
+        } catch {
+          // Continue to final failure log below
+        }
         console.log(`[formFiller]   skip ${tag} (file input failed)`);
         return false;
       }
@@ -1675,10 +1886,10 @@ async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
     if (role === 'radiogroup') return !!el.querySelector('input[type="radio"]:checked');
     if (role === 'switch') {
       const cb = el.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
-      if (cb) return true;
+      if (cb) return cb.checked;
       return el.getAttribute('aria-checked') === 'true';
     }
-    if (type === 'checkbox') return true;
+    if (type === 'checkbox') return (el as HTMLInputElement).checked;
     if (type === 'range') return true;
     if (type === 'file') return true;
     if (el.getAttribute('contenteditable') === 'true') return (el.textContent?.trim() || '').length > 0;
@@ -2023,6 +2234,9 @@ export async function fillFormOnPage(
   console.log('[formFiller] Extracting form fields…');
   const allFields = await extractFields(page);
   const visibleFields = allFields.filter((f) => f.visibleByDefault && f.name);
+  const llmFields = visibleFields.filter((f) => f.type !== 'file');
+  const profileSkills = parseProfileSkills(profileText);
+  const profileSkillsCsv = profileSkills.join(', ');
   result.totalFields = visibleFields.length;
   console.log(`[formFiller] Found ${visibleFields.length} visible fields.`);
 
@@ -2036,12 +2250,18 @@ export async function fillFormOnPage(
   await discoverDropdownOptions(page, allFields);
 
   // 6. Ask LLM for answers
-  console.log('[formFiller] Asking LLM for answers…');
-  const genResult = await generateAnswers(allFields, profileText);
-  const answers = { ...genResult.answers };
-  const fieldIdMap: Record<string, string> = { ...genResult.fieldIdToKey };
-  result.llmCalls++;
-  console.log(`[formFiller] LLM provided ${Object.keys(answers).length} answers.`);
+  let answers: AnswerMap = {};
+  const fieldIdMap: Record<string, string> = {};
+  if (llmFields.length > 0) {
+    console.log('[formFiller] Asking LLM for answers…');
+    const genResult = await generateAnswers(llmFields, profileText);
+    answers = { ...genResult.answers };
+    Object.assign(fieldIdMap, genResult.fieldIdToKey);
+    result.llmCalls++;
+    console.log(`[formFiller] LLM provided ${Object.keys(answers).length} answers.`);
+  } else {
+    console.log('[formFiller] No named non-file fields for LLM — skipping answer generation.');
+  }
 
   // 7. Iterative fill loop
   const attempted = new Set<string>();
@@ -2080,7 +2300,11 @@ export async function fillFormOnPage(
 
     // If new fields appeared that the LLM hasn't seen, ask again
     const unseen = toFill.filter(
-      (f) => getAnswerForField(answers, f, fieldIdMap) === undefined && f.type !== 'file'
+      (f) => {
+        if (f.type === 'file') return false;
+        if (isSkillLikeFieldName(f.name) && profileSkillsCsv) return false;
+        return getAnswerForField(answers, f, fieldIdMap) === undefined;
+      }
     );
     if (unseen.length > 0 && round > 1) {
       console.log(`[formFiller] ${unseen.length} new fields discovered — asking LLM…`);
@@ -2094,7 +2318,10 @@ export async function fillFormOnPage(
 
     for (const field of toFill) {
       attempted.add(field.id);
-      const resolved = getAnswerForField(answers, field, fieldIdMap);
+      let resolved = getAnswerForField(answers, field, fieldIdMap);
+      if (!resolved && isSkillLikeFieldName(field.name) && profileSkillsCsv) {
+        resolved = profileSkillsCsv;
+      }
       const fieldAnswers = resolved !== undefined ? { ...answers, [field.name]: resolved } : answers;
       const ok = await fillField(page, field, fieldAnswers, resumePath);
       if (ok) domFilledOk.add(field.id);
@@ -2121,7 +2348,8 @@ export async function fillFormOnPage(
 
     const filled = await isFieldFilled(page, f.id);
     if (!filled) {
-      const answer = getAnswerForField(answers, f, fieldIdMap);
+      const answer = getAnswerForField(answers, f, fieldIdMap)
+        ?? (isSkillLikeFieldName(f.name) && profileSkillsCsv ? profileSkillsCsv : undefined);
       if (answer !== undefined && answer.trim() === '') continue;
       unfilledFields.push(f);
     }
@@ -2139,7 +2367,8 @@ export async function fillFormOnPage(
       }, field.id);
       await page.waitForTimeout(300);
 
-      const answer = getAnswerForField(answers, field, fieldIdMap);
+      const answer = getAnswerForField(answers, field, fieldIdMap)
+        ?? (isSkillLikeFieldName(field.name) && profileSkillsCsv ? profileSkillsCsv : undefined);
       let prompt = `You are filling out a job application for this person:\n${profileText.trim()}\n\n`;
       prompt += `Fill the form field labeled "${field.name}"`;
       if (answer) {
