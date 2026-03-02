@@ -1,8 +1,8 @@
 /**
  * @wekruit/ghosthands-engine — Job application automation engine.
  *
- * Public API for the GH-Desktop-App. The desktop app imports from this
- * package instead of copying engine files directly.
+ * Public API for the GH-Desktop-App.
+ * The desktop app imports from this package instead of copying engine files directly.
  *
  * @packageDocumentation
  */
