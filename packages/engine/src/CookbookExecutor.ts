@@ -1,7 +1,7 @@
 /**
  * CookbookExecutor — Deterministic step replay engine.
  *
- * Replays an ActionManual's steps using LocatorResolver for element finding
+ * Replays an ActionManual's steps via LocatorResolver for element finding
  * and direct Playwright actions for execution. Zero LLM calls.
  */
 
