@@ -34,7 +34,7 @@ export async function fetchEc2InstanceId(): Promise<string> {
     const instanceId = (await idRes.text()).trim();
 
     if (!/^i-[0-9a-f]{8,17}$/.test(instanceId)) {
-      logger.warn({ instanceId }, 'IMDS returned unexpected instance ID format');
+      logger.warn('IMDS returned unexpected instance ID format', { instanceId });
       return process.env.EC2_INSTANCE_ID || 'unknown';
     }
 
@@ -80,7 +80,7 @@ export async function discoverImdsInstanceId(): Promise<string | null> {
     const instanceId = (await idRes.text()).trim();
 
     if (!/^i-[0-9a-f]{8,17}$/.test(instanceId)) {
-      logger.warn({ instanceId }, 'IMDS returned unexpected instance ID format');
+      logger.warn('IMDS returned unexpected instance ID format', { instanceId });
       return null;
     }
 
