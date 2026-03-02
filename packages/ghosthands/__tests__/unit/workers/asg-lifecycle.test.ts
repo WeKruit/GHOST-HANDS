@@ -30,7 +30,7 @@ vi.mock('../../../src/monitoring/logger.js', () => ({
   }),
 }));
 
-import { completeLifecycleAction, fetchEc2InstanceId, fetchEc2Ip } from '../../../src/workers/asg-lifecycle.js';
+import { completeLifecycleAction, fetchEc2InstanceId, fetchEc2Ip, discoverImdsInstanceId } from '../../../src/workers/asg-lifecycle.js';
 
 // ---------------------------------------------------------------------------
 // completeLifecycleAction
@@ -126,11 +126,11 @@ describe('fetchEc2InstanceId', () => {
 
   test('returns instance ID from metadata service on success', async () => {
     globalThis.fetch = vi.fn()
-      .mockResolvedValueOnce({ text: async () => 'mock-token' } as Response)
-      .mockResolvedValueOnce({ text: async () => 'i-metadata123' } as Response);
+      .mockResolvedValueOnce({ ok: true, text: async () => 'mock-token' } as Response)
+      .mockResolvedValueOnce({ ok: true, text: async () => 'i-0abc123def456' } as Response);
 
     const result = await fetchEc2InstanceId();
-    expect(result).toBe('i-metadata123');
+    expect(result).toBe('i-0abc123def456');
   });
 
   test('falls back to EC2_INSTANCE_ID env var when metadata fails', async () => {
@@ -170,8 +170,8 @@ describe('fetchEc2Ip', () => {
 
   test('returns public IP from metadata service on success', async () => {
     globalThis.fetch = vi.fn()
-      .mockResolvedValueOnce({ text: async () => 'mock-token' } as Response)
-      .mockResolvedValueOnce({ text: async () => '1.2.3.4' } as Response);
+      .mockResolvedValueOnce({ ok: true, text: async () => 'mock-token' } as Response)
+      .mockResolvedValueOnce({ ok: true, text: async () => '1.2.3.4' } as Response);
 
     const result = await fetchEc2Ip();
     expect(result).toBe('1.2.3.4');
@@ -191,5 +191,67 @@ describe('fetchEc2Ip', () => {
 
     const result = await fetchEc2Ip();
     expect(result).toBe('local');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// discoverImdsInstanceId (strict IMDS-only, no env fallback)
+// ---------------------------------------------------------------------------
+
+describe('discoverImdsInstanceId', () => {
+  const originalEnv = process.env;
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env = { ...originalEnv };
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    process.env = originalEnv;
+  });
+
+  test('returns valid instance ID on IMDS success', async () => {
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce({ ok: true, text: async () => 'mock-token' } as Response)
+      .mockResolvedValueOnce({ ok: true, text: async () => 'i-0abc123def456' } as Response);
+
+    const result = await discoverImdsInstanceId();
+    expect(result).toBe('i-0abc123def456');
+  });
+
+  test('returns null on fetch failure', async () => {
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network error'));
+
+    const result = await discoverImdsInstanceId();
+    expect(result).toBeNull();
+  });
+
+  test('returns null on non-ok response', async () => {
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce({ ok: true, text: async () => 'mock-token' } as Response)
+      .mockResolvedValueOnce({ ok: false, status: 404, text: async () => '' } as Response);
+
+    const result = await discoverImdsInstanceId();
+    expect(result).toBeNull();
+  });
+
+  test('returns null on invalid format', async () => {
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce({ ok: true, text: async () => 'mock-token' } as Response)
+      .mockResolvedValueOnce({ ok: true, text: async () => 'not-an-instance-id' } as Response);
+
+    const result = await discoverImdsInstanceId();
+    expect(result).toBeNull();
+  });
+
+  test('does NOT fall back to EC2_INSTANCE_ID env var', async () => {
+    process.env.EC2_INSTANCE_ID = 'i-envfallback999';
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('timeout'));
+
+    const result = await discoverImdsInstanceId();
+    // discoverImdsInstanceId is strict — returns null, not env value
+    expect(result).toBeNull();
   });
 });

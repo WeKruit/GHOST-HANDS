@@ -12,8 +12,10 @@ async function getImdsToken(): Promise<string> {
     method: 'PUT',
     headers: { 'X-aws-ec2-metadata-token-ttl-seconds': '21600' },
     signal: AbortSignal.timeout(1000),
+    redirect: 'error',
   });
-  return res.text();
+  if (!res.ok) throw new Error(`IMDS token request failed: ${res.status}`);
+  return (await res.text()).trim();
 }
 
 /**
@@ -26,8 +28,17 @@ export async function fetchEc2InstanceId(): Promise<string> {
     const idRes = await fetch('http://169.254.169.254/latest/meta-data/instance-id', {
       headers: { 'X-aws-ec2-metadata-token': token },
       signal: AbortSignal.timeout(1000),
+      redirect: 'error',
     });
-    return await idRes.text();
+    if (!idRes.ok) return process.env.EC2_INSTANCE_ID || 'unknown';
+    const instanceId = (await idRes.text()).trim();
+
+    if (!/^i-[0-9a-f]{8,17}$/.test(instanceId)) {
+      logger.warn({ instanceId }, 'IMDS returned unexpected instance ID format');
+      return process.env.EC2_INSTANCE_ID || 'unknown';
+    }
+
+    return instanceId;
   } catch {
     return process.env.EC2_INSTANCE_ID || 'unknown';
   }
@@ -43,10 +54,39 @@ export async function fetchEc2Ip(): Promise<string> {
     const ipRes = await fetch('http://169.254.169.254/latest/meta-data/public-ipv4', {
       headers: { 'X-aws-ec2-metadata-token': token },
       signal: AbortSignal.timeout(1000),
+      redirect: 'error',
     });
-    return await ipRes.text();
+    if (!ipRes.ok) return process.env.EC2_IP || 'local';
+    return (await ipRes.text()).trim();
   } catch {
     return process.env.EC2_IP || 'local';
+  }
+}
+
+/**
+ * Strict IMDS-only instance ID discovery for worker ID resolution.
+ * Returns null on any failure — NO env var fallback.
+ * This prevents stale/incorrect EC2_INSTANCE_ID env from polluting worker identity.
+ */
+export async function discoverImdsInstanceId(): Promise<string | null> {
+  try {
+    const token = await getImdsToken();
+    const idRes = await fetch('http://169.254.169.254/latest/meta-data/instance-id', {
+      headers: { 'X-aws-ec2-metadata-token': token },
+      signal: AbortSignal.timeout(1000),
+      redirect: 'error',
+    });
+    if (!idRes.ok) return null;
+    const instanceId = (await idRes.text()).trim();
+
+    if (!/^i-[0-9a-f]{8,17}$/.test(instanceId)) {
+      logger.warn({ instanceId }, 'IMDS returned unexpected instance ID format');
+      return null;
+    }
+
+    return instanceId;
+  } catch {
+    return null;
   }
 }
 

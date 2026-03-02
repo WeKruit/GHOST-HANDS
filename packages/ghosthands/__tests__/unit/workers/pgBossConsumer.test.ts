@@ -177,7 +177,7 @@ describe('PgBossConsumer', () => {
       const dbRow = sampleDbRow();
       mockPg.query
         .mockResolvedValueOnce({ rows: [dbRow] })  // SELECT
-        .mockResolvedValueOnce({ rows: [] });       // UPDATE status
+        .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'gh-job-001' }] });  // CAS UPDATE
 
       const consumer = createConsumer();
       await consumer.start();
@@ -214,7 +214,7 @@ describe('PgBossConsumer', () => {
       const dbRow = sampleDbRow();
       mockPg.query
         .mockResolvedValueOnce({ rows: [dbRow] })
-        .mockResolvedValueOnce({ rows: [] });
+        .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'gh-job-001' }] });  // CAS UPDATE
 
       const consumer = createConsumer();
       await consumer.start();
@@ -225,6 +225,46 @@ describe('PgBossConsumer', () => {
       // After completion, counters should reset
       expect(consumer.activeJobCount).toBe(0);
       expect(consumer.currentJobId).toBeNull();
+    });
+  });
+
+  // ── Test 2b: CAS guard ─────────────────────────────────────────────
+
+  describe('handleJob() — CAS guard', () => {
+    test('skips execution when job is not in claimable state (CAS no-op)', async () => {
+      const dbRow = sampleDbRow({ status: 'failed' });
+      mockPg.query
+        .mockResolvedValueOnce({ rows: [dbRow] })  // SELECT — job exists but in 'failed' state
+        .mockResolvedValueOnce({ rowCount: 0, rows: [] });  // CAS UPDATE — 0 rows = not claimable
+
+      const consumer = createConsumer();
+      await consumer.start();
+
+      const workCallback = mockBoss.work.mock.calls[0][2];
+      await workCallback([samplePgBossJob()]);
+
+      // executor.execute should NOT be called
+      expect(mockExecutor.execute).not.toHaveBeenCalled();
+
+      // State should be cleaned up by finally block
+      expect(consumer.activeJobCount).toBe(0);
+      expect(consumer.currentJobId).toBeNull();
+    });
+
+    test('proceeds with execution when CAS succeeds', async () => {
+      const dbRow = sampleDbRow({ status: 'queued' });
+      mockPg.query
+        .mockResolvedValueOnce({ rows: [dbRow] })  // SELECT
+        .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'gh-job-001' }] });  // CAS UPDATE succeeds
+
+      const consumer = createConsumer();
+      await consumer.start();
+
+      const workCallback = mockBoss.work.mock.calls[0][2];
+      await workCallback([samplePgBossJob()]);
+
+      // executor.execute SHOULD be called
+      expect(mockExecutor.execute).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -242,7 +282,7 @@ describe('PgBossConsumer', () => {
       mockExecutor.execute.mockImplementationOnce(() => firstJobPromise);
       mockPg.query
         .mockResolvedValueOnce({ rows: [dbRow] })   // SELECT for job 1
-        .mockResolvedValueOnce({ rows: [] });        // UPDATE for job 1
+        .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'gh-job-001' }] });  // CAS UPDATE for job 1
 
       const consumer = createConsumer();
       await consumer.start();
@@ -288,7 +328,7 @@ describe('PgBossConsumer', () => {
       mockExecutor.execute.mockImplementationOnce(() => firstJobPromise);
       mockPg.query
         .mockResolvedValueOnce({ rows: [dbRow] })
-        .mockResolvedValueOnce({ rows: [] });
+        .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'gh-job-001' }] });  // CAS UPDATE
 
       const consumer = createConsumer();
       await consumer.start();
@@ -333,7 +373,7 @@ describe('PgBossConsumer', () => {
       const dbRow = sampleDbRow();
       mockPg.query
         .mockResolvedValueOnce({ rows: [dbRow] })
-        .mockResolvedValueOnce({ rows: [] });
+        .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'gh-job-001' }] });  // CAS UPDATE
 
       mockExecutor.execute.mockRejectedValueOnce(new Error('Browser crashed'));
 
@@ -384,7 +424,7 @@ describe('PgBossConsumer', () => {
 
       mockPg.query
         .mockResolvedValueOnce({ rows: [dbRow] })   // SELECT
-        .mockResolvedValueOnce({ rows: [] })         // UPDATE to running
+        .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'gh-job-001' }] })  // CAS UPDATE
         .mockResolvedValueOnce({ rows: [{ id: 'gh-job-001' }] }); // releaseClaimedJobs UPDATE
 
       const consumer = createConsumer();
@@ -426,7 +466,7 @@ describe('PgBossConsumer', () => {
 
       mockPg.query
         .mockResolvedValueOnce({ rows: [dbRow] })
-        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'gh-job-001' }] })  // CAS UPDATE
         .mockResolvedValueOnce({ rows: [] }); // releaseClaimedJobs
 
       mockBoss.fail.mockRejectedValueOnce(new Error('pg-boss connection lost'));
@@ -492,7 +532,7 @@ describe('PgBossConsumer', () => {
       const dbRow = sampleDbRow({ input_data: '{"resume_ref":"resume-xyz"}' });
       mockPg.query
         .mockResolvedValueOnce({ rows: [dbRow] })
-        .mockResolvedValueOnce({ rows: [] });
+        .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'gh-job-001' }] });  // CAS UPDATE
 
       const consumer = createConsumer();
       await consumer.start();
@@ -514,7 +554,7 @@ describe('PgBossConsumer', () => {
       });
       mockPg.query
         .mockResolvedValueOnce({ rows: [dbRow] })
-        .mockResolvedValueOnce({ rows: [] });
+        .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'gh-job-001' }] });  // CAS UPDATE
 
       const consumer = createConsumer();
       await consumer.start();
@@ -548,7 +588,7 @@ describe('PgBossConsumer', () => {
       const dbRow = sampleDbRow({ metadata: '{"source":"valet","quality_preset":"speed"}' });
       mockPg.query
         .mockResolvedValueOnce({ rows: [dbRow] })
-        .mockResolvedValueOnce({ rows: [] });
+        .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'gh-job-001' }] });  // CAS UPDATE
 
       const consumer = createConsumer();
       await consumer.start();
@@ -564,7 +604,7 @@ describe('PgBossConsumer', () => {
       const dbRow = sampleDbRow({ tags: '["valet","apply"]' });
       mockPg.query
         .mockResolvedValueOnce({ rows: [dbRow] })
-        .mockResolvedValueOnce({ rows: [] });
+        .mockResolvedValueOnce({ rowCount: 1, rows: [{ id: 'gh-job-001' }] });  // CAS UPDATE
 
       const consumer = createConsumer();
       await consumer.start();
