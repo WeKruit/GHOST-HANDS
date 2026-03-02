@@ -1374,15 +1374,42 @@ export class JobExecutor {
       return;
     }
 
-    // Extract the workflow state from the result
-    const finalState = result?.result as WorkflowState | undefined;
+    // Extract the workflow state from the result.
+    // Mastra may return the state directly as result.result, or wrapped inside
+    // a StepResult (result.result.output), or keyed by step ID in result.steps.
+    let finalState: WorkflowState | undefined;
+    const raw = result?.result;
 
-    if (!finalState) {
-      logger.error('Mastra workflow returned no result', { jobId: job.id, rawResult: result });
-      throw new Error('Mastra workflow returned no result');
+    if (raw && typeof raw === 'object' && 'cookbook' in raw && 'handler' in raw) {
+      // Direct: result.result IS the WorkflowState
+      finalState = raw as WorkflowState;
+    } else if (raw && typeof raw === 'object' && 'output' in raw && typeof raw.output === 'object' && raw.output && 'cookbook' in raw.output) {
+      // Wrapped in StepResult: result.result.output is the WorkflowState
+      finalState = raw.output as WorkflowState;
+    } else if (result?.steps) {
+      // Fallback: extract from individual step results
+      const stepKeys = ['execute_handler', 'cookbook_done'];
+      for (const key of stepKeys) {
+        const stepResult = (result.steps as Record<string, any>)[key];
+        if (stepResult?.output && typeof stepResult.output === 'object' && 'cookbook' in stepResult.output) {
+          finalState = stepResult.output as WorkflowState;
+          break;
+        }
+      }
     }
 
-    if (finalState.cookbook.success) {
+    if (!finalState) {
+      logger.error('Mastra workflow returned no extractable state', {
+        jobId: job.id,
+        resultStatus: result?.status,
+        resultKeys: raw ? Object.keys(raw) : 'null',
+        hasSteps: !!result?.steps,
+        stepKeys: result?.steps ? Object.keys(result.steps) : [],
+      });
+      throw new Error('Mastra workflow returned no extractable state');
+    }
+
+    if (finalState.cookbook?.success) {
       // Cookbook path finalization
       await finalizeCookbookSuccess({
         job,
@@ -1405,7 +1432,7 @@ export class JobExecutor {
       return;
     }
 
-    if (finalState.handler.attempted && finalState.handler.taskResult) {
+    if (finalState.handler?.attempted && finalState.handler.taskResult) {
       // Handler path finalization
       const { awaitingReview } = await finalizeHandlerResult({
         job,
@@ -1422,7 +1449,7 @@ export class JobExecutor {
         engineResult: {
           success: false,
           mode: 'magnitude',
-          cookbookSteps: finalState.cookbook.steps,
+          cookbookSteps: finalState.cookbook?.steps ?? 0,
           magnitudeSteps: costTracker.getSnapshot().actionCount,
         },
       });

@@ -68,3 +68,5 @@ magnitude-source/
 
 #Stagehand logs
 packages/ghosthands/inference_summary/
+
+packages/ghosthands/action-cache/

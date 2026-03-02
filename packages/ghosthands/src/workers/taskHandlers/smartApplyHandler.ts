@@ -69,6 +69,14 @@ export class SmartApplyHandler implements TaskHandler {
 
     const qaOverrides = job.input_data.qa_overrides || {};
 
+    // Polyfill __name in browser context — esbuild/bun may inject __name
+    // references into serialized page.evaluate() callbacks. Define it as a
+    // no-op both now (for the current page) and via addInitScript (survives
+    // SPA navigations).
+    const namePolyfill = 'if(typeof globalThis.__name==="undefined"){globalThis.__name=function(f){return f}}';
+    await adapter.page.addInitScript(namePolyfill);
+    await adapter.page.evaluate(namePolyfill);
+
     // Resolve platform config from URL
     const config = detectPlatformFromUrl(job.target_url);
     console.log(`[SmartApply] Platform: ${config.displayName} (${config.platformId})`);
@@ -602,9 +610,10 @@ export class SmartApplyHandler implements TaskHandler {
     await this.throttleLlm(adapter);
     const result = await adapter.act(
       'Click the "Apply" or "Apply Now" button to start the job application. ' +
-      'Your ONLY task is to click the apply button — nothing else. ' +
-      'After clicking, report the task as done immediately. ' +
-      'The page will navigate away — that is expected.',
+      'If a modal or dialog appears with options like "Apply Manually", "Autofill with Resume", ' +
+      '"Use My Last Application", etc., click "Apply Manually" to proceed. ' +
+      'Do NOT stop after clicking Apply if a modal with further choices appears — ' +
+      'you must click through it to actually begin the application.',
     );
 
     // The LLM agent may report "failure" if the page navigated to a login/auth
@@ -615,7 +624,21 @@ export class SmartApplyHandler implements TaskHandler {
       if (urlAfter !== urlBefore) {
         console.log('[SmartApply] Apply button clicked — page navigated. Continuing...');
       } else {
-        throw new Error(`Failed to click Apply button: ${result.message}`);
+        // The modal might still be open — try clicking "Apply Manually" directly
+        try {
+          await this.throttleLlm(adapter);
+          const modalResult = await adapter.act(
+            'A dialog or modal is open. Click "Apply Manually" or the option to proceed ' +
+            'with the application without autofill. If no modal is visible, report done.',
+          );
+          if (modalResult.success) {
+            console.log('[SmartApply] Clicked through Apply modal. Continuing...');
+          } else {
+            throw new Error(`Failed to click Apply button: ${result.message}`);
+          }
+        } catch (modalErr) {
+          throw new Error(`Failed to click Apply button: ${result.message}`);
+        }
       }
     }
 

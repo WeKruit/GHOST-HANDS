@@ -161,7 +161,7 @@ function recordCostBestEffort(
 function fireCallbackBestEffort(
   job: AutomationJob,
   workerId: string,
-  status: 'completed',
+  status: 'completed' | 'failed',
   resultData: Record<string, unknown>,
   resultSummary: string,
   screenshotUrls: string[],
@@ -387,6 +387,30 @@ export async function finalizeHandlerResult(
   // 4. Save fresh session cookies (Google + target domain)
   await saveFreshSessionCookies(adapter, sessionManager, job.user_id, job.target_url);
 
+  // 4.5. Persist final_mode and engine/cost metadata (parity with legacy path)
+  await supabase
+    .from('gh_automation_jobs')
+    .update({
+      final_mode: finalMode,
+      metadata: {
+        ...(job.metadata || {}),
+        engine: {
+          manual_id: engineResult.manualId || null,
+          manual_status: engineResult.manualId ? 'cookbook_failed_fallback' : 'no_manual_available',
+          fallback_reason: engineResult.error || null,
+        },
+        cost_breakdown: {
+          cookbook_steps: engineResult.cookbookSteps,
+          magnitude_steps: finalCost.actionCount,
+          cookbook_cost_usd: 0,
+          magnitude_cost_usd: finalCost.totalCost,
+          image_cost_usd: finalCost.imageCost,
+          reasoning_cost_usd: finalCost.reasoningCost,
+        },
+      },
+    })
+    .eq('id', job.id);
+
   // 5. Handle awaiting_user_review vs normal completion
   if (taskResult.awaitingUserReview) {
     await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
@@ -435,10 +459,7 @@ export async function finalizeHandlerResult(
     return { awaitingReview: true };
   }
 
-  // 6. Normal completion flow
-  await progress.setStep(ProgressStep.COMPLETED);
-  await progress.flush();
-
+  // 6. Build result data (shared by success and failure paths)
   const resultData: Record<string, unknown> = {
     ...(taskResult.data || {}),
     cost: {
@@ -448,6 +469,63 @@ export async function finalizeHandlerResult(
       action_count: finalCost.actionCount,
     },
   };
+
+  // 7. Handler failure — mark job as failed, not completed
+  if (!taskResult.success) {
+    await progress.setStep(ProgressStep.COMPLETED);
+    await progress.flush();
+
+    const errorMessage = taskResult.error || 'Handler returned success: false';
+
+    await supabase
+      .from('gh_automation_jobs')
+      .update({
+        status: 'failed',
+        completed_at: new Date().toISOString(),
+        error_code: 'handler_failed',
+        error_details: { message: errorMessage },
+        result_data: resultData,
+        screenshot_urls: screenshotUrls,
+        llm_cost_cents: Math.round(finalCost.totalCost * 100),
+        action_count: finalCost.actionCount,
+        total_tokens: finalCost.inputTokens + finalCost.outputTokens,
+      })
+      .eq('id', job.id);
+
+    await logEvent('job_failed', {
+      error_code: 'handler_failed',
+      error_message: errorMessage,
+      action_count: finalCost.actionCount,
+      total_tokens: finalCost.inputTokens + finalCost.outputTokens,
+      cost_cents: Math.round(finalCost.totalCost * 100),
+      final_mode: finalMode,
+    });
+
+    recordCostBestEffort(supabase, job.user_id, job.id, finalCost);
+
+    fireCallbackBestEffort(
+      job,
+      workerId,
+      'failed',
+      resultData,
+      errorMessage,
+      screenshotUrls,
+      finalCost,
+    );
+
+    logger.info('Job failed via handler', {
+      jobId: job.id,
+      error: errorMessage,
+      actionCount: finalCost.actionCount,
+      costUsd: finalCost.totalCost,
+    });
+
+    return { awaitingReview: false };
+  }
+
+  // 8. Normal completion flow
+  await progress.setStep(ProgressStep.COMPLETED);
+  await progress.flush();
 
   const resultSummary =
     taskResult.data?.success_message ||
