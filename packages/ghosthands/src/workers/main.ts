@@ -63,13 +63,47 @@ import { JobPoller } from './JobPoller.js';
 import { PgBossConsumer } from './PgBossConsumer.js';
 import { JobExecutor } from './JobExecutor.js';
 import { registerBuiltinHandlers } from './taskHandlers/index.js';
-import { getLogger } from '../monitoring/logger.js';
+import { getLogger, getLogStream } from '../monitoring/logger.js';
 import { fetchEc2InstanceId, fetchEc2Ip, completeLifecycleAction } from './asg-lifecycle.js';
 import { resolveWorkerId } from './resolveWorkerId.js';
 import { SessionManager } from '../sessions/SessionManager.js';
 import { createEncryptionFromEnv } from '../db/encryption.js';
 
 const logger = getLogger({ service: 'Worker' });
+
+// ── Mirror ALL console output to log file when GH_LOG_FILE=true ─────────
+// The Logger class writes its own structured output to the file, but
+// [SmartApply], [formFiller], Magnitude narration, and third-party libs
+// use raw console.log/error/warn/debug. This intercept captures everything.
+{
+  const stream = getLogStream();
+  if (stream) {
+    const ANSI_RE = /\x1b\[[0-9;]*m/g;
+    function stripAnsi(s: string): string { return s.replace(ANSI_RE, ''); }
+
+    const origLog = console.log.bind(console);
+    const origError = console.error.bind(console);
+    const origWarn = console.warn.bind(console);
+    const origDebug = console.debug.bind(console);
+
+    console.log = (...args: any[]) => {
+      origLog(...args);
+      stream.write(stripAnsi(args.map(String).join(' ')) + '\n');
+    };
+    console.error = (...args: any[]) => {
+      origError(...args);
+      stream.write(stripAnsi(args.map(String).join(' ')) + '\n');
+    };
+    console.warn = (...args: any[]) => {
+      origWarn(...args);
+      stream.write(stripAnsi(args.map(String).join(' ')) + '\n');
+    };
+    console.debug = (...args: any[]) => {
+      origDebug(...args);
+      stream.write(stripAnsi(args.map(String).join(' ')) + '\n');
+    };
+  }
+}
 
 /**
  * GhostHands Worker Entry Point
