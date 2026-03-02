@@ -3,6 +3,8 @@
  *
  * Public API for the GH-Desktop-App. The desktop app imports from this
  * package instead of copying engine files directly.
+ *
+ * @packageDocumentation
  */
 
 // ── High-level API ────────────────────────────────────────────────────
