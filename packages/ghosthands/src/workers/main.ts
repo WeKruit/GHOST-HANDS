@@ -64,7 +64,7 @@ import { PgBossConsumer } from './PgBossConsumer.js';
 import { JobExecutor } from './JobExecutor.js';
 import { registerBuiltinHandlers } from './taskHandlers/index.js';
 import { getLogger } from '../monitoring/logger.js';
-import { fetchEc2InstanceId, fetchEc2Ip, completeLifecycleAction } from './asg-lifecycle.js';
+import { fetchEc2InstanceId, fetchEc2Ip, completeLifecycleAction, discoverImdsInstanceId } from './asg-lifecycle.js';
 import { SessionManager } from '../sessions/SessionManager.js';
 import { createEncryptionFromEnv } from '../db/encryption.js';
 
@@ -93,23 +93,40 @@ const logger = getLogger({ service: 'Worker' });
  *            dispatch mode.
  */
 
-function parseWorkerId(): string {
+/**
+ * Resolves worker ID from multiple sources (in priority order).
+ * Uses strict IMDS (no env fallback) for Kamal deploys where env vars aren't per-host.
+ */
+async function resolveWorkerId(): Promise<string> {
+  // 1. CLI arg (explicit override)
   const arg = process.argv.find((a) => a.startsWith('--worker-id='));
   if (arg) {
     const id = arg.split('=')[1];
     if (!id) {
       throw new Error('--worker-id requires a value (e.g. --worker-id=adam)');
     }
+    logger.info({ source: 'cli', workerId: id }, 'Worker ID resolved');
     return id;
   }
-  // Environment variable for Docker/EC2 deployments (set via .env)
+
+  // 2. Environment variable (backward compat, docker-compose deploys)
   if (process.env.GH_WORKER_ID) {
+    logger.info({ source: 'env', workerId: process.env.GH_WORKER_ID }, 'Worker ID resolved');
     return process.env.GH_WORKER_ID;
   }
-  return `worker-${process.env.FLY_REGION || process.env.NODE_ENV || 'local'}-${Date.now()}`;
-}
 
-const WORKER_ID = parseWorkerId();
+  // 3. EC2 IMDS — strict, no env fallback (prevents stale EC2_INSTANCE_ID from leaking in)
+  const instanceId = await discoverImdsInstanceId();
+  if (instanceId) {
+    logger.info({ source: 'imds', workerId: instanceId }, 'Worker ID resolved');
+    return instanceId;
+  }
+
+  // 4. Fallback (local dev)
+  const generated = `worker-${process.env.FLY_REGION || process.env.NODE_ENV || 'local'}-${Date.now()}`;
+  logger.info({ source: 'generated', workerId: generated }, 'Worker ID resolved');
+  return generated;
+}
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -120,6 +137,9 @@ function requireEnv(name: string): string {
 }
 
 async function main(): Promise<void> {
+  // Resolve worker ID first — everything downstream depends on this
+  const WORKER_ID = await resolveWorkerId();
+
   // GH uses JOB_DISPATCH_MODE; VALET uses TASK_DISPATCH_MODE — these are different env vars
   // on different services. Legacy mode is backward-compatible and works regardless of
   // VALET's dispatch mode because JobPoller picks up both 'pending' and 'queued' statuses.
