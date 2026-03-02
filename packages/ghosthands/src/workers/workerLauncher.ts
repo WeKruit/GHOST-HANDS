@@ -9,5 +9,4 @@
 process.env.BAML_LOG ??= 'off';
 process.env.MAGNITUDE_LOG_LEVEL ??= 'warn';
 
-export {};
-await import('./main.js');
+import('./main.js');

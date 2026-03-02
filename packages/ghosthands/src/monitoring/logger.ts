@@ -1,4 +1,27 @@
 import { getEnv } from '../config/env.js';
+import * as fs from 'fs';
+import * as path from 'path';
+
+// --- File log stream (shared across all Logger instances) ---
+
+let _logStream: fs.WriteStream | null = null;
+let _logStreamInitialized = false;
+
+export function getLogStream(): fs.WriteStream | null {
+  if (_logStreamInitialized) return _logStream;
+  _logStreamInitialized = true;
+
+  if (process.env.GH_LOG_FILE !== 'true') return null;
+
+  const logsDir = path.resolve(process.cwd(), 'logs');
+  if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const logPath = path.join(logsDir, `worker-${timestamp}.log`);
+  _logStream = fs.createWriteStream(logPath, { flags: 'a' });
+  // Log to console so the user knows where the file is
+  console.log(`[logger] Writing logs to: ${logPath}`);
+  return _logStream;
+}
 
 // --- Types ---
 
@@ -172,6 +195,24 @@ function formatDevLine(entry: LogEntry): string {
   return `${COLORS.dim}${timePart}${COLORS.reset} ${color}${label}${COLORS.reset} ${entry.msg}${COLORS.dim}${contextStr}${COLORS.reset}`;
 }
 
+/**
+ * Format a LogEntry as a plain-text line (no ANSI colors) for file output.
+ */
+function formatPlainLine(entry: LogEntry): string {
+  const timePart = entry.timestamp.slice(11, 19);
+  const { label } = LEVEL_FORMAT[entry.level];
+
+  const extras: string[] = [];
+  for (const [key, value] of Object.entries(entry)) {
+    if (DEV_OMIT_KEYS.has(key)) continue;
+    if (value === undefined || value === null) continue;
+    extras.push(`${key}=${String(value)}`);
+  }
+
+  const contextStr = extras.length > 0 ? `  ${extras.join(' ')}` : '';
+  return `${timePart} ${label} ${entry.msg}${contextStr}`;
+}
+
 // --- Logger class ---
 
 export class Logger {
@@ -245,6 +286,10 @@ export class Logger {
       default:
         console.log(line);
     }
+
+    // Note: file logging is handled by the console intercept in main.ts.
+    // When GH_LOG_FILE=true, main.ts monkey-patches console.log/error/warn/debug
+    // to mirror all output (including Logger output) to the log file stream.
   }
 }
 
