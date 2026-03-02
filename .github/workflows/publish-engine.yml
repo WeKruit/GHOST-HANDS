@@ -1,0 +1,205 @@
+# Publish @wekruit/ghosthands-engine to GitHub Packages.
+# Staging: prerelease with commit SHA suffix (strict one-version-per-commit).
+# Main: stable release (fails if version not bumped).
+name: Publish Engine
+
+on:
+  push:
+    branches: [staging, main]
+    paths: ['packages/engine/**']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://npm.pkg.github.com
+
+      - name: Install and build
+        working-directory: packages/engine
+        run: |
+          npm install
+          npm run build
+
+      - name: Determine version and target
+        id: meta
+        working-directory: packages/engine
+        run: |
+          BASE_VERSION=$(node -p "require('./package.json').version")
+          SHORT_SHA=$(git rev-parse --short=8 HEAD)
+          if [ "${{ github.ref }}" = "refs/heads/staging" ]; then
+            VERSION="${BASE_VERSION}-staging.${SHORT_SHA}"
+            echo "tag=staging" >> "$GITHUB_OUTPUT"
+            echo "desktop-target=staging" >> "$GITHUB_OUTPUT"
+            echo "channel=staging" >> "$GITHUB_OUTPUT"
+          else
+            VERSION="${BASE_VERSION}"
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "desktop-target=main" >> "$GITHUB_OUTPUT"
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if version already published
+        id: check
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          CHANNEL="${{ steps.meta.outputs.channel }}"
+          if npm view "@wekruit/ghosthands-engine@${VERSION}" version 2>/dev/null; then
+            if [ "$CHANNEL" = "stable" ]; then
+              echo "::error::Version ${VERSION} already published. Bump the version in packages/engine/package.json before merging to main."
+              exit 1
+            else
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "Version ${VERSION} already published for this commit, skipping."
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set package version
+        if: steps.check.outputs.skip == 'false'
+        working-directory: packages/engine
+        run: npm version "${{ steps.meta.outputs.version }}" --no-git-tag-version
+
+      - name: Generate MANIFEST.json
+        if: steps.check.outputs.skip == 'false'
+        working-directory: packages/engine
+        run: |
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const crypto = require('crypto');
+
+            function walk(dir, base = '') {
+              const entries = [];
+              for (const f of fs.readdirSync(dir, { withFileTypes: true })) {
+                const rel = path.join(base, f.name);
+                if (f.isDirectory()) {
+                  entries.push(...walk(path.join(dir, f.name), rel));
+                } else {
+                  const content = fs.readFileSync(path.join(dir, f.name));
+                  entries.push({
+                    file: rel,
+                    size: content.length,
+                    sha256: crypto.createHash('sha256').update(content).digest('hex'),
+                  });
+                }
+              }
+              return entries;
+            }
+
+            const manifest = {
+              version: '${{ steps.meta.outputs.version }}',
+              commit: '${{ github.sha }}',
+              timestamp: new Date().toISOString(),
+              files: walk('dist'),
+            };
+            fs.writeFileSync('MANIFEST.json', JSON.stringify(manifest, null, 2));
+            console.log('Manifest:', manifest.files.length, 'files');
+          "
+
+      - name: Publish to GitHub Packages (with provenance)
+        if: steps.check.outputs.skip == 'false'
+        working-directory: packages/engine
+        run: npm publish --tag ${{ steps.meta.outputs.tag }} --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute source changeset
+        if: steps.check.outputs.skip == 'false'
+        id: changeset
+        run: |
+          CHANNEL="${{ steps.meta.outputs.channel }}"
+          if [ "$CHANNEL" = "staging" ]; then
+            PREV_TAG=$(git tag --list 'engine-v*-staging.*' --sort=-v:refname | head -1)
+          else
+            PREV_TAG=$(git tag --list 'engine-v*' --sort=-v:refname | { grep -v '\-staging\.' || true; } | head -1)
+          fi
+
+          if [ -n "$PREV_TAG" ]; then
+            echo "previous_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+            PREV_SHA=$(git rev-list -1 "$PREV_TAG")
+            echo "previous_sha=${PREV_SHA}" >> "$GITHUB_OUTPUT"
+
+            DIFF_STAT=$(git diff --stat "$PREV_TAG"..HEAD -- packages/engine/src/ | tail -1)
+            DIFF_FILES=$(git diff --name-status "$PREV_TAG"..HEAD -- packages/engine/src/)
+            COMPARE_URL="https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${{ github.sha }}"
+
+            DIFF_FILES_ESCAPED=$(echo "$DIFF_FILES" | jq -Rsa .)
+
+            echo "diff_stat=${DIFF_STAT}" >> "$GITHUB_OUTPUT"
+            echo "diff_files=${DIFF_FILES_ESCAPED}" >> "$GITHUB_OUTPUT"
+            echo "compare_url=${COMPARE_URL}" >> "$GITHUB_OUTPUT"
+            echo "has_previous=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_previous=false" >> "$GITHUB_OUTPUT"
+            echo "diff_stat=Initial publish (no previous version)" >> "$GITHUB_OUTPUT"
+            echo "diff_files=\"(initial publish)\"" >> "$GITHUB_OUTPUT"
+            echo "compare_url=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag this publish
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          TAG_NAME="engine-v${{ steps.meta.outputs.version }}"
+          git tag "$TAG_NAME" "${{ github.sha }}"
+          git push origin "$TAG_NAME"
+
+      - name: Write traceability artifacts
+        if: steps.check.outputs.skip == 'false'
+        id: trace
+        working-directory: packages/engine
+        run: |
+          jq -n \
+            --arg prev_tag "${{ steps.changeset.outputs.previous_tag }}" \
+            --arg prev_sha "${{ steps.changeset.outputs.previous_sha }}" \
+            --arg diff_stat "${{ steps.changeset.outputs.diff_stat }}" \
+            --arg compare_url "${{ steps.changeset.outputs.compare_url }}" \
+            --argjson diff_files "${{ steps.changeset.outputs.diff_files }}" \
+            --slurpfile manifest MANIFEST.json \
+            '{
+              previous_tag: $prev_tag,
+              previous_sha: $prev_sha,
+              diff_stat: $diff_stat,
+              diff_files: $diff_files,
+              compare_url: $compare_url,
+              manifest: $manifest[0]
+            }' > /tmp/engine-trace.json
+
+      - name: Upload traceability artifact
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-trace-${{ steps.meta.outputs.version }}
+          path: /tmp/engine-trace.json
+          retention-days: 90
+
+      - name: Trigger desktop repo update
+        if: steps.check.outputs.skip == 'false'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.DESKTOP_REPO_PAT }}
+          repository: WeKruit/GH-Desktop-App-1
+          event-type: engine-updated
+          client-payload: >-
+            {
+              "version": "${{ steps.meta.outputs.version }}",
+              "sha": "${{ github.sha }}",
+              "target": "${{ steps.meta.outputs.desktop-target }}",
+              "diff_stat": "${{ steps.changeset.outputs.diff_stat }}",
+              "compare_url": "${{ steps.changeset.outputs.compare_url }}",
+              "run_id": "${{ github.run_id }}"
+            }
