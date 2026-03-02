@@ -1,6 +1,4 @@
-/**
- * Platform detection from URL patterns.
- */
+/** Platform detection from URL patterns. */
 
 const PLATFORM_PATTERNS: Array<{ platform: string; patterns: RegExp[] }> = [
   { platform: 'workday', patterns: [/\.myworkdayjobs\.com/, /\.wd\d\.myworkdaysite\.com/] },
