@@ -14,7 +14,6 @@ jobs:
     permissions:
       packages: write
       contents: write
-      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -111,10 +110,10 @@ jobs:
             console.log('Manifest:', manifest.files.length, 'files');
           "
 
-      - name: Publish to GitHub Packages (with provenance)
+      - name: Publish to GitHub Packages
         if: steps.check.outputs.skip == 'false'
         working-directory: packages/engine
-        run: npm publish --tag ${{ steps.meta.outputs.tag }} --provenance
+        run: npm publish --tag ${{ steps.meta.outputs.tag }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
