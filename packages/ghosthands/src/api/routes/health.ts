@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import * as os from 'os';
-import { readFileSync } from 'fs';
+import { readFileSync, statfsSync } from 'fs';
 
 const startedAt = Date.now();
 
@@ -88,11 +88,21 @@ health.get('/system', (c) => {
       totalMb: Math.round(totalMem / 1024 / 1024),
       usagePercent: Math.round(usedMem / totalMem * 100 * 100) / 100,
     },
-    disk: {
-      usedGb: 0,
-      totalGb: 0,
-      usagePercent: 0,
-    },
+    disk: (() => {
+      try {
+        const { bsize, blocks, bfree } = statfsSync('/');
+        const totalGb = (bsize * blocks) / (1024 ** 3);
+        const freeGb = (bsize * bfree) / (1024 ** 3);
+        const usedGb = totalGb - freeGb;
+        return {
+          usedGb: Math.round(usedGb * 100) / 100,
+          totalGb: Math.round(totalGb * 100) / 100,
+          usagePercent: totalGb > 0 ? Math.round((usedGb / totalGb) * 100 * 100) / 100 : 0,
+        };
+      } catch {
+        return { usedGb: 0, totalGb: 0, usagePercent: 0 };
+      }
+    })(),
     timestamp: new Date().toISOString(),
   });
 });
