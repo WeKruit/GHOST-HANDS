@@ -52,8 +52,15 @@ export interface FillResult {
 
 interface GenerateResult {
   answers: AnswerMap;
+  fieldIdToKey: Record<string, string>;
   inputTokens: number;
   outputTokens: number;
+}
+
+interface RepeaterInfo {
+  label: string;
+  addButtonSelector: string;
+  currentCount: number;
 }
 
 // ── Constants ────────────────────────────────────────────────
@@ -147,13 +154,33 @@ function defaultValue(field: FormField): string {
   }
 }
 
+function normalizeName(s: string): string {
+  return s.replace(/\*/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
 function getAnswer(answers: AnswerMap, field: FormField): string | undefined {
   if (field.name in answers) return answers[field.name];
-  const norm = field.name.replace(/\*/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const norm = normalizeName(field.name);
   for (const [key, val] of Object.entries(answers)) {
-    if (key.replace(/\*/g, '').replace(/\s+/g, ' ').trim().toLowerCase() === norm) return val;
+    if (normalizeName(key) === norm) return val;
   }
   return undefined;
+}
+
+function getAnswerForField(
+  answers: AnswerMap,
+  field: FormField,
+  fieldIdMap?: Record<string, string>,
+): string | undefined {
+  const mappedKey = fieldIdMap?.[field.id];
+  if (mappedKey) {
+    if (mappedKey in answers) return answers[mappedKey];
+    const mappedNorm = normalizeName(mappedKey);
+    for (const [key, val] of Object.entries(answers)) {
+      if (normalizeName(key) === mappedNorm) return val;
+    }
+  }
+  return getAnswer(answers, field);
 }
 
 // ── Browser-side injection ───────────────────────────────────
@@ -784,8 +811,25 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
 async function generateAnswers(fields: FormField[], profileText: string): Promise<GenerateResult> {
   const client = new Anthropic();
 
-  const fieldDescriptions = fields.map((f) => {
-    let desc = `- "${f.name}" (type: ${f.isMultiSelect ? 'multi-select' : f.type})`;
+  // Disambiguate duplicate field names by appending "#2", "#3", etc.
+  const nameCounts = new Map<string, number>();
+  const disambiguatedNames: string[] = [];
+  for (let i = 0; i < fields.length; i++) {
+    const baseName = fields[i].name?.trim() || `Field ${i + 1}`;
+    const norm = normalizeName(baseName) || `field-${i + 1}`;
+    const count = (nameCounts.get(norm) || 0) + 1;
+    nameCounts.set(norm, count);
+    disambiguatedNames.push(count > 1 ? `${baseName} #${count}` : baseName);
+  }
+
+  const fieldIdToKey: Record<string, string> = {};
+  for (let i = 0; i < fields.length; i++) {
+    fieldIdToKey[fields[i].id] = disambiguatedNames[i];
+  }
+
+  const fieldDescriptions = fields.map((f, i) => {
+    const displayName = disambiguatedNames[i];
+    let desc = `- "${displayName}" (type: ${f.isMultiSelect ? 'multi-select' : f.type})`;
     if (f.options?.length) desc += ` options: [${f.options.join(', ')}]`;
     if (f.choices?.length) desc += ` choices: [${f.choices.join(', ')}]`;
     if (f.section) desc += ` [section: ${f.section}]`;
@@ -818,6 +862,8 @@ Rules:
 - For conditional "Please specify" or "Other (please explain)" fields, answer in context of what triggered them (e.g., if "How did you hear about us?" was "Other", specify the referral source, not the job title).
 - For demographic/EEO fields (gender, race, ethnicity, veteran, disability), use the applicant's actual demographic info from their profile. Pick the option that best matches.
 - For salary fields, provide a realistic number based on the role and experience level (e.g., 120000 for a mid-level engineer).
+- Fields with "#2", "#3", etc. are repeated fields from repeater sections (e.g. multiple work experiences or education entries). Use the matching numbered entry from the profile.
+- Use the EXACT field names shown above (including any "#N" suffix) as JSON keys.
 - You MUST respond with ONLY a valid JSON object. No explanation, no commentary, no markdown fences.
 
 Example response:
@@ -840,10 +886,10 @@ Example response:
       if (Array.isArray(v)) (parsed as any)[k] = v.join(',');
       else if (typeof v === 'number') (parsed as any)[k] = String(v);
     }
-    return { answers: parsed, inputTokens, outputTokens };
+    return { answers: parsed, fieldIdToKey, inputTokens, outputTokens };
   } catch {
     console.log('[formFiller] Failed to parse LLM response as JSON, using empty answers');
-    return { answers: {}, inputTokens, outputTokens };
+    return { answers: {}, fieldIdToKey, inputTokens, outputTokens };
   }
 }
 
@@ -1672,6 +1718,256 @@ async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
   }, ffId);
 }
 
+async function hasFieldValueForRerender(page: Page, ffId: string): Promise<boolean> {
+  return page.evaluate((id) => {
+    const el = document.querySelector(`[data-ff-id="${id}"]`) as HTMLElement | null;
+    if (!el) return false;
+
+    const tag = el.tagName;
+    const role = el.getAttribute('role') || '';
+    const type = (el as HTMLInputElement).type || '';
+
+    if (tag === 'INPUT' || tag === 'TEXTAREA') {
+      if (type === 'checkbox' || type === 'radio') {
+        return (el as HTMLInputElement).checked || el.getAttribute('aria-checked') === 'true';
+      }
+      return !!(el as HTMLInputElement).value?.trim();
+    }
+
+    if (tag === 'SELECT') {
+      const sel = el as HTMLSelectElement;
+      const selectedOpt = sel.options[sel.selectedIndex];
+      if (!selectedOpt) return false;
+      const text = selectedOpt.textContent?.trim() || '';
+      return sel.value !== '' && !/^(select|choose|pick|--|—)/i.test(text);
+    }
+
+    if (role === 'checkbox' || role === 'radio' || role === 'switch') {
+      if (el.getAttribute('aria-checked') === 'true') return true;
+      const inner = el.querySelector('input[type="checkbox"], input[type="radio"]') as HTMLInputElement | null;
+      return !!inner?.checked;
+    }
+
+    if (role === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox') {
+      const pills = el.closest('[data-automation-id]')
+        ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
+      if (pills && pills.textContent?.trim()) return true;
+      const input = (el as HTMLInputElement).value ? (el as HTMLInputElement) : el.querySelector('input');
+      if (input && (input as HTMLInputElement).value?.trim()) return true;
+      const trigger = el.querySelector('.custom-select-trigger span');
+      if (trigger && trigger.textContent?.trim()) {
+        const t = trigger.textContent.trim();
+        if (!/^(select|choose|pick|--|—|start typing)/i.test(t)) return true;
+      }
+      return false;
+    }
+
+    if (el.getAttribute('contenteditable') === 'true') {
+      return !!el.textContent?.trim();
+    }
+
+    return false;
+  }, ffId);
+}
+
+// ── Repeater section handling (Work Experience / Education "Add" buttons) ──
+
+async function detectRepeaters(page: Page): Promise<RepeaterInfo[]> {
+  return page.evaluate(() => {
+    const repeaters: RepeaterInfo[] = [];
+    const ADD_RE = /^\+?\s*add\b/i;
+
+    const buttons = Array.from(document.querySelectorAll<HTMLElement>(
+      'button, [role="button"], a.add-btn, .add-btn'
+    ));
+
+    for (const btn of buttons) {
+      const rect = btn.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+
+      const style = window.getComputedStyle(btn);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      if (btn.getAttribute('aria-hidden') === 'true') continue;
+      if (btn.hasAttribute('disabled') || btn.getAttribute('aria-disabled') === 'true') continue;
+
+      const text = (btn.textContent || '').trim();
+      if (!ADD_RE.test(text)) continue;
+
+      const card = btn.closest(
+        '.card, .section, [class*="section"], [class*="card"], ' +
+        '[data-automation-id*="Section"], [data-automation-id*="panel"], ' +
+        '[class*="Panel"], [class*="panel"]'
+      );
+
+      let label = '';
+      if (card) {
+        const heading = card.querySelector(
+          'h2, h3, h4, [class*="heading"], [class*="title"], ' +
+          '[data-automation-id*="sectionHeader"], [data-automation-id*="Title"], ' +
+          'legend, [class*="legend"]'
+        );
+        label = heading?.textContent?.trim() || '';
+      }
+
+      if (!label) {
+        let el: Element | null = btn.parentElement;
+        while (el && !label) {
+          const prev = el.previousElementSibling;
+          if (prev) {
+            const tag = prev.tagName;
+            if (tag === 'H2' || tag === 'H3' || tag === 'H4' || tag === 'LEGEND') {
+              label = prev.textContent?.trim() || '';
+            }
+            const hdr = prev.querySelector('[data-automation-id*="sectionHeader"], [data-automation-id*="Title"]');
+            if (hdr) label = hdr.textContent?.trim() || '';
+          }
+          el = el.parentElement;
+          if (el === card) break;
+        }
+      }
+
+      if (!label) {
+        label = btn.getAttribute('aria-label')?.trim() || text;
+      }
+
+      let currentCount = 0;
+      if (card) {
+        const allText = card.textContent || '';
+        const sectionBase = label.replace(/\s*\d+$/, '').trim();
+        if (sectionBase) {
+          const numberedRe = new RegExp(`${sectionBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+\\d+`, 'gi');
+          const matches = allText.match(numberedRe);
+          if (matches) {
+            const unique = new Set(matches.map((m) => m.trim().toLowerCase()));
+            currentCount = unique.size;
+          }
+        }
+
+        if (currentCount === 0) {
+          const list = card.querySelector(
+            '.repeater-list, [class*="repeater"], [class*="entries"], ' +
+            '[data-automation-id*="itemList"], [data-automation-id*="entryList"]'
+          );
+          if (list) currentCount = list.children.length;
+        }
+
+        if (currentCount === 0) {
+          const fieldsets = card.querySelectorAll('fieldset, [class*="entry"], [class*="item-group"]');
+          if (fieldsets.length > 0) currentCount = fieldsets.length;
+        }
+
+        if (currentCount === 0) {
+          const inputs = card.querySelectorAll('input[type="text"], textarea');
+          for (const inp of inputs) {
+            if ((inp as HTMLInputElement).value.trim()) {
+              currentCount = 1;
+              break;
+            }
+          }
+        }
+      }
+
+      const marker = `ff-add-${repeaters.length}`;
+      btn.setAttribute('data-ff-add', marker);
+
+      repeaters.push({
+        label,
+        addButtonSelector: `[data-ff-add="${marker}"]`,
+        currentCount,
+      });
+    }
+
+    return repeaters;
+  });
+}
+
+function countNumberedEntriesInSection(profileText: string, header: string): number {
+  const escaped = header.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const blockMatch = profileText.match(
+    new RegExp(`${escaped}:\\s*\\n([\\s\\S]*?)(?=\\n[A-Z][^\\n:]{1,40}:|\\nDemographics:|$)`, 'i')
+  );
+  if (!blockMatch) return 0;
+
+  const numbered = blockMatch[1].match(/^\s*\d+\.\s+/gm);
+  if (numbered?.length) return numbered.length;
+
+  const bulleted = blockMatch[1].match(/^\s*[-*•]\s+/gm);
+  if (bulleted?.length) return bulleted.length;
+
+  return 0;
+}
+
+function countProfileEntries(profileText: string, sectionLabel: string): number {
+  const cap = (n: number) => Math.max(1, Math.min(n, 8));
+  const lower = sectionLabel.toLowerCase();
+
+  if (lower.includes('work') || lower.includes('experience') || lower.includes('employment')) {
+    const numbered = countNumberedEntriesInSection(profileText, 'Work Experience');
+    if (numbered > 0) return cap(numbered);
+
+    const roleLines = profileText.match(/^\s*(Current Role|Previous):\s+/gim);
+    if (roleLines?.length) return cap(roleLines.length);
+
+    const workBlock = profileText.match(
+      /Work Experience:\s*\n([\s\S]*?)(?=\nEducation:|\nSkills:|\nWork authorization:|\nDemographics:|$)/i
+    );
+    if (workBlock) {
+      const atCount = workBlock[1].match(/\bat\s+[A-Za-z0-9]/gi)?.length || 0;
+      if (atCount > 0) return cap(atCount);
+    }
+
+    return 1;
+  }
+
+  if (lower.includes('education') || lower.includes('school') || lower.includes('university')) {
+    const numbered = countNumberedEntriesInSection(profileText, 'Education');
+    if (numbered > 0) return cap(numbered);
+
+    const eduLines = profileText.match(/^\s*Education:\s+/gim);
+    if (eduLines?.length) return cap(eduLines.length);
+
+    return 1;
+  }
+
+  return 1;
+}
+
+async function expandRepeaters(page: Page, profileText: string): Promise<void> {
+  const repeaters = await detectRepeaters(page);
+  if (repeaters.length === 0) return;
+
+  const targetSections = /(work|experience|employment|education|school|university)/i;
+  const deduped = new Map<string, RepeaterInfo>();
+  for (const rep of repeaters) {
+    if (!targetSections.test(rep.label)) continue;
+    const key = normalizeName(rep.label);
+    if (!deduped.has(key)) deduped.set(key, rep);
+  }
+
+  if (deduped.size === 0) return;
+  console.log(`[formFiller] Found ${deduped.size} repeater section(s).`);
+
+  for (const rep of deduped.values()) {
+    const needed = countProfileEntries(profileText, rep.label);
+    const toAdd = Math.max(0, needed - rep.currentCount);
+    console.log(
+      `[formFiller] repeater "${rep.label}": need ${needed}, have ${rep.currentCount}, adding ${toAdd}`
+    );
+
+    for (let i = 0; i < toAdd; i++) {
+      try {
+        await page.click(rep.addButtonSelector, { timeout: 3000 });
+        await page.waitForTimeout(500);
+      } catch (e: any) {
+        console.log(`[formFiller] repeater "${rep.label}" add failed: ${e.message?.slice(0, 80)}`);
+        break;
+      }
+    }
+  }
+
+  await page.waitForTimeout(500);
+}
+
 // ── Main entry point ─────────────────────────────────────────
 
 /**
@@ -1719,7 +2015,11 @@ export async function fillFormOnPage(
     });
   });
 
-  // 3. Extract fields
+  // 3. Expand repeater sections (Work Experience / Education) first.
+  await expandRepeaters(page, profileText);
+  await injectHelpers(page);
+
+  // 4. Extract fields
   console.log('[formFiller] Extracting form fields…');
   const allFields = await extractFields(page);
   const visibleFields = allFields.filter((f) => f.visibleByDefault && f.name);
@@ -1731,18 +2031,19 @@ export async function fillFormOnPage(
     return result;
   }
 
-  // 4. Discover dropdown options (including hierarchical Workday dropdowns)
+  // 5. Discover dropdown options (including hierarchical Workday dropdowns)
   console.log('[formFiller] Discovering dropdown options…');
   await discoverDropdownOptions(page, allFields);
 
-  // 5. Ask LLM for answers
+  // 6. Ask LLM for answers
   console.log('[formFiller] Asking LLM for answers…');
   const genResult = await generateAnswers(allFields, profileText);
-  const answers = genResult.answers;
+  const answers = { ...genResult.answers };
+  const fieldIdMap: Record<string, string> = { ...genResult.fieldIdToKey };
   result.llmCalls++;
   console.log(`[formFiller] LLM provided ${Object.keys(answers).length} answers.`);
 
-  // 6. Iterative fill loop
+  // 7. Iterative fill loop
   const attempted = new Set<string>();
   const domFilledOk = new Set<string>();
   let round = 0;
@@ -1759,17 +2060,33 @@ export async function fillFormOnPage(
     const fields = await extractFields(page);
     const visible = fields.filter((f) => f.visibleByDefault && f.name);
 
-    const toFill = visible.filter((f) => !attempted.has(f.id));
+    const candidates = visible.filter((f) => !attempted.has(f.id));
+    if (candidates.length === 0) break;
+
+    // Skip React re-rendered replacements that already contain a value.
+    const toFill: FormField[] = [];
+    for (const field of candidates) {
+      if (round > 1) {
+        const hasValue = await hasFieldValueForRerender(page, field.id);
+        if (hasValue) {
+          attempted.add(field.id);
+          domFilledOk.add(field.id);
+          continue;
+        }
+      }
+      toFill.push(field);
+    }
     if (toFill.length === 0) break;
 
     // If new fields appeared that the LLM hasn't seen, ask again
     const unseen = toFill.filter(
-      (f) => getAnswer(answers, f) === undefined && f.type !== 'file'
+      (f) => getAnswerForField(answers, f, fieldIdMap) === undefined && f.type !== 'file'
     );
     if (unseen.length > 0 && round > 1) {
       console.log(`[formFiller] ${unseen.length} new fields discovered — asking LLM…`);
       const extraResult = await generateAnswers(unseen, profileText);
       Object.assign(answers, extraResult.answers);
+      Object.assign(fieldIdMap, extraResult.fieldIdToKey);
       result.llmCalls++;
     }
 
@@ -1777,7 +2094,9 @@ export async function fillFormOnPage(
 
     for (const field of toFill) {
       attempted.add(field.id);
-      const ok = await fillField(page, field, answers, resumePath);
+      const resolved = getAnswerForField(answers, field, fieldIdMap);
+      const fieldAnswers = resolved !== undefined ? { ...answers, [field.name]: resolved } : answers;
+      const ok = await fillField(page, field, fieldAnswers, resumePath);
       if (ok) domFilledOk.add(field.id);
     }
 
@@ -1791,7 +2110,7 @@ export async function fillFormOnPage(
   result.totalAttempted = attempted.size;
   console.log(`[formFiller] DOM fill done: ${domFilledOk.size}/${attempted.size} fields in ${round} round(s).`);
 
-  // 7. MagnitudeHand fallback
+  // 8. MagnitudeHand fallback
   await page.waitForTimeout(500);
   const postFields = await extractFields(page);
   const postVisible = postFields.filter((f) => f.visibleByDefault);
@@ -1802,7 +2121,7 @@ export async function fillFormOnPage(
 
     const filled = await isFieldFilled(page, f.id);
     if (!filled) {
-      const answer = getAnswer(answers, f);
+      const answer = getAnswerForField(answers, f, fieldIdMap);
       if (answer !== undefined && answer.trim() === '') continue;
       unfilledFields.push(f);
     }
@@ -1820,7 +2139,7 @@ export async function fillFormOnPage(
       }, field.id);
       await page.waitForTimeout(300);
 
-      const answer = getAnswer(answers, field);
+      const answer = getAnswerForField(answers, field, fieldIdMap);
       let prompt = `You are filling out a job application for this person:\n${profileText.trim()}\n\n`;
       prompt += `Fill the form field labeled "${field.name}"`;
       if (answer) {
