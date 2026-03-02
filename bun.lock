@@ -20,8 +20,10 @@
     },
     "packages/engine": {
       "name": "@wekruit/ghosthands-engine",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "dependencies": {
+        "@browserbasehq/stagehand": "3.1.0",
+        "eventemitter3": "^5.0.1",
         "playwright": "npm:patchright@^1.52.0",
       },
       "devDependencies": {
