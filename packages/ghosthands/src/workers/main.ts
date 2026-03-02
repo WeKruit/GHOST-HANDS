@@ -65,6 +65,7 @@ import { JobExecutor } from './JobExecutor.js';
 import { registerBuiltinHandlers } from './taskHandlers/index.js';
 import { getLogger } from '../monitoring/logger.js';
 import { fetchEc2InstanceId, fetchEc2Ip, completeLifecycleAction } from './asg-lifecycle.js';
+import { resolveWorkerId } from './resolveWorkerId.js';
 import { SessionManager } from '../sessions/SessionManager.js';
 import { createEncryptionFromEnv } from '../db/encryption.js';
 
@@ -93,24 +94,6 @@ const logger = getLogger({ service: 'Worker' });
  *            dispatch mode.
  */
 
-function parseWorkerId(): string {
-  const arg = process.argv.find((a) => a.startsWith('--worker-id='));
-  if (arg) {
-    const id = arg.split('=')[1];
-    if (!id) {
-      throw new Error('--worker-id requires a value (e.g. --worker-id=adam)');
-    }
-    return id;
-  }
-  // Environment variable for Docker/EC2 deployments (set via .env)
-  if (process.env.GH_WORKER_ID) {
-    return process.env.GH_WORKER_ID;
-  }
-  return `worker-${process.env.FLY_REGION || process.env.NODE_ENV || 'local'}-${Date.now()}`;
-}
-
-const WORKER_ID = parseWorkerId();
-
 function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -120,6 +103,9 @@ function requireEnv(name: string): string {
 }
 
 async function main(): Promise<void> {
+  // Resolve worker ID first — everything downstream depends on this
+  const WORKER_ID = await resolveWorkerId();
+
   // GH uses JOB_DISPATCH_MODE; VALET uses TASK_DISPATCH_MODE — these are different env vars
   // on different services. Legacy mode is backward-compatible and works regardless of
   // VALET's dispatch mode because JobPoller picks up both 'pending' and 'queued' statuses.
