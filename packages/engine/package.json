@@ -1,6 +1,6 @@
 {
   "name": "@wekruit/ghosthands-engine",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "main": "dist/packages/engine/src/index.js",
   "types": "dist/packages/engine/src/index.d.ts",
   "files": ["dist", "MANIFEST.json"],
