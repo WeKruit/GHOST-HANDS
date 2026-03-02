@@ -28,25 +28,25 @@ export async function resolveWorkerId(): Promise<string> {
     if (!id) {
       throw new Error('--worker-id requires a value (e.g. --worker-id=adam)');
     }
-    logger.info({ source: 'cli', workerId: id }, 'Worker ID resolved');
+    logger.info('Worker ID resolved', { source: 'cli', workerId: id });
     return id;
   }
 
   // 2. Environment variable (backward compat, docker-compose deploys)
   if (process.env.GH_WORKER_ID) {
-    logger.info({ source: 'env', workerId: process.env.GH_WORKER_ID }, 'Worker ID resolved');
+    logger.info('Worker ID resolved', { source: 'env', workerId: process.env.GH_WORKER_ID });
     return process.env.GH_WORKER_ID;
   }
 
   // 3. EC2 IMDS — strict, no env fallback (prevents stale EC2_INSTANCE_ID from leaking in)
   const instanceId = await discoverImdsInstanceId();
   if (instanceId) {
-    logger.info({ source: 'imds', workerId: instanceId }, 'Worker ID resolved');
+    logger.info('Worker ID resolved', { source: 'imds', workerId: instanceId });
     return instanceId;
   }
 
   // 4. Fallback — generated ID (see IMDS-unavailable contract in JSDoc above)
   const generated = `worker-${process.env.FLY_REGION || process.env.NODE_ENV || 'local'}-${Date.now()}`;
-  logger.info({ source: 'generated', workerId: generated }, 'Worker ID resolved');
+  logger.info('Worker ID resolved', { source: 'generated', workerId: generated });
   return generated;
 }
