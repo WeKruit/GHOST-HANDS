@@ -185,11 +185,19 @@ export class PgBossConsumer {
 
       const dbJob = result.rows[0];
 
-      // Update status to running, set worker_id
-      await this.pgDirect.query(
-        `UPDATE gh_automation_jobs SET status = 'running', worker_id = $1, started_at = NOW(), last_heartbeat = NOW() WHERE id = $2`,
+      // CAS guard: only claim jobs in queued/pending state. If externally failed, skip.
+      const claimResult = await this.pgDirect.query(
+        `UPDATE gh_automation_jobs SET status = 'running', worker_id = $1, started_at = NOW(), last_heartbeat = NOW()
+         WHERE id = $2 AND status IN ('queued', 'pending')
+         RETURNING id`,
         [this.workerId, ghJobId],
       );
+      if (claimResult.rowCount === 0) {
+        logger.warn('Job not in claimable state — skipping execution', {
+          ghJobId, currentStatus: dbJob.status, workerId: this.workerId,
+        });
+        return; // Clean exit — finally block handles counter cleanup
+      }
 
       // Map DB row to AutomationJob shape that JobExecutor expects
       const automationJob: AutomationJob = {
