@@ -40,3 +40,6 @@ export { CookbookExecutor, type ExecuteAllResult, type ExecuteStepResult, type C
 export { LocatorResolver, type ResolveResult, type LocatorResolverOptions } from './LocatorResolver';
 export { resolveTemplate, resolveOptionalTemplate } from './templateResolver';
 export { detectPlatform, generateUrlPattern } from './platformDetector';
+
+// ── v3 engine ────────────────────────────────────────────────────────
+export * as v3 from '../../ghosthands/src/engine/v3';
