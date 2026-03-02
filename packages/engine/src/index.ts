@@ -43,3 +43,8 @@ export { detectPlatform, generateUrlPattern } from './platformDetector';
 
 // ── v3 engine ────────────────────────────────────────────────────────
 export * as v3 from '../../ghosthands/src/engine/v3';
+
+// ── v3 supporting types & classes (used by Desktop App adapter) ──────
+export { CostTracker } from '../../ghosthands/src/workers/costControl';
+export type { AutomationJob } from '../../ghosthands/src/workers/taskHandlers/types';
+export type { BrowserAutomationAdapter, AdapterEvent } from '../../ghosthands/src/adapters/types';
