@@ -5,11 +5,14 @@
  * POST the results back to VALET. Retries on failure (3 attempts).
  * Callback failures are logged but never fail the job.
  *
- * NOTE: The gh_callback_dedupe table (migration 019) exists but is not yet
- * wired at runtime. Dedupe enforcement is deferred to Phase 2.
+ * Dedupe: Each callback is guarded by an INSERT into gh_callback_dedupe.
+ * If the INSERT conflicts (same job_id + event_type + nonce), the callback
+ * is skipped. Fail-open on DB errors — callbacks are never blocked by dedupe
+ * failures.
  */
 
 import { getLogger } from '../monitoring/logger.js';
+import { getSupabaseClient } from '../db/client.js';
 
 export interface InteractionInfo {
   type: string;
@@ -17,6 +20,8 @@ export interface InteractionInfo {
   page_url?: string;
   timeout_seconds?: number;
   description?: string;
+  message?: string;
+  original_blocker_type?: string;
   metadata?: {
     blocker_confidence?: number;
     captcha_type?: string;
@@ -226,8 +231,59 @@ export class CallbackNotifier {
     return this.sendWithRetry(callbackUrl, payload);
   }
 
+  /**
+   * Attempt to insert a dedupe record. Returns true if the insert succeeded
+   * (first time), false if the row already exists (duplicate).
+   * Returns true (proceed) on DB errors — fail-open to avoid blocking callbacks.
+   */
+  private async checkDedupe(jobId: string, eventType: string, nonce: string): Promise<boolean> {
+    try {
+      const supabase = getSupabaseClient();
+      const { error } = await supabase
+        .from('gh_callback_dedupe')
+        .insert({ job_id: jobId, event_type: eventType, nonce });
+
+      if (error) {
+        // Unique constraint violation = already sent
+        if (error.code === '23505') {
+          getLogger().debug('Callback dedupe: already sent', { jobId, eventType, nonce });
+          return false;
+        }
+        // Other DB errors — fail open
+        getLogger().warn('Callback dedupe check failed, proceeding', {
+          jobId, eventType, error: error.message,
+        });
+        return true;
+      }
+
+      return true; // Insert succeeded, proceed with send
+    } catch (err) {
+      // Fail open — don't block callbacks on dedupe errors
+      getLogger().warn('Callback dedupe exception, proceeding', {
+        jobId, eventType,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return true;
+    }
+  }
+
   private async sendWithRetry(url: string, payload: CallbackPayload): Promise<boolean> {
     const logger = getLogger();
+
+    // Dedupe guard: skip if this callback has already been sent.
+    // Nonce is deterministic so duplicate invocations collide on the PK
+    // (job_id, event_type, nonce). Interaction type is included so that
+    // legitimate re-sends (e.g. needs_human:captcha then needs_human:context_lost)
+    // use different nonces and are not suppressed.
+    const nonce = payload.interaction?.type
+      ? `${payload.status}:${payload.interaction.type}`
+      : payload.status;
+    const shouldSend = await this.checkDedupe(payload.job_id, payload.status, nonce);
+    if (!shouldSend) {
+      logger.info('Callback skipped (dedupe)', { jobId: payload.job_id, status: payload.status });
+      return true; // Already sent — treat as success
+    }
+
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
         const controller = new AbortController();

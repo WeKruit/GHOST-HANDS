@@ -158,8 +158,9 @@ async function sendNeedsHumanCallback(
 }
 
 /**
- * Log a context_lost event and send callback — the human resolved the blocker
- * but the page context has changed, so we need to suspend again.
+ * Log a context_lost event and send callback with full PRD V5.2 payload —
+ * the human resolved the blocker but the page context has changed, so we
+ * need to suspend again.
  */
 async function emitContextLost(rt: RuntimeContext, state: WorkflowState): Promise<void> {
   await rt.logEvent('blocker_context_lost', {
@@ -168,15 +169,44 @@ async function emitContextLost(rt: RuntimeContext, state: WorkflowState): Promis
   });
 
   if (rt.job.callback_url) {
+    // Capture screenshot (best-effort)
+    let screenshotUrl: string | undefined;
+    if (rt.uploadScreenshot) {
+      try {
+        const buffer = await rt.adapter.screenshot();
+        screenshotUrl = await rt.uploadScreenshot(state.jobId, 'context_lost', buffer);
+      } catch (err) {
+        logger.warn('context_lost screenshot failed', {
+          jobId: state.jobId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Get current page URL (best-effort)
+    const pageUrl = await rt.adapter.getCurrentUrl().catch(() => state.targetUrl);
+
+    const contextLostMessage =
+      'Browser context could not be restored after interruption. ' +
+      'The application may need to be restarted or the page state verified.';
+
     await callbackNotifier.notifyHumanNeeded(
       state.jobId,
       rt.job.callback_url,
       {
         type: 'context_lost',
-        description: 'Blocker persists after human resolution. Please re-check the page.',
+        message: contextLostMessage,
+        description: contextLostMessage,
+        screenshot_url: screenshotUrl,
+        page_url: pageUrl,
+        original_blocker_type: state.hitl.blockerType || 'unknown',
+        timeout_seconds: 300,
+        metadata: {
+          detection_method: 'post_resume_recheck',
+        },
       },
       rt.job.valet_task_id,
-      process.env.GH_WORKER_ID,
+      rt.workerId,
     );
   }
 }
@@ -261,6 +291,21 @@ export function buildSteps(rt: RuntimeContext) {
           .from('gh_automation_jobs')
           .update({ status: 'running', updated_at: new Date().toISOString() })
           .eq('id', state.jobId);
+
+        // Notify VALET that the job has resumed (parity with legacy path)
+        if (rt.job.callback_url) {
+          callbackNotifier.notifyResumed(
+            state.jobId,
+            rt.job.callback_url,
+            rt.job.valet_task_id,
+            rt.workerId,
+          ).catch((err) => {
+            logger.warn('Resume callback failed', {
+              jobId: state.jobId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
 
         return state;
       }

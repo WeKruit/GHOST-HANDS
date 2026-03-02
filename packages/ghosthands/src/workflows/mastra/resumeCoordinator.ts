@@ -57,7 +57,7 @@ export async function claimResume(
     SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{resume_requested}', 'false'::jsonb, true)
     WHERE id = $1::uuid
       AND execution_mode = 'mastra'
-      AND status IN ('pending', 'queued', 'running')
+      AND status IN ('pending', 'queued')
       AND metadata->>'mastra_run_id' = $2
       AND COALESCE((metadata->>'resume_requested')::boolean, false) = true
     RETURNING metadata;
@@ -147,26 +147,31 @@ export async function readResolutionData(
 // ---------------------------------------------------------------------------
 
 /**
- * Persists the mastra_run_id in job metadata before first execution.
+ * Persists the mastra_run_id (and optional extra metadata) in job metadata
+ * before first execution.
  *
  * This allows the resume discriminator and claim logic to correlate
  * incoming resume requests with the correct workflow run.
+ *
+ * @param extraMetadata - Additional keys to merge (e.g. `{ mastra_run_recreated: true }`)
  */
 export async function persistMastraRunId(
   pool: pg.Pool,
   jobId: string,
   runId: string,
+  extraMetadata?: Record<string, unknown>,
 ): Promise<void> {
+  const metadataObj: Record<string, unknown> = { mastra_run_id: runId, ...extraMetadata };
   const sql = `
     UPDATE gh_automation_jobs
-    SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{mastra_run_id}', to_jsonb($2::text), true),
+    SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
         updated_at = NOW()
     WHERE id = $1::uuid
   `;
 
   try {
-    await pool.query(sql, [jobId, runId]);
-    logger.info('Persisted mastra_run_id', { jobId, runId });
+    await pool.query(sql, [jobId, JSON.stringify(metadataObj)]);
+    logger.info('Persisted mastra_run_id', { jobId, runId, extraMetadata });
   } catch (err) {
     logger.error('Failed to persist mastra_run_id', {
       jobId,

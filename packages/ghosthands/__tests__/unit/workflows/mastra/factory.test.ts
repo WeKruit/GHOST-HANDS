@@ -174,6 +174,7 @@ function createMockRuntimeContext(overrides: Partial<RuntimeContext> = {}): Runt
     resumeFilePath: null,
     supabase: createMockSupabase() as any,
     logEvent: vi.fn().mockResolvedValue(undefined),
+    workerId: 'test-worker-1',
     ...overrides,
   };
 }
@@ -587,13 +588,14 @@ describe('check_blockers_checkpoint', () => {
         },
       });
 
-      // Use real timers but mock setTimeout to avoid 2s waits
-      vi.useFakeTimers();
-      const resultPromise = checkBlockers.execute(params);
-      // Advance past all 3 recheck attempts (2s each)
-      await vi.advanceTimersByTimeAsync(10000);
-      const result = (await resultPromise) as WorkflowState;
-      vi.useRealTimers();
+      // Mock setTimeout to resolve immediately (bun doesn't support vi.advanceTimersByTimeAsync)
+      const origSetTimeout = globalThis.setTimeout;
+      globalThis.setTimeout = ((fn: (...args: any[]) => void, _ms?: number, ...args: any[]) => {
+        fn(...args);
+        return 0 as any;
+      }) as typeof setTimeout;
+      const result = (await checkBlockers.execute(params)) as WorkflowState;
+      globalThis.setTimeout = origSetTimeout;
 
       // HITL state should be cleared
       expect(result.hitl.blocked).toBe(false);
@@ -631,11 +633,14 @@ describe('check_blockers_checkpoint', () => {
         },
       });
 
-      vi.useFakeTimers();
-      const resultPromise = checkBlockers.execute(params);
-      await vi.advanceTimersByTimeAsync(10000);
-      await resultPromise;
-      vi.useRealTimers();
+      // Mock setTimeout to resolve immediately (bun doesn't support vi.advanceTimersByTimeAsync)
+      const origSetTimeout = globalThis.setTimeout;
+      globalThis.setTimeout = ((fn: (...args: any[]) => void, _ms?: number, ...args: any[]) => {
+        fn(...args);
+        return 0 as any;
+      }) as typeof setTimeout;
+      await checkBlockers.execute(params);
+      globalThis.setTimeout = origSetTimeout;
 
       expect(rt.logEvent).toHaveBeenCalledWith(
         'blocker_resolved',
@@ -673,11 +678,14 @@ describe('check_blockers_checkpoint', () => {
         },
       });
 
-      vi.useFakeTimers();
-      const resultPromise = checkBlockers.execute(params);
-      await vi.advanceTimersByTimeAsync(10000);
-      await resultPromise;
-      vi.useRealTimers();
+      // Mock setTimeout to resolve immediately (bun doesn't support vi.advanceTimersByTimeAsync)
+      const origSetTimeout = globalThis.setTimeout;
+      globalThis.setTimeout = ((fn: (...args: any[]) => void, _ms?: number, ...args: any[]) => {
+        fn(...args);
+        return 0 as any;
+      }) as typeof setTimeout;
+      await checkBlockers.execute(params);
+      globalThis.setTimeout = origSetTimeout;
 
       // Verify database update was called to set status to running
       expect(updateFn).toHaveBeenCalledWith(
@@ -713,11 +721,14 @@ describe('check_blockers_checkpoint', () => {
         },
       });
 
-      vi.useFakeTimers();
-      const resultPromise = checkBlockers.execute(params);
-      await vi.advanceTimersByTimeAsync(10000);
-      await resultPromise;
-      vi.useRealTimers();
+      // Mock setTimeout to resolve immediately (bun doesn't support vi.advanceTimersByTimeAsync)
+      const origSetTimeout = globalThis.setTimeout;
+      globalThis.setTimeout = ((fn: (...args: any[]) => void, _ms?: number, ...args: any[]) => {
+        fn(...args);
+        return 0 as any;
+      }) as typeof setTimeout;
+      await checkBlockers.execute(params);
+      globalThis.setTimeout = origSetTimeout;
 
       expect(rt.adapter.resume).toHaveBeenCalledWith({
         resolutionType: 'credentials',

@@ -154,11 +154,12 @@ describe('persistMastraRunId', () => {
     expect(pool.query).toHaveBeenCalledTimes(1);
 
     const [sql, params] = pool.query.mock.calls[0];
-    // Verify the SQL updates gh_automation_jobs with jsonb_set for mastra_run_id
+    // Verify the SQL updates gh_automation_jobs metadata with jsonb merge
     expect(sql).toContain('UPDATE gh_automation_jobs');
-    expect(sql).toContain('mastra_run_id');
-    expect(sql).toContain('jsonb_set');
-    expect(params).toEqual([jobId, runId]);
+    expect(params[0]).toBe(jobId);
+    // Second param is a JSON string containing the mastra_run_id
+    const parsedMetadata = JSON.parse(params[1]);
+    expect(parsedMetadata.mastra_run_id).toBe(runId);
   });
 
   test('propagates pool.query errors', async () => {

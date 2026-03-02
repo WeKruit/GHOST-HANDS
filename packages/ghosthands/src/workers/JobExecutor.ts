@@ -30,7 +30,7 @@ import { getMastra } from '../workflows/mastra/init.js';
 import { buildApplyWorkflow } from '../workflows/mastra/applyWorkflow.js';
 import { isMastraResume, claimResume, persistMastraRunId } from '../workflows/mastra/resumeCoordinator.js';
 import { workflowState, type RuntimeContext, type WorkflowState } from '../workflows/mastra/types.js';
-import { finalizeCookbookSuccess, finalizeHandlerResult } from './finalization.js';
+import { finalizeCookbookSuccess, finalizeHandlerResult, finalizeHandlerSideEffects } from './finalization.js';
 
 const logger = getLogger({ service: 'job-executor' });
 
@@ -1278,6 +1278,8 @@ export class JobExecutor {
       resumeFilePath,
       supabase: this.supabase,
       logEvent: logEventFn,
+      workerId: this.workerId,
+      uploadScreenshot: (jid: string, name: string, buf: Buffer) => this.uploadScreenshot(jid, name, buf),
     };
 
     // Build the workflow (per-job, captures rt via closure)
@@ -1334,14 +1336,48 @@ export class JobExecutor {
       });
     } else {
       // --- FRESH EXECUTION PATH ---
-      const run = await registeredWf.createRun();
+      // Per PRD AD-6: reuse existing mastra_run_id if one exists (re-entry after
+      // worker crash). Only generate a new run ID when there is no existing one.
+      const existingRunId = job.metadata?.mastra_run_id;
+      let run: any;
 
-      // Persist the mastra_run_id before execution
-      if (this.pgPool) {
-        await persistMastraRunId(this.pgPool, job.id, run.runId);
+      if (typeof existingRunId === 'string') {
+        // Re-entry: a previous execution created this run ID but didn't complete.
+        logger.info('Reusing existing mastra_run_id for re-entry', { jobId: job.id, runId: existingRunId });
+        try {
+          run = await registeredWf.createRun({ runId: existingRunId });
+        } catch (reuseErr) {
+          // Corruption path: existing run state is unrecoverable.
+          // Per PRD AD-6, create a new run and mark as recreated.
+          logger.warn('Failed to reuse existing run, creating new (corruption recovery)', {
+            jobId: job.id,
+            existingRunId,
+            error: reuseErr instanceof Error ? reuseErr.message : String(reuseErr),
+          });
+          run = await registeredWf.createRun();
+          job.metadata = {
+            ...job.metadata,
+            mastra_run_id: run.runId,
+            mastra_run_recreated: true,
+          };
+          if (this.pgPool) {
+            await persistMastraRunId(this.pgPool, job.id, run.runId, { mastra_run_recreated: true });
+          }
+          await logEventFn('context_lost', {
+            jobId: job.id,
+            reason: 'mastra_run_recreated',
+            previousRunId: existingRunId,
+            newRunId: run.runId,
+          });
+        }
+      } else {
+        // Truly fresh: no existing run ID
+        run = await registeredWf.createRun();
+        if (this.pgPool) {
+          await persistMastraRunId(this.pgPool, job.id, run.runId);
+        }
+        job.metadata = { ...job.metadata, mastra_run_id: run.runId };
       }
-      // Also update job.metadata in memory for consistency
-      job.metadata = { ...job.metadata, mastra_run_id: run.runId };
 
       logger.info('Mastra fresh execution', { jobId: job.id, runId: run.runId });
 
@@ -1433,7 +1469,65 @@ export class JobExecutor {
     }
 
     if (finalState.handler?.attempted && finalState.handler.taskResult) {
-      // Handler path finalization
+      const taskResult = finalState.handler.taskResult as any;
+      const finalMode = (finalState.cookbook?.steps ?? 0) > 0 ? 'hybrid' : 'magnitude';
+      const engineResult = {
+        success: false,
+        mode: 'magnitude' as const,
+        cookbookSteps: finalState.cookbook?.steps ?? 0,
+        magnitudeSteps: costTracker.getSnapshot().actionCount,
+      };
+
+      // PRD V5.2: If handler failed, check if browser should stay open for
+      // manual recovery (keepBrowserOpen=true) before routing to retry logic.
+      if (!taskResult.success) {
+        const awaitingManualRecovery =
+          taskResult.awaitingUserReview === true || taskResult.keepBrowserOpen === true;
+
+        if (awaitingManualRecovery) {
+          // Browser stays open for manual recovery even on failure.
+          // Use standard finalization (writes awaiting_user_review status).
+          const { awaitingReview: isReviewing } = await finalizeHandlerResult({
+            job,
+            adapter,
+            costTracker,
+            progress,
+            sessionManager: this.sessionManager,
+            workerId: this.workerId,
+            supabase: this.supabase,
+            logEvent: logEventFn,
+            uploadScreenshot: (jid, name, buf) => this.uploadScreenshot(jid, name, buf),
+            taskResult,
+            finalMode,
+            engineResult,
+          });
+          if (isReviewing) {
+            logger.info('Browser open for manual review/recovery, heartbeat continues', { jobId: job.id });
+            await new Promise<void>(() => {});
+          }
+          return;
+        }
+
+        // True failure — perform side effects then throw so the outer catch
+        // runs handleJobError() with classification + retry + backoff.
+        await finalizeHandlerSideEffects({
+          job,
+          adapter,
+          costTracker,
+          progress,
+          sessionManager: this.sessionManager,
+          workerId: this.workerId,
+          supabase: this.supabase,
+          logEvent: logEventFn,
+          uploadScreenshot: (jid, name, buf) => this.uploadScreenshot(jid, name, buf),
+          taskResult,
+          finalMode,
+          engineResult,
+        });
+        throw new Error(taskResult.error || 'Handler returned success: false');
+      }
+
+      // Handler succeeded (or awaiting review) — use standard finalization
       const { awaitingReview } = await finalizeHandlerResult({
         job,
         adapter,
@@ -1444,14 +1538,9 @@ export class JobExecutor {
         supabase: this.supabase,
         logEvent: logEventFn,
         uploadScreenshot: (jid, name, buf) => this.uploadScreenshot(jid, name, buf),
-        taskResult: finalState.handler.taskResult as any,
-        finalMode: 'magnitude',
-        engineResult: {
-          success: false,
-          mode: 'magnitude',
-          cookbookSteps: finalState.cookbook?.steps ?? 0,
-          magnitudeSteps: costTracker.getSnapshot().actionCount,
-        },
+        taskResult,
+        finalMode,
+        engineResult,
       });
 
       if (awaitingReview) {

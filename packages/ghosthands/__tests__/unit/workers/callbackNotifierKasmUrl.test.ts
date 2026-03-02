@@ -2,13 +2,17 @@ import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
 import { CallbackNotifier } from '../../../src/workers/callbackNotifier.js';
 import type { CallbackPayload } from '../../../src/workers/callbackNotifier.js';
 
-/** Capture all payloads sent by CallbackNotifier via fetch. */
+/** Capture callback payloads sent by CallbackNotifier via fetch (ignores Supabase/other requests). */
 function createFetchCapture() {
   const payloads: CallbackPayload[] = [];
   const originalFetch = globalThis.fetch;
 
-  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
-    payloads.push(JSON.parse(init!.body as string));
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url;
+    // Only capture requests to the VALET callback URL, not Supabase REST calls
+    if (urlStr === 'https://valet.example.com/callback') {
+      payloads.push(JSON.parse(init!.body as string));
+    }
     return new Response('OK', { status: 200 });
   }) as typeof fetch;
 

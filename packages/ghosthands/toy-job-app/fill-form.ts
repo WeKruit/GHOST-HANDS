@@ -54,6 +54,8 @@ import {
   injectHelpers,
   extractFields,
   clickComboboxTrigger,
+  readActiveListOptions,
+  clickActiveListOption,
   PLACEHOLDER_RE,
 } from "./extract-form-structure";
 
@@ -203,48 +205,201 @@ Date of birth: 1996-03-15
 Languages spoken: English (native), Mandarin Chinese (conversational)
 `;
 
-/** Open each custom dropdown briefly to discover its options at fill-time. */
+/** Dismiss any lingering Workday dropdown portal before opening the next one.
+ *  Workday reuses a single activeListContainer across all dropdowns, so stale
+ *  state from a previous dropdown can leak if not explicitly dismissed. */
+async function dismissDropdownPortal(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    (document.activeElement as HTMLElement)?.blur();
+    document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  }).catch(() => {});
+  await page.waitForTimeout(300);
+}
+
+/** Open each custom dropdown briefly to discover its options at fill-time.
+ *  For hierarchical Workday dropdowns (with chevron sub-categories),
+ *  drills into each category and stores options as "Category > SubOption".
+ *  For virtualized lists, scrolls to load more items. */
 async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise<void> {
   for (const f of fields) {
     if (f.type !== "select" || f.isNative || (f.options && f.options.length > 0)) continue;
+    if (!f.name) continue; // skip unnamed fields (language switchers, etc.)
 
     try {
+      // Dismiss any lingering dropdown portal before opening next
+      await dismissDropdownPortal(page);
+
       await clickComboboxTrigger(page, f.id);
-      await page.waitForTimeout(300);
+      await page.waitForTimeout(500);
 
-      const options = await page.evaluate((ffId) => {
-        const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-        if (!el) return [];
-        const results: string[] = [];
+      // Check if Workday's activeListContainer appeared
+      const topLevel = await readActiveListOptions(page);
 
-        const collect = (container: Element) => {
-          const opts = container.querySelectorAll('[role="option"], [role="menuitem"], li');
-          for (const o of opts) {
-            const t = o.textContent?.trim();
-            if (t && t.length < 200) results.push(t);
+      if (topLevel.length > 0) {
+        // Detect chevrons indicating hierarchical sub-categories
+        const hasChevrons = await page.evaluate(() => {
+          const container = document.querySelector('[data-automation-id="activeListContainer"]');
+          if (!container) return false;
+          return container.querySelector('svg.wd-icon-chevron-right-small') !== null ||
+            container.querySelector('[data-uxi-multiselectlistitem-hassidecharm="true"]') !== null;
+        });
+
+        if (hasChevrons) {
+          // Hierarchical dropdown — drill into each category
+          const allOptions: string[] = [];
+
+          for (let i = 0; i < topLevel.length; i++) {
+            const category = topLevel[i];
+
+            if (i > 0) {
+              // Reopen dropdown for each category after the first
+              await clickComboboxTrigger(page, f.id);
+              await page.waitForTimeout(500);
+            }
+
+            // Click the category to drill into sub-options
+            await clickActiveListOption(page, category);
+            await page.waitForTimeout(800);
+
+            // Read sub-options, handling virtualized lists
+            const info = await page.evaluate(() => {
+              const c = document.querySelector('[data-automation-id="activeListContainer"]');
+              if (!c) return { setsize: 0, texts: [] as string[] };
+              const items = c.querySelectorAll('[role="option"]');
+              const setsize = parseInt(items[0]?.getAttribute("aria-setsize") || "0", 10);
+              const texts = Array.from(items)
+                .filter((o: any) => o.getBoundingClientRect().height > 0)
+                .map((o: any) => (o.textContent || "").trim())
+                .filter(Boolean);
+              return { setsize, texts: [...new Set(texts)] };
+            });
+
+            const allSubs: string[] = [...info.texts];
+
+            // If virtualized, scroll to load more items
+            if (info.setsize > info.texts.length) {
+              for (let scrollAttempt = 0; scrollAttempt < 20; scrollAttempt++) {
+                await page.evaluate(() => {
+                  const c = document.querySelector('[data-automation-id="activeListContainer"]') as HTMLElement;
+                  if (c) c.scrollTop += 300;
+                });
+                await page.waitForTimeout(200);
+
+                const moreTexts = await page.evaluate(() => {
+                  const c = document.querySelector('[data-automation-id="activeListContainer"]');
+                  if (!c) return [];
+                  return Array.from(c.querySelectorAll('[role="option"]'))
+                    .filter((o: any) => o.getBoundingClientRect().height > 0)
+                    .map((o: any) => (o.textContent || "").trim())
+                    .filter(Boolean);
+                });
+
+                let newCount = 0;
+                for (const t of moreTexts) {
+                  if (!allSubs.includes(t)) {
+                    allSubs.push(t);
+                    newCount++;
+                  }
+                }
+                if (newCount === 0) break;
+              }
+            }
+
+            for (const sub of allSubs) {
+              allOptions.push(`${category} > ${sub}`);
+            }
+
+            // Close and dismiss before next category
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(200);
+            await dismissDropdownPortal(page);
           }
-        };
 
-        collect(el);
-        const ctrlId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
-        if (ctrlId) {
-          const popup = document.getElementById(ctrlId);
-          if (popup) collect(popup);
-        }
-        if (el.tagName === "INPUT") {
-          const container = el.closest('[class*="select"], [class*="combobox"], .form-group');
-          if (container) collect(container);
-        }
-        return results;
-      }, f.id);
+          f.options = allOptions;
+          console.error(`  discovered ${allOptions.length} hierarchical options for "${f.name}"`);
+        } else {
+          // Flat Workday dropdown — check for virtualized scrolling
+          const info = await page.evaluate(() => {
+            const c = document.querySelector('[data-automation-id="activeListContainer"]');
+            if (!c) return { setsize: 0, count: 0 };
+            const items = c.querySelectorAll('[role="option"]');
+            const setsize = parseInt(items[0]?.getAttribute("aria-setsize") || "0", 10);
+            return { setsize, count: items.length };
+          });
 
-      if (options.length > 0) {
-        f.options = options;
-        console.error(`  discovered ${options.length} options for "${f.name}"`);
+          if (info.setsize > topLevel.length) {
+            // Virtualized — scroll to load more
+            const allOpts = [...topLevel];
+            for (let scrollAttempt = 0; scrollAttempt < 20; scrollAttempt++) {
+              await page.evaluate(() => {
+                const c = document.querySelector('[data-automation-id="activeListContainer"]') as HTMLElement;
+                if (c) c.scrollTop += 300;
+              });
+              await page.waitForTimeout(200);
+
+              const more = await readActiveListOptions(page);
+              let newCount = 0;
+              for (const t of more) {
+                if (!allOpts.includes(t)) {
+                  allOpts.push(t);
+                  newCount++;
+                }
+              }
+              if (newCount === 0) break;
+            }
+            f.options = allOpts;
+            console.error(`  discovered ${allOpts.length} options for "${f.name}" (scrolled)`);
+          } else {
+            f.options = topLevel;
+            console.error(`  discovered ${topLevel.length} options for "${f.name}"`);
+          }
+        }
+      } else {
+        // No activeListContainer — fall back to standard option extraction
+        const options = await page.evaluate((ffId) => {
+          const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+          if (!el) return [];
+          const results: string[] = [];
+
+          function collect(container: Element) {
+            const opts = container.querySelectorAll('[role="option"], [role="menuitem"], li');
+            for (const o of opts) {
+              const r = o.getBoundingClientRect();
+              if (r.width === 0 || r.height === 0) continue;
+              const t = o.textContent?.trim();
+              if (t && t.length < 200) results.push(t);
+            }
+          }
+
+          collect(el);
+          const ctrlId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
+          if (ctrlId) {
+            const popup = document.getElementById(ctrlId);
+            if (popup) collect(popup);
+          }
+          if (el.tagName === "INPUT") {
+            const container = el.closest('[class*="select"], [class*="combobox"], .form-group');
+            if (container) collect(container);
+          }
+          // Workday button dropdowns: UL[role="listbox"]
+          const listboxes = document.querySelectorAll('[role="listbox"]');
+          for (const lb of listboxes) {
+            const r = (lb as HTMLElement).getBoundingClientRect();
+            if (r.height > 0) collect(lb);
+          }
+          return [...new Set(results)];
+        }, f.id);
+
+        if (options.length > 0) {
+          f.options = options;
+          console.error(`  discovered ${options.length} options for "${f.name}" (fallback)`);
+        }
       }
 
+      // Ensure dropdown is fully closed
       await page.keyboard.press("Escape");
-      await page.waitForTimeout(150);
+      await dismissDropdownPortal(page);
     } catch {
       // Ignore — some fields won't open
     }
@@ -548,6 +703,9 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
               const container = el.closest('[class*="select"], [class*="combobox"], .form-group');
               if (container && tryClick(container)) return true;
             }
+            // Workday activeListContainer portal
+            const portal = document.querySelector('[data-automation-id="activeListContainer"]');
+            if (portal && tryClick(portal)) return true;
             return false;
           }, field.id);
           if (clicked) {
@@ -626,6 +784,9 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap = {}):
             // For multi-selects
             const dropdown = el.querySelector('[class*="dropdown"], [role="listbox"]');
             if (dropdown && findAndClick(dropdown)) return true;
+            // Workday activeListContainer portal (options rendered outside the element)
+            const portal = document.querySelector('[data-automation-id="activeListContainer"]');
+            if (portal && findAndClick(portal)) return true;
             return false;
           },
           { ffId: field.id, text: opt, strict: hasAnswer }
