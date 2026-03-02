@@ -57,6 +57,7 @@ const PASSTHROUGH_PREFIXES = [
   'DATABASE_', 'SUPABASE_', 'REDIS_', 'GH_', 'ANTHROPIC_', 'DEEPSEEK_',
   'SILICONFLOW_', 'OPENAI_', 'AWS_', 'ECR_', 'CORS_', 'NODE_ENV',
   'MAX_CONCURRENT_', 'JOB_DISPATCH_', 'GHOSTHANDS_', 'KASM_', 'VNC_',
+  'COMMIT_', 'IMAGE_', 'BUILD_',
 ];
 
 /**
@@ -125,7 +126,7 @@ function buildWorkerService(ecrImage: string, envVars: string[]): ServiceDefinit
     config: {
       Image: ecrImage,
       Cmd: ['bun', 'packages/ghosthands/src/workers/workerLauncher.ts'],
-      Env: [...envVars, 'GH_WORKER_PORT=3101', 'MAX_CONCURRENT_JOBS=1', 'GH_HEADLESS=false'],
+      Env: [...envVars, 'GH_WORKER_PORT=3101', 'MAX_CONCURRENT_JOBS=1'],
       HostConfig: {
         NetworkMode: 'host',
         RestartPolicy: {
