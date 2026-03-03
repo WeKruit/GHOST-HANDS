@@ -643,7 +643,9 @@ export class SmartApplyHandler implements TaskHandler {
       'If a modal or dialog appears with options like "Apply Manually", "Autofill with Resume", ' +
       '"Use My Last Application", etc., click "Apply Manually" to proceed. ' +
       'Do NOT stop after clicking Apply if a modal with further choices appears — ' +
-      'you must click through it to actually begin the application.',
+      'you must click through it to actually begin the application. ' +
+      'IMPORTANT: Once the application reaches ANY sign-in/login/auth page, STOP and report done. ' +
+      'Do NOT click Sign In with email, Create Account, or any auth option in this step.',
     );
 
     // The LLM agent may report "failure" if the page navigated to a login/auth
@@ -651,7 +653,8 @@ export class SmartApplyHandler implements TaskHandler {
     // URL actually changed to determine real success.
     if (!result.success) {
       const urlAfter = await adapter.getCurrentUrl();
-      if (urlAfter !== urlBefore) {
+      const onAuthPage = await this.isLikelyAuthPage(adapter);
+      if (urlAfter !== urlBefore || onAuthPage) {
         console.log('[SmartApply] Apply button clicked — page navigated. Continuing...');
       } else {
         // The modal might still be open — try clicking "Apply Manually" directly
@@ -673,6 +676,203 @@ export class SmartApplyHandler implements TaskHandler {
     }
 
     await this.waitForPageLoad(adapter);
+  }
+
+  /**
+   * Best-effort auth-page detection used after Apply actions.
+   * Some ATS flows keep the same URL while replacing content with login UI.
+   */
+  private async isLikelyAuthPage(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    return adapter.page.evaluate(() => {
+      const bodyText = (document.body?.innerText || '').toLowerCase();
+      const hasPasswordField = document.querySelectorAll('input[type="password"]:not([disabled])').length > 0;
+      const clickables = Array.from(document.querySelectorAll('button, a, [role="button"], [role="link"]'));
+      const hasGoogleSignIn = clickables.some((el) => {
+        const text = (el.textContent || '').trim().toLowerCase();
+        const aria = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+        return (
+          (text.includes('google') && (text.includes('sign in') || text.includes('continue') || text.includes('log in')))
+          || (aria.includes('google') && (aria.includes('sign in') || aria.includes('continue') || aria.includes('log in')))
+        );
+      });
+      const hasNativeSignIn = clickables.some((el) => {
+        const text = (el.textContent || '').trim().toLowerCase();
+        return text === 'sign in' || text === 'log in' || text === 'login';
+      });
+      const hasAuthText = bodyText.includes('sign in') || bodyText.includes('log in') || bodyText.includes('create account');
+
+      return hasPasswordField || hasGoogleSignIn || (hasAuthText && hasNativeSignIn);
+    });
+  }
+
+  /**
+   * Priority 1: Prefer Google SSO when available.
+   */
+  private async clickPreferredGoogleSignIn(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    const selectors = [
+      'button:has-text("Sign in with Google")',
+      'button:has-text("Continue with Google")',
+      'a:has-text("Sign in with Google")',
+      'a:has-text("Continue with Google")',
+      '[data-automation-id*="google" i]',
+      '[aria-label*="google" i]',
+    ];
+
+    for (const sel of selectors) {
+      try {
+        const el = adapter.page.locator(sel).first();
+        const visible = await el.isVisible({ timeout: 1000 }).catch(() => false);
+        if (visible) {
+          await el.click();
+          return true;
+        }
+      } catch {
+        // try next selector
+      }
+    }
+
+    return adapter.page.evaluate(() => {
+      const els = document.querySelectorAll<HTMLElement>('a, button, [role="button"], [role="link"]');
+      for (const el of els) {
+        const text = (el.textContent || '').trim().toLowerCase();
+        const aria = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+        const isGoogle = text.includes('google') || aria.includes('google');
+        const isSignIn = text.includes('sign in') || text.includes('continue') || text.includes('log in')
+          || aria.includes('sign in') || aria.includes('continue') || aria.includes('log in');
+        if (isGoogle && isSignIn) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
+  }
+
+  /**
+   * Priority 2: Open the platform's sign-in path (not account creation).
+   */
+  private async clickPlatformSpecificSignIn(
+    adapter: BrowserAutomationAdapter,
+    url: string,
+  ): Promise<boolean> {
+    const platformId = detectPlatformFromUrl(url).platformId;
+    const selectors: string[] = [];
+
+    if (platformId === 'workday') {
+      selectors.push(
+        '[data-automation-id="signInLink"]',
+        '[data-automation-id="utilityButtonSignIn"]',
+        '[data-automation-id="click_filter"][aria-label*="Sign In" i]',
+        '[role="tab"]:has-text("Sign In")',
+        'button:has-text("Sign In")',
+        'a:has-text("Sign In")',
+      );
+    }
+
+    selectors.push(
+      '[role="tab"]:has-text("Sign In")',
+      'button:has-text("Sign In")',
+      'a:has-text("Sign In")',
+      'button:has-text("Log In")',
+      'a:has-text("Log In")',
+    );
+
+    for (const sel of selectors) {
+      try {
+        const el = adapter.page.locator(sel).first();
+        const visible = await el.isVisible({ timeout: 700 }).catch(() => false);
+        if (visible) {
+          await el.click();
+          return true;
+        }
+      } catch {
+        // try next selector
+      }
+    }
+
+    return adapter.page.evaluate(() => {
+      const body = document.body.innerText || '';
+      const candidates = Array.from(document.querySelectorAll<HTMLElement>('button, a, [role="button"], [role="link"], [role="tab"]'));
+
+      if (body.includes('Already have an account')) {
+        for (const el of candidates) {
+          const t = (el.textContent || '').trim().toLowerCase();
+          if (!/^sign\s*in$|^log\s*in$/.test(t)) continue;
+          let parent: HTMLElement | null = el;
+          for (let i = 0; i < 5 && parent; i++) {
+            parent = parent.parentElement;
+            if (parent && parent.textContent?.includes('Already have an account')) {
+              el.click();
+              return true;
+            }
+          }
+        }
+      }
+
+      for (const el of candidates) {
+        const t = (el.textContent || '').trim().toLowerCase();
+        if (t === 'sign in' || t === 'log in' || t === 'login') {
+          el.click();
+          return true;
+        }
+      }
+
+      return false;
+    });
+  }
+
+  /**
+   * Priority 3: If sign-in fails, move to platform-specific account creation.
+   */
+  private async clickPlatformSpecificCreateAccount(
+    adapter: BrowserAutomationAdapter,
+    url: string,
+  ): Promise<boolean> {
+    const platformId = detectPlatformFromUrl(url).platformId;
+    const selectors: string[] = [];
+
+    if (platformId === 'workday') {
+      selectors.push(
+        '[data-automation-id="createAccountLink"]',
+        '[role="tab"]:has-text("Create Account")',
+      );
+    }
+
+    selectors.push(
+      '[role="tab"]:has-text("Create Account")',
+      'a:has-text("Create Account")',
+      'button:has-text("Create Account")',
+      'a:has-text("Sign Up")',
+      'button:has-text("Sign Up")',
+      'a:has-text("Register")',
+      'button:has-text("Register")',
+    );
+
+    for (const sel of selectors) {
+      try {
+        const el = adapter.page.locator(sel).first();
+        const visible = await el.isVisible({ timeout: 700 }).catch(() => false);
+        if (visible) {
+          await el.click();
+          return true;
+        }
+      } catch {
+        // try next selector
+      }
+    }
+
+    return adapter.page.evaluate(() => {
+      const TEXTS = ['create account', 'sign up', 'register', "don't have an account", 'new user', 'get started'];
+      const els = document.querySelectorAll<HTMLElement>('a, button, [role="button"], [role="link"], [role="tab"], span');
+      for (const el of els) {
+        const text = (el.textContent || '').trim().toLowerCase();
+        if (TEXTS.some((t) => text.includes(t))) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
   }
 
   private async handleGenericLogin(
@@ -811,33 +1011,30 @@ Click only ONE button, then report the task as done.`,
       return;
     }
 
-    // Non-Google login path: Google SSO → native email/password → account creation
+    // Non-Google login path: Google SSO → platform sign-in → account creation
     console.log('[SmartApply] On login page, looking for sign-in options...');
     const password = process.env.TEST_GMAIL_PASSWORD || profile.password || '';
 
-    // Step 1: Check for a Google SSO button
-    const hasGoogleSSO = await adapter.page.evaluate(() => {
-      const els = document.querySelectorAll('a, button, [role="button"], [role="link"]');
-      for (const el of els) {
-        const text = (el.textContent || '').toLowerCase();
-        if (text.includes('google') && (text.includes('sign in') || text.includes('continue') || text.includes('log in'))) return true;
-        const img = el.querySelector('img[src*="google" i], img[alt*="google" i]');
-        if (img) return true;
-      }
-      return false;
-    });
-
-    if (hasGoogleSSO) {
-      console.log('[SmartApply] Google SSO button found — clicking...');
-      await adapter.act('Click the "Sign in with Google" button, Google icon/logo button, or "Continue with Google" option. Click ONLY ONE button, then report done.');
+    // Step 1: Prefer Google SSO when available.
+    const clickedGoogle = await this.clickPreferredGoogleSignIn(adapter);
+    if (clickedGoogle) {
+      console.log('[SmartApply] Clicked Google SSO option.');
       await this.waitForPageLoad(adapter);
       return;
     }
 
-    // Step 2: No Google SSO — check if this is Create Account or Sign In
-    console.log('[SmartApply] No Google SSO available — checking page type...');
+    // Step 2: No Google SSO — try opening the platform-specific sign-in path.
+    const signInViewClicked = await this.clickPlatformSpecificSignIn(
+      adapter,
+      await adapter.getCurrentUrl(),
+    );
+    if (signInViewClicked) {
+      console.log('[SmartApply] Opened platform-specific sign-in view.');
+      await adapter.page.waitForTimeout(1200);
+    }
 
-    const formState = await adapter.page.evaluate(() => {
+    console.log('[SmartApply] No Google SSO available — checking sign-in/create-account state...');
+    const readFormState = () => adapter.page.evaluate(() => {
       const passwordFields = document.querySelectorAll('input[type="password"]:not([disabled])');
       const headings = Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]'));
       const headingText = headings.map(h => (h.textContent || '').toLowerCase()).join(' ');
@@ -852,6 +1049,20 @@ Click only ONE button, then report the task as done.`,
       const hasPassword = passwordFields.length > 0;
       return { hasEmail, hasPassword, isCreateAccountForm };
     });
+    let formState = await readFormState();
+
+    // If we're still on Create Account, one more explicit attempt to switch to Sign In.
+    if (formState.isCreateAccountForm) {
+      const switchedToSignIn = await this.clickPlatformSpecificSignIn(
+        adapter,
+        await adapter.getCurrentUrl(),
+      );
+      if (switchedToSignIn) {
+        console.log('[SmartApply] Create Account view detected — switched to Sign In.');
+        await adapter.page.waitForTimeout(1200);
+        formState = await readFormState();
+      }
+    }
 
     // Create Account form → delegate entirely to handleAccountCreation
     // (no DOM clicking of "Sign In" links — that can open modals and cause loops)
@@ -978,11 +1189,16 @@ Click only ONE button, then report the task as done.`,
           return;
         }
 
-        console.log(`[SmartApply] Login failed: "${loginError}" — will try account creation on next iteration.`);
-        // Navigate to Create Account — MagnitudeHand handles it
-        await adapter.act(
-          'The login failed. Look for a "Create Account", "Sign Up", "Register", or "Don\'t have an account?" link and click it. Click ONLY ONE link.',
+        console.log(`[SmartApply] Login failed: "${loginError}" — moving to account creation path...`);
+        const clickedCreate = await this.clickPlatformSpecificCreateAccount(
+          adapter,
+          await adapter.getCurrentUrl(),
         );
+        if (!clickedCreate) {
+          await adapter.act(
+            'The login failed. Look for a "Create Account", "Sign Up", "Register", or "Don\'t have an account?" link and click it. Click ONLY ONE link.',
+          );
+        }
         await this.waitForPageLoad(adapter);
       }
       return;
@@ -990,8 +1206,10 @@ Click only ONE button, then report the task as done.`,
 
     // Step 3: No form fields visible — let MagnitudeHand find the sign-in option
     await adapter.act(
-      'This is a login page. Look for a "Sign In" or "Log In" button and click it. ' +
-      'If there is no sign-in option, click a "Create Account" or "Sign Up" link instead. ' +
+      'This is a login page. Follow this order strictly: ' +
+      '(1) If "Sign in with Google" or "Continue with Google" exists, click that first. ' +
+      '(2) Otherwise click a platform Sign In / Log In option (NOT Create Account). ' +
+      '(3) Only if there is truly no sign-in option, click a Create Account / Sign Up link. ' +
       'Click ONLY ONE button, then report done.',
     );
     await this.waitForPageLoad(adapter);
