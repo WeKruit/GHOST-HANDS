@@ -78,6 +78,12 @@ export interface RuntimeContext {
   logEvent: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
   workerId: string;
   uploadScreenshot?: (jobId: string, name: string, buffer: Buffer) => Promise<string>;
+  /** Block handler execution until human completes a manual action (email verification, etc.) */
+  waitForManualAction?: (options: {
+    type: string;
+    description: string;
+    timeoutSeconds?: number;
+  }) => Promise<{ resumed: boolean }>;
 }
 
 // ---------------------------------------------------------------------------
