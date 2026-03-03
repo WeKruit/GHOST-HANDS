@@ -2543,6 +2543,8 @@ export async function fillFormOnPage(
     console.log(`[formFiller] [MagnitudeHand] ${unfilledFields.length} field(s) — ${forceMagnitude ? 'ESCALATION: DOM fill failed validation, retrying all fields' : 'using visual agent'}…`);
 
     let filledCount = 0;
+    let adapterBusyCount = 0;
+    let abortedDueToBusy = false;
 
     for (const field of unfilledFields) {
       // Skip fields with empty labels — MagnitudeHand can't identify them
@@ -2593,8 +2595,33 @@ export async function fillFormOnPage(
         await adapter.act(prompt, { timeoutMs: MAGNITUDE_HAND_ACT_TIMEOUT_MS });
         console.log(`[formFiller] [MagnitudeHand] Filled "${field.name}" OK`);
         filledCount++;
+        adapterBusyCount = 0;
       } catch (e: any) {
-        console.log(`[formFiller] [MagnitudeHand] ERROR on "${field.name}": ${e.message?.slice(0, 120)}`);
+        const msg = e?.message ? String(e.message) : String(e);
+        const shortMsg = msg.slice(0, 160);
+        console.log(`[formFiller] [MagnitudeHand] ERROR on "${field.name}": ${shortMsg}`);
+
+        const isBusy = msg.includes('adapter busy: previous act() still running')
+          || msg.includes('adapter busy: act() already in flight');
+        const isTimeout = msg.includes('act() timed out');
+
+        // When act() times out, the underlying SDK call keeps running and poisons
+        // the adapter mutex. Additional act() calls will just thrash.
+        if (isTimeout || isBusy) {
+          adapterBusyCount += 1;
+          const waitMs = Math.min(2_000 * adapterBusyCount, 8_000);
+          console.log(`[formFiller] [MagnitudeHand] Waiting ${waitMs}ms for in-flight action to settle...`);
+          await page.waitForTimeout(waitMs);
+
+          // Stop issuing further visual-agent calls in this pass. The page will
+          // continue with DOM-filled state and next loop can recover naturally.
+          abortedDueToBusy = true;
+        }
+      }
+
+      if (abortedDueToBusy) {
+        console.log('[formFiller] [MagnitudeHand] Aborting remaining visual-agent fields due to in-flight act() contention.');
+        break;
       }
 
       await page.waitForTimeout(200);
