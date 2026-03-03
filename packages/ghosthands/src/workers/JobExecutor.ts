@@ -309,11 +309,15 @@ export class JobExecutor {
         progress.setKasmUrl(kasmUrl);
       }
       if (job.callback_url) {
+        const sessionSnap = browserSessionRegistry.getPublicSnapshot();
         callbackNotifier.notifyRunning(
           job.id,
           job.callback_url,
           job.valet_task_id,
-          kasmUrl ? { kasm_url: kasmUrl } : undefined,
+          {
+            ...(kasmUrl ? { kasm_url: kasmUrl } : {}),
+            browser_session_available: sessionSnap.available === true,
+          },
           this.workerId,
         ).catch((err) => {
           getLogger().warn('Running callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
@@ -510,6 +514,7 @@ export class JobExecutor {
             pausedForHuman: false,
             updatedAt: Date.now(),
           });
+          progress.setBrowserSessionAvailable(true);
         }
       }
 
@@ -1579,6 +1584,7 @@ export class JobExecutor {
     // 4. Notify VALET via callback
     if (job.callback_url) {
       const costSnapshot = costTracker?.getSnapshot();
+      const hitlSessionSnap = browserSessionRegistry.getPublicSnapshot();
       callbackNotifier.notifyHumanNeeded(
         job.id,
         job.callback_url,
@@ -1603,6 +1609,8 @@ export class JobExecutor {
           action_count: costSnapshot.actionCount,
           total_tokens: costSnapshot.inputTokens + costSnapshot.outputTokens,
         } : undefined,
+        undefined, // kasmUrl — resolved inside notifyHumanNeeded
+        hitlSessionSnap.available === true,
       ).catch((err) => {
         getLogger().warn('HITL callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       });
@@ -1646,7 +1654,8 @@ export class JobExecutor {
       });
 
       if (job.callback_url) {
-        callbackNotifier.notifyResumed(job.id, job.callback_url, job.valet_task_id, this.workerId).catch((err) => {
+        const resumeSessionSnap = browserSessionRegistry.getPublicSnapshot();
+        callbackNotifier.notifyResumed(job.id, job.callback_url, job.valet_task_id, this.workerId, undefined, resumeSessionSnap.available === true).catch((err) => {
           getLogger().warn('Resume callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });
       }
