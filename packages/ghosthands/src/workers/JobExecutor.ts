@@ -1280,6 +1280,98 @@ export class JobExecutor {
       logEvent: logEventFn,
       workerId: this.workerId,
       uploadScreenshot: (jid: string, name: string, buf: Buffer) => this.uploadScreenshot(jid, name, buf),
+
+      // Allow handlers to pause mid-execution for manual user actions (email verification, etc.)
+      waitForManualAction: async (actionOpts) => {
+        const timeout = actionOpts.timeoutSeconds ?? this.hitlTimeoutSeconds;
+
+        // 1. Take screenshot of the current page state
+        let screenshotUrl: string | undefined;
+        try {
+          const buf = await adapter.screenshot();
+          screenshotUrl = await this.uploadScreenshot(job.id, 'manual-action', buf);
+        } catch { /* non-fatal */ }
+
+        const pageUrl = await adapter.getCurrentUrl().catch(() => job.target_url);
+
+        // 2. Update job to 'paused' with interaction_data
+        await this.supabase
+          .from('gh_automation_jobs')
+          .update({
+            status: 'paused',
+            interaction_type: actionOpts.type,
+            interaction_data: {
+              type: actionOpts.type,
+              description: actionOpts.description,
+              screenshot_url: screenshotUrl,
+              page_url: pageUrl,
+              detected_at: new Date().toISOString(),
+            },
+            paused_at: new Date().toISOString(),
+            status_message: `Waiting for human: ${actionOpts.description}`,
+          })
+          .eq('id', job.id);
+
+        // 3. Log event + notify VALET
+        await logEventFn('manual_action_required', {
+          jobId: job.id,
+          action_type: actionOpts.type,
+          description: actionOpts.description,
+        });
+
+        if (job.callback_url) {
+          callbackNotifier.notifyHumanNeeded(
+            job.id,
+            job.callback_url,
+            {
+              type: actionOpts.type,
+              screenshot_url: screenshotUrl,
+              page_url: pageUrl,
+              timeout_seconds: timeout,
+              description: actionOpts.description,
+            },
+            job.valet_task_id,
+            this.workerId,
+          ).catch(() => { /* non-fatal */ });
+        }
+
+        logger.info('Handler suspended for manual action', {
+          jobId: job.id,
+          type: actionOpts.type,
+          timeoutSeconds: timeout,
+        });
+
+        // 4. Wait for resume signal (reuses existing LISTEN/NOTIFY infrastructure)
+        const result = await this.waitForResume(job.id, timeout);
+
+        if (result.resumed) {
+          // 5. Update back to running
+          await this.supabase
+            .from('gh_automation_jobs')
+            .update({
+              status: 'running',
+              paused_at: null,
+              status_message: 'Resumed after manual action',
+            })
+            .eq('id', job.id);
+
+          await logEventFn('manual_action_resolved', {
+            jobId: job.id,
+            action_type: actionOpts.type,
+          });
+
+          if (job.callback_url) {
+            callbackNotifier.notifyResumed(job.id, job.callback_url, job.valet_task_id, this.workerId)
+              .catch(() => { /* non-fatal */ });
+          }
+
+          logger.info('Handler resumed after manual action', { jobId: job.id });
+        } else {
+          logger.warn('Manual action timed out', { jobId: job.id, timeoutSeconds: timeout });
+        }
+
+        return { resumed: result.resumed };
+      },
     };
 
     // Build the workflow (per-job, captures rt via closure)
