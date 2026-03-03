@@ -934,7 +934,9 @@ async function generateAnswers(fields: FormField[], profileText: string): Promis
     max_tokens: 4096,
     messages: [{
       role: 'user',
-      content: `You are filling out a job application form on behalf of an applicant. Here is their profile:
+      content: `You are filling out a job application form on behalf of an applicant. Today's date is ${new Date().toISOString().split('T')[0]}.
+
+Here is their profile:
 
 ${profileText}
 
@@ -944,8 +946,8 @@ ${fieldDescriptions}
 
 Rules:
 - For each field, decide what value to put based on the profile.
-- If the profile doesn't have enough info for a REQUIRED field, make up a plausible value.
-- For OPTIONAL fields where the profile has no relevant info (e.g. phone extension, middle name), return "" (empty string) — do NOT make up values for optional fields.
+- Fields marked with * are REQUIRED. NEVER return "" for required fields. Always provide a value from the profile or make up a plausible one.
+- For optional fields, still fill them in if the profile has any relevant info. Only return "" for optional fields where there is truly nothing relevant to put (e.g. phone extension when none exists, middle name when none provided).
 - For dropdowns/radio groups with listed options, you MUST pick the EXACT text of one of the available options.
 - For hierarchical dropdown options (format "Category > SubOption"), pick the EXACT full path including the " > " separator.
 - For dropdowns WITHOUT listed options, provide your best guess for the value.
@@ -1105,7 +1107,12 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
 
       const val = getAnswer(answers, field) ?? defaultValue(field);
       if (!val) {
-        console.log(`[formFiller]   skip ${tag} (no answer, optional)`);
+        if (field.required || field.name.includes('*')) {
+          // Required but no answer — don't fill with empty string, let MagnitudeHand handle it
+          console.log(`[formFiller]   skip ${tag} (no answer, required — deferring to MagnitudeHand)`);
+        } else {
+          console.log(`[formFiller]   skip ${tag} (no answer, optional)`);
+        }
         return false;
       }
       try {
@@ -2247,6 +2254,7 @@ export async function fillFormOnPage(
   adapter: BrowserAutomationAdapter,
   profileText: string,
   resumePath?: string | null,
+  opts?: { forceMagnitude?: boolean },
 ): Promise<FillResult> {
   const result: FillResult = {
     domFilled: 0,
@@ -2394,12 +2402,23 @@ export async function fillFormOnPage(
   console.log(`[formFiller] DOM fill done: ${domFilledOk.size}/${attempted.size} fields in ${round} round(s).`);
 
   // 8. MagnitudeHand fallback
+  const forceMagnitude = opts?.forceMagnitude === true;
   await page.waitForTimeout(500);
   const postFields = await extractFields(page);
   const postVisible = postFields.filter((f) => f.visibleByDefault);
 
   const unfilledFields: FormField[] = [];
   for (const f of postVisible) {
+    // Skip file inputs and non-interactive types from MagnitudeHand
+    if (f.type === 'file') continue;
+
+    if (forceMagnitude) {
+      // Escalation mode: send ALL visible fields to MagnitudeHand — DOM values
+      // may be present but wrong (e.g. bad date format, validation failures).
+      unfilledFields.push(f);
+      continue;
+    }
+
     if (domFilledOk.has(f.id)) continue;
 
     const filled = await isFieldFilled(page, f.id);
@@ -2412,7 +2431,7 @@ export async function fillFormOnPage(
   }
 
   if (unfilledFields.length > 0) {
-    console.log(`[formFiller] [MagnitudeHand] ${unfilledFields.length} unfilled field(s) — using visual agent…`);
+    console.log(`[formFiller] [MagnitudeHand] ${unfilledFields.length} field(s) — ${forceMagnitude ? 'ESCALATION: DOM fill failed validation, retrying all fields' : 'using visual agent'}…`);
 
     let filledCount = 0;
 
@@ -2425,7 +2444,7 @@ export async function fillFormOnPage(
 
       const answer = getAnswerForField(answers, field, fieldIdMap)
         ?? (isSkillLikeFieldName(field.name) && profileSkillsCsv ? profileSkillsCsv : undefined);
-      let prompt = `You are filling out a job application for this person:\n${profileText.trim()}\n\n`;
+      let prompt = `You are filling out a job application for this person. Today's date is ${new Date().toISOString().split('T')[0]}.\n${profileText.trim()}\n\n`;
       prompt += `Fill the form field labeled "${field.name}"`;
       if (answer) {
         prompt += ` with the value "${answer}"`;

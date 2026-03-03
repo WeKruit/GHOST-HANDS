@@ -138,7 +138,8 @@ export class SmartApplyHandler implements TaskHandler {
     let pagesProcessed = 0;
     let lastPageSignature = '';
     let samePageCount = 0;
-    const MAX_SAME_PAGE = 3; // bail if stuck on same page this many times
+    const ESCALATE_AFTER = 3;  // escalate to MagnitudeHand after this many stuck iterations
+    const MAX_SAME_PAGE = 6;   // bail after this many total stuck iterations (3 DOM + 3 Magnitude)
 
     try {
       // Main detect-and-act loop
@@ -160,10 +161,11 @@ export class SmartApplyHandler implements TaskHandler {
         // so we also check headings, field count, and active sidebar item.
         const contentFingerprint = await this.getPageFingerprint(adapter);
         const pageSignature = `${currentPageUrl}|${contentFingerprint}`;
+        let stuckEscalate = false;
         if (pageSignature === lastPageSignature) {
           samePageCount++;
           if (samePageCount >= MAX_SAME_PAGE) {
-            console.warn(`[SmartApply] Stuck on same page for ${samePageCount} iterations (signature: ${contentFingerprint}) — stopping.`);
+            console.warn(`[SmartApply] Stuck on same page for ${samePageCount} iterations (${ESCALATE_AFTER} DOM + ${samePageCount - ESCALATE_AFTER} Magnitude) — stopping.`);
             await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
             return {
               success: true,
@@ -176,6 +178,10 @@ export class SmartApplyHandler implements TaskHandler {
                 message: `Application appears stuck on the same page. Browser open for manual takeover.`,
               },
             };
+          }
+          if (samePageCount >= ESCALATE_AFTER) {
+            console.log(`[SmartApply] Stuck ${samePageCount}/${MAX_SAME_PAGE} — escalating to MagnitudeHand for this page.`);
+            stuckEscalate = true;
           }
         } else {
           samePageCount = 0;
@@ -362,7 +368,7 @@ export class SmartApplyHandler implements TaskHandler {
               : ProgressStep.FILLING_FORM;
             await progress.setStep(step as any);
 
-            const result = await this.fillPage(adapter, config, resumePath, profileText);
+            const result = await this.fillPage(adapter, config, resumePath, profileText, 0, stuckEscalate);
 
             if (result === 'review') {
               // fillPage detected this is actually the review page
@@ -1165,6 +1171,7 @@ ${dataPrompt}`,
     resumePath?: string | null,
     profileText?: string,
     _depth = 0,
+    forceEscalate = false,
   ): Promise<'navigated' | 'review' | 'complete'> {
     const MAX_DEPTH = 3;
 
@@ -1180,8 +1187,13 @@ ${dataPrompt}`,
     }
 
     // ── FILL PHASE: Use formFiller (DOM fill + MagnitudeHand fallback) ──
+    // Escalate to MagnitudeHand when:
+    //   - _depth > 0: validation errors bounced us back (DOM values wrong)
+    //   - forceEscalate: stuck on same page too many times (DOM can't advance)
     if (profileText) {
-      const fillResult = await fillFormOnPage(adapter.page, adapter, profileText, resumePath);
+      const escalate = _depth > 0 || forceEscalate;
+      if (escalate) console.log(`[SmartApply] Escalating to MagnitudeHand (${forceEscalate ? 'stuck escalation' : `retry ${_depth}/${MAX_DEPTH}`})`);
+      const fillResult = await fillFormOnPage(adapter.page, adapter, profileText, resumePath, { forceMagnitude: escalate });
       console.log(`[SmartApply] formFiller: ${fillResult.domFilled} DOM + ${fillResult.magnitudeFilled} Magnitude filled (${fillResult.llmCalls} LLM calls)`);
     }
 
