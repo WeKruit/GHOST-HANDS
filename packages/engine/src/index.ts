@@ -75,6 +75,27 @@ export {
   handleAccountCreation,
 } from '../../ghosthands/src/workers/taskHandlers/workday/pageHandlers';
 
+// ── SmartApply orchestration loop ──────────────────────────────────
+export { SmartApplyHandler } from '../../ghosthands/src/workers/taskHandlers/smartApplyHandler';
+
+// ── Platform configuration system ──────────────────────────────────
+export type { PlatformConfig, PageType, ScannedField, ScanResult }
+  from '../../ghosthands/src/workers/taskHandlers/platforms/types';
+export type { PageState as SmartApplyPageState }
+  from '../../ghosthands/src/workers/taskHandlers/platforms/types';
+export { detectPlatformFromUrl, getPlatformConfig }
+  from '../../ghosthands/src/workers/taskHandlers/platforms/index';
+
+// ── Form filling ───────────────────────────────────────────────────
+export { fillFormOnPage, buildProfileText }
+  from '../../ghosthands/src/workers/taskHandlers/formFiller';
+export type { FillResult }
+  from '../../ghosthands/src/workers/taskHandlers/formFiller';
+
+// ── Task handler types (needed for SmartApplyHandler.execute ctx) ──
+export type { TaskContext, TaskResult, TaskHandler }
+  from '../../ghosthands/src/workers/taskHandlers/types';
+
 // ── Workday types (needed by handler consumers) ──────────────────────
 export type { WorkdayUserProfile } from '../../ghosthands/src/workers/taskHandlers/workday/workdayTypes';
 export type { PageState as WorkdayPageState } from '../../ghosthands/src/workers/taskHandlers/workday/constants';
