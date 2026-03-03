@@ -1064,9 +1064,9 @@ Click only ONE button, then report the task as done.`,
     // Use TEST_GMAIL credentials for account creation (not the applicant's resume email).
     // The applicant's actual email goes in the application form later via formFiller.
     const email = process.env.TEST_GMAIL_EMAIL || profile.email || '';
-    const basePassword = process.env.TEST_GMAIL_PASSWORD || profile.password || '';
-    // Append suffix to satisfy stricter password requirements on job sites
-    const password = basePassword ? basePassword + 'aA1!' : 'GhApp2026!x';
+    // TEST_GMAIL_PASSWORD must already satisfy all site password requirements
+    // (uppercase, lowercase, digit, special char, 8+ chars).
+    const password = process.env.TEST_GMAIL_PASSWORD || profile.password || '';
 
     // ── DOM-first: fill everything without LLM (cost: $0) ──
 
