@@ -156,6 +156,11 @@ YAML
 
 setup_vnc_password
 
+# Export DISPLAY in parent shell scope so exec "$@" inherits it.
+# Kasm's vnc_startup.sh starts Xvfb on this display; worker/API processes
+# need DISPLAY set to connect to it for headed browser mode.
+export DISPLAY="${VNC_DISPLAY:-:1}"
+
 # Start VNC (non-fatal on failure — bun process must still run)
 start_vnc || echo "[entrypoint] WARNING: VNC startup failed — continuing without live view" | tee -a "$VNC_LOG"
 

@@ -11,8 +11,12 @@
 
 # Environment files (secrets set via Fly.io / env vars)
 .env
+.env.*
 .env.local
 .env.*.local
+
+# Secrets and local-only files
+*.pem
 
 # IDE
 .vscode
