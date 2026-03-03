@@ -172,6 +172,18 @@ function parseProfileSkills(profileText: string): string[] {
   return [...deduped];
 }
 
+function resolveExistingFilePath(candidate?: string | null): string | null {
+  if (!candidate) return null;
+  try {
+    const resolved = path.resolve(candidate);
+    if (!fs.existsSync(resolved)) return null;
+    const stat = fs.statSync(resolved);
+    return stat.isFile() ? resolved : null;
+  } catch {
+    return null;
+  }
+}
+
 function isExplicitFalse(value?: string): boolean {
   if (!value) return false;
   return /^(false|off|no|unchecked|0)$/i.test(value.trim());
@@ -196,6 +208,43 @@ async function readBinaryControlState(page: Page, ffId: string): Promise<boolean
 
     return null;
   }, ffId);
+}
+
+async function uploadResumeIfPresent(page: Page, resumePath?: string | null): Promise<boolean> {
+  const resolvedResume = resolveExistingFilePath(resumePath);
+  if (!resolvedResume) return false;
+
+  const beforeCount = await page.evaluate(() => {
+    const inputs = Array.from(document.querySelectorAll('input[type="file"]')) as HTMLInputElement[];
+    let selected = 0;
+    for (const input of inputs) {
+      if ((input.files?.length || 0) > 0 || (input.value || '').trim().length > 0) selected++;
+    }
+    return { total: inputs.length, selected };
+  }).catch(() => ({ total: 0, selected: 0 }));
+
+  if (beforeCount.total === 0) return false;
+  if (beforeCount.selected > 0) return true;
+
+  const fileInputs = page.locator('input[type="file"]');
+  const count = await fileInputs.count();
+  if (count === 0) return false;
+
+  let uploaded = false;
+  for (let i = 0; i < count; i++) {
+    try {
+      await fileInputs.nth(i).setInputFiles(resolvedResume, { timeout: 2500 });
+      uploaded = true;
+    } catch {
+      // Keep trying other file inputs
+    }
+  }
+
+  if (uploaded) {
+    console.log(`[formFiller] resume upload → ${path.basename(resolvedResume)}`);
+    await page.waitForTimeout(500);
+  }
+  return uploaded;
 }
 
 function normalizeName(s: string): string {
@@ -1797,24 +1846,22 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
 
     case 'file': {
       const llmPath = getAnswer(answers, field)?.trim();
-      let filePath = '';
-
-      if (resumePath) {
-        const resolvedResume = path.resolve(resumePath);
-        if (fs.existsSync(resolvedResume) && fs.statSync(resolvedResume).isFile()) {
-          filePath = resolvedResume;
-        }
-      }
-      if (!filePath && llmPath) {
-        const resolvedLlm = path.resolve(llmPath);
-        if (fs.existsSync(resolvedLlm) && fs.statSync(resolvedLlm).isFile()) {
-          filePath = resolvedLlm;
-        }
-      }
+      let filePath = resolveExistingFilePath(resumePath) || '';
+      if (!filePath) filePath = resolveExistingFilePath(llmPath) || '';
 
       if (!filePath) {
         console.log(`[formFiller]   skip ${tag} (no resume path)`);
         return false;
+      }
+
+      const alreadyUploaded = await page.evaluate((ffId) => {
+        const el = document.querySelector(`[data-ff-id="${ffId}"]`) as HTMLInputElement | null;
+        if (!el) return false;
+        return (el.files?.length || 0) > 0 || (el.value || '').trim().length > 0;
+      }, field.id).catch(() => false);
+      if (alreadyUploaded) {
+        console.log(`[formFiller]   skip ${tag} (already uploaded)`);
+        return true;
       }
 
       try {
@@ -2234,12 +2281,13 @@ export async function fillFormOnPage(
   // 3. Expand repeater sections (Work Experience / Education) first.
   await expandRepeaters(page, profileText);
   await injectHelpers(page);
+  let resumeUploaded = await uploadResumeIfPresent(page, resumePath);
 
   // 4. Extract fields
   console.log('[formFiller] Extracting form fields…');
   const allFields = await extractFields(page);
-  const visibleFields = allFields.filter((f) => f.visibleByDefault && f.name);
-  const llmFields = visibleFields.filter((f) => f.type !== 'file');
+  const visibleFields = allFields.filter((f) => f.visibleByDefault && (f.name || f.type === 'file'));
+  const llmFields = visibleFields.filter((f) => f.type !== 'file' && !!f.name);
   const profileSkills = parseProfileSkills(profileText);
   const profileSkillsCsv = profileSkills.join(', ');
   result.totalFields = visibleFields.length;
@@ -2282,8 +2330,11 @@ export async function fillFormOnPage(
       console.log(`[formFiller] Re-injecting helpers (lost after page interaction)`);
       await injectHelpers(page);
     }
+    if (!resumeUploaded) {
+      resumeUploaded = await uploadResumeIfPresent(page, resumePath);
+    }
     const fields = await extractFields(page);
-    const visible = fields.filter((f) => f.visibleByDefault && f.name);
+    const visible = fields.filter((f) => f.visibleByDefault && (f.name || f.type === 'file'));
 
     const candidates = visible.filter((f) => !attempted.has(f.id));
     if (candidates.length === 0) break;
