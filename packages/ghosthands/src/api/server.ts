@@ -15,6 +15,7 @@ import { createUsageRoutes } from './routes/usage.js';
 import { requestLoggingMiddleware, getLogger } from '../monitoring/logger.js';
 import { metricsMiddleware } from './middleware/metrics.js';
 import { createMonitoringRoutes } from './routes/monitoring.js';
+import { browserSessionRegistry } from '../workers/browserSessionRegistry.js';
 
 const { Pool } = pg;
 
@@ -79,6 +80,21 @@ export function createApp() {
   // Mount under versioned prefix
   app.route('/api/v1/gh', api);
 
+  // ─── Internal Browser Session Endpoint (service-key auth) ─────
+
+  app.get('/internal/browser-session', (c) => {
+    const serviceKey = c.req.header('X-GH-Service-Key');
+    const expectedSecret = process.env.GH_SERVICE_SECRET;
+    if (!expectedSecret) {
+      return c.json({ error: 'server_config_error', message: 'Service secret not configured' }, 500);
+    }
+    if (!serviceKey || serviceKey !== expectedSecret) {
+      return c.json({ error: 'unauthorized', message: 'Invalid service key' }, 401);
+    }
+    const snapshot = browserSessionRegistry.getPublicSnapshot();
+    return c.json(snapshot);
+  });
+
   // ─── 404 Fallback ─────────────────────────────────────────────
 
   app.notFound((c) => {
@@ -88,28 +104,130 @@ export function createApp() {
   return app;
 }
 
+/** Data attached to each CDP proxy WebSocket connection */
+export interface CdpProxyData { cdpWsUrl: string; jobId: string; cdpSocket?: WebSocket }
+
+/** Validate X-GH-Service-Key from header or query param */
+function validateServiceKey(req: Request): boolean {
+  const expectedSecret = process.env.GH_SERVICE_SECRET;
+  if (!expectedSecret) return false;
+  // Check header first, then ?key= query param (for WebSocket clients)
+  const headerKey = req.headers.get('X-GH-Service-Key');
+  if (headerKey === expectedSecret) return true;
+  const url = new URL(req.url);
+  const queryKey = url.searchParams.get('key');
+  return queryKey === expectedSecret;
+}
+
 /**
  * Start the server if this file is run directly.
- * Uses Bun.serve or Node's built-in fetch adapter.
+ * Uses Bun.serve (with WebSocket support) or Node's built-in fetch adapter.
  */
 export function startServer(port: number = 3100) {
   const app = createApp();
+  const srvLogger = getLogger({ service: 'api-server' });
 
-  getLogger().info('GhostHands API starting', { port });
+  srvLogger.info('GhostHands API starting', { port });
 
-  // Bun-native serve
+  // Bun-native serve with WebSocket CDP proxy
   if (typeof Bun !== 'undefined') {
-    return Bun.serve({
+    const server = Bun.serve<CdpProxyData>({
       port,
-      fetch: app.fetch,
+      fetch(req, server) {
+        const url = new URL(req.url);
+
+        // Handle CDP proxy WebSocket upgrade
+        if (url.pathname === '/internal/cdp-proxy') {
+          if (!validateServiceKey(req)) {
+            return new Response(JSON.stringify({ error: 'unauthorized', message: 'Invalid service key' }), {
+              status: 401,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const session = browserSessionRegistry.getCurrent();
+          if (!session || !session.pausedForHuman) {
+            return new Response(JSON.stringify({ error: 'no_paused_session', message: 'No paused browser session available' }), {
+              status: 409,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const upgraded = server.upgrade(req, {
+            data: { cdpWsUrl: session.cdpWsUrl, jobId: session.jobId },
+          });
+          if (upgraded) return undefined;
+          return new Response('WebSocket upgrade failed', { status: 500 });
+        }
+
+        // All other routes handled by Hono
+        return app.fetch(req, server);
+      },
+      websocket: {
+        open(ws) {
+          const { cdpWsUrl, jobId } = ws.data;
+          srvLogger.info('CDP proxy WebSocket opened', { jobId });
+
+          // Connect to internal Chrome CDP
+          const cdpSocket = new WebSocket(cdpWsUrl);
+
+          cdpSocket.addEventListener('open', () => {
+            srvLogger.info('CDP proxy connected to Chrome', { jobId });
+          });
+
+          cdpSocket.addEventListener('message', (event) => {
+            // Forward Chrome -> VALET
+            const data = event.data;
+            if (typeof data === 'string') {
+              ws.send(data);
+            } else if (data instanceof ArrayBuffer) {
+              ws.send(new Uint8Array(data));
+            } else if (data instanceof Blob) {
+              data.arrayBuffer().then((buf) => ws.send(new Uint8Array(buf)));
+            }
+          });
+
+          cdpSocket.addEventListener('close', () => {
+            srvLogger.info('CDP upstream closed', { jobId });
+            ws.close();
+          });
+
+          cdpSocket.addEventListener('error', (err) => {
+            srvLogger.warn('CDP upstream error', { jobId, error: String(err) });
+            ws.close();
+          });
+
+          // Store reference for message forwarding and cleanup
+          ws.data.cdpSocket = cdpSocket;
+        },
+        message(ws, msg) {
+          // Forward VALET -> Chrome CDP
+          const { cdpSocket } = ws.data;
+          if (cdpSocket?.readyState === WebSocket.OPEN) {
+            if (typeof msg === 'string') {
+              cdpSocket.send(msg);
+            } else {
+              cdpSocket.send(msg);
+            }
+          }
+        },
+        close(ws) {
+          const { cdpSocket, jobId } = ws.data;
+          srvLogger.info('CDP proxy WebSocket closed', { jobId });
+          if (cdpSocket && cdpSocket.readyState !== WebSocket.CLOSED) {
+            cdpSocket.close();
+          }
+        },
+      },
     });
+
+    return server;
   }
 
-  // Node.js fallback via @hono/node-server
-  // Users should install @hono/node-server if not using Bun
+  // Node.js fallback via @hono/node-server (no WebSocket support)
   return import('@hono/node-server').then(({ serve }) => {
     serve({ fetch: app.fetch, port });
-    getLogger().info('GhostHands API listening', { url: `http://localhost:${port}` });
+    srvLogger.info('GhostHands API listening (Node.js, no CDP proxy)', { url: `http://localhost:${port}` });
   });
 }
 
