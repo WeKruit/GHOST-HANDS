@@ -20,7 +20,7 @@ export const ProgressStep = {
   REVIEWING: 'reviewing',
   SUBMITTING: 'submitting',
   EXTRACTING_RESULTS: 'extracting_results',
-  AWAITING_USER_REVIEW: 'awaiting_user_review',
+  AWAITING_USER_REVIEW: 'awaiting_review',
   COMPLETED: 'completed',
   FAILED: 'failed',
 } as const;

@@ -108,14 +108,14 @@ export class JobController {
     return rows[0] || null;
   }
 
-  /** Cancel a job. Only works for pending/queued/running/paused jobs. */
+  /** Cancel a job. Only works for cancellable statuses in schema constants. */
   async cancelJob(jobId: string, userId?: string) {
     const job = await this.getJob(jobId, userId);
     if (!job) return { notFound: true as const };
 
     if (!CANCELLABLE_STATUSES.includes(job.status)) {
       // EC6: Structured logging for 409 cancel attempts on non-cancellable jobs
-      const terminalStates = ['completed', 'failed', 'cancelled'];
+      const terminalStates = ['completed', 'failed', 'cancelled', 'expired', 'needs_human', 'awaiting_review'];
       const reason = terminalStates.includes(job.status)
         ? `job already in terminal state: ${job.status}`
         : `job in non-cancellable state: ${job.status}`;
@@ -229,7 +229,7 @@ export class JobController {
     };
   }
 
-  /** Retry a failed or cancelled job by resetting it to pending. */
+  /** Retry a failed, needs_human, or cancelled job by resetting it to pending. */
   async retryJob(jobId: string, userId?: string) {
     const job = await this.getJob(jobId, userId);
     if (!job) return { notFound: true as const };

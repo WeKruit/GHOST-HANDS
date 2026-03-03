@@ -371,7 +371,7 @@ export function createValetRoutes(pool: pg.Pool) {
             completed_at = NOW(),
             updated_at = NOW()
         WHERE worker_id = ANY($1::TEXT[])
-          AND status IN ('queued', 'running', 'paused')
+          AND status IN ('queued', 'running', 'paused', 'awaiting_review')
         RETURNING id, callback_url, valet_task_id
       `, [workerIds, body.reason || 'sandbox_terminated', body.target_worker_id]);
 
@@ -524,11 +524,11 @@ export function createValetRoutes(pool: pg.Pool) {
         summary: job.result_summary,
         screenshots: job.screenshot_urls,
       } : null,
-      error: job.status === 'failed' ? {
+      error: (job.status === 'failed' || job.status === 'needs_human') ? {
         code: job.error_code,
         details: job.error_details,
       } : null,
-      interaction: job.status === 'paused' && interactionInfo ? {
+      interaction: ['paused', 'needs_human', 'awaiting_review'].includes(job.status) && interactionInfo ? {
         type: job.interaction_type,
         screenshot_url: interactionInfo.screenshot_url || null,
         page_url: interactionInfo.page_url || null,

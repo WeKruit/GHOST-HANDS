@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 /**
- * Release Stuck Jobs Script
+ * Recover Stuck Jobs Script
  *
- * Manually release jobs that are stuck in 'queued' or 'running' state
+ * Manually mark jobs as needs_human when they are stuck in 'queued' or 'running' state
  * with stale worker_ids (no heartbeat for 2+ minutes).
  *
  * Usage:
@@ -32,12 +32,22 @@ async function main() {
         const result = await client.query(`
       UPDATE gh_automation_jobs
       SET
-        status = 'pending',
+        status = 'needs_human',
+        completed_at = NOW(),
         worker_id = NULL,
+        error_code = 'stuck_job_timeout',
+        interaction_type = 'stuck_job_timeout',
+        interaction_data = jsonb_build_object(
+          'type', 'stuck_job_timeout',
+          'message', 'Job exceeded stale heartbeat threshold and needs human review',
+          'description', 'Worker heartbeat timed out before meaningful progress was detected',
+          'timeout_seconds', 120
+        ),
         error_details = jsonb_build_object(
           'released_by', 'manual-script',
           'reason', 'stuck_job_manual_recovery',
-          'released_at', NOW()::TEXT
+          'released_at', NOW()::TEXT,
+          'message', 'Job exceeded stale heartbeat threshold and was marked needs_human'
         )
       WHERE status IN ('queued', 'running')
         AND (
@@ -50,7 +60,7 @@ async function main() {
         if (result.rows.length === 0) {
             console.log("✓ No stuck jobs found");
         } else {
-            console.log(`✓ Released ${result.rows.length} stuck job(s):\n`);
+            console.log(`✓ Marked ${result.rows.length} stuck job(s) as needs_human:\n`);
             for (const job of result.rows) {
                 console.log(
                     `  - ${job.id} (${job.job_type}) - was assigned to ${

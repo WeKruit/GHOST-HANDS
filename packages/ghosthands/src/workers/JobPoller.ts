@@ -1,6 +1,7 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { Client as PgClient, Notification } from "pg";
 import { JobExecutor } from "./JobExecutor.js";
+import { callbackNotifier } from './callbackNotifier.js';
 import { getLogger } from '../monitoring/logger.js';
 
 const logger = getLogger({ service: 'JobPoller' });
@@ -276,13 +277,13 @@ export class JobPoller {
     }
 
     /**
-     * Detect and re-queue jobs that appear stuck (no heartbeat for 2+ minutes).
+     * Detect jobs that appear stuck (no heartbeat for 2+ minutes).
      * This handles worker crashes where a job was claimed but never completed.
      *
-     * EC3: Before re-enqueueing, check if the job has form_submitted events.
-     * If it does, mark as completed instead of resetting to pending (prevent
-     * re-running a partially completed application). In either case, clear the
-     * execution_attempt_id to allow a new worker to claim it.
+     * Recovery policy:
+     * - If the job appears to have meaningful progress (form submitted), mark completed.
+     * - Otherwise mark needs_human (do NOT re-queue), so workers don't keep retrying
+     *   the same stale job forever.
      */
     private async recoverStuckJobs(): Promise<void> {
         const STUCK_THRESHOLD_SECONDS = 120;
@@ -291,9 +292,12 @@ export class JobPoller {
             // First, find stuck jobs
             const stuckResult = await this.pgDirect.query(
                 `
-        SELECT id FROM gh_automation_jobs
+        SELECT id, callback_url, valet_task_id FROM gh_automation_jobs
         WHERE status IN ('queued', 'running')
-          AND last_heartbeat < NOW() - INTERVAL '${STUCK_THRESHOLD_SECONDS} seconds'
+          AND (
+            last_heartbeat IS NULL
+            OR last_heartbeat < NOW() - INTERVAL '${STUCK_THRESHOLD_SECONDS} seconds'
+          )
       `,
             );
 
@@ -304,10 +308,11 @@ export class JobPoller {
             const stuckJobIds = stuckResult.rows.map((j: { id: string }) => j.id);
             logger.info('Found stuck jobs', { count: stuckJobIds.length, jobIds: stuckJobIds });
 
-            const requeued: string[] = [];
+            const needsHumanDueToStuck: string[] = [];
             const completedDueToProgress: string[] = [];
 
-            for (const jobId of stuckJobIds) {
+            for (const stuckJob of stuckResult.rows as Array<{ id: string; callback_url?: string | null; valet_task_id?: string | null }>) {
+                const jobId = stuckJob.id;
                 // EC3: Check if the job has any events indicating meaningful progress
                 // (form_submitted, or cookbook steps that indicate form-filling occurred)
                 const eventsResult = await this.pgDirect.query(
@@ -335,27 +340,58 @@ export class JobPoller {
                     );
                     completedDueToProgress.push(jobId);
                 } else {
-                    // No meaningful progress — safe to re-queue
+                    // No meaningful progress — move to needs_human instead of re-queueing
+                    // to avoid infinite loops while surfacing that intervention is required.
                     await this.pgDirect.query(
                         `UPDATE gh_automation_jobs
-                         SET status = 'pending',
+                         SET status = 'needs_human',
+                             completed_at = NOW(),
                              worker_id = NULL,
                              execution_attempt_id = NULL,
+                             error_code = 'stuck_job_timeout',
+                             interaction_type = 'stuck_job_timeout',
+                             interaction_data = jsonb_build_object(
+                               'type', 'stuck_job_timeout',
+                               'message', 'Job exceeded stale heartbeat threshold and needs human review',
+                               'description', 'Worker heartbeat timed out before meaningful progress was detected',
+                               'timeout_seconds', ${STUCK_THRESHOLD_SECONDS}
+                             ),
                              error_details = jsonb_build_object(
                                'recovered_by', $1::TEXT,
-                               'reason', 'stuck_job_recovery'
+                               'reason', 'stuck_job_recovery',
+                               'message', 'Job exceeded stale heartbeat threshold and was auto-marked needs_human'
                              )
                          WHERE id = $2::UUID`,
                         [this.workerId, jobId],
                     );
-                    requeued.push(jobId);
+                    needsHumanDueToStuck.push(jobId);
+
+                    if (stuckJob.callback_url) {
+                        callbackNotifier.notifyHumanNeeded(
+                            jobId,
+                            stuckJob.callback_url,
+                            {
+                                type: 'stuck_job_timeout',
+                                message: 'Job exceeded stale heartbeat threshold and needs human review',
+                                description: 'Worker heartbeat timed out before meaningful progress was detected',
+                                timeout_seconds: STUCK_THRESHOLD_SECONDS,
+                            },
+                            stuckJob.valet_task_id || null,
+                            this.workerId,
+                        ).catch((err) => {
+                            logger.warn('Failed callback for needs_human stuck job', {
+                                jobId,
+                                error: err instanceof Error ? err.message : String(err),
+                            });
+                        });
+                    }
                 }
             }
 
-            if (requeued.length > 0) {
-                logger.info('Re-queued stuck jobs (no progress)', {
-                    count: requeued.length,
-                    jobIds: requeued,
+            if (needsHumanDueToStuck.length > 0) {
+                logger.info('Marked stuck jobs as needs_human (no progress)', {
+                    count: needsHumanDueToStuck.length,
+                    jobIds: needsHumanDueToStuck,
                 });
             }
             if (completedDueToProgress.length > 0) {

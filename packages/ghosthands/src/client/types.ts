@@ -8,6 +8,8 @@ export const JobStatus = {
   QUEUED: 'queued',
   RUNNING: 'running',
   PAUSED: 'paused',
+  NEEDS_HUMAN: 'needs_human',
+  AWAITING_REVIEW: 'awaiting_review',
   COMPLETED: 'completed',
   FAILED: 'failed',
   CANCELLED: 'cancelled',
@@ -17,6 +19,8 @@ export const JobStatus = {
 export type JobStatus = (typeof JobStatus)[keyof typeof JobStatus];
 
 export const TERMINAL_STATUSES: ReadonlySet<JobStatus> = new Set([
+  JobStatus.NEEDS_HUMAN,
+  JobStatus.AWAITING_REVIEW,
   JobStatus.COMPLETED,
   JobStatus.FAILED,
   JobStatus.CANCELLED,
@@ -28,6 +32,8 @@ export const CANCELLABLE_STATUSES: ReadonlySet<JobStatus> = new Set([
   JobStatus.QUEUED,
   JobStatus.RUNNING,
   JobStatus.PAUSED,
+  JobStatus.NEEDS_HUMAN,
+  JobStatus.AWAITING_REVIEW,
 ]);
 
 // --------------------------------------------------------------------------

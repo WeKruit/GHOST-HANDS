@@ -11,14 +11,14 @@
  *   bun run job cancel <id>             # Cancel a job
  *   bun run job cancel --all            # Cancel all active jobs
  *   bun run job cancel --worker=adam    # Cancel all jobs targeted to adam
- *   bun run job retry <id>              # Retry a failed/cancelled job
+ *   bun run job retry <id>              # Retry a failed/needs_human/cancelled job
  *   bun run job logs <id>               # Show job events
  */
 
 import { Client as PgClient } from "pg";
 
-const CANCELLABLE = ["pending", "queued", "running", "paused"];
-const RETRYABLE = ["failed", "cancelled"];
+const CANCELLABLE = ["pending", "queued", "running", "paused", "needs_human", "awaiting_review"];
+const RETRYABLE = ["failed", "needs_human", "cancelled"];
 
 async function getClient(): Promise<PgClient> {
     const dbUrl =
@@ -62,9 +62,11 @@ async function listJobs() {
                 WHEN 'queued' THEN 2
                 WHEN 'pending' THEN 3
                 WHEN 'paused' THEN 4
-                WHEN 'failed' THEN 5
-                WHEN 'completed' THEN 6
-                ELSE 7
+                WHEN 'needs_human' THEN 5
+                WHEN 'awaiting_review' THEN 6
+                WHEN 'failed' THEN 7
+                WHEN 'completed' THEN 8
+                ELSE 9
             END,
             created_at DESC
         LIMIT 20
@@ -91,8 +93,10 @@ async function listJobs() {
         const status =
             row.status === "running"
                 ? `\x1b[32m${row.status}\x1b[0m`
-                : row.status === "failed"
+                : row.status === "failed" || row.status === "needs_human"
                   ? `\x1b[31m${row.status}\x1b[0m`
+                  : row.status === "awaiting_review"
+                    ? `\x1b[35m${row.status}\x1b[0m`
                   : row.status === "pending"
                     ? `\x1b[33m${row.status}\x1b[0m`
                     : row.status;
@@ -249,7 +253,7 @@ async function retryJob(jobId: string) {
 
     if (result.rows.length === 0) {
         console.error(
-            `Job ${jobId} not found or not retryable (must be failed/cancelled).`
+            `Job ${jobId} not found or not retryable (must be failed/needs_human/cancelled).`
         );
         process.exit(1);
     }
@@ -345,7 +349,7 @@ Commands:
   cancel <id>               Cancel a specific job (alias: c)
   cancel --all              Cancel all active jobs
   cancel --worker=<name>    Cancel all jobs for a worker
-  retry <id>                Retry a failed/cancelled job (alias: r)
+  retry <id>                Retry a failed/needs_human/cancelled job (alias: r)
   logs <id>                 Show job event log (alias: l)
 
 Short IDs supported: "bun run job cancel a23c" matches "a23c728e-..."

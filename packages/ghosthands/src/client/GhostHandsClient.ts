@@ -373,7 +373,7 @@ export class GhostHandsClient {
   }
 
   /**
-   * Re-queue a failed or cancelled job for another attempt.
+   * Re-queue a failed, needs_human, or cancelled job for another attempt.
    */
   async retryJob(jobId: string): Promise<AutomationJob> {
     if (this.mode === 'api') {
@@ -383,7 +383,7 @@ export class GhostHandsClient {
     const supabase = this.requireSupabase();
     const current = await this.getJob(jobId);
 
-    if (current.status !== 'failed' && current.status !== 'cancelled') {
+    if (current.status !== 'failed' && current.status !== 'needs_human' && current.status !== 'cancelled') {
       throw new GhostHandsError(
         `Job ${jobId} cannot be retried (current status: ${current.status})`,
         'job_not_retryable',
@@ -404,7 +404,7 @@ export class GhostHandsClient {
         retry_count: current.retry_count + 1,
       })
       .eq('id', jobId)
-      .in('status', ['failed', 'cancelled'])
+      .in('status', ['failed', 'needs_human', 'cancelled'])
       .select()
       .single();
 

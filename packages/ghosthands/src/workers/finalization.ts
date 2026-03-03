@@ -411,7 +411,7 @@ export async function finalizeHandlerResult(
     })
     .eq('id', job.id);
 
-  // 5. Handle awaiting_user_review vs normal completion
+  // 5. Handle awaiting_review vs normal completion
   if (taskResult.awaitingUserReview) {
     await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
     await progress.flush();
@@ -429,7 +429,7 @@ export async function finalizeHandlerResult(
     await supabase
       .from('gh_automation_jobs')
       .update({
-        status: 'awaiting_user_review',
+        status: 'awaiting_review',
         result_data: resultData,
         result_summary: 'Application filled — waiting for user to review and submit',
         screenshot_urls: screenshotUrls,
@@ -439,7 +439,7 @@ export async function finalizeHandlerResult(
       })
       .eq('id', job.id);
 
-    await logEvent('awaiting_user_review', {
+    await logEvent('awaiting_review', {
       action_count: finalCost.actionCount,
       total_tokens: finalCost.inputTokens + finalCost.outputTokens,
       cost_cents: Math.round(finalCost.totalCost * 100),

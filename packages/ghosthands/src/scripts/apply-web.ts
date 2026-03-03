@@ -241,6 +241,8 @@ const PAGE_HTML = `<!DOCTYPE html>
   .status-running { background: #1a3a1a; color: #4caf50; }
   .status-completed { background: #1a3a1a; color: #4caf50; }
   .status-failed { background: #3a1a1a; color: #f44336; }
+  .status-needs_human { background: #3a1a1a; color: #f44336; }
+  .status-awaiting_review { background: #1a2a3a; color: #2196f3; }
   .status-cancelled { background: #3a2a1a; color: #ff9800; }
   .status-paused { background: #1a2a3a; color: #2196f3; }
   .job-id { font-size: 0.75rem; color: #666; font-family: monospace; }
@@ -607,7 +609,7 @@ async function pollStatus() {
     renderEvents(data.events);
 
     // Stop polling on terminal states
-    if (['completed', 'failed', 'cancelled'].includes(data.job.status)) {
+    if (['completed', 'failed', 'cancelled', 'expired', 'needs_human', 'awaiting_review'].includes(data.job.status)) {
       clearInterval(pollTimer);
       pollTimer = null;
       const btn = document.getElementById('submitBtn');

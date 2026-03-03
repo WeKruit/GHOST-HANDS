@@ -75,7 +75,7 @@ describe('workflowState schema', () => {
   });
 
   test('accepts all valid status values', () => {
-    const statuses = ['running', 'suspended', 'awaiting_user_review', 'completed', 'failed'] as const;
+    const statuses = ['running', 'suspended', 'awaiting_review', 'completed', 'failed'] as const;
     for (const status of statuses) {
       const input = {
         jobId: '550e8400-e29b-41d4-a716-446655440000',

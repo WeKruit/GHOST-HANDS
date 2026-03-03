@@ -338,7 +338,7 @@ describe('Error Handling', () => {
 
   // ─── Heartbeat timeout (stuck job recovery) ─────────────────────
 
-  it('should detect and recover stuck jobs with stale heartbeats', async () => {
+  it('should detect and mark stuck jobs as needs_human with stale heartbeats', async () => {
     const staleHeartbeat = new Date(Date.now() - 3 * 60 * 1000).toISOString(); // 3 minutes ago
 
     const [stuckJob] = await insertTestJobs(supabase, {
@@ -354,8 +354,10 @@ describe('Error Handling', () => {
     const { data: recovered } = await supabase
       .from('gh_automation_jobs')
       .update({
-        status: 'pending',
+        status: 'needs_human',
+        completed_at: new Date().toISOString(),
         worker_id: null,
+        error_code: 'stuck_job_timeout',
         error_details: { recovered_by: TEST_WORKER_ID, reason: 'stuck_job_recovery' },
       })
       .eq('job_type', JOB_TYPE)
@@ -370,7 +372,7 @@ describe('Error Handling', () => {
     expect(recovered!.map((r: { id: string }) => r.id)).toContain(stuckJob.id);
 
     const recoveredJob = await valet.getJob(stuckJob.id as string);
-    expect(recoveredJob!.status).toBe('pending');
+    expect(recoveredJob!.status).toBe('needs_human');
     expect(recoveredJob!.worker_id).toBeNull();
   });
 });

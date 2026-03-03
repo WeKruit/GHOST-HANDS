@@ -481,7 +481,7 @@ export function buildSteps(rt: RuntimeContext) {
         result.awaitingUserReview === true || result.keepBrowserOpen === true;
 
       if (awaitingReview) {
-        state.status = 'awaiting_user_review';
+        state.status = 'awaiting_review';
       } else if (result.success) {
         state.status = 'completed';
       } else {

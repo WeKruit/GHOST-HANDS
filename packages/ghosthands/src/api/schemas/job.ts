@@ -84,10 +84,18 @@ export const JobIdParamSchema = z.object({
 
 export const JOB_STATUSES = [
   'pending', 'queued', 'running', 'paused',
+  'needs_human', 'awaiting_review',
   'completed', 'failed', 'cancelled', 'expired',
 ] as const;
 
 export type JobStatus = typeof JOB_STATUSES[number];
 
-export const CANCELLABLE_STATUSES: JobStatus[] = ['pending', 'queued', 'running', 'paused'];
-export const RETRYABLE_STATUSES: JobStatus[] = ['failed', 'cancelled'];
+export const CANCELLABLE_STATUSES: JobStatus[] = [
+  'pending',
+  'queued',
+  'running',
+  'paused',
+  'needs_human',
+  'awaiting_review',
+];
+export const RETRYABLE_STATUSES: JobStatus[] = ['failed', 'needs_human', 'cancelled'];

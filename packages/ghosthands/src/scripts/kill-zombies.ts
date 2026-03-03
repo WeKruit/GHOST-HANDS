@@ -5,7 +5,7 @@
  * What this does:
  *   1. Shows all active Postgres connections to your database (so you can see who's connected)
  *   2. Terminates any LISTEN connections (zombie workers holding Postgres LISTEN channels)
- *   3. Releases all queued/running jobs back to "pending" (so your real worker can pick them up)
+ *   3. Marks all queued/running jobs as "needs_human" (prevents infinite re-pick loops)
  *   4. Shows a summary of recent jobs so you can verify the state
  *
  * Usage:
@@ -56,15 +56,30 @@ async function main() {
     console.log(`  pid=${row.pid}  app=${row.application_name}  state=${row.state}  uptime=${row.uptime}`);
   }
 
-  // ── 3. Release stuck jobs ─────────────────────────────────────────
+  // ── 3. Mark stuck jobs as needs_human ─────────────────────────────
   const released = await client.query(`
     UPDATE gh_automation_jobs
-    SET status = 'pending', worker_id = NULL
+    SET status = 'needs_human',
+        completed_at = NOW(),
+        worker_id = NULL,
+        error_code = 'stuck_job_timeout',
+        interaction_type = 'stuck_job_timeout',
+        interaction_data = jsonb_build_object(
+          'type', 'stuck_job_timeout',
+          'message', 'Job was owned by a zombie worker and needs human review',
+          'description', 'Worker heartbeat timed out before meaningful progress was detected'
+        ),
+        error_details = jsonb_build_object(
+          'released_by', 'kill-zombies-script',
+          'reason', 'stuck_job_manual_recovery',
+          'released_at', NOW()::TEXT,
+          'message', 'Job was owned by a zombie worker and was marked needs_human'
+        )
     WHERE status IN ('queued', 'running')
     RETURNING id, worker_id, job_type, status
   `);
 
-  console.log(`\nReleased ${released.rowCount} stuck job(s)`);
+  console.log(`\nMarked ${released.rowCount} stuck job(s) as needs_human`);
   for (const row of released.rows) {
     console.log(`  ${row.id}  type=${row.job_type}  was_worker=${row.worker_id || 'null'}`);
   }

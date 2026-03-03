@@ -172,7 +172,7 @@ export async function POST_cancel(
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/gh/jobs/[id]/retry  -- retry a failed/cancelled job
+// POST /api/gh/jobs/[id]/retry  -- retry a failed/needs_human/cancelled job
 // ---------------------------------------------------------------------------
 export async function POST_retry(
   _request: Request,

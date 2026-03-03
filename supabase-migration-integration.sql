@@ -76,7 +76,18 @@ CREATE TABLE IF NOT EXISTS gh_automation_jobs (
 -- Validate status values
 ALTER TABLE gh_automation_jobs
     ADD CONSTRAINT gh_jobs_status_check
-    CHECK (status IN ('pending', 'queued', 'running', 'paused', 'completed', 'failed', 'cancelled', 'expired'));
+    CHECK (status IN (
+      'pending',
+      'queued',
+      'running',
+      'paused',
+      'needs_human',
+      'awaiting_review',
+      'completed',
+      'failed',
+      'cancelled',
+      'expired'
+    ));
 
 -- Validate priority range
 ALTER TABLE gh_automation_jobs
