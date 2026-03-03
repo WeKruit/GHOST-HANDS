@@ -12,6 +12,13 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src", "../ghosthands/src/engine"],
-  "exclude": ["node_modules", "dist"]
+  "include": ["src", "../ghosthands/src"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "../ghosthands/src/__tests__/**",
+    "../ghosthands/src/scripts/**",
+    "../ghosthands/src/workflows/**",
+    "../ghosthands/__tests__/**"
+  ]
 }
