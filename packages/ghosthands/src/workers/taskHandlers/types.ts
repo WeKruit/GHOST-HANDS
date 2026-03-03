@@ -43,6 +43,12 @@ export interface TaskContext {
   dataPrompt: string;
   /** Local file path to the downloaded resume, if a resume_ref was provided */
   resumeFilePath?: string | null;
+  /** Block handler execution until human completes a manual action (email verification, manual sign-in, etc.) */
+  waitForManualAction?: (options: {
+    type: string;
+    description: string;
+    timeoutSeconds?: number;
+  }) => Promise<{ resumed: boolean }>;
 }
 
 export interface TaskResult {

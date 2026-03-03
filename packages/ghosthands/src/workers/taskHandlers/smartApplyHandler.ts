@@ -208,7 +208,7 @@ export class SmartApplyHandler implements TaskHandler {
             if (config.handleLogin) {
               await config.handleLogin(adapter, userProfile);
             } else {
-              await this.handleGenericLogin(adapter, userProfile, dataPrompt);
+              await this.handleGenericLogin(adapter, userProfile, dataPrompt, ctx);
             }
             // Track that login was attempted so detectObviousPage doesn't
             // re-classify a Create Account page as login.
@@ -232,7 +232,7 @@ export class SmartApplyHandler implements TaskHandler {
               if (config.handleLogin) {
                 await config.handleLogin(adapter, userProfile);
               } else {
-                await this.handleGenericLogin(adapter, userProfile, dataPrompt);
+                await this.handleGenericLogin(adapter, userProfile, dataPrompt, ctx);
               }
               this.loginAttempted = true;
               // Don't call handleAccountCreation here — let the main loop re-detect the page.
@@ -679,6 +679,7 @@ export class SmartApplyHandler implements TaskHandler {
     adapter: BrowserAutomationAdapter,
     profile: Record<string, any>,
     dataPrompt = '',
+    ctx?: TaskContext,
   ): Promise<void> {
     const currentUrl = await adapter.getCurrentUrl();
     // Use TEST_GMAIL credentials for login/account creation pages;
@@ -860,6 +861,32 @@ Click only ONE button, then report the task as done.`,
       return;
     }
 
+    // Check if the page says "verify your email" (after account creation) — HITL
+    const needsEmailVerification = await adapter.page.evaluate(() => {
+      const text = document.body.innerText.toLowerCase();
+      return text.includes('verify your account') || text.includes('verify your email')
+        || text.includes('email has been sent') || text.includes('verification email')
+        || text.includes('confirm your email') || text.includes('check your email')
+        || text.includes('please verify');
+    });
+
+    if (needsEmailVerification) {
+      if (ctx?.waitForManualAction) {
+        console.log('[SmartApply] Email verification required — pausing for human action...');
+        const hitlResult = await ctx.waitForManualAction({
+          type: 'email_verification',
+          description: 'Please verify your email and sign in manually, then click Resume.',
+          timeoutSeconds: 600,
+        });
+        if (!hitlResult.resumed) {
+          throw new Error('Email verification timed out — user did not respond within 10 minutes.');
+        }
+        console.log('[SmartApply] Resumed after email verification — continuing page loop.');
+        return; // return from handleGenericLogin → page loop re-detects the page
+      }
+      throw new Error('Email verification required. Please check your email, click the verification link, then sign in manually.');
+    }
+
     // Sign-in form: DOM-fill email + password, then MagnitudeHand clicks the button
     if (formState.hasEmail || formState.hasPassword) {
       console.log('[SmartApply] On sign-in form — filling credentials...');
@@ -901,11 +928,17 @@ Click only ONE button, then report the task as done.`,
       await adapter.page.waitForTimeout(300);
 
       // MagnitudeHand handles the rest — button clicks, checkboxes, etc.
-      await adapter.act(
-        'The email and password fields are already filled. ' +
-        'Check any required checkboxes (like "Remember me"), then click the "Sign In", "Log In", or "Continue" button. ' +
-        'Click ONLY ONE button, then report done.',
-      );
+      // Wrap in try-catch because MagnitudeHand may report ✕ fail if it sees an error on the page
+      try {
+        await adapter.act(
+          'The email and password fields are already filled. ' +
+          'Check any required checkboxes (like "Remember me"), then click the "Sign In", "Log In", or "Continue" button. ' +
+          'Click ONLY ONE button, then report done.',
+        );
+      } catch (signInErr) {
+        console.log(`[SmartApply] MagnitudeHand sign-in failed: ${signInErr instanceof Error ? signInErr.message : String(signInErr)}`);
+        // Fall through to login error check below
+      }
 
       await adapter.page.waitForTimeout(2000);
       await this.waitForPageLoad(adapter);
@@ -913,7 +946,7 @@ Click only ONE button, then report the task as done.`,
       // Check for login errors
       const loginError = await adapter.page.evaluate(() => {
         const patterns = ['incorrect', 'invalid', 'wrong', 'not found', "doesn't exist", 'does not exist',
-          'failed', 'try again', 'not recognized', 'no account', 'unable to sign'];
+          'failed', 'try again', 'not recognized', 'no account', 'unable to sign', 'locked'];
         const alertEls = document.querySelectorAll(
           '[role="alert"], .error, .alert-error, .alert-danger, ' +
           '[class*="error-msg"], [class*="error-message"], [class*="errorMessage"]'
@@ -928,6 +961,23 @@ Click only ONE button, then report the task as done.`,
       });
 
       if (loginError) {
+        // Check if the error suggests a locked/unverified account — trigger HITL
+        const isLockedOrUnverified = loginError.includes('locked') || loginError.includes('verify')
+          || loginError.includes('verified') || loginError.includes('confirm your email');
+        if (isLockedOrUnverified && ctx?.waitForManualAction) {
+          console.log(`[SmartApply] Account appears locked/unverified: "${loginError}" — pausing for human action...`);
+          const hitlResult = await ctx.waitForManualAction({
+            type: 'account_locked',
+            description: 'Account appears locked or unverified. Please verify your email, sign in manually, then click Resume.',
+            timeoutSeconds: 600,
+          });
+          if (!hitlResult.resumed) {
+            throw new Error('Account locked/unverified — user did not respond within 10 minutes.');
+          }
+          console.log('[SmartApply] Resumed after manual sign-in — continuing page loop.');
+          return;
+        }
+
         console.log(`[SmartApply] Login failed: "${loginError}" — will try account creation on next iteration.`);
         // Navigate to Create Account — MagnitudeHand handles it
         await adapter.act(

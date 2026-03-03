@@ -440,6 +440,7 @@ export function buildSteps(rt: RuntimeContext) {
         credentials: rt.credentials,
         dataPrompt: rt.dataPrompt,
         resumeFilePath: rt.resumeFilePath,
+        waitForManualAction: rt.waitForManualAction,
       };
 
       let result: Awaited<ReturnType<typeof rt.handler.execute>>;
