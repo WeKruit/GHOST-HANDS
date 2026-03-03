@@ -6,7 +6,9 @@ name: Publish Engine
 on:
   push:
     branches: [staging, spencer-magnitude-hand]
-    paths: ['packages/engine/**']
+    paths:
+      - 'packages/engine/**'
+      - 'packages/ghosthands/src/**'
 
 jobs:
   publish:
@@ -139,8 +141,8 @@ jobs:
             PREV_SHA=$(git rev-list -1 "$PREV_TAG")
             echo "previous_sha=${PREV_SHA}" >> "$GITHUB_OUTPUT"
 
-            DIFF_STAT=$(git diff --stat "$PREV_TAG"..HEAD -- packages/engine/src/ | tail -1)
-            DIFF_FILES=$(git diff --name-status "$PREV_TAG"..HEAD -- packages/engine/src/)
+            DIFF_STAT=$(git diff --stat "$PREV_TAG"..HEAD -- packages/engine/src/ packages/ghosthands/src/ | tail -1)
+            DIFF_FILES=$(git diff --name-status "$PREV_TAG"..HEAD -- packages/engine/src/ packages/ghosthands/src/)
             COMPARE_URL="https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${{ github.sha }}"
 
             DIFF_FILES_ESCAPED=$(echo "$DIFF_FILES" | jq -Rsa .)
