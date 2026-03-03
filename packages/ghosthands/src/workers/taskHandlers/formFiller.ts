@@ -1020,7 +1020,8 @@ Rules:
 - For file upload fields, skip them (don't include in output).
 - For textarea fields (cover letters, open-ended questions), write 2-4 thoughtful sentences using the applicant's real background. NEVER return a single letter or placeholder — write a genuine response.
 - For conditional "Please specify" or "Other (please explain)" fields, answer in context of what triggered them (e.g., if "How did you hear about us?" was "Other", specify the referral source, not the job title).
-- For demographic/EEO fields (gender, race, ethnicity, veteran, disability), use the applicant's actual demographic info from their profile. Pick the option that best matches.
+- For demographic/EEO fields (gender, race, ethnicity, veteran, disability), use the applicant's actual demographic info from their profile. Pick the option that best matches. If the profile has NO demographic info for a field, choose the most neutral "decline" option (e.g. "Not Declared", "Prefer not to say", "I do not wish to disclose", "Decline to self-identify") — NEVER leave it as the default placeholder.
+- NEVER select a default placeholder value like "Select One", "Choose one", "Please select", "-- Select --", or any similar default/blank option. These are not valid answers. Always pick a real option from the list.
 - For salary fields, provide a realistic number based on the role and experience level (e.g., 120000 for a mid-level engineer).
 - Fields with "#2", "#3", etc. are repeated fields from repeater sections (e.g. multiple work experiences or education entries). Use the matching numbered entry from the profile.
 - Use the EXACT field names shown above (including any "#N" suffix) as JSON keys.
@@ -1046,6 +1047,36 @@ Example response:
       if (Array.isArray(v)) (parsed as any)[k] = v.join(',');
       else if (typeof v === 'number') (parsed as any)[k] = String(v);
     }
+
+    // Post-processing: replace placeholder answers with neutral "decline" options
+    const placeholderPattern = /^(select one|choose one|please select|-- ?select ?--|— ?select ?—|\(select\)|select\.{0,3})$/i;
+    const declinePatterns = [
+      /not declared/i, /prefer not/i, /decline/i, /do not wish/i,
+      /choose not/i, /rather not/i, /not specified/i, /not applicable/i, /n\/?a/i,
+    ];
+    for (const [key, val] of Object.entries(parsed)) {
+      if (typeof val === 'string' && placeholderPattern.test(val.trim())) {
+        // Find the matching field to get its options
+        const fieldIdx = disambiguatedNames.indexOf(key);
+        const field = fieldIdx >= 0 ? fields[fieldIdx] : undefined;
+        const options = field?.options ?? field?.choices ?? [];
+        // Find best neutral "decline" option
+        const neutral = options.find(o => declinePatterns.some(p => p.test(o)));
+        if (neutral) {
+          console.log(`[formFiller] Replaced placeholder "${val}" → "${neutral}" for field "${key}"`);
+          (parsed as any)[key] = neutral;
+        } else if (options.length > 0) {
+          // No explicit decline option — pick the last non-placeholder option (often the "other" or neutral one)
+          const nonPlaceholder = options.filter(o => !placeholderPattern.test(o.trim()));
+          if (nonPlaceholder.length > 0) {
+            const fallback = nonPlaceholder[nonPlaceholder.length - 1];
+            console.log(`[formFiller] Replaced placeholder "${val}" → "${fallback}" (last non-placeholder) for field "${key}"`);
+            (parsed as any)[key] = fallback;
+          }
+        }
+      }
+    }
+
     return { answers: parsed, fieldIdToKey, inputTokens, outputTokens };
   } catch {
     console.log('[formFiller] Failed to parse LLM response as JSON, using empty answers');
@@ -2514,6 +2545,12 @@ export async function fillFormOnPage(
     let filledCount = 0;
 
     for (const field of unfilledFields) {
+      // Skip fields with empty labels — MagnitudeHand can't identify them
+      if (!field.name || !field.name.trim()) {
+        console.log(`[formFiller] [MagnitudeHand] Skipping field with empty label (id=${field.id}, type=${field.type})`);
+        continue;
+      }
+
       await page.evaluate((ffId) => {
         const el = document.querySelector(`[data-ff-id="${ffId}"]`);
         el?.scrollIntoView({ block: 'center', behavior: 'auto' });
