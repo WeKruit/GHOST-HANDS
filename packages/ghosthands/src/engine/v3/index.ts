@@ -29,3 +29,12 @@ export { CookbookExecutorV3, type CookbookV3Result } from './CookbookExecutorV3'
 
 // Engine
 export { V3ExecutionEngine, type V3ExecutionResult, type V3ExecutionParams } from './V3ExecutionEngine';
+
+// Platform framework
+export type { PlatformConfig, PageType, PageState, ScannedField, ScanResult, FieldKind, FillStrategy } from './platformTypes';
+export { GenericPlatformConfig, findBestAnswer } from './GenericPlatformConfig';
+export { getPlatformHandler } from './platforms';
+export { PageScanner } from './PageScanner';
+export { FieldMatcher } from './FieldMatcher';
+export { DOMActionExecutor } from './DOMActionExecutor';
+export { toV2FieldModel, toV2PageModel } from './v2compat';

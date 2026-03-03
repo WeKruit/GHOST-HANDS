@@ -21,8 +21,9 @@ import { getLogger } from '../../../monitoring/logger.js';
 export async function handleGoogleSignIn(
   adapter: BrowserAutomationAdapter,
   email: string,
+  password?: string,
 ): Promise<void> {
-  const password = process.env.TEST_GMAIL_PASSWORD || '';
+  const pwd = password ?? process.env.TEST_GMAIL_PASSWORD ?? '';
 
   const logger = getLogger();
   logger.info('On Google sign-in page', { email });
@@ -145,7 +146,7 @@ export async function handleGoogleSignIn(
       logger.info('Password entry page, typing password via DOM');
       // Use :visible pseudo-class to skip hidden inputs Google puts in the DOM
       const passwordInput = adapter.page.locator('input[type="password"]:visible').first();
-      await passwordInput.fill(password);
+      await passwordInput.fill(pwd);
       await adapter.page.waitForTimeout(300);
       // Click "Next" button
       const nextClicked = await adapter.page.evaluate(() => {
@@ -175,9 +176,9 @@ export async function handleGoogleSignIn(
       // Attempt DOM-based password entry (handles cases the detector missed)
       const passwordField = adapter.page.locator('input[type="password"]:visible').first();
       const hasPasswordField = await passwordField.isVisible({ timeout: 1000 }).catch(() => false);
-      if (hasPasswordField && password) {
+      if (hasPasswordField && pwd) {
         logger.info('Found visible password field, filling via DOM');
-        await passwordField.fill(password);
+        await passwordField.fill(pwd);
         await adapter.page.waitForTimeout(300);
         const nextClicked = await adapter.page.evaluate(() => {
           const buttons = document.querySelectorAll('button, div[role="button"]');
