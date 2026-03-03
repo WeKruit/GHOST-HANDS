@@ -49,6 +49,10 @@ export interface FillResult {
   totalAttempted: number;
   totalFields: number;
   llmCalls: number;
+  /** Total input tokens consumed by formFiller LLM calls */
+  inputTokens: number;
+  /** Total output tokens consumed by formFiller LLM calls */
+  outputTokens: number;
 }
 
 interface GenerateResult {
@@ -210,41 +214,100 @@ async function readBinaryControlState(page: Page, ffId: string): Promise<boolean
   }, ffId);
 }
 
+/** Explicit resume/CV keywords — high confidence this field wants a resume. */
+const RESUME_KEYWORDS = ['resume', 'cv', 'curriculum vitae'];
+
+/**
+ * Determine if a file input is a resume upload field.
+ *
+ * Returns:
+ *  - 'yes'   — label explicitly mentions resume/CV
+ *  - 'maybe' — label is empty or purely generic (e.g. "Attach", "Upload file")
+ *  - 'no'    — label describes something else (cover letter, portfolio, etc.)
+ */
+function classifyFileInput(label: string): 'yes' | 'maybe' | 'no' {
+  const trimmed = label.trim();
+  if (!trimmed) return 'maybe'; // Unlabeled
+  const lower = trimmed.toLowerCase();
+  // Explicit resume match
+  if (RESUME_KEYWORDS.some(kw => lower.includes(kw))) return 'yes';
+  // Generic labels with no specific content descriptor
+  // e.g. "Attach", "Upload", "Choose file", "Browse" — these are ambiguous
+  const genericOnly = /^(attach|upload|choose|browse|select|add)(\s+(a\s+)?file)?s?\.?$/i;
+  if (genericOnly.test(trimmed)) return 'maybe';
+  // Anything else (cover letter, portfolio, writing sample, etc.)
+  return 'no';
+}
+
+/**
+ * Check if a file input should receive the resume.
+ * Wraps classifyFileInput — returns true for 'yes' and 'maybe'.
+ */
+function isResumeFileInput(label: string): boolean {
+  return classifyFileInput(label) !== 'no';
+}
+
 async function uploadResumeIfPresent(page: Page, resumePath?: string | null): Promise<boolean> {
   const resolvedResume = resolveExistingFilePath(resumePath);
   if (!resolvedResume) return false;
 
-  const beforeCount = await page.evaluate(() => {
+  // Get file inputs with their labels so we can skip non-resume fields
+  const fileInputInfo = await page.evaluate(() => {
     const inputs = Array.from(document.querySelectorAll('input[type="file"]')) as HTMLInputElement[];
-    let selected = 0;
-    for (const input of inputs) {
-      if ((input.files?.length || 0) > 0 || (input.value || '').trim().length > 0) selected++;
-    }
-    return { total: inputs.length, selected };
-  }).catch(() => ({ total: 0, selected: 0 }));
+    return inputs.map((input, idx) => {
+      const hasFile = (input.files?.length || 0) > 0 || (input.value || '').trim().length > 0;
+      // Gather accessible label: aria-label, associated <label>, or nearby text
+      let label = input.getAttribute('aria-label') || '';
+      if (!label) {
+        const labelEl = input.id ? document.querySelector(`label[for="${input.id}"]`) : null;
+        label = labelEl?.textContent?.trim() || '';
+      }
+      if (!label) {
+        // Check parent/sibling text
+        const parent = input.closest('.field, .form-group, .form-field, [class*="upload"]');
+        if (parent) {
+          const clone = parent.cloneNode(true) as HTMLElement;
+          clone.querySelectorAll('input, button').forEach((el: any) => el.remove());
+          label = clone.textContent?.trim() || '';
+        }
+      }
+      return { idx, hasFile, label };
+    });
+  }).catch(() => [] as { idx: number; hasFile: boolean; label: string }[]);
 
-  if (beforeCount.total === 0) return false;
-  if (beforeCount.selected > 0) return true;
+  if (fileInputInfo.length === 0) return false;
+  if (fileInputInfo.every(fi => fi.hasFile)) return true;
+
+  // Classify each file input and prioritize explicit resume fields
+  const classified = fileInputInfo
+    .filter(fi => !fi.hasFile)
+    .map(fi => ({ ...fi, classification: classifyFileInput(fi.label) }));
+
+  // Two-pass: try explicit resume fields first, then generic/unlabeled ones
+  const explicitResume = classified.filter(fi => fi.classification === 'yes');
+  const genericFields = classified.filter(fi => fi.classification === 'maybe');
+  const candidates = explicitResume.length > 0 ? explicitResume : genericFields;
+
+  if (candidates.length === 0) {
+    for (const fi of classified.filter(c => c.classification === 'no')) {
+      console.log(`[formFiller] skip file input "${fi.label}" (not a resume field)`);
+    }
+    return false;
+  }
 
   const fileInputs = page.locator('input[type="file"]');
-  const count = await fileInputs.count();
-  if (count === 0) return false;
-
-  let uploaded = false;
-  for (let i = 0; i < count; i++) {
+  for (const fi of candidates) {
     try {
-      await fileInputs.nth(i).setInputFiles(resolvedResume, { timeout: 2500 });
-      uploaded = true;
+      await fileInputs.nth(fi.idx).setInputFiles(resolvedResume, { timeout: 2500 });
+      console.log(`[formFiller] resume upload → ${path.basename(resolvedResume)} (field: "${fi.label || 'unlabeled'}")`);
+      await page.waitForTimeout(500);
+      return true;
     } catch {
-      // Keep trying other file inputs
+      // Keep trying other candidates
     }
   }
 
-  if (uploaded) {
-    console.log(`[formFiller] resume upload → ${path.basename(resolvedResume)}`);
-    await page.waitForTimeout(500);
-  }
-  return uploaded;
+  return false;
 }
 
 function normalizeName(s: string): string {
@@ -992,7 +1055,7 @@ Example response:
 
 // ── Fill a single field ──────────────────────────────────────
 
-async function fillField(page: Page, field: FormField, answers: AnswerMap, resumePath?: string | null): Promise<boolean> {
+async function fillField(page: Page, field: FormField, answers: AnswerMap, resumePath?: string | null, resumeAlreadyUploaded = false): Promise<boolean> {
   const sel = `[data-ff-id="${field.id}"]`;
   const tag = `[${field.name || field.type}]`;
 
@@ -1852,6 +1915,18 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
     }
 
     case 'file': {
+      // Skip if resume was already uploaded to any field on this page
+      if (resumeAlreadyUploaded) {
+        console.log(`[formFiller]   skip ${tag} (resume already uploaded)`);
+        return true;
+      }
+
+      // Skip non-resume file fields (cover letter, portfolio, etc.)
+      if (!isResumeFileInput(field.name)) {
+        console.log(`[formFiller]   skip ${tag} (not a resume field)`);
+        return false;
+      }
+
       const llmPath = getAnswer(answers, field)?.trim();
       let filePath = resolveExistingFilePath(resumePath) || '';
       if (!filePath) filePath = resolveExistingFilePath(llmPath) || '';
@@ -1859,16 +1934,6 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
       if (!filePath) {
         console.log(`[formFiller]   skip ${tag} (no resume path)`);
         return false;
-      }
-
-      const alreadyUploaded = await page.evaluate((ffId) => {
-        const el = document.querySelector(`[data-ff-id="${ffId}"]`) as HTMLInputElement | null;
-        if (!el) return false;
-        return (el.files?.length || 0) > 0 || (el.value || '').trim().length > 0;
-      }, field.id).catch(() => false);
-      if (alreadyUploaded) {
-        console.log(`[formFiller]   skip ${tag} (already uploaded)`);
-        return true;
       }
 
       try {
@@ -2262,6 +2327,8 @@ export async function fillFormOnPage(
     totalAttempted: 0,
     totalFields: 0,
     llmCalls: 0,
+    inputTokens: 0,
+    outputTokens: 0,
   };
 
   // 0. Ensure __name polyfill (esbuild/bun may inject __name into serialized
@@ -2289,7 +2356,11 @@ export async function fillFormOnPage(
   // 3. Expand repeater sections (Work Experience / Education) first.
   await expandRepeaters(page, profileText);
   await injectHelpers(page);
-  let resumeUploaded = await uploadResumeIfPresent(page, resumePath);
+
+  // Track whether the resume has already been uploaded to ANY file input.
+  // Once true, all subsequent file fields are skipped to prevent duplicate uploads
+  // (e.g. on retry rounds or multi-file inputs that would accept a second file).
+  let resumeAlreadyUploaded = await uploadResumeIfPresent(page, resumePath);
 
   // 4. Extract fields
   console.log('[formFiller] Extracting form fields…');
@@ -2319,6 +2390,8 @@ export async function fillFormOnPage(
     answers = { ...genResult.answers };
     Object.assign(fieldIdMap, genResult.fieldIdToKey);
     result.llmCalls++;
+    result.inputTokens += genResult.inputTokens;
+    result.outputTokens += genResult.outputTokens;
     console.log(`[formFiller] LLM provided ${Object.keys(answers).length} answers.`);
   } else {
     console.log('[formFiller] No named non-file fields for LLM — skipping answer generation.');
@@ -2338,8 +2411,8 @@ export async function fillFormOnPage(
       console.log(`[formFiller] Re-injecting helpers (lost after page interaction)`);
       await injectHelpers(page);
     }
-    if (!resumeUploaded) {
-      resumeUploaded = await uploadResumeIfPresent(page, resumePath);
+    if (!resumeAlreadyUploaded) {
+      resumeAlreadyUploaded = await uploadResumeIfPresent(page, resumePath);
     }
     const fields = await extractFields(page);
     const visible = fields.filter((f) => f.visibleByDefault && (f.name || f.type === 'file'));
@@ -2376,6 +2449,8 @@ export async function fillFormOnPage(
       Object.assign(answers, extraResult.answers);
       Object.assign(fieldIdMap, extraResult.fieldIdToKey);
       result.llmCalls++;
+      result.inputTokens += extraResult.inputTokens;
+      result.outputTokens += extraResult.outputTokens;
     }
 
     console.log(`[formFiller] Round ${round}: ${toFill.length} new fields to fill…`);
@@ -2387,8 +2462,11 @@ export async function fillFormOnPage(
         resolved = profileSkillsCsv;
       }
       const fieldAnswers = resolved !== undefined ? { ...answers, [field.name]: resolved } : answers;
-      const ok = await fillField(page, field, fieldAnswers, resumePath);
-      if (ok) domFilledOk.add(field.id);
+      const ok = await fillField(page, field, fieldAnswers, resumePath, resumeAlreadyUploaded);
+      if (ok) {
+        domFilledOk.add(field.id);
+        if (field.type === 'file') resumeAlreadyUploaded = true;
+      }
     }
 
     // Dismiss any leftover open dropdowns

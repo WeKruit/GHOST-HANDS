@@ -206,18 +206,26 @@ export class GenericPlatformConfig implements PlatformConfig {
         || bodyText.includes('qualifications') || bodyText.includes('about the role')
         || bodyText.includes('about this job') || bodyText.includes('what you\'ll do');
 
-      // Sign-in detection
-      const hasPasswordField = document.querySelectorAll('input[type="password"]').length > 0;
+      // Sign-in / account creation detection
+      const passwordFieldCount = document.querySelectorAll('input[type="password"]').length;
+      const hasPasswordField = passwordFieldCount > 0;
       const hasEmailField = document.querySelectorAll('input[type="email"]').length > 0;
       const hasSignInWithGoogle = bodyText.includes('sign in with google') || bodyText.includes('continue with google');
       const hasSignInClickable = clickableTexts.some(t =>
         t === 'sign in' || t === 'log in' || t === 'login' ||
         t === 'sign in with google' || t === 'continue with google'
       );
+      // Account creation: 2+ password fields (password + confirm) OR heading says "create account"
+      const headings = Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]'));
+      const headingText = headings.map(h => (h.textContent || '').toLowerCase()).join(' ');
+      const isAccountCreation = passwordFieldCount >= 2
+        || headingText.includes('create account')
+        || headingText.includes('register')
+        || headingText.includes('sign up');
       // Require password field OR Google SSO OR (email + sign-in button).
       // A standalone "Sign In" link in a nav bar should NOT classify as login.
-      const isLoginPage = hasPasswordField || hasSignInWithGoogle ||
-        (hasEmailField && hasSignInClickable);
+      const isLoginPage = (hasPasswordField && !isAccountCreation) || hasSignInWithGoogle ||
+        (hasEmailField && hasSignInClickable && !isAccountCreation);
 
       // Native inputs + ARIA-based form controls
       const hasFormInputs = document.querySelectorAll(
@@ -226,7 +234,7 @@ export class GenericPlatformConfig implements PlatformConfig {
 
       const hasConfirmation = bodyText.includes('thank you') || bodyText.includes('application received') || bodyText.includes('successfully submitted');
 
-      return { hasApplyButton, hasSubmitButton, hasReviewSignals, hasJobDescription, isLoginPage, hasSignInClickable, hasSignInWithGoogle, hasFormInputs, hasConfirmation };
+      return { hasApplyButton, hasSubmitButton, hasReviewSignals, hasJobDescription, isLoginPage, isAccountCreation, hasSignInClickable, hasSignInWithGoogle, hasFormInputs, hasConfirmation };
     });
 
     if (signals.hasConfirmation && !signals.hasFormInputs) {
@@ -245,7 +253,12 @@ export class GenericPlatformConfig implements PlatformConfig {
       return { page_type: 'job_listing', page_title: 'Job Listing', has_apply_button: true };
     }
 
-    // Login: has sign-in button/link
+    // Account creation: 2+ password fields or "Create Account" heading
+    if (signals.isAccountCreation) {
+      return { page_type: 'account_creation', page_title: 'Account Creation' };
+    }
+
+    // Login: has sign-in button/link (but NOT account creation — checked above)
     if (signals.isLoginPage) {
       return { page_type: 'login', page_title: 'Sign-In', has_sign_in_with_google: signals.hasSignInWithGoogle };
     }
