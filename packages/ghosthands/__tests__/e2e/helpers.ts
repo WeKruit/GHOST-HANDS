@@ -45,6 +45,8 @@ export const JOB_STATUSES = [
   'queued',
   'running',
   'paused',
+  'needs_human',
+  'awaiting_review',
   'completed',
   'failed',
   'cancelled',

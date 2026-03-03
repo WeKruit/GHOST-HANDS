@@ -179,7 +179,7 @@ export function createJobRoutes(controller: JobController) {
       return c.json(
         {
           error: 'job_not_retryable',
-          message: `Job with status '${result.current_status}' cannot be retried. Only failed or cancelled jobs can be retried.`,
+          message: `Job with status '${result.current_status}' cannot be retried. Only failed, needs_human, or cancelled jobs can be retried.`,
           current_status: result.current_status,
         },
         409,

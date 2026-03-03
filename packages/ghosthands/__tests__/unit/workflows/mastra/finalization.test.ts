@@ -324,7 +324,7 @@ describe('finalizeHandlerResult', () => {
     expect(result).toEqual({ awaitingReview: false });
   });
 
-  test('updates DB status to "awaiting_user_review" for review result', async () => {
+  test('updates DB status to "awaiting_review" for review result', async () => {
     const supabase = createMockSupabase();
     const adapter = createMockAdapter();
     const costTracker = createMockCostTracker();
@@ -347,13 +347,13 @@ describe('finalizeHandlerResult', () => {
       engineResult: makeEngineResult({ mode: 'magnitude', cookbookSteps: 0, magnitudeSteps: 5 }),
     });
 
-    // Find the update call that sets status to 'awaiting_user_review'
+    // Find the update call that sets status to 'awaiting_review'
     const updateCalls = supabase._updateFn.mock.calls;
     const reviewUpdate = updateCalls.find(
-      (call: any[]) => call[0]?.status === 'awaiting_user_review',
+      (call: any[]) => call[0]?.status === 'awaiting_review',
     );
     expect(reviewUpdate).toBeDefined();
-    expect(reviewUpdate[0].status).toBe('awaiting_user_review');
+    expect(reviewUpdate[0].status).toBe('awaiting_review');
   });
 
   test('updates DB status to "completed" for normal completion', async () => {

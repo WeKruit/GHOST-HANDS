@@ -1003,7 +1003,7 @@ export class JobExecutor {
         getLogger().warn('Session save failed (non-fatal)', { error: err instanceof Error ? err.message : String(err) });
       }
 
-      // 13. Handle awaiting_user_review vs completed
+      // 13. Handle awaiting_review vs completed
       if (taskResult.awaitingUserReview) {
         // Job paused at review page — keep browser open
         await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
@@ -1022,7 +1022,7 @@ export class JobExecutor {
         await this.supabase
           .from('gh_automation_jobs')
           .update({
-            status: 'awaiting_user_review',
+            status: 'awaiting_review',
             result_data: resultData,
             result_summary: 'Application filled — waiting for user to review and submit',
             screenshot_urls: screenshotUrls,
@@ -1032,7 +1032,7 @@ export class JobExecutor {
           })
           .eq('id', job.id);
 
-        await this.logJobEvent(job.id, 'awaiting_user_review', {
+        await this.logJobEvent(job.id, 'awaiting_review', {
           handler: handler.type,
           action_count: finalCost.actionCount,
           total_tokens: finalCost.inputTokens + finalCost.outputTokens,
@@ -1548,7 +1548,7 @@ export class JobExecutor {
 
         if (awaitingManualRecovery) {
           // Browser stays open for manual recovery even on failure.
-          // Use standard finalization (writes awaiting_user_review status).
+          // Use standard finalization (writes awaiting_review status).
           const { awaitingReview: isReviewing } = await finalizeHandlerResult({
             job,
             adapter,

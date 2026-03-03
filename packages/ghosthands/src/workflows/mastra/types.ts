@@ -53,7 +53,7 @@ export const workflowState = z.object({
   status: z.enum([
     'running',
     'suspended',
-    'awaiting_user_review',
+    'awaiting_review',
     'completed',
     'failed',
   ]).default('running'),

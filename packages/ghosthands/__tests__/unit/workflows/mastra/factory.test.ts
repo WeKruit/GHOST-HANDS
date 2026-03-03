@@ -915,7 +915,7 @@ describe('execute_handler', () => {
     });
   });
 
-  test('sets status to "awaiting_user_review" when awaitingUserReview=true', async () => {
+  test('sets status to "awaiting_review" when awaitingUserReview=true', async () => {
     const handler = createMockHandler();
     handler.execute.mockResolvedValue({
       success: true,
@@ -929,10 +929,10 @@ describe('execute_handler', () => {
     const params = makeExecuteParams();
     const result = (await executeHandler.execute(params)) as WorkflowState;
 
-    expect(result.status).toBe('awaiting_user_review');
+    expect(result.status).toBe('awaiting_review');
   });
 
-  test('sets status to "awaiting_user_review" when keepBrowserOpen=true', async () => {
+  test('sets status to "awaiting_review" when keepBrowserOpen=true', async () => {
     const handler = createMockHandler();
     handler.execute.mockResolvedValue({
       success: true,
@@ -946,7 +946,7 @@ describe('execute_handler', () => {
     const params = makeExecuteParams();
     const result = (await executeHandler.execute(params)) as WorkflowState;
 
-    expect(result.status).toBe('awaiting_user_review');
+    expect(result.status).toBe('awaiting_review');
   });
 
   test('sets status to "completed" when result.success=true and no review', async () => {

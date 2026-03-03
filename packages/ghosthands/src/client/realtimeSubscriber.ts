@@ -29,7 +29,7 @@ export interface SubscribeToJobOptions {
   onError?: JobErrorCallback;
   /**
    * If true, automatically unsubscribes when the job reaches a terminal
-   * status (completed, failed, cancelled, expired). Default: true.
+   * status (completed, failed, cancelled, expired, needs_human, awaiting_review). Default: true.
    */
   autoUnsubscribe?: boolean;
 }

@@ -84,6 +84,8 @@ const STATUS_COLORS: Record<string, string> = {
   queued: '\x1b[33m',    // yellow
   running: '\x1b[36m',   // cyan
   paused: '\x1b[35m',    // magenta
+  needs_human: '\x1b[31m', // red
+  awaiting_review: '\x1b[35m', // magenta
   completed: '\x1b[32m', // green
   failed: '\x1b[31m',    // red
   cancelled: '\x1b[90m', // gray
@@ -95,7 +97,14 @@ function colorStatus(status: string): string {
   return `${STATUS_COLORS[status] || ''}${status}${RESET}`;
 }
 
-const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'expired']);
+const TERMINAL_STATUSES = new Set([
+  'completed',
+  'failed',
+  'cancelled',
+  'expired',
+  'needs_human',
+  'awaiting_review',
+]);
 
 async function pollStatus(
   client: PgClient,
@@ -132,8 +141,8 @@ async function pollStatus(
 
         console.log(`[${now}] Status: ${colorStatus(job.status)}${job.status_message ? ` — ${job.status_message}` : ''}`);
 
-        // Show interaction details when paused (HITL)
-        if (job.status === 'paused' && job.interaction_data) {
+        // Show interaction details for HITL/human-needed states
+        if (['paused', 'needs_human', 'awaiting_review'].includes(job.status) && job.interaction_data) {
           const interaction = job.interaction_data;
           console.log(`         Blocker: ${interaction.blocker_type || interaction.type || 'unknown'}`);
           if (interaction.page_url) {
@@ -168,7 +177,7 @@ async function pollStatus(
           }
         }
 
-        if (job.status === 'failed') {
+        if (job.status === 'failed' || job.status === 'needs_human') {
           console.log(`Error:      ${job.error_code || 'unknown'}`);
           if (job.error_details) {
             console.log(`Details:    ${JSON.stringify(job.error_details, null, 2)}`);
