@@ -116,6 +116,7 @@ export function startServer(port: number = 3100) {
 // Auto-start when run directly
 const isMainModule =
   typeof Bun !== 'undefined'
+    // @ts-ignore TS1343: import.meta requires ES modules; only evaluated in Bun runtime
     ? Bun.main === import.meta.path
     : process.argv[1]?.endsWith('server.ts') || process.argv[1]?.endsWith('server.js');
 

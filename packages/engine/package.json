@@ -1,6 +1,6 @@
 {
   "name": "@wekruit/ghosthands-engine",
-  "version": "0.2.1",
+  "version": "0.2.1-spencer-magnitude-hand.448327c",
   "main": "dist/packages/engine/src/index.js",
   "types": "dist/packages/engine/src/index.d.ts",
   "files": ["dist", "MANIFEST.json"],
@@ -19,7 +19,23 @@
   },
   "peerDependencies": {
     "magnitude-core": "^0.3.1",
-    "zod": "^3.24.0"
+    "zod": "^3.24.0",
+    "hono": "^4.0.0",
+    "pg": "^8.13.0",
+    "pg-boss": "^12.13.0",
+    "ioredis": "^5.4.0",
+    "@supabase/supabase-js": "^2.95.3",
+    "@actionbookdev/sdk": "^0.3.0",
+    "magnitude-extract": "^0.0.2"
+  },
+  "peerDependenciesMeta": {
+    "hono": { "optional": true },
+    "pg": { "optional": true },
+    "pg-boss": { "optional": true },
+    "ioredis": { "optional": true },
+    "@supabase/supabase-js": { "optional": true },
+    "@actionbookdev/sdk": { "optional": true },
+    "magnitude-extract": { "optional": true }
   },
   "devDependencies": {
     "typescript": "~5.7.2",
