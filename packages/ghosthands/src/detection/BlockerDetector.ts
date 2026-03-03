@@ -293,17 +293,40 @@ export class BlockerDetector {
     const matches: BlockerResult[] = [];
 
     // 1. Check selector-based patterns via page.evaluate (with timeout)
-    let selectorResults: { selector: string; type: string; confidence: number; visible: boolean }[] = [];
+    let selectorResults: { selector: string; type: string; confidence: number; visible: boolean; isNonBlocking: boolean }[] = [];
     try {
       selectorResults = await Promise.race([
         page.evaluate((patterns: { selector: string; type: string; confidence: number }[]) => {
-          const found: { selector: string; type: string; confidence: number; visible: boolean }[] = [];
+          const found: { selector: string; type: string; confidence: number; visible: boolean; isNonBlocking: boolean }[] = [];
           for (const p of patterns) {
             const el = document.querySelector(p.selector);
             if (el) {
               const rect = el.getBoundingClientRect();
               const visible = rect.width > 0 && rect.height > 0;
-              found.push({ ...p, visible });
+
+              // Detect non-blocking reCAPTCHA (invisible v2 / v3).
+              // These are embedded on many forms but do NOT block the user —
+              // they validate silently on submit. Signals:
+              //   - .g-recaptcha[data-size="invisible"]
+              //   - reCAPTCHA badge iframe (tiny, ~70x60px in bottom-right)
+              //   - .grecaptcha-badge element present
+              let isNonBlocking = false;
+              if (p.selector.includes('recaptcha') || p.selector === '.g-recaptcha') {
+                // Check for explicit invisible marker
+                const invisibleWidget = document.querySelector('.g-recaptcha[data-size="invisible"]');
+                // Check for the v3/invisible badge element
+                const badge = document.querySelector('.grecaptcha-badge');
+                // Check for reCAPTCHA v3 script (site key in script src)
+                const v3Script = document.querySelector('script[src*="recaptcha"][src*="render="]');
+                // Check if the matched iframe is small (badge-sized, not a challenge)
+                const isSmallIframe = el.tagName === 'IFRAME' && rect.width < 100 && rect.height < 100;
+
+                if (invisibleWidget || badge || v3Script || isSmallIframe) {
+                  isNonBlocking = true;
+                }
+              }
+
+              found.push({ ...p, visible, isNonBlocking });
             }
           }
           return found;
@@ -318,6 +341,19 @@ export class BlockerDetector {
     }
 
     for (const result of selectorResults) {
+      // Non-blocking reCAPTCHA (invisible/v3): drastically reduce confidence
+      // so it doesn't trigger HITL. These validate silently on submit.
+      if (result.isNonBlocking) {
+        matches.push({
+          type: result.type as BlockerType,
+          confidence: 0.15,
+          selector: result.selector,
+          details: `Matched selector: ${result.selector} (non-blocking reCAPTCHA, invisible/v3)`,
+          source: 'dom',
+        });
+        continue;
+      }
+
       // Visible elements get full confidence; hidden ones get reduced
       const confidence = result.visible ? result.confidence : result.confidence * 0.5;
       matches.push({

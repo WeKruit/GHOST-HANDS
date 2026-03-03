@@ -1297,6 +1297,7 @@ export class JobExecutor {
     const isResume = isMastraResume(job);
 
     let result: any;
+    let run: any;
 
     if (isResume) {
       // --- RESUME PATH ---
@@ -1326,7 +1327,7 @@ export class JobExecutor {
         resolutionType = interactionRow.interaction_data.resolution_type;
       }
 
-      const run = await registeredWf.createRun({ runId: job.metadata.mastra_run_id });
+      run = await registeredWf.createRun({ runId: job.metadata.mastra_run_id });
       result = await run.resume({
         step: 'check_blockers_checkpoint',
         resumeData: {
@@ -1339,7 +1340,6 @@ export class JobExecutor {
       // Per PRD AD-6: reuse existing mastra_run_id if one exists (re-entry after
       // worker crash). Only generate a new run ID when there is no existing one.
       const existingRunId = job.metadata?.mastra_run_id;
-      let run: any;
 
       if (typeof existingRunId === 'string') {
         // Re-entry: a previous execution created this run ID but didn't complete.
@@ -1397,18 +1397,80 @@ export class JobExecutor {
       result = await run.start({ inputData: initialState });
     }
 
+    // --- HITL WAIT LOOP ---
+    // When the workflow suspends for HITL, keep the browser alive and wait
+    // for the user to resolve the blocker (via LISTEN/NOTIFY or polling).
+    // Once resolved, resume the Mastra workflow in-process with the same
+    // browser session — no context loss.
+    const MAX_HITL_SUSPENSIONS = 3;
+    let hitlAttempts = 0;
+
+    while (result?.status === 'suspended' && hitlAttempts < MAX_HITL_SUSPENSIONS) {
+      hitlAttempts++;
+      logger.info('Workflow suspended for HITL, waiting for human resolution (browser stays open)', {
+        jobId: job.id,
+        attempt: hitlAttempts,
+        maxAttempts: MAX_HITL_SUSPENSIONS,
+        timeoutSeconds: this.hitlTimeoutSeconds,
+      });
+
+      // Wait for the job status to change to 'running' (human resolved the blocker)
+      const resumeResult = await this.waitForResume(job.id, this.hitlTimeoutSeconds);
+
+      if (!resumeResult.resumed) {
+        // Timeout — fail the job
+        logger.warn('HITL wait timed out, failing job', { jobId: job.id, timeoutSeconds: this.hitlTimeoutSeconds });
+        await this.logJobEvent(job.id, JOB_EVENT_TYPES.HITL_TIMEOUT, { timeout_seconds: this.hitlTimeoutSeconds });
+        await this.supabase
+          .from('gh_automation_jobs')
+          .update({
+            status: 'failed',
+            completed_at: new Date().toISOString(),
+            error_code: 'hitl_timeout',
+            error_details: {
+              message: `Human intervention timed out after ${this.hitlTimeoutSeconds}s`,
+            },
+          })
+          .eq('id', job.id);
+        return;
+      }
+
+      // Human resolved — resume the Mastra workflow in-process
+      logger.info('HITL resolved, resuming workflow in-process', {
+        jobId: job.id,
+        resolutionType: resumeResult.resolutionType,
+      });
+
+      result = await run.resume({
+        step: 'check_blockers_checkpoint',
+        resumeData: {
+          resolutionType: resumeResult.resolutionType || 'manual',
+          resumeNonce: crypto.randomUUID(),
+        },
+      });
+    }
+
+    if (result?.status === 'suspended') {
+      // Exhausted max HITL attempts
+      logger.error('Max HITL suspension attempts exceeded', { jobId: job.id, attempts: hitlAttempts });
+      await this.supabase
+        .from('gh_automation_jobs')
+        .update({
+          status: 'failed',
+          completed_at: new Date().toISOString(),
+          error_code: 'hitl_max_attempts',
+          error_details: { message: `Blocker persisted after ${hitlAttempts} HITL attempts` },
+        })
+        .eq('id', job.id);
+      return;
+    }
+
     logger.info('Mastra workflow completed', { jobId: job.id, status: result?.status });
 
     // --- FINALIZATION ---
     // The workflow returned; now we finalize based on the result status.
     // Finalization stays in JobExecutor (not inside the workflow) to avoid
     // duplicating the ~150 lines of finalization logic.
-
-    if (result?.status === 'suspended') {
-      // Workflow suspended for HITL — worker can now process other jobs
-      logger.info('Workflow suspended for HITL, worker released', { jobId: job.id });
-      return;
-    }
 
     // Extract the workflow state from the result.
     // Mastra may return the state directly as result.result, or wrapped inside
