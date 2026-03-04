@@ -49,6 +49,7 @@ function classifyQuestionType(fieldType: string): QuestionType {
   if (fieldType === 'file') return 'file';
   if (fieldType === 'select') return 'select';
   if (fieldType === 'radio' || fieldType === 'radio-group') return 'radio';
+  if (fieldType === 'button-group') return 'radio';
   if (fieldType === 'checkbox' || fieldType === 'checkbox-group') return 'checkbox';
   if (fieldType === 'text') return 'text';
   return 'unknown';
@@ -211,7 +212,7 @@ export function normalizeExtractedQuestions(
       continue;
     }
 
-    if (field.choices?.length && (field.type === 'radio-group' || field.type === 'checkbox-group')) {
+    if (field.choices?.length && (field.type === 'radio-group' || field.type === 'checkbox-group' || field.type === 'button-group')) {
       questions.push(
         buildSnapshot(
           [field],
@@ -254,4 +255,109 @@ export function buildAnswerDecisionsFromFieldAnswers(
   }
 
   return decisions;
+}
+
+export interface NormalizedQuestionDraft {
+  promptText: string;
+  questionType: string;
+  required: boolean;
+  fieldIds: string[];
+  options: string[];
+  groupingConfidence: number;
+  warnings: string[];
+}
+
+export function reconcileNormalizedQuestions(
+  heuristicSnapshots: QuestionSnapshot[],
+  llmDrafts: NormalizedQuestionDraft[],
+  liveFields: QuestionNormalizerField[],
+): QuestionSnapshot[] {
+  const liveFieldIds = new Set(liveFields.map((f) => f.id));
+  const liveFieldMap = new Map(liveFields.map((f) => [f.id, f]));
+  const coveredFieldIds = new Set<string>();
+  const results: QuestionSnapshot[] = [];
+  let orderIndex = 0;
+
+  for (const draft of llmDrafts) {
+    const validFieldIds = draft.fieldIds.filter((id) => liveFieldIds.has(id));
+    const invalidCount = draft.fieldIds.length - validFieldIds.length;
+
+    if (validFieldIds.length === 0) {
+      continue;
+    }
+
+    const warnings = [...draft.warnings];
+    if (invalidCount > 0) {
+      warnings.push('invalid_field_ids_discarded');
+    }
+
+    const fields = validFieldIds
+      .map((id) => liveFieldMap.get(id))
+      .filter((f): f is QuestionNormalizerField => f !== undefined);
+
+    const questionType = classifyQuestionType(draft.questionType);
+    const snapshot = buildSnapshot(
+      fields,
+      orderIndex++,
+      draft.promptText,
+      questionType,
+      draft.groupingConfidence,
+      warnings,
+      'none',
+    );
+    // LLM required flag takes precedence over heuristic extraction
+    if (draft.required && !snapshot.required) {
+      snapshot.required = true;
+    }
+
+    for (const id of validFieldIds) {
+      coveredFieldIds.add(id);
+    }
+
+    results.push(snapshot);
+  }
+
+  const uncoveredFieldIds = [...liveFieldIds].filter((id) => !coveredFieldIds.has(id));
+
+  for (const fieldId of uncoveredFieldIds) {
+    const heuristicMatch = heuristicSnapshots.find((s) => s.fieldIds.includes(fieldId));
+
+    if (heuristicMatch) {
+      const uncoveredFromHeuristic = heuristicMatch.fieldIds.filter(
+        (id) => !coveredFieldIds.has(id) && liveFieldIds.has(id),
+      );
+      if (uncoveredFromHeuristic.length === 0) continue;
+
+      const fields = uncoveredFromHeuristic
+        .map((id) => liveFieldMap.get(id))
+        .filter((f): f is QuestionNormalizerField => f !== undefined);
+
+      const snapshot = buildSnapshot(
+        fields,
+        orderIndex++,
+        heuristicMatch.promptText,
+        heuristicMatch.questionType,
+        heuristicMatch.groupingConfidence,
+        [...heuristicMatch.warnings],
+        heuristicMatch.riskLevel,
+      );
+
+      for (const id of uncoveredFromHeuristic) {
+        coveredFieldIds.add(id);
+      }
+
+      results.push(snapshot);
+    } else {
+      const field = liveFieldMap.get(fieldId);
+      if (!field) continue;
+
+      const snapshot = buildSingleFieldSnapshot(field, orderIndex++);
+      snapshot.warnings.push('llm_omitted_fallback');
+      coveredFieldIds.add(fieldId);
+      results.push(snapshot);
+    }
+  }
+
+  results.sort((a, b) => a.orderIndex - b.orderIndex);
+  return results;
 }

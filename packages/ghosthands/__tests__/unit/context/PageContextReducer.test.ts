@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'bun:test';
 import {
+  applyAnswerDecisions,
   applyPageEntry,
   auditPage,
+  buildContextReport,
   createEmptySession,
   createPageRecord,
   finalizeActivePage,
@@ -125,5 +127,61 @@ describe('PageContextReducer', () => {
     expect(session.pages[0].status).toBe('completed');
     expect(session.pages[0].exitedAt).toBeTruthy();
     expect(session.activePageId).toBe(session.pages[1].pageId);
+  });
+
+  it('stores answerMode from answer decision on question record', () => {
+    const base = createEmptySession('job-am', 'run-am');
+    const page = createPageRecord({
+      pageType: 'questions',
+      pageTitle: 'EEO',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-am',
+      pageStepKey: 'questions::eeo',
+      pageSequence: 1,
+    });
+
+    let session = applyPageEntry(base, page);
+    session = syncQuestions(session, [makeSnapshot()]);
+    session = applyAnswerDecisions(session, [
+      {
+        questionKey: 'eligibility::sponsorship::radio::ff-1',
+        answer: 'No',
+        confidence: 0.95,
+        source: 'llm',
+        answerMode: 'profile_backed',
+      },
+    ]);
+
+    expect(session.pages[0].questions[0].answerMode).toBe('profile_backed');
+    expect(session.pages[0].questions[0].lastAnswer).toBe('No');
+  });
+
+  it('includes best_effort_guess answers in bestEffortGuesses report', () => {
+    const base = createEmptySession('job-beg', 'run-beg');
+    const page = createPageRecord({
+      pageType: 'questions',
+      pageTitle: 'Demographics',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-beg',
+      pageStepKey: 'questions::demographics',
+      pageSequence: 1,
+    });
+
+    let session = applyPageEntry(base, page);
+    session = syncQuestions(session, [makeSnapshot({ questionKey: 'demo::gender::select::male|female' })]);
+    session = applyAnswerDecisions(session, [
+      {
+        questionKey: 'demo::gender::select::male|female',
+        answer: 'Prefer not to say',
+        confidence: 0.5,
+        source: 'llm',
+        answerMode: 'best_effort_guess',
+      },
+    ]);
+
+    const report = buildContextReport(session);
+    expect(report.bestEffortGuesses).toHaveLength(1);
+    expect(report.bestEffortGuesses[0].questionKey).toBe('demo::gender::select::male|female');
+    expect(report.bestEffortGuesses[0].answerMode).toBe('best_effort_guess');
   });
 });

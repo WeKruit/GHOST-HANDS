@@ -43,6 +43,7 @@ export function createEmptyContextReport(
     riskyOptionalAnswers: [],
     lowConfidenceAnswers: [],
     ambiguousQuestionGroups: [],
+    bestEffortGuesses: [],
     partialPages: [],
     flushStatus,
     ...(flushError ? { flushError } : {}),
@@ -78,6 +79,7 @@ function cloneReport(report: ContextReport): ContextReport {
     riskyOptionalAnswers: [...report.riskyOptionalAnswers],
     lowConfidenceAnswers: [...report.lowConfidenceAnswers],
     ambiguousQuestionGroups: [...report.ambiguousQuestionGroups],
+    bestEffortGuesses: [...report.bestEffortGuesses],
     partialPages: [...report.partialPages],
   };
 }
@@ -220,6 +222,7 @@ export function applyAnswerDecisions(
       state: 'planned',
       source: decision.source,
       lastAnswer: decision.answer,
+      answerMode: decision.answerMode,
       resolutionConfidence: Math.max(
         page.questions[index].resolutionConfidence,
         decision.confidence,
@@ -547,6 +550,17 @@ export function buildContextReport(
           promptText: question.promptText,
           questionKey: question.questionKey,
           warnings: question.warnings,
+        });
+      }
+
+      if (question.answerMode === 'best_effort_guess' || question.answerMode === 'default_decline') {
+        report.bestEffortGuesses.push({
+          pageId: page.pageId,
+          pageSequence: page.sequence,
+          questionKey: question.questionKey,
+          promptText: question.promptText,
+          answer: question.lastAnswer,
+          answerMode: question.answerMode,
         });
       }
     }
