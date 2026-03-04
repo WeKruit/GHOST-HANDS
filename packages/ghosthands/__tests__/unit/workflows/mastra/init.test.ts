@@ -79,9 +79,12 @@ describe('getMastra / resetMastra', () => {
     expect(() => getMastra()).toThrowError(/P0/);
   });
 
-  test('throws P0 error when NODE_ENV=production but no DB URL', () => {
+  test('returns null when NODE_ENV=production but no hosted env vars', () => {
+    // NODE_ENV alone does NOT indicate a hosted worker — only AWS_ASG_NAME
+    // or EC2_INSTANCE_ID do. Desktop Electron builds can set NODE_ENV=production.
     process.env.NODE_ENV = 'production';
-    expect(() => getMastra()).toThrowError(/P0/);
+    const result = getMastra();
+    expect(result).toBeNull();
   });
 
   // ─── Test 2 ──────────────────────────────────────────────────────────
