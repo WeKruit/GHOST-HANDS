@@ -157,10 +157,10 @@ describe('QuestionNormalizer', () => {
 
     expect(questions).toHaveLength(2);
     expect(questions[0].questionKey).not.toBe(questions[1].questionKey);
-    // One should have ::0 ordinal appended, the other ::1
+    // Dedup uses sorted fieldIds as suffix (order-independent, stable across reordering)
     const keys = questions.map((q) => q.questionKey);
-    expect(keys.some((k) => k.endsWith('::0'))).toBe(true);
-    expect(keys.some((k) => k.endsWith('::1'))).toBe(true);
+    expect(keys.some((k) => k.endsWith('::ff-dup-1'))).toBe(true);
+    expect(keys.some((k) => k.endsWith('::ff-dup-2'))).toBe(true);
   });
 
   it('does not append ordinal to unique question keys', () => {
