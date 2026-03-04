@@ -3651,16 +3651,33 @@ export async function fillFormOnPage(
   );
   if (finalSnapshots.length > 0) {
     result.questionSnapshots = finalSnapshots;
-    // Only emit a full-sync observer notification if NO questions were synced to
-    // context earlier.  The initial sync (line ~3109) uses LLM-reconciled keys;
-    // this heuristic-only pass would produce different keys and cause duplicates.
-    // When questions were already synced, the context already has the authoritative
-    // set — we just update result.questionSnapshots for the handler return.
     if (initialQuestionSnapshots.length === 0) {
+      // No prior sync — use fresh heuristic snapshots directly
       await notifyObserver(
         'onQuestionsNormalized',
         observers?.onQuestionsNormalized
           ? () => observers.onQuestionsNormalized!(finalSnapshots, { isFullSync: true })
+          : undefined,
+      );
+    } else {
+      // Prior sync used LLM-reconciled keys. Build retirement-safe snapshots by
+      // mapping current DOM fieldIds back to existing question keys. This allows
+      // the fullSync retirement logic to detect fields that disappeared during fill
+      // without introducing key mismatches that would create duplicate questions.
+      const fieldIdToKey = new Map<string, string>();
+      for (const snap of initialQuestionSnapshots) {
+        for (const fid of snap.fieldIds) fieldIdToKey.set(fid, snap.questionKey);
+      }
+      const retirementSnapshots = finalSnapshots.map((snap) => {
+        const matchedKey = snap.fieldIds
+          .map((fid) => fieldIdToKey.get(fid))
+          .find((key) => key !== undefined);
+        return matchedKey ? { ...snap, questionKey: matchedKey } : snap;
+      });
+      await notifyObserver(
+        'onQuestionsNormalized',
+        observers?.onQuestionsNormalized
+          ? () => observers.onQuestionsNormalized!(retirementSnapshots, { isFullSync: true })
           : undefined,
       );
     }
