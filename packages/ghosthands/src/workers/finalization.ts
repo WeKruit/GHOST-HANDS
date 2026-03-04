@@ -76,6 +76,7 @@ export function serializeContextReport(report: ContextReport): Record<string, un
     risky_optional_answers: report.riskyOptionalAnswers,
     low_confidence_answers: report.lowConfidenceAnswers,
     ambiguous_question_groups: report.ambiguousQuestionGroups,
+    best_effort_guesses: report.bestEffortGuesses,
     partial_pages: report.partialPages,
     flush_status: report.flushStatus,
     ...(report.flushError ? { flush_error: report.flushError } : {}),

@@ -279,8 +279,9 @@ export function reconcileNormalizedQuestions(
   let orderIndex = 0;
 
   for (const draft of llmDrafts) {
-    const validFieldIds = draft.fieldIds.filter((id) => liveFieldIds.has(id));
-    const invalidCount = draft.fieldIds.length - validFieldIds.length;
+    const duplicateFieldIds = draft.fieldIds.filter((id) => coveredFieldIds.has(id));
+    const validFieldIds = draft.fieldIds.filter((id) => liveFieldIds.has(id) && !coveredFieldIds.has(id));
+    const invalidCount = draft.fieldIds.length - validFieldIds.length - duplicateFieldIds.length;
 
     if (validFieldIds.length === 0) {
       continue;
@@ -289,6 +290,9 @@ export function reconcileNormalizedQuestions(
     const warnings = [...draft.warnings];
     if (invalidCount > 0) {
       warnings.push('invalid_field_ids_discarded');
+    }
+    if (duplicateFieldIds.length > 0) {
+      warnings.push('duplicate_field_id_skipped');
     }
 
     const fields = validFieldIds

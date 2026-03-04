@@ -2880,7 +2880,7 @@ export async function fillFormOnPage(
   // 4. Extract fields
   console.log('[formFiller] Extracting form fields…');
   const allFields = await extractFields(page);
-  const visibleFields = allFields.filter((f) => f.visibleByDefault && (f.name || f.type === 'file'));
+  const visibleFields = allFields.filter((f) => f.visibleByDefault);
 
   // Assign synthetic labels to unlabeled visible non-file controls so they reach normalization
   let syntheticCounter = 0;
@@ -3085,9 +3085,8 @@ export async function fillFormOnPage(
       }
     }
 
-    // Never-empty policy: sweep required non-file fields and fill deterministically if empty
+    // Never-empty policy: sweep ALL non-file fields and fill deterministically if empty
     for (const field of llmFields) {
-      if (!field.required) continue;
       const existing = fieldIdToResolvedAnswer[field.id];
       if (existing && existing.trim()) continue;
       // Best-effort fallback
@@ -3098,8 +3097,35 @@ export async function fillFormOnPage(
         if (nonPlaceholder.length) fieldIdToResolvedAnswer[field.id] = nonPlaceholder[0];
       }
       if (fieldIdToResolvedAnswer[field.id] && fieldIdToResolvedAnswer[field.id] !== existing) {
-        console.log(`[formFiller] Required fallback: "${field.name}" → "${fieldIdToResolvedAnswer[field.id]}"`);
+        console.log(`[formFiller] Never-empty fallback: "${field.name}" → "${fieldIdToResolvedAnswer[field.id]}"`);
       }
+    }
+
+    // Emit AnswerDecisions for fallback-filled answers
+    const fallbackDecisions: AnswerDecision[] = [];
+    for (const field of llmFields) {
+      const answer = fieldIdToResolvedAnswer[field.id];
+      if (!answer || !answer.trim()) continue;
+      const questionKey = fieldIdToQuestionKey[field.id];
+      if (!questionKey) continue;
+      const alreadyDecided = result.answerDecisions?.some((d) => d.questionKey === questionKey);
+      if (alreadyDecided) continue;
+      fallbackDecisions.push({
+        questionKey,
+        answer,
+        confidence: 0.3,
+        source: 'dom' as const,
+        answerMode: 'default_decline' as AnswerMode,
+      });
+    }
+    if (fallbackDecisions.length > 0) {
+      result.answerDecisions = [...(result.answerDecisions || []), ...fallbackDecisions];
+      await notifyObserver(
+        'onAnswerPlanned',
+        observers?.onAnswerPlanned
+          ? () => observers.onAnswerPlanned!(fallbackDecisions)
+          : undefined,
+      );
     }
 
     console.log(`[formFiller] Total resolved answers: ${Object.keys(fieldIdToResolvedAnswer).length}.`);
@@ -3125,7 +3151,7 @@ export async function fillFormOnPage(
       resumeAlreadyUploaded = await uploadResumeIfPresent(page, resumePath);
     }
     const fields = await extractFields(page);
-    const visible = fields.filter((f) => f.visibleByDefault && (f.name || f.type === 'file'));
+    const visible = fields.filter((f) => f.visibleByDefault);
 
     const candidates = visible.filter((f) => !attempted.has(f.id));
     if (candidates.length === 0) break;
@@ -3166,7 +3192,7 @@ export async function fillFormOnPage(
       }
 
       // Re-normalize the FULL current visible non-file set (not just unseen)
-      const currentVisibleNonFile = visible.filter((f) => f.type !== 'file' && f.name);
+      const currentVisibleNonFile = visible.filter((f) => f.type !== 'file');
       console.log(`[formFiller] ${unseen.length} new fields discovered — re-normalizing full set of ${currentVisibleNonFile.length}…`);
 
       const currentNormFields = currentVisibleNonFile.map((f) => ({
@@ -3262,7 +3288,7 @@ export async function fillFormOnPage(
 
     for (const field of toFill) {
       attempted.add(field.id);
-      let resolved = getAnswerForField(answers, field, fieldIdMap);
+      let resolved = fieldIdToResolvedAnswer[field.id] ?? getAnswerForField(answers, field, fieldIdMap);
       if (!resolved && isSkillLikeFieldName(field.name) && profileSkillsCsv) {
         resolved = profileSkillsCsv;
       }
