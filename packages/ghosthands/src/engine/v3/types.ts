@@ -49,6 +49,7 @@ export type FieldType =
   | 'date'
   | 'file'
   | 'hidden'
+  | 'button_group'
   | 'unknown';
 
 export interface BoundingBox {

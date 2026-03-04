@@ -68,6 +68,7 @@ function mapV2FieldType(ft: string): FormField['fieldType'] {
     date: 'date',
     file: 'file',
     contenteditable: 'text',
+    button_group: 'button_group',
     hidden: 'hidden',
   };
   return map[ft] ?? 'unknown';
