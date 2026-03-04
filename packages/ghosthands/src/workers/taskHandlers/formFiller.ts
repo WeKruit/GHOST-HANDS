@@ -3325,9 +3325,23 @@ export async function fillFormOnPage(
 
       // Find snapshots that cover new (unseen) field IDs
       const unseenIds = new Set(unseen.map((f) => f.id));
-      const newSnapshots = reconciledSnapshots.filter((q) =>
+      const rawNewSnapshots = reconciledSnapshots.filter((q) =>
         q.fieldIds.some((fid) => unseenIds.has(fid)),
       );
+
+      // Strip already-mapped fieldIds from snapshots BEFORE syncing to page context.
+      // Without this, a rerun snapshot containing [f1(existing), f3(new)] gets synced
+      // under a new key while f1 already exists under its initial key — creating a
+      // duplicate live question record that retirement cannot clean up (because both
+      // records share f1, so neither has allFieldsMissing).
+      const newSnapshots = rawNewSnapshots
+        .map((snap) => {
+          const cleanFieldIds = snap.fieldIds.filter((fid) => !fieldIdToQuestionKey[fid]);
+          if (cleanFieldIds.length === snap.fieldIds.length) return snap;
+          if (cleanFieldIds.length === 0) return null;
+          return { ...snap, fieldIds: cleanFieldIds };
+        })
+        .filter((snap): snap is QuestionSnapshot => snap !== null);
 
       if (newSnapshots.length > 0) {
         await notifyObserver(
@@ -3339,12 +3353,7 @@ export async function fillFormOnPage(
         for (const question of newSnapshots) {
           const isDemographic = DEMOGRAPHIC_RE.test(question.promptText || '');
           for (const fieldId of question.fieldIds) {
-            // Only write new entries — don't overwrite already-synced field mappings.
-            // If the LLM regroups an existing field with a new field, the existing
-            // field's key must stay pointing to the question already in page context.
-            if (!fieldIdToQuestionKey[fieldId]) {
-              fieldIdToQuestionKey[fieldId] = question.questionKey;
-            }
+            fieldIdToQuestionKey[fieldId] = question.questionKey;
             if (isDemographic) demographicFieldIds.add(fieldId);
           }
         }
