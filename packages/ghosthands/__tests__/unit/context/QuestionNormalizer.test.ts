@@ -156,6 +156,33 @@ describe('QuestionNormalizer', () => {
     expect(allFieldIds).toContain('f3');
   });
 
+  it('reconciliation deduplicates field IDs across LLM drafts', () => {
+    const liveFields = [
+      { id: 'f1', name: 'First name', type: 'text', section: '', required: true },
+      { id: 'f2', name: 'Last name', type: 'text', section: '', required: true },
+      { id: 'f3', name: 'Email', type: 'email', section: '', required: true },
+    ];
+    const heuristic = normalizeExtractedQuestions(liveFields);
+    const llmDrafts: NormalizedQuestionDraft[] = [
+      { promptText: 'Full name', questionType: 'text', required: true, fieldIds: ['f1', 'f2'], options: [], groupingConfidence: 0.9, warnings: [] },
+      { promptText: 'Name again', questionType: 'text', required: true, fieldIds: ['f1', 'f3'], options: [], groupingConfidence: 0.8, warnings: [] },
+    ];
+
+    const result = reconcileNormalizedQuestions(heuristic, llmDrafts, liveFields);
+
+    // First draft gets f1 and f2
+    const firstDraft = result.find((q) => q.promptText === 'Full name');
+    expect(firstDraft).toBeDefined();
+    expect(firstDraft!.fieldIds).toEqual(['f1', 'f2']);
+
+    // Second draft gets only f3 (f1 already claimed by first draft)
+    const secondDraft = result.find((q) => q.promptText === 'Name again');
+    expect(secondDraft).toBeDefined();
+    expect(secondDraft!.fieldIds).toEqual(['f3']);
+    expect(secondDraft!.fieldIds).not.toContain('f1');
+    expect(secondDraft!.warnings).toContain('duplicate_field_id_skipped');
+  });
+
   it('reconciliation discards invalid field IDs from LLM drafts', () => {
     const liveFields = [
       { id: 'f1', name: 'Email', type: 'email', section: '', required: true },
