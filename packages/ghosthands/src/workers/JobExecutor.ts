@@ -1850,6 +1850,7 @@ export class JobExecutor {
       getLogger().info('Job re-queued for retry', { jobId: job.id, retryCount: job.retry_count + 1, maxRetries: job.max_retries, backoffSeconds });
     } else {
       let finalResultData = resultData;
+      let flushFailed = false;
       // Only flush if finalizeHandlerSideEffects hasn't already flushed
       if (pageContext && !contextFlushed) {
         try {
@@ -1859,6 +1860,7 @@ export class JobExecutor {
             context_report: serializeContextReport(report),
           };
         } catch (flushErr) {
+          flushFailed = true;
           const message = flushErr instanceof Error ? flushErr.message : String(flushErr);
           await pageContext.markFlushPending(message).catch(() => {});
           await this.logJobEvent(job.id, 'page_context_flush_failed', { error: message }).catch(() => {});
@@ -1880,6 +1882,9 @@ export class JobExecutor {
           error_code: errorCode,
           error_details: { message: errorMessage },
           ...(finalResultData && { result_data: finalResultData }),
+          ...(flushFailed && {
+            metadata: { ...(job.metadata || {}), page_context_flush_pending: true },
+          }),
           action_count: actionCount,
           total_tokens: totalTokens,
           llm_cost_cents: Math.round(totalCost * 100),

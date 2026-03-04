@@ -214,12 +214,13 @@ export function syncQuestions(
   }
 
   // Only retire on full-page syncs — partial (rerun) syncs contain just new fields.
-  // Only retire questions that haven't progressed past planning — preserve filled/verified/attempted progress.
-  const RETIRABLE_STATES = new Set(['empty', 'planned']);
+  // Protect only confirmed progress (filled/verified) — retire everything else
+  // including attempted/failed to prevent stale hidden fields from blocking forever.
+  const PROTECTED_STATES = new Set(['filled', 'verified']);
   if (opts?.isFullSync) {
     for (const question of page.questions) {
       if (question.state === 'skipped') continue;
-      if (!RETIRABLE_STATES.has(question.state)) continue;
+      if (PROTECTED_STATES.has(question.state)) continue;
       const allFieldsMissing = question.fieldIds.length > 0
         && question.fieldIds.every((id) => !incomingFieldIds.has(id));
       if (allFieldsMissing) {
