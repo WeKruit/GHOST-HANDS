@@ -29,7 +29,7 @@ export function getMastra(): Mastra {
   const store = new PostgresStore({ id: 'ghosthands', connectionString });
 
   _mastra = new Mastra({
-    storage: store,
+    storage: store as any,
   });
 
   logger.info('Mastra singleton initialized with PostgresStore');
