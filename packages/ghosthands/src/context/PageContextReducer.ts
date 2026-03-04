@@ -18,7 +18,11 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function emptyCoverage(): PageCoverage {
+const MAX_PAGE_HISTORY_EVENTS = 200;
+const AMBIGUOUS_GROUPING_THRESHOLD = 0.6;
+const LOW_CONFIDENCE_THRESHOLD = 0.7;
+
+export function createEmptyCoverage(): PageCoverage {
   return {
     requiredTotal: 0,
     requiredResolved: 0,
@@ -29,7 +33,10 @@ function emptyCoverage(): PageCoverage {
   };
 }
 
-function emptyReport(flushStatus: ContextReport['flushStatus'] = 'pending'): ContextReport {
+export function createEmptyContextReport(
+  flushStatus: ContextReport['flushStatus'] = 'pending',
+  flushError?: string,
+): ContextReport {
   return {
     pagesVisited: 0,
     requiredUnresolved: [],
@@ -38,6 +45,48 @@ function emptyReport(flushStatus: ContextReport['flushStatus'] = 'pending'): Con
     ambiguousQuestionGroups: [],
     partialPages: [],
     flushStatus,
+    ...(flushError ? { flushError } : {}),
+  };
+}
+
+function clonePage(page: LogicalPageRecord): LogicalPageRecord {
+  return {
+    ...page,
+    questions: page.questions.map((question) => ({
+      ...question,
+      selectors: [...question.selectors],
+      options: question.options.map((option) => ({ ...option })),
+      selectedOptions: [...question.selectedOptions],
+      warnings: [...question.warnings],
+      fieldIds: [...question.fieldIds],
+    })),
+    actionables: page.actionables.map((actionable) => ({ ...actionable })),
+    history: page.history.map((event) => ({
+      ...event,
+      before: event.before ? { ...event.before } : undefined,
+      after: event.after ? { ...event.after } : undefined,
+    })),
+    coverage: { ...page.coverage },
+    mergeStats: { ...page.mergeStats },
+  };
+}
+
+function cloneReport(report: ContextReport): ContextReport {
+  return {
+    ...report,
+    requiredUnresolved: [...report.requiredUnresolved],
+    riskyOptionalAnswers: [...report.riskyOptionalAnswers],
+    lowConfidenceAnswers: [...report.lowConfidenceAnswers],
+    ambiguousQuestionGroups: [...report.ambiguousQuestionGroups],
+    partialPages: [...report.partialPages],
+  };
+}
+
+function cloneSession(session: PageContextSession): PageContextSession {
+  return {
+    ...session,
+    pages: session.pages.map(clonePage),
+    reportDraft: cloneReport(session.reportDraft),
   };
 }
 
@@ -51,6 +100,9 @@ function pushEvent(
     targetPageId: page.pageId,
     ...event,
   });
+  if (page.history.length > MAX_PAGE_HISTORY_EVENTS) {
+    page.history.splice(0, page.history.length - MAX_PAGE_HISTORY_EVENTS);
+  }
 }
 
 function findActivePage(session: PageContextSession): LogicalPageRecord | undefined {
@@ -66,7 +118,7 @@ export function createEmptySession(jobId: string, mastraRunId: string): PageCont
     updatedAt: now,
     status: 'running',
     pages: [],
-    reportDraft: emptyReport(),
+    reportDraft: createEmptyContextReport(),
     version: 0,
   };
 }
@@ -89,7 +141,7 @@ export function createPageRecord(input: PageEntryInput): LogicalPageRecord {
     questions: [],
     actionables: [],
     history: [],
-    coverage: emptyCoverage(),
+    coverage: createEmptyCoverage(),
     mergeStats: {
       questionMergeCount: 0,
       resumedCount: 0,
@@ -103,12 +155,12 @@ export function applyPageEntry(
   session: PageContextSession,
   page: LogicalPageRecord,
 ): PageContextSession {
-  const next = { ...session, pages: [...session.pages] };
+  const next = cloneSession(session);
   const existingIndex = next.pages.findIndex((entry) => entry.pageId === page.pageId);
   if (existingIndex >= 0) {
-    next.pages[existingIndex] = page;
+    next.pages[existingIndex] = clonePage(page);
   } else {
-    next.pages.push(page);
+    next.pages.push(clonePage(page));
   }
   next.activePageId = page.pageId;
   next.updatedAt = nowIso();
@@ -120,7 +172,8 @@ export function syncQuestions(
   session: PageContextSession,
   snapshots: QuestionSnapshot[],
 ): PageContextSession {
-  const page = findActivePage(session);
+  const next = cloneSession(session);
+  const page = findActivePage(next);
   if (!page) return session;
 
   const now = nowIso();
@@ -143,8 +196,10 @@ export function syncQuestions(
     actor: 'dom',
     after: { questionCount: page.questions.length },
   });
+  page.coverage = computeCoverage(page);
 
-  const next = { ...session, updatedAt: now, version: session.version + 1 };
+  next.updatedAt = now;
+  next.version = session.version + 1;
   return next;
 }
 
@@ -152,7 +207,8 @@ export function applyAnswerDecisions(
   session: PageContextSession,
   decisions: AnswerDecision[],
 ): PageContextSession {
-  const page = findActivePage(session);
+  const next = cloneSession(session);
+  const page = findActivePage(next);
   if (!page) return session;
 
   for (const decision of decisions) {
@@ -179,7 +235,10 @@ export function applyAnswerDecisions(
     });
   }
 
-  return { ...session, updatedAt: nowIso(), version: session.version + 1 };
+  page.coverage = computeCoverage(page);
+  next.updatedAt = nowIso();
+  next.version = session.version + 1;
+  return next;
 }
 
 export function recordAttempt(
@@ -188,7 +247,8 @@ export function recordAttempt(
   actor: 'dom' | 'magnitude' | 'human',
   notes?: string,
 ): PageContextSession {
-  const page = findActivePage(session);
+  const next = cloneSession(session);
+  const page = findActivePage(next);
   if (!page) return session;
 
   const index = page.questions.findIndex((question) => question.questionKey === questionKey);
@@ -207,14 +267,18 @@ export function recordAttempt(
     targetQuestionKey: questionKey,
     notes,
   });
-  return { ...session, updatedAt: nowIso(), version: session.version + 1 };
+  page.coverage = computeCoverage(page);
+  next.updatedAt = nowIso();
+  next.version = session.version + 1;
+  return next;
 }
 
 export function recordOutcome(
   session: PageContextSession,
   outcome: QuestionOutcome,
 ): PageContextSession {
-  const page = findActivePage(session);
+  const next = cloneSession(session);
+  const page = findActivePage(next);
   if (!page) return session;
 
   const index = page.questions.findIndex(
@@ -260,8 +324,11 @@ export function recordOutcome(
       value: outcome.currentValue,
     },
   });
+  page.coverage = computeCoverage(page);
 
-  return { ...session, updatedAt: nowIso(), version: session.version + 1 };
+  next.updatedAt = nowIso();
+  next.version = session.version + 1;
+  return next;
 }
 
 export function computeCoverage(page: LogicalPageRecord): PageCoverage {
@@ -282,10 +349,17 @@ export function computeCoverage(page: LogicalPageRecord): PageCoverage {
       optionalRisky++;
     }
 
-    if (question.groupingConfidence < 0.6 || question.warnings.includes('ambiguous_prompt_anchor')) {
+    if (
+      question.groupingConfidence < AMBIGUOUS_GROUPING_THRESHOLD ||
+      question.warnings.includes('ambiguous_prompt_anchor')
+    ) {
       ambiguousGrouped++;
     }
-    if (resolved && question.resolutionConfidence > 0 && question.resolutionConfidence < 0.7) {
+    if (
+      resolved &&
+      question.resolutionConfidence > 0 &&
+      question.resolutionConfidence < LOW_CONFIDENCE_THRESHOLD
+    ) {
       lowConfidenceResolved++;
     }
   }
@@ -304,7 +378,8 @@ export function auditPage(session: PageContextSession): {
   session: PageContextSession;
   result: PageAuditResult;
 } {
-  const page = findActivePage(session);
+  const next = cloneSession(session);
+  const page = findActivePage(next);
   if (!page) {
     return {
       session,
@@ -351,7 +426,8 @@ export function auditPage(session: PageContextSession): {
     after: { coverage: page.coverage, result },
   });
 
-  const next = { ...session, updatedAt: nowIso(), version: session.version + 1 };
+  next.updatedAt = nowIso();
+  next.version = session.version + 1;
   return { session: next, result };
 }
 
@@ -359,7 +435,8 @@ export function finalizeActivePage(
   session: PageContextSession,
   input: PageFinalizeInput = {},
 ): PageContextSession {
-  const page = findActivePage(session);
+  const next = cloneSession(session);
+  const page = findActivePage(next);
   if (!page) return session;
 
   page.coverage = computeCoverage(page);
@@ -374,12 +451,10 @@ export function finalizeActivePage(
     after: { status: page.status, coverage: page.coverage },
   });
 
-  return {
-    ...session,
-    activePageId: undefined,
-    updatedAt: nowIso(),
-    version: session.version + 1,
-  };
+  next.activePageId = undefined;
+  next.updatedAt = nowIso();
+  next.version = session.version + 1;
+  return next;
 }
 
 export function markSessionStatus(
@@ -387,7 +462,10 @@ export function markSessionStatus(
   status: PageContextSession['status'],
   pageStatus?: LogicalPageRecord['status'],
 ): PageContextSession {
-  const next = { ...session, status, updatedAt: nowIso(), version: session.version + 1 };
+  const next = cloneSession(session);
+  next.status = status;
+  next.updatedAt = nowIso();
+  next.version = session.version + 1;
   const page = findActivePage(next);
   if (page && pageStatus) {
     page.status = pageStatus;
@@ -404,12 +482,13 @@ export function markSessionStatus(
 export function buildContextReport(
   session: PageContextSession,
   flushStatus: ContextReport['flushStatus'] = 'pending',
+  flushError?: string,
 ): ContextReport {
-  const report = emptyReport(flushStatus);
+  const report = createEmptyContextReport(flushStatus, flushError);
   report.pagesVisited = session.pages.length;
 
   for (const page of session.pages) {
-    const coverage = computeCoverage(page);
+    const coverage = page.coverage;
     if (page.status !== 'completed' || coverage.requiredUnresolved > 0) {
       report.partialPages.push({
         pageId: page.pageId,
@@ -443,7 +522,11 @@ export function buildContextReport(
         });
       }
 
-      if (resolved && question.resolutionConfidence > 0 && question.resolutionConfidence < 0.7) {
+      if (
+        resolved &&
+        question.resolutionConfidence > 0 &&
+        question.resolutionConfidence < LOW_CONFIDENCE_THRESHOLD
+      ) {
         report.lowConfidenceAnswers.push({
           pageId: page.pageId,
           pageSequence: page.sequence,
@@ -455,7 +538,7 @@ export function buildContextReport(
       }
 
       if (
-        question.groupingConfidence < 0.6 ||
+        question.groupingConfidence < AMBIGUOUS_GROUPING_THRESHOLD ||
         question.warnings.includes('ambiguous_prompt_anchor')
       ) {
         report.ambiguousQuestionGroups.push({
@@ -475,10 +558,11 @@ export function buildContextReport(
 export function attachReport(
   session: PageContextSession,
   flushStatus: ContextReport['flushStatus'],
+  flushError?: string,
 ): PageContextSession {
   return {
-    ...session,
-    reportDraft: buildContextReport(session, flushStatus),
+    ...cloneSession(session),
+    reportDraft: buildContextReport(session, flushStatus, flushError),
     updatedAt: nowIso(),
     version: session.version + 1,
   };

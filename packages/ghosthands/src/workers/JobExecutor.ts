@@ -30,7 +30,12 @@ import { getMastra } from '../workflows/mastra/init.js';
 import { buildApplyWorkflow } from '../workflows/mastra/applyWorkflow.js';
 import { isMastraResume, claimResume, persistMastraRunId } from '../workflows/mastra/resumeCoordinator.js';
 import { workflowState, type RuntimeContext, type WorkflowState } from '../workflows/mastra/types.js';
-import { finalizeCookbookSuccess, finalizeHandlerResult, finalizeHandlerSideEffects } from './finalization.js';
+import {
+  finalizeCookbookSuccess,
+  finalizeHandlerResult,
+  finalizeHandlerSideEffects,
+  serializeContextReport,
+} from './finalization.js';
 import { LivePageContextService, type PageContextService } from '../context/PageContextService.js';
 import { RedisPageContextStore } from '../context/RedisPageContextStore.js';
 import { SupabasePageContextFlusher } from '../context/SupabasePageContextFlusher.js';
@@ -49,6 +54,16 @@ interface ResumeResult {
   resumed: boolean;
   resolutionType?: 'manual' | 'code_entry' | 'credentials' | 'skip';
   resolutionData?: Record<string, unknown>;
+}
+
+interface HandleJobErrorInput {
+  job: AutomationJob;
+  error: unknown;
+  actionCount: number;
+  totalTokens: number;
+  totalCost: number;
+  resultData?: Record<string, unknown>;
+  pageContext?: PageContextService;
 }
 
 export interface JobExecutorOptions {
@@ -1191,7 +1206,13 @@ export class JobExecutor {
       await progress.setStep(ProgressStep.FAILED);
       await progress.flush();
       const snapshot = costTracker.getSnapshot();
-      await this.handleJobError(job, error, snapshot.actionCount, snapshot.inputTokens + snapshot.outputTokens, snapshot.totalCost);
+      await this.handleJobError({
+        job,
+        error,
+        actionCount: snapshot.actionCount,
+        totalTokens: snapshot.inputTokens + snapshot.outputTokens,
+        totalCost: snapshot.totalCost,
+      });
 
       // Always record cost on failure (even zero cost for consistent accounting)
       await costService.recordJobCost(job.user_id, job.id, snapshot).catch((err) => {
@@ -1692,15 +1713,15 @@ export class JobExecutor {
           finalMode,
           engineResult,
         });
-        await this.handleJobError(
+        await this.handleJobError({
           job,
-          new Error(taskResult.error || 'Handler returned success: false'),
-          sideEffects.finalCost.actionCount,
-          sideEffects.finalCost.inputTokens + sideEffects.finalCost.outputTokens,
-          sideEffects.finalCost.totalCost,
-          sideEffects.resultData,
+          error: new Error(taskResult.error || 'Handler returned success: false'),
+          actionCount: sideEffects.finalCost.actionCount,
+          totalTokens: sideEffects.finalCost.inputTokens + sideEffects.finalCost.outputTokens,
+          totalCost: sideEffects.finalCost.totalCost,
+          resultData: sideEffects.resultData,
           pageContext,
-        );
+        });
         return;
       }
 
@@ -1735,15 +1756,15 @@ export class JobExecutor {
 
   // --- Error handling ---
 
-  private async handleJobError(
-    job: AutomationJob,
-    error: unknown,
-    actionCount: number,
-    totalTokens: number,
-    totalCost: number,
-    resultData?: Record<string, unknown>,
-    pageContext?: PageContextService,
-  ): Promise<void> {
+  private async handleJobError({
+    job,
+    error,
+    actionCount,
+    totalTokens,
+    totalCost,
+    resultData,
+    pageContext,
+  }: HandleJobErrorInput): Promise<void> {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorCode = this.classifyError(errorMessage);
 
@@ -1790,15 +1811,7 @@ export class JobExecutor {
           const report = await pageContext.flushToSupabase();
           finalResultData = {
             ...(finalResultData || {}),
-            context_report: {
-              pages_visited: report.pagesVisited,
-              required_unresolved: report.requiredUnresolved,
-              risky_optional_answers: report.riskyOptionalAnswers,
-              low_confidence_answers: report.lowConfidenceAnswers,
-              ambiguous_question_groups: report.ambiguousQuestionGroups,
-              partial_pages: report.partialPages,
-              flush_status: report.flushStatus,
-            },
+            context_report: serializeContextReport(report),
           };
         } catch (flushErr) {
           const message = flushErr instanceof Error ? flushErr.message : String(flushErr);
@@ -1808,15 +1821,7 @@ export class JobExecutor {
           if (pendingReport) {
             finalResultData = {
               ...(finalResultData || {}),
-              context_report: {
-                pages_visited: pendingReport.pagesVisited,
-                required_unresolved: pendingReport.requiredUnresolved,
-                risky_optional_answers: pendingReport.riskyOptionalAnswers,
-                low_confidence_answers: pendingReport.lowConfidenceAnswers,
-                ambiguous_question_groups: pendingReport.ambiguousQuestionGroups,
-                partial_pages: pendingReport.partialPages,
-                flush_status: pendingReport.flushStatus,
-              },
+              context_report: serializeContextReport(pendingReport),
             };
           }
         }

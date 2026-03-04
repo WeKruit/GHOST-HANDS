@@ -8,6 +8,7 @@ import type {
   QuestionSnapshot,
 } from './types.js';
 import type { PageContextService } from './PageContextService.js';
+import { createEmptyContextReport } from './PageContextReducer.js';
 
 export class NoopPageContextService implements PageContextService {
   async initializeRun(_mastraRunId: string): Promise<void> {}
@@ -37,15 +38,7 @@ export class NoopPageContextService implements PageContextService {
   async markFailed(): Promise<void> {}
   async markFlushPending(_error: string): Promise<void> {}
   async getContextReport(flushStatus: ContextReport['flushStatus'] = 'pending'): Promise<ContextReport> {
-    return {
-      pagesVisited: 0,
-      requiredUnresolved: [],
-      riskyOptionalAnswers: [],
-      lowConfidenceAnswers: [],
-      ambiguousQuestionGroups: [],
-      partialPages: [],
-      flushStatus,
-    };
+    return createEmptyContextReport(flushStatus);
   }
   async flushToSupabase(): Promise<ContextReport> {
     return this.getContextReport('pending');

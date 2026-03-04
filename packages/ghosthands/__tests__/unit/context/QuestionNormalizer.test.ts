@@ -68,4 +68,37 @@ describe('QuestionNormalizer', () => {
 
     expect(first[0].questionKey).toBe(second[0].questionKey);
   });
+
+  it('keeps the same logical question key when a question appears in a later subset scan', () => {
+    const fullScan = normalizeExtractedQuestions([
+      {
+        id: 'ff-20',
+        name: 'First name',
+        type: 'text',
+        section: 'Profile',
+        required: true,
+      },
+      {
+        id: 'ff-21',
+        name: 'Do you need sponsorship?',
+        type: 'radio-group',
+        section: 'Application Questions',
+        required: true,
+        choices: ['Yes', 'No'],
+      },
+    ]);
+
+    const subsetScan = normalizeExtractedQuestions([
+      {
+        id: 'ff-210',
+        name: 'Do you need sponsorship?',
+        type: 'radio-group',
+        section: 'Application Questions',
+        required: true,
+        choices: ['Yes', 'No'],
+      },
+    ]);
+
+    expect(fullScan[1].questionKey).toBe(subsetScan[0].questionKey);
+  });
 });

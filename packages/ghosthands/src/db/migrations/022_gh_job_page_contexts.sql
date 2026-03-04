@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS gh_job_page_contexts (
   history JSONB NOT NULL DEFAULT '[]'::jsonb,
   entered_at TIMESTAMPTZ NOT NULL,
   exited_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -33,7 +34,3 @@ CREATE INDEX IF NOT EXISTS idx_gh_job_page_contexts_mastra_run
 
 CREATE INDEX IF NOT EXISTS idx_gh_job_page_contexts_job
   ON gh_job_page_contexts(job_id, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_gh_job_page_contexts_context_gin
-  ON gh_job_page_contexts
-  USING GIN(page_context);

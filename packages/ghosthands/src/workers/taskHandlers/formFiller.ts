@@ -107,6 +107,15 @@ const PLACEHOLDER_RE = /^(select|choose|pick|--|—)/i;
 
 const MAGNITUDE_HAND_ACT_TIMEOUT_MS = 30_000;
 
+const FIELD_RESULT_CONFIDENCE = {
+  domFilled: 0.8,
+  domFailed: 0.35,
+  magnitudeFilled: 0.7,
+  magnitudeFailed: 0.25,
+  verified: 0.85,
+  unresolved: 0.3,
+} as const;
+
 // ── Profile text builder ─────────────────────────────────────
 
 /** Convert a WorkdayUserProfile into a human-readable profile string for LLM prompts. */
@@ -2724,6 +2733,18 @@ export async function fillFormOnPage(
   const profileSkills = parseProfileSkills(profileText);
   const profileSkillsCsv = profileSkills.join(', ');
   const observers = opts?.observers;
+  const notifyObserver = async (
+    label: keyof FillObservers,
+    fn: (() => Promise<void>) | (() => void) | undefined,
+  ): Promise<void> => {
+    if (!fn) return;
+    try {
+      await fn();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[formFiller] observer ${String(label)} failed: ${message}`);
+    }
+  };
   const initialQuestionSnapshots = normalizeExtractedQuestions(visibleFields);
   result.questionSnapshots = initialQuestionSnapshots;
   result.totalFields = visibleFields.length;
@@ -2735,7 +2756,12 @@ export async function fillFormOnPage(
   }
 
   if (initialQuestionSnapshots.length > 0) {
-    await observers?.onQuestionsNormalized?.(initialQuestionSnapshots);
+    await notifyObserver(
+      'onQuestionsNormalized',
+      observers?.onQuestionsNormalized
+        ? () => observers.onQuestionsNormalized!(initialQuestionSnapshots)
+        : undefined,
+    );
   }
 
   // 5. Discover dropdown options (including hierarchical Workday dropdowns)
@@ -2747,6 +2773,7 @@ export async function fillFormOnPage(
   const fieldIdMap: Record<string, string> = {};
   const fieldIdToQuestionKey: Record<string, string> = {};
   const fieldIdToResolvedAnswer: Record<string, string> = {};
+  const fieldIdToFillSource = new Map<string, 'dom' | 'magnitude'>();
   for (const question of initialQuestionSnapshots) {
     for (const fieldId of question.fieldIds) {
       fieldIdToQuestionKey[fieldId] = question.questionKey;
@@ -2773,7 +2800,12 @@ export async function fillFormOnPage(
     );
     result.answerDecisions = initialDecisions;
     if (initialDecisions.length > 0) {
-      await observers?.onAnswerPlanned?.(initialDecisions);
+      await notifyObserver(
+        'onAnswerPlanned',
+        observers?.onAnswerPlanned
+          ? () => observers.onAnswerPlanned!(initialDecisions)
+          : undefined,
+      );
     }
     console.log(`[formFiller] LLM provided ${Object.keys(answers).length} answers.`);
   } else {
@@ -2836,7 +2868,12 @@ export async function fillFormOnPage(
       result.outputTokens += extraResult.outputTokens;
       const unseenSnapshots = normalizeExtractedQuestions(unseen);
       if (unseenSnapshots.length > 0) {
-        await observers?.onQuestionsNormalized?.(unseenSnapshots);
+        await notifyObserver(
+          'onQuestionsNormalized',
+          observers?.onQuestionsNormalized
+            ? () => observers.onQuestionsNormalized!(unseenSnapshots)
+            : undefined,
+        );
         for (const question of unseenSnapshots) {
           for (const fieldId of question.fieldIds) {
             fieldIdToQuestionKey[fieldId] = question.questionKey;
@@ -2856,7 +2893,12 @@ export async function fillFormOnPage(
       );
       if (extraDecisions.length > 0) {
         result.answerDecisions = [...(result.answerDecisions || []), ...extraDecisions];
-        await observers?.onAnswerPlanned?.(extraDecisions);
+        await notifyObserver(
+          'onAnswerPlanned',
+          observers?.onAnswerPlanned
+            ? () => observers.onAnswerPlanned!(extraDecisions)
+            : undefined,
+        );
       }
     }
 
@@ -2873,22 +2915,36 @@ export async function fillFormOnPage(
       }
       const questionKey = fieldIdToQuestionKey[field.id];
       if (questionKey) {
-        await observers?.onFieldAttempt?.(questionKey, 'dom');
+        await notifyObserver(
+          'onFieldAttempt',
+          observers?.onFieldAttempt
+            ? () => observers.onFieldAttempt!(questionKey, 'dom')
+            : undefined,
+        );
       }
       const fieldAnswers = resolved !== undefined ? { ...answers, [field.name]: resolved } : answers;
       const ok = await fillField(page, field, fieldAnswers, resumePath, resumeAlreadyUploaded);
       if (ok) {
         domFilledOk.add(field.id);
+        fieldIdToFillSource.set(field.id, 'dom');
         if (field.type === 'file') resumeAlreadyUploaded = true;
       }
       if (questionKey) {
-        await observers?.onFieldResult?.({
-          questionKey,
-          state: ok ? 'filled' : 'failed',
-          currentValue: ok ? resolved : undefined,
-          confidence: ok ? 0.8 : 0.35,
-          source: 'dom',
-        });
+        await notifyObserver(
+          'onFieldResult',
+          observers?.onFieldResult
+            ? () =>
+                observers.onFieldResult!({
+                  questionKey,
+                  state: ok ? 'filled' : 'failed',
+                  currentValue: ok ? resolved : undefined,
+                  confidence: ok
+                    ? FIELD_RESULT_CONFIDENCE.domFilled
+                    : FIELD_RESULT_CONFIDENCE.domFailed,
+                  source: 'dom',
+                })
+            : undefined,
+        );
       }
     }
 
@@ -2996,25 +3052,38 @@ export async function fillFormOnPage(
       try {
         const questionKey = fieldIdToQuestionKey[field.id];
         if (questionKey) {
-          await observers?.onFieldAttempt?.(
-            questionKey,
-            'magnitude',
-            neighborCtx ? 'neighbor_context' : undefined,
+          await notifyObserver(
+            'onFieldAttempt',
+            observers?.onFieldAttempt
+              ? () =>
+                  observers.onFieldAttempt!(
+                    questionKey,
+                    'magnitude',
+                    neighborCtx ? 'neighbor_context' : undefined,
+                  )
+              : undefined,
           );
         }
         await adapter.act(prompt, { timeoutMs: MAGNITUDE_HAND_ACT_TIMEOUT_MS });
         console.log(`[formFiller] [MagnitudeHand] Filled "${field.name}" OK`);
         filledCount++;
         filledIds.add(field.id);
+        fieldIdToFillSource.set(field.id, 'magnitude');
         adapterBusyCount = 0;
         if (questionKey) {
-          await observers?.onFieldResult?.({
-            questionKey,
-            state: 'filled',
-            currentValue: answer,
-            confidence: 0.7,
-            source: 'magnitude',
-          });
+          await notifyObserver(
+            'onFieldResult',
+            observers?.onFieldResult
+              ? () =>
+                  observers.onFieldResult!({
+                    questionKey,
+                    state: 'filled',
+                    currentValue: answer,
+                    confidence: FIELD_RESULT_CONFIDENCE.magnitudeFilled,
+                    source: 'magnitude',
+                  })
+              : undefined,
+          );
         }
       } catch (e: any) {
         const msg = e?.message ? String(e.message) : String(e);
@@ -3022,13 +3091,19 @@ export async function fillFormOnPage(
         console.log(`[formFiller] [MagnitudeHand] ERROR on "${field.name}": ${shortMsg}`);
         const questionKey = fieldIdToQuestionKey[field.id];
         if (questionKey) {
-          await observers?.onFieldResult?.({
-            questionKey,
-            state: 'failed',
-            currentValue: undefined,
-            confidence: 0.25,
-            source: 'magnitude',
-          });
+          await notifyObserver(
+            'onFieldResult',
+            observers?.onFieldResult
+              ? () =>
+                  observers.onFieldResult!({
+                    questionKey,
+                    state: 'failed',
+                    currentValue: undefined,
+                    confidence: FIELD_RESULT_CONFIDENCE.magnitudeFailed,
+                    source: 'magnitude',
+                  })
+              : undefined,
+          );
         }
 
         const isBusy = msg.includes('adapter busy: previous act() still running')
@@ -3068,7 +3143,12 @@ export async function fillFormOnPage(
   );
   if (finalSnapshots.length > 0) {
     result.questionSnapshots = finalSnapshots;
-    await observers?.onQuestionsNormalized?.(finalSnapshots);
+    await notifyObserver(
+      'onQuestionsNormalized',
+      observers?.onQuestionsNormalized
+        ? () => observers.onQuestionsNormalized!(finalSnapshots)
+        : undefined,
+    );
   }
 
   const finalFilledIds = new Set<string>(filledIds);
@@ -3091,13 +3171,20 @@ export async function fillFormOnPage(
         : question.riskLevel !== 'none'
           ? 'uncertain'
           : 'empty';
+    const source = question.fieldIds.some(
+      (fieldId) => fieldIdToFillSource.get(fieldId) === 'magnitude',
+    )
+      ? 'magnitude'
+      : 'dom';
 
     return {
       questionKey: question.questionKey,
       state,
       currentValue: resolvedAnswer,
-      confidence: hasFilledField ? 0.85 : 0.3,
-      source: hasFilledField ? 'dom' : 'dom',
+      confidence: hasFilledField
+        ? FIELD_RESULT_CONFIDENCE.verified
+        : FIELD_RESULT_CONFIDENCE.unresolved,
+      source,
     };
   });
 
@@ -3115,7 +3202,10 @@ export async function fillFormOnPage(
     .map((question) => question.questionKey);
 
   for (const outcome of questionOutcomes) {
-    await observers?.onVerification?.(outcome);
+    await notifyObserver(
+      'onVerification',
+      observers?.onVerification ? () => observers.onVerification!(outcome) : undefined,
+    );
   }
 
   return result;
