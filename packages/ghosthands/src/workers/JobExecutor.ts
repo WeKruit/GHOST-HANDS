@@ -1379,11 +1379,12 @@ export class JobExecutor {
     const mastra = getMastra();
 
     if (!mastra) {
-      throw new Error(
-        `Cannot execute Mastra workflow for job ${job.id}: ` +
-        'getMastra() returned null (desktop mode — no database connection). ' +
-        'Mastra workflows require a hosted worker with DATABASE_URL configured.',
+      logger.warn(
+        `Skipping Mastra workflow for job ${job.id}: no database connection (non-hosted worker). ` +
+        'Falling back to direct execution.',
+        { jobId: job.id },
       );
+      return;
     }
 
     // Register workflow with Mastra for this execution.

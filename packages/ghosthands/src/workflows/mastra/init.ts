@@ -22,8 +22,7 @@ export interface CreateMastraOptions {
 function isHostedWorker(): boolean {
   return !!(
     process.env.AWS_ASG_NAME ||
-    process.env.EC2_INSTANCE_ID ||
-    process.env.NODE_ENV === 'production'
+    process.env.EC2_INSTANCE_ID
   );
 }
 
@@ -87,10 +86,11 @@ export function createMastra(options: CreateMastraOptions = {}): Mastra {
 /**
  * Get or lazily create the Mastra singleton.
  *
- * - **Hosted workers** (EC2 / production): throws a P0-level error when the
- *   database connection string is missing — this is a deployment misconfiguration.
- * - **Desktop workers**: logs a warning and returns `null` — desktop mode does
- *   not require Mastra/Postgres workflows.
+ * - **Hosted workers** (EC2 with AWS_ASG_NAME or EC2_INSTANCE_ID): throws a
+ *   P0-level error when the database connection string is missing — this is
+ *   a deployment misconfiguration.
+ * - **Non-hosted runtimes** (desktop, local dev): logs a warning and returns
+ *   `null` — desktop mode does not require Mastra/Postgres workflows.
  */
 export function getMastra(): Mastra | null {
   if (_mastra) return _mastra;
@@ -108,7 +108,7 @@ export function getMastra(): Mastra | null {
     throw new Error(
       '[P0] HOSTED WORKER MISSING DATABASE CONNECTION\n' +
       '─────────────────────────────────────────────\n' +
-      'getMastra() was called on a hosted worker (EC2/production) but neither\n' +
+      'getMastra() was called on a hosted worker (EC2) but neither\n' +
       'DATABASE_URL nor SUPABASE_DIRECT_URL is set.\n\n' +
       'Remediation steps:\n' +
       '  1. Check the env_file / docker-compose env section on this instance\n' +
