@@ -161,6 +161,10 @@ export class DOMActionExecutor {
         return await this.fillAriaRadio(field, value);
       }
 
+      case 'button_group': {
+        return await this.fillButtonGroup(field, value);
+      }
+
       case 'checkbox': {
         const result = await this.checkCheckbox(field);
         return result || 'not_found';
@@ -550,6 +554,78 @@ export class DOMActionExecutor {
     } catch (err) {
       if (this.isFatalBrowserError(err)) throw err;
       this.logger.debug('fillAriaRadio error', {
+        label: field.label,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return 'not_found';
+    }
+  }
+
+  /**
+   * Fill a button group by clicking the button whose text matches the value.
+   * Used for Yes/No and multiple-choice button-based questions (e.g., Ashby).
+   * The field's platformMeta.buttonSelectors contains JSON array of selectors
+   * for each button, corresponding 1:1 with field.options.
+   */
+  private async fillButtonGroup(field: FieldModel, value: string): Promise<true | 'not_found' | 'no_match'> {
+    try {
+      await this.scrollFieldIntoView(field);
+
+      // Parse button selectors from platformMeta
+      const btnSelectorsJson = field.platformMeta?.buttonSelectors;
+      if (!btnSelectorsJson) {
+        this.logger.debug('fillButtonGroup: no buttonSelectors in platformMeta', { label: field.label });
+        return 'not_found';
+      }
+
+      let btnSelectors: string[];
+      try {
+        btnSelectors = JSON.parse(btnSelectorsJson);
+      } catch {
+        return 'not_found';
+      }
+
+      const clicked = await this.page.evaluate(({ selectors, options, val }) => {
+        const valLower = val.toLowerCase().trim();
+
+        // Build option list with their selectors
+        const pairs: Array<{ selector: string; text: string }> = [];
+        for (let i = 0; i < selectors.length; i++) {
+          pairs.push({ selector: selectors[i], text: (options[i] || '').toLowerCase().trim() });
+        }
+
+        // Exact match
+        for (const pair of pairs) {
+          if (pair.text === valLower) {
+            const el = document.querySelector(pair.selector) as HTMLElement | null;
+            if (el) { el.click(); return true; }
+          }
+        }
+
+        // Starts-with match
+        for (const pair of pairs) {
+          if (pair.text.startsWith(valLower) || valLower.startsWith(pair.text)) {
+            const el = document.querySelector(pair.selector) as HTMLElement | null;
+            if (el) { el.click(); return true; }
+          }
+        }
+
+        // Contains match
+        for (const pair of pairs) {
+          if (pair.text.includes(valLower) || valLower.includes(pair.text)) {
+            const el = document.querySelector(pair.selector) as HTMLElement | null;
+            if (el) { el.click(); return true; }
+          }
+        }
+
+        return 'no_match';
+      }, { selectors: btnSelectors, options: field.options || [], val: value });
+
+      this.logger.debug('fillButtonGroup result', { label: field.label, success: clicked === true, value });
+      return clicked;
+    } catch (err) {
+      if (this.isFatalBrowserError(err)) throw err;
+      this.logger.debug('fillButtonGroup error', {
         label: field.label,
         error: err instanceof Error ? err.message : String(err),
       });

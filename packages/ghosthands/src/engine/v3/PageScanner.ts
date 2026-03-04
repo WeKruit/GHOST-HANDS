@@ -797,6 +797,216 @@ export class PageScanner {
           idx++;
         }
 
+        // ── Detect button groups (Yes/No, multiple-choice buttons) ──
+        // Finds clusters of 2-4 short buttons sharing a parent container
+        // with a question label. Converts them to fields instead of buttons.
+
+        (function detectButtonGroups() {
+          // Find all visible buttons that could be answer choices
+          var allBtnEls = document.querySelectorAll('button, [role="button"]');
+          // Group buttons by their parent container
+          var parentMap = {};
+          for (var bg = 0; bg < allBtnEls.length; bg++) {
+            var btn = allBtnEls[bg];
+            if (!isVisible(btn)) continue;
+            if (btn.disabled) continue;
+            // Skip buttons already captured as fields
+            if (btn.getAttribute('data-gh-scan-idx') !== null) continue;
+            // Skip combobox / dropdown triggers
+            if (btn.getAttribute('role') === 'combobox') continue;
+            if (btn.getAttribute('aria-haspopup') === 'listbox') continue;
+            // Skip submit/input buttons
+            if (btn.tagName.toLowerCase() === 'input') continue;
+
+            var btnText = (btn.textContent || '').trim();
+            // Only short button text qualifies as an answer choice
+            if (!btnText || btnText.length > 30) continue;
+            // Skip navigation/submit/add buttons
+            var btnLower = btnText.toLowerCase();
+            if (btnLower === 'save and continue' || btnLower === 'next' || btnLower === 'continue' ||
+                btnLower === 'submit' || btnLower === 'submit application' || btnLower === 'apply' ||
+                btnLower === 'add' || btnLower.startsWith('add ') || btnLower === 'add another' ||
+                btnLower === 'replace' || btnLower === 'upload' || btnLower === 'browse' ||
+                btnLower === 'remove' || btnLower === 'delete' || btnLower === 'cancel' ||
+                btnLower === 'back' || btnLower === 'previous' || btnLower === 'close' ||
+                btnLower === 'save' || btnLower.includes('save & continue') ||
+                btnLower === 'select one' || btnLower === 'choose file') continue;
+
+            // Find the nearest container that could group these buttons
+            var parent = btn.parentElement;
+            // Walk up at most 3 levels to find a shared container
+            for (var pu = 0; pu < 3 && parent; pu++) {
+              var childBtns = parent.querySelectorAll('button, [role="button"]');
+              // If this parent has 2-4 visible buttons, it's a candidate
+              var visibleCount = 0;
+              for (var vc = 0; vc < childBtns.length; vc++) {
+                if (isVisible(childBtns[vc])) visibleCount++;
+              }
+              if (visibleCount >= 2 && visibleCount <= 4) break;
+              parent = parent.parentElement;
+            }
+            if (!parent) continue;
+
+            // Use a unique key for this parent to group buttons
+            var parentKey = parent.getAttribute('data-gh-btn-group') || ('btngrp-' + bg);
+            parent.setAttribute('data-gh-btn-group', parentKey);
+
+            if (!parentMap[parentKey]) {
+              parentMap[parentKey] = { parent: parent, buttons: [] };
+            }
+            // Avoid duplicates
+            var already = false;
+            for (var dd = 0; dd < parentMap[parentKey].buttons.length; dd++) {
+              if (parentMap[parentKey].buttons[dd].el === btn) { already = true; break; }
+            }
+            if (!already) {
+              parentMap[parentKey].buttons.push({ el: btn, text: btnText });
+            }
+          }
+
+          // Process each button group
+          for (var groupKey in parentMap) {
+            var group = parentMap[groupKey];
+            if (group.buttons.length < 2 || group.buttons.length > 4) continue;
+
+            // All buttons must be short (answer choices, not paragraphs)
+            var allShort = true;
+            for (var as2 = 0; as2 < group.buttons.length; as2++) {
+              if (group.buttons[as2].text.length > 30) { allShort = false; break; }
+            }
+            if (!allShort) continue;
+
+            // Extract the question label from the container
+            var container = group.parent;
+            var questionLabel = '';
+
+            // Strategy 1: Look for a preceding element with question text
+            var prevSib = container.previousElementSibling;
+            if (prevSib) {
+              var prevText = (prevSib.textContent || '').trim();
+              if (prevText && prevText.length > 5 && prevText.length < 300) {
+                questionLabel = prevText;
+              }
+            }
+
+            // Strategy 2: Walk up to find a container with a label/heading before the buttons
+            if (!questionLabel) {
+              var labelContainer = container.parentElement;
+              for (var lc = 0; lc < 5 && labelContainer && !questionLabel; lc++) {
+                // Look for text nodes or elements that appear before the button container
+                var children = labelContainer.children;
+                for (var ch = 0; ch < children.length; ch++) {
+                  var child = children[ch];
+                  // Stop if we've reached the button container
+                  if (child === container || child.contains(container)) break;
+                  var childText = (child.textContent || '').trim();
+                  // Take the last substantial text element before the buttons as the label
+                  if (childText && childText.length > 5 && childText.length < 300) {
+                    questionLabel = childText;
+                  }
+                }
+                if (questionLabel) break;
+                labelContainer = labelContainer.parentElement;
+              }
+            }
+
+            // Strategy 3: aria-label on the container or a parent
+            if (!questionLabel) {
+              var ariaContainer = container.closest('[aria-label]');
+              if (ariaContainer) {
+                var ariaText = ariaContainer.getAttribute('aria-label');
+                if (ariaText && ariaText.length > 5) questionLabel = ariaText;
+              }
+            }
+
+            // If we couldn't find a question label, skip this group
+            if (!questionLabel) continue;
+
+            // Clean up the label
+            questionLabel = questionLabel
+              .replace(/\s*\*\s*/g, ' ')
+              .replace(/\s*Required\s*/gi, '')
+              .replace(/\s+/g, ' ')
+              .trim();
+            if (questionLabel.length > 200) questionLabel = questionLabel.substring(0, 200).trim();
+
+            // Build options list and selectors for each button
+            var options = [];
+            var btnSelectors = [];
+            for (var bo = 0; bo < group.buttons.length; bo++) {
+              options.push(group.buttons[bo].text);
+              var bEl = group.buttons[bo].el;
+              // Tag each button so it's skipped by the regular button scan
+              bEl.setAttribute('data-gh-scan-idx', String(idx));
+              var bSel = '';
+              if (bEl.id) {
+                bSel = '#' + CSS.escape(bEl.id);
+              } else if (bEl.getAttribute('data-testid')) {
+                bSel = '[data-testid="' + bEl.getAttribute('data-testid') + '"]';
+              } else {
+                bSel = '[data-gh-scan-idx="' + idx + '"]';
+              }
+              btnSelectors.push(bSel);
+              idx++;
+            }
+
+            // Build a selector for the container to use as the field selector
+            var containerSel = '';
+            if (container.id) {
+              containerSel = '#' + CSS.escape(container.id);
+            } else if (container.getAttribute('data-testid')) {
+              containerSel = '[data-testid="' + container.getAttribute('data-testid') + '"]';
+            } else {
+              container.setAttribute('data-gh-scan-idx', 'btngrp-field-' + idx);
+              containerSel = '[data-gh-scan-idx="btngrp-field-' + idx + '"]';
+            }
+
+            // Check if any button is already "selected" (active/pressed state)
+            var currentValue = '';
+            for (var cv = 0; cv < group.buttons.length; cv++) {
+              var cvBtn = group.buttons[cv].el;
+              if (cvBtn.getAttribute('aria-pressed') === 'true' ||
+                  cvBtn.getAttribute('aria-selected') === 'true' ||
+                  cvBtn.classList.contains('active') ||
+                  cvBtn.classList.contains('selected')) {
+                currentValue = group.buttons[cv].text;
+                break;
+              }
+            }
+
+            // Check if required (look for * in the question label text from the original element)
+            var isRequired = false;
+            if (prevSib) {
+              var origText = (prevSib.textContent || '');
+              isRequired = origText.includes('*');
+            }
+
+            fields.push({
+              selector: containerSel,
+              automationId: undefined,
+              fieldId: undefined,
+              name: undefined,
+              fieldType: 'button_group',
+              fillStrategy: 'click_option',
+              isRequired: isRequired,
+              isVisible: true,
+              isDisabled: false,
+              label: questionLabel,
+              placeholder: undefined,
+              ariaLabel: container.getAttribute('aria-label') || undefined,
+              currentValue: currentValue,
+              isEmpty: !currentValue,
+              options: options,
+              groupKey: containerSel,
+              boundingBox: getBBox(container),
+              absoluteY: Math.round(container.getBoundingClientRect().top + scrollY),
+              platformMeta: {
+                buttonSelectors: JSON.stringify(btnSelectors),
+              },
+            });
+          }
+        })();
+
         // ── Scan buttons ──────────────────────────────────────────
 
         var btnEls = document.querySelectorAll('button, [role="button"], input[type="submit"]');

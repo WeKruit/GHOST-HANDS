@@ -28,6 +28,7 @@ function mapV3ToV2FieldType(v3Type: FormField['fieldType']): V2FieldType {
     date: 'date',
     file: 'file',
     hidden: 'unknown',
+    button_group: 'button_group',
     unknown: 'unknown',
   };
   return map[v3Type] ?? 'unknown';
@@ -51,6 +52,7 @@ function getFillStrategy(fieldType: V2FieldType): FillStrategy {
     case 'typeahead':
     case 'radio':
     case 'aria_radio':
+    case 'button_group':
       return 'click_option';
     case 'checkbox':
       return 'click';

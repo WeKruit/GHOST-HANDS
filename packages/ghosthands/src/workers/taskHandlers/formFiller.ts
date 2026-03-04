@@ -683,6 +683,166 @@ async function extractFields(page: Page): Promise<FormField[]> {
     }
   }
 
+  // Detect button groups (Yes/No, multiple-choice button questions)
+  const buttonGroups: FormField[] = await page.evaluate(() => {
+    const ff = (window as any).__ff;
+    const results: any[] = [];
+
+    // Find all visible buttons that could be answer choices
+    const allBtnEls = document.querySelectorAll('button, [role="button"]');
+    // Group buttons by parent container
+    const parentMap: Record<string, { parent: HTMLElement; buttons: Array<{ el: HTMLElement; text: string }> }> = {};
+
+    for (let i = 0; i < allBtnEls.length; i++) {
+      const btn = allBtnEls[i] as HTMLElement;
+      if (!ff.isVisible(btn)) continue;
+      if ((btn as any).disabled) continue;
+      // Skip combobox/dropdown triggers
+      if (btn.getAttribute('role') === 'combobox') continue;
+      if (btn.getAttribute('aria-haspopup') === 'listbox') continue;
+      if (btn.tagName.toLowerCase() === 'input') continue;
+
+      const btnText = (btn.textContent || '').trim();
+      if (!btnText || btnText.length > 30) continue;
+
+      // Skip navigation/submit/utility buttons
+      const btnLower = btnText.toLowerCase();
+      if (['save and continue', 'next', 'continue', 'submit', 'submit application',
+        'apply', 'add', 'add another', 'replace', 'upload', 'browse', 'remove',
+        'delete', 'cancel', 'back', 'previous', 'close', 'save', 'select one',
+        'choose file'].includes(btnLower) ||
+        btnLower.startsWith('add ') || btnLower.includes('save & continue')) continue;
+
+      // Find the nearest container with 2-4 visible buttons
+      let parent = btn.parentElement as HTMLElement | null;
+      for (let pu = 0; pu < 3 && parent; pu++) {
+        const childBtns = parent.querySelectorAll('button, [role="button"]');
+        let visibleCount = 0;
+        for (let vc = 0; vc < childBtns.length; vc++) {
+          if (ff.isVisible(childBtns[vc])) visibleCount++;
+        }
+        if (visibleCount >= 2 && visibleCount <= 4) break;
+        parent = parent.parentElement as HTMLElement | null;
+      }
+      if (!parent) continue;
+
+      const parentKey = parent.getAttribute('data-ff-btn-group') || ('btngrp-' + i);
+      parent.setAttribute('data-ff-btn-group', parentKey);
+
+      if (!parentMap[parentKey]) {
+        parentMap[parentKey] = { parent, buttons: [] };
+      }
+      // Avoid duplicates
+      if (!parentMap[parentKey].buttons.some(b => b.el === btn)) {
+        parentMap[parentKey].buttons.push({ el: btn, text: btnText });
+      }
+    }
+
+    // Process each button group
+    for (const groupKey in parentMap) {
+      const group = parentMap[groupKey];
+      if (group.buttons.length < 2 || group.buttons.length > 4) continue;
+      if (group.buttons.some(b => b.text.length > 30)) continue;
+
+      const container = group.parent;
+
+      // Extract question label
+      let questionLabel = '';
+
+      // Strategy 1: Preceding sibling with question text
+      const prevSib = container.previousElementSibling;
+      if (prevSib) {
+        const prevText = (prevSib.textContent || '').trim();
+        if (prevText && prevText.length > 5 && prevText.length < 300) {
+          questionLabel = prevText;
+        }
+      }
+
+      // Strategy 2: Walk up to find text before the button container
+      if (!questionLabel) {
+        let labelContainer = container.parentElement;
+        for (let lc = 0; lc < 5 && labelContainer && !questionLabel; lc++) {
+          const children = labelContainer.children;
+          for (let ch = 0; ch < children.length; ch++) {
+            const child = children[ch];
+            if (child === container || child.contains(container)) break;
+            const childText = (child.textContent || '').trim();
+            if (childText && childText.length > 5 && childText.length < 300) {
+              questionLabel = childText;
+            }
+          }
+          if (questionLabel) break;
+          labelContainer = labelContainer.parentElement;
+        }
+      }
+
+      // Strategy 3: aria-label
+      if (!questionLabel) {
+        const ariaContainer = container.closest('[aria-label]');
+        if (ariaContainer) {
+          const ariaText = ariaContainer.getAttribute('aria-label');
+          if (ariaText && ariaText.length > 5) questionLabel = ariaText;
+        }
+      }
+
+      if (!questionLabel) continue;
+
+      // Clean label
+      questionLabel = questionLabel
+        .replace(/\s*\*\s*/g, ' ')
+        .replace(/\s*Required\s*/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (questionLabel.length > 200) questionLabel = questionLabel.substring(0, 200).trim();
+
+      // Tag each button with data-ff-id and collect choices
+      const choices: string[] = [];
+      const btnIds: string[] = [];
+      for (const b of group.buttons) {
+        const id = ff.tag(b.el);
+        choices.push(b.text);
+        btnIds.push(id);
+      }
+
+      // Tag the container too
+      const containerId = ff.tag(container);
+
+      // Check required
+      let isRequired = false;
+      if (prevSib) {
+        isRequired = (prevSib.textContent || '').includes('*');
+      }
+
+      results.push({
+        id: containerId,
+        name: questionLabel,
+        type: 'button-group',
+        section: ff.getSection(container),
+        required: isRequired,
+        visible: true,
+        isNative: false,
+        choices,
+        btnIds,
+      });
+    }
+    return results;
+  });
+
+  for (const bg of buttonGroups) {
+    if (seen.has(bg.id)) continue;
+    seen.add(bg.id);
+    fields.push({
+      id: bg.id,
+      name: bg.name,
+      type: 'button-group',
+      section: bg.section,
+      required: bg.required,
+      isNative: false,
+      choices: bg.choices,
+      visibleByDefault: true,
+    });
+  }
+
   // Strip Workday internal elements
   return fields.filter((f) => f.name !== 'items selected');
 }
@@ -1921,6 +2081,41 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
       return false;
     }
 
+    case 'button-group': {
+      const choice = getAnswer(answers, field) ?? field.choices?.[0];
+      if (!choice) {
+        console.log(`[formFiller]   skip ${tag} (button-group, no answer)`);
+        return false;
+      }
+      const clicked = await page.evaluate(
+        ({ ffId, text }) => {
+          const container = document.querySelector(`[data-ff-id="${ffId}"]`);
+          if (!container) return false;
+          const textLower = text.toLowerCase().trim();
+          // Find all buttons in this container
+          const btns = container.querySelectorAll('button, [role="button"]');
+          // Exact match
+          for (const btn of btns) {
+            const btnText = (btn.textContent || '').trim().toLowerCase();
+            if (btnText === textLower) { (btn as HTMLElement).click(); return true; }
+          }
+          // Contains match
+          for (const btn of btns) {
+            const btnText = (btn.textContent || '').trim().toLowerCase();
+            if (btnText.includes(textLower) || textLower.includes(btnText)) {
+              (btn as HTMLElement).click();
+              return true;
+            }
+          }
+          return false;
+        },
+        { ffId: field.id, text: choice }
+      );
+      if (clicked) { console.log(`[formFiller]   button-group ${tag} → "${choice}"`); return true; }
+      console.log(`[formFiller]   skip ${tag} (button-group, no matching button)`);
+      return false;
+    }
+
     case 'checkbox-group': {
       const val = getAnswer(answers, field);
       if (isExplicitFalse(val)) {
@@ -2099,6 +2294,18 @@ async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
     const tag = el.tagName;
     const type = (el as HTMLInputElement).type || '';
     const role = el.getAttribute('role') || '';
+
+    // Button group: check if any button has pressed/selected state
+    if (el.hasAttribute('data-ff-btn-group') || el.getAttribute('data-gh-scan-idx')?.startsWith('btngrp-')) {
+      const btns = el.querySelectorAll('button, [role="button"]');
+      for (const btn of btns) {
+        if (btn.getAttribute('aria-pressed') === 'true' ||
+            btn.getAttribute('aria-selected') === 'true' ||
+            btn.classList.contains('active') ||
+            btn.classList.contains('selected')) return true;
+      }
+      return false;
+    }
 
     if (type === 'radio') {
       const name = (el as HTMLInputElement).name;

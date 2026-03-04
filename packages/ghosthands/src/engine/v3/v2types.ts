@@ -28,6 +28,7 @@ export type FieldType =
   | 'contenteditable'
   | 'upload_button'
   | 'password'
+  | 'button_group'
   | 'unknown';
 
 /** How a field should be filled. */
