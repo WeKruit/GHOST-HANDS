@@ -3067,6 +3067,13 @@ export async function fillFormOnPage(
 
   let initialQuestionSnapshots: QuestionSnapshot[];
   let usedNewPipeline = false;
+  const canonicalSnapshotByKey = new Map<string, QuestionSnapshot>();
+  const rememberCanonicalSnapshots = (snapshots: QuestionSnapshot[]): void => {
+    for (const snapshot of snapshots) {
+      if (!snapshot.questionKey) continue;
+      canonicalSnapshotByKey.set(snapshot.questionKey, snapshot);
+    }
+  };
 
   if (llmFields.length > 0) {
     // 6a. LLM normalization via adapter.extract
@@ -3089,6 +3096,7 @@ export async function fillFormOnPage(
   }
 
   result.questionSnapshots = initialQuestionSnapshots;
+  rememberCanonicalSnapshots(initialQuestionSnapshots);
 
   // Map field IDs → question keys and thread demographicHint from normalized questions
   const demographicFieldIds = new Set<string>();
@@ -3348,6 +3356,7 @@ export async function fillFormOnPage(
         .filter((snap): snap is QuestionSnapshot => snap !== null);
 
       if (newSnapshots.length > 0) {
+        rememberCanonicalSnapshots(newSnapshots);
         await notifyObserver(
           'onQuestionsNormalized',
           observers?.onQuestionsNormalized
@@ -3677,6 +3686,24 @@ export async function fillFormOnPage(
     fieldIdToInitialKey.set(fid, key);
   }
 
+  const mapSnapshotToExistingQuestion = (
+    snapshot: QuestionSnapshot,
+    mappedKey: string,
+    fieldIds: string[],
+  ): QuestionSnapshot => {
+    const canonical = canonicalSnapshotByKey.get(mappedKey);
+    if (!canonical) {
+      return { ...snapshot, questionKey: mappedKey, fieldIds: [...fieldIds] };
+    }
+    return { ...canonical, questionKey: mappedKey, fieldIds: [...fieldIds] };
+  };
+  const mapSnapshotKey = (snapshot: QuestionSnapshot): string => {
+    const mappedKey = snapshot.fieldIds
+      .map((fid) => fieldIdToInitialKey.get(fid))
+      .find((key) => key !== undefined);
+    return mappedKey ?? snapshot.questionKey;
+  };
+
   // outcomeSnapshots will be used for building questionOutcomes (may differ from
   // finalSnapshots when retirement splitting remaps/splits heuristic snapshots).
   let outcomeSnapshots = finalSnapshots;
@@ -3714,16 +3741,24 @@ export async function fillFormOnPage(
             unmapped.push(fid);
           }
         }
-        if (keyGroups.size <= 1) {
-          // All agree (or none mapped) — use .find() as before
-          const matchedKey = [...keyGroups.keys()][0];
-          retirementSnapshots.push(matchedKey ? { ...snap, questionKey: matchedKey } : snap);
-        } else {
-          // Split: each key group becomes its own snapshot
-          for (const [key, fids] of keyGroups) {
-            retirementSnapshots.push({ ...snap, questionKey: key, fieldIds: fids });
+        if (keyGroups.size === 0) {
+          retirementSnapshots.push(snap);
+        } else if (keyGroups.size === 1) {
+          const [matchedKey, mappedFieldIds] = [...keyGroups.entries()][0];
+          retirementSnapshots.push(
+            mapSnapshotToExistingQuestion(snap, matchedKey, mappedFieldIds),
+          );
+          if (unmapped.length > 0) {
+            retirementSnapshots.push({ ...snap, fieldIds: unmapped });
           }
-          // Unmapped fieldIds keep the heuristic key
+        } else {
+          // Split: each key group becomes its own snapshot with metadata from
+          // the canonical mapped question to avoid leaking grouped flags.
+          for (const [key, fids] of keyGroups) {
+            retirementSnapshots.push(
+              mapSnapshotToExistingQuestion(snap, key, fids),
+            );
+          }
           if (unmapped.length > 0) {
             retirementSnapshots.push({ ...snap, fieldIds: unmapped });
           }
@@ -3769,12 +3804,10 @@ export async function fillFormOnPage(
 
     // Remap heuristic key to LLM-reconciled key so recordOutcome can find the
     // matching question in the page context (which was synced with initial keys).
-    const mappedKey = question.fieldIds
-      .map((fid) => fieldIdToInitialKey.get(fid))
-      .find((key) => key !== undefined);
+    const mappedKey = mapSnapshotKey(question);
 
     return {
-      questionKey: mappedKey ?? question.questionKey,
+      questionKey: mappedKey,
       state,
       currentValue: resolvedAnswer,
       confidence: hasFilledField
@@ -3788,24 +3821,18 @@ export async function fillFormOnPage(
 
   // Build required-key set using mapped keys for consistency with outcomes
   const requiredMappedKeys = new Set(
-    finalSnapshots
+    outcomeSnapshots
       .filter((q) => q.required)
-      .map((q) => {
-        const mk = q.fieldIds.map((fid) => fieldIdToInitialKey.get(fid)).find((k) => k !== undefined);
-        return mk ?? q.questionKey;
-      }),
+      .map((q) => mapSnapshotKey(q)),
   );
-  result.unresolvedQuestionKeys = questionOutcomes
+  result.unresolvedQuestionKeys = [...new Set(questionOutcomes
     .filter((outcome) => outcome.state !== 'verified' && outcome.state !== 'filled')
     .map((outcome) => outcome.questionKey)
-    .filter((key) => requiredMappedKeys.has(key));
+    .filter((key) => requiredMappedKeys.has(key)))];
 
-  result.riskyQuestionKeys = finalSnapshots
+  result.riskyQuestionKeys = [...new Set(outcomeSnapshots
     .filter((question) => !question.required && question.riskLevel !== 'none')
-    .map((question) => {
-      const mk = question.fieldIds.map((fid) => fieldIdToInitialKey.get(fid)).find((k) => k !== undefined);
-      return mk ?? question.questionKey;
-    });
+    .map((question) => mapSnapshotKey(question)))];
 
   for (const outcome of questionOutcomes) {
     await notifyObserver(

@@ -249,10 +249,26 @@ export function syncQuestions(
     .map((q, idx) => ({ q, idx }))
     .filter(({ q }) => q.state !== 'skipped');
 
-  // Pass 1: protected-state questions claim first (by orderIndex within protected set)
+  // Pass 1: protected-state questions claim first.
+  // Within protected states, prefer verified > filled > planned before orderIndex.
+  const PROTECTED_CLAIM_PRIORITY: Record<QuestionRecord['state'], number> = {
+    verified: 3,
+    filled: 2,
+    planned: 1,
+    attempted: 0,
+    uncertain: 0,
+    failed: 0,
+    skipped: 0,
+    empty: 0,
+  };
   const protectedLive = liveForConsolidation
     .filter(({ q }) => CONSOLIDATION_PROTECTED.has(q.state))
-    .sort((a, b) => a.q.orderIndex - b.q.orderIndex);
+    .sort((a, b) => {
+      const priorityDiff =
+        PROTECTED_CLAIM_PRIORITY[b.q.state] - PROTECTED_CLAIM_PRIORITY[a.q.state];
+      if (priorityDiff !== 0) return priorityDiff;
+      return a.q.orderIndex - b.q.orderIndex;
+    });
   for (const { q, idx } of protectedLive) {
     for (const fid of q.fieldIds) {
       if (!claimedFieldIds.has(fid)) {
