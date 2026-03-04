@@ -642,10 +642,8 @@ export class SmartApplyHandler implements TaskHandler {
       'Click the "Apply" or "Apply Now" button to start the job application. ' +
       'If a modal or dialog appears with options like "Apply Manually", "Autofill with Resume", ' +
       '"Use My Last Application", etc., click "Apply Manually" to proceed. ' +
-      'Do NOT stop after clicking Apply if a modal with further choices appears — ' +
-      'you must click through it to actually begin the application. ' +
-      'IMPORTANT: Once the application reaches ANY sign-in/login/auth page, STOP and report done. ' +
-      'Do NOT click Sign In with email, Create Account, or any auth option in this step.',
+      'Once you have clicked Apply AND handled any modal (e.g. clicked "Apply Manually"), STOP and report done. ' +
+      'Do NOT fill in any form fields, do NOT click Next, and do NOT click any sign-in/auth buttons.',
     );
 
     // The LLM agent may report "failure" if the page navigated to a login/auth
