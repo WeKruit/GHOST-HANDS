@@ -32,14 +32,9 @@
   },
   "peerDependenciesMeta": {
     "hono": { "optional": true },
-    "pg": { "optional": true },
-    "pg-boss": { "optional": true },
-    "ioredis": { "optional": true },
     "@supabase/supabase-js": { "optional": true },
     "@actionbookdev/sdk": { "optional": true },
-    "magnitude-extract": { "optional": true },
-    "@mastra/core": { "optional": true },
-    "@mastra/pg": { "optional": true }
+    "magnitude-extract": { "optional": true }
   },
   "devDependencies": {
     "typescript": "~5.7.2",
