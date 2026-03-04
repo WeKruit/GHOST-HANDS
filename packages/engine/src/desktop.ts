@@ -32,24 +32,51 @@ class LocalWorkerManagerImpl extends EventEmitter implements LocalWorkerManager 
       lastError: null,
       startedAt: Date.now(),
     };
-    const registration = await this.broker.registerLocalWorker({
+    this.options.logger?.info?.('Starting local worker manager', {
       desktopWorkerId: this.options.desktopWorkerId,
-      deviceId: this.options.desktopWorkerId,
-      appVersion: input.appVersion,
+      hasSecretsProvider: !!this.options.secrets,
+      hasStorage: !!this.options.storage?.mastraStatePath,
+      hasWorkerBinaryPath: !!this.options.workerBinaryPath,
     });
-    this.sessionToken = registration.sessionToken;
-    this.state = {
-      ...this.state,
-      status: 'running',
-    };
-    this.emit('status', {
-      type: 'ready',
-      desktopWorkerId: registration.desktopWorkerId,
-      userId: input.userId,
-    });
+
+    try {
+      const registration = await this.broker.registerLocalWorker({
+        desktopWorkerId: this.options.desktopWorkerId,
+        deviceId: this.options.desktopWorkerId,
+        appVersion: input.appVersion,
+      });
+      this.sessionToken = registration.sessionToken;
+      this.state = {
+        ...this.state,
+        status: 'running',
+      };
+      this.emit('status', {
+        type: 'ready',
+        desktopWorkerId: registration.desktopWorkerId,
+        userId: input.userId,
+      });
+    } catch (error: any) {
+      const message = error?.message ?? 'Failed to start local worker manager';
+      this.state = {
+        ...this.state,
+        status: 'error',
+        lastError: message,
+      };
+      this.options.logger?.error?.(message, {
+        desktopWorkerId: this.options.desktopWorkerId,
+      });
+      if (this.listenerCount('error') > 0) {
+        this.emit('error', { type: 'fatal', error: message });
+      }
+      throw error;
+    }
   }
 
   async stop(reason?: string): Promise<void> {
+    this.options.logger?.info?.('Stopping local worker manager', {
+      desktopWorkerId: this.options.desktopWorkerId,
+      reason: reason ?? null,
+    });
     this.state = {
       ...this.state,
       status: 'stopped',
@@ -61,6 +88,9 @@ class LocalWorkerManagerImpl extends EventEmitter implements LocalWorkerManager 
   }
 
   async drain(): Promise<void> {
+    this.options.logger?.info?.('Draining local worker manager', {
+      desktopWorkerId: this.options.desktopWorkerId,
+    });
     this.state = {
       ...this.state,
       status: 'draining',

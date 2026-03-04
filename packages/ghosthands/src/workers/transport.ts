@@ -39,6 +39,7 @@ export interface JobSource {
 export interface JobSink {
   emitEvent(jobId: string, event: JobEventInput): Promise<void>;
   emitProgress(jobId: string, progress: ProgressPayload): Promise<void>;
+  awaitingReview(jobId: string, result: JobCompletionPayload): Promise<void>;
   complete(jobId: string, result: JobCompletionPayload): Promise<void>;
   fail(jobId: string, error: JobFailurePayload): Promise<void>;
 }
