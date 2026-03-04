@@ -3336,7 +3336,11 @@ export async function fillFormOnPage(
       // records share f1, so neither has allFieldsMissing).
       const newSnapshots = rawNewSnapshots
         .map((snap) => {
-          const cleanFieldIds = snap.fieldIds.filter((fid) => !fieldIdToQuestionKey[fid]);
+          // Keep fieldIds that are either brand-new (not yet in fieldIdToQuestionKey)
+          // OR were normalized but never got an answer (giving them a second chance).
+          const cleanFieldIds = snap.fieldIds.filter(
+            (fid) => !fieldIdToQuestionKey[fid] || fieldIdToResolvedAnswer[fid] === undefined,
+          );
           if (cleanFieldIds.length === snap.fieldIds.length) return snap;
           if (cleanFieldIds.length === 0) return null;
           return { ...snap, fieldIds: cleanFieldIds };
@@ -3688,12 +3692,39 @@ export async function fillFormOnPage(
       // mapping current DOM fieldIds back to existing question keys. This allows
       // the fullSync retirement logic to detect fields that disappeared during fill
       // without introducing key mismatches that would create duplicate questions.
-      const retirementSnapshots = finalSnapshots.map((snap) => {
-        const matchedKey = snap.fieldIds
-          .map((fid) => fieldIdToInitialKey.get(fid))
-          .find((key) => key !== undefined);
-        return matchedKey ? { ...snap, questionKey: matchedKey } : snap;
-      });
+      // Map each heuristic snapshot to the LLM-reconciled key. If all mapped
+      // fieldIds agree on one key, use it directly. If they disagree (heuristic
+      // grouped fields from different LLM questions), split into per-key snapshots
+      // so each page-context question gets its own retirement signal.
+      const retirementSnapshots: typeof finalSnapshots = [];
+      for (const snap of finalSnapshots) {
+        const keyGroups = new Map<string, string[]>();
+        const unmapped: string[] = [];
+        for (const fid of snap.fieldIds) {
+          const key = fieldIdToInitialKey.get(fid);
+          if (key) {
+            const group = keyGroups.get(key) || [];
+            group.push(fid);
+            keyGroups.set(key, group);
+          } else {
+            unmapped.push(fid);
+          }
+        }
+        if (keyGroups.size <= 1) {
+          // All agree (or none mapped) — use .find() as before
+          const matchedKey = [...keyGroups.keys()][0];
+          retirementSnapshots.push(matchedKey ? { ...snap, questionKey: matchedKey } : snap);
+        } else {
+          // Split: each key group becomes its own snapshot
+          for (const [key, fids] of keyGroups) {
+            retirementSnapshots.push({ ...snap, questionKey: key, fieldIds: fids });
+          }
+          // Unmapped fieldIds keep the heuristic key
+          if (unmapped.length > 0) {
+            retirementSnapshots.push({ ...snap, fieldIds: unmapped });
+          }
+        }
+      }
       await notifyObserver(
         'onQuestionsNormalized',
         observers?.onQuestionsNormalized
