@@ -3099,9 +3099,15 @@ export async function fillFormOnPage(
         fieldIdToResolvedAnswer[field.id] = '0';
       } else if (field.type === 'date') {
         fieldIdToResolvedAnswer[field.id] = new Date().toISOString().slice(0, 10);
+      } else if (field.type === 'email') {
+        fieldIdToResolvedAnswer[field.id] = 'n/a@example.com';
+      } else if (field.type === 'tel') {
+        fieldIdToResolvedAnswer[field.id] = '0000000000';
+      } else if (field.type === 'url') {
+        fieldIdToResolvedAnswer[field.id] = 'https://example.com';
       } else if (field.type === 'textarea') {
         fieldIdToResolvedAnswer[field.id] = 'N/A';
-      } else if (field.type === 'text' || field.type === 'email' || field.type === 'tel' || field.type === 'url') {
+      } else if (field.type === 'text') {
         fieldIdToResolvedAnswer[field.id] = 'N/A';
       }
       if (fieldIdToResolvedAnswer[field.id] && fieldIdToResolvedAnswer[field.id] !== existing) {
@@ -3118,9 +3124,11 @@ export async function fillFormOnPage(
       if (!questionKey) continue;
       const alreadyDecided = result.answerDecisions?.some((d) => d.questionKey === questionKey);
       if (alreadyDecided) continue;
-      // Determine accurate answerMode based on what kind of fallback was applied
+      // Determine accurate answerMode: default_decline only when the answer
+      // matches a decline/opt-out lexicon; otherwise best_effort_guess.
+      const isDecline = /prefer\s*not|decline|do\s*not\s*wish|rather\s*not|n\/a/i.test(answer);
       const hasChoices = (field.choices?.length ?? 0) > 0 || (field.options?.length ?? 0) > 0;
-      const mode: AnswerMode = hasChoices ? 'default_decline' : 'best_effort_guess';
+      const mode: AnswerMode = isDecline ? 'default_decline' : 'best_effort_guess';
       fallbackDecisions.push({
         questionKey,
         answer,
