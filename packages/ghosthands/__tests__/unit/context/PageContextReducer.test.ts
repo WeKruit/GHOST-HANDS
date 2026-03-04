@@ -351,6 +351,42 @@ describe('PageContextReducer', () => {
     expect(keys).toContain('q::b::text::no-options');
   });
 
+  it('retires attempted (non-protected) questions when their fields disappear on full sync', () => {
+    const base = createEmptySession('job-attempt-retire', 'run-attempt-retire');
+    const page = createPageRecord({
+      pageType: 'questions',
+      pageTitle: 'Mixed',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-attempt-retire',
+      pageStepKey: 'questions::mixed',
+      pageSequence: 1,
+    });
+
+    let session = applyPageEntry(base, page);
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::a::text::no-options', fieldIds: ['ff-1'], promptText: 'First name', questionType: 'text' }),
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['ff-2'], promptText: 'Last name', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    // Simulate an attempted fill (state transitions: empty → planned → attempted)
+    session = applyAnswerDecisions(session, [
+      { questionKey: 'q::a::text::no-options', answer: 'John', confidence: 0.95, source: 'llm' },
+    ]);
+    // Manually transition past planned to 'attempted' (simulating a DOM write attempt)
+    const q1Pre = session.pages[0].questions.find((q) => q.questionKey === 'q::a::text::no-options');
+    if (q1Pre) (q1Pre as any).state = 'attempted';
+
+    // Full sync drops ff-1 — attempted question should be RETIRED (not protected)
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['ff-2'], promptText: 'Last name', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    const q1 = session.pages[0].questions.find((q) => q.questionKey === 'q::a::text::no-options');
+    expect(q1).toBeDefined();
+    expect(q1!.state).toBe('skipped');
+    expect(q1!.warnings).toContain('retired_missing_from_dom');
+  });
+
   it('includes best_effort_guess answers in bestEffortGuesses report', () => {
     const base = createEmptySession('job-beg', 'run-beg');
     const page = createPageRecord({

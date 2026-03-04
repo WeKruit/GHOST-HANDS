@@ -273,4 +273,24 @@ describe('QuestionNormalizer', () => {
     expect(result[0].fieldIds).not.toContain('f999');
     expect(result[0].warnings).toContain('invalid_field_ids_discarded');
   });
+
+  it('reconciliation deduplicates keys that collide between LLM draft and heuristic fallback', () => {
+    const liveFields = [
+      { id: 'f1', name: 'Phone', type: 'tel', section: 'Contact', required: true },
+      { id: 'f2', name: 'Phone', type: 'tel', section: 'Contact', required: false },
+    ];
+    const heuristic = normalizeExtractedQuestions(liveFields);
+    // LLM only covers f1, f2 falls to heuristic fallback — both produce same base key
+    const llmDrafts: NormalizedQuestionDraft[] = [
+      { promptText: 'Phone', questionType: 'tel', required: true, fieldIds: ['f1'], options: [], groupingConfidence: 0.9, warnings: [] },
+    ];
+
+    const result = reconcileNormalizedQuestions(heuristic, llmDrafts, liveFields);
+    expect(result).toHaveLength(2);
+    const allFieldIds = result.flatMap((q) => q.fieldIds);
+    expect(allFieldIds).toContain('f1');
+    expect(allFieldIds).toContain('f2');
+    // Keys must be distinct even though both originate from "Phone"
+    expect(result[0].questionKey).not.toBe(result[1].questionKey);
+  });
 });
