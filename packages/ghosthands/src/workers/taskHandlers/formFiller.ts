@@ -3649,6 +3649,15 @@ export async function fillFormOnPage(
   const finalSnapshots = normalizeExtractedQuestions(
     postVisible.filter((field) => field.type !== 'file'),
   );
+  // Build a fieldId → questionKey map for remapping heuristic keys back to
+  // LLM-reconciled keys. Used for both the retirement sync and outcome dispatch.
+  const fieldIdToInitialKey = new Map<string, string>();
+  if (initialQuestionSnapshots.length > 0) {
+    for (const snap of initialQuestionSnapshots) {
+      for (const fid of snap.fieldIds) fieldIdToInitialKey.set(fid, snap.questionKey);
+    }
+  }
+
   if (finalSnapshots.length > 0) {
     result.questionSnapshots = finalSnapshots;
     if (initialQuestionSnapshots.length === 0) {
@@ -3664,13 +3673,9 @@ export async function fillFormOnPage(
       // mapping current DOM fieldIds back to existing question keys. This allows
       // the fullSync retirement logic to detect fields that disappeared during fill
       // without introducing key mismatches that would create duplicate questions.
-      const fieldIdToKey = new Map<string, string>();
-      for (const snap of initialQuestionSnapshots) {
-        for (const fid of snap.fieldIds) fieldIdToKey.set(fid, snap.questionKey);
-      }
       const retirementSnapshots = finalSnapshots.map((snap) => {
         const matchedKey = snap.fieldIds
-          .map((fid) => fieldIdToKey.get(fid))
+          .map((fid) => fieldIdToInitialKey.get(fid))
           .find((key) => key !== undefined);
         return matchedKey ? { ...snap, questionKey: matchedKey } : snap;
       });
@@ -3709,8 +3714,14 @@ export async function fillFormOnPage(
       ? 'magnitude'
       : 'dom';
 
+    // Remap heuristic key to LLM-reconciled key so recordOutcome can find the
+    // matching question in the page context (which was synced with initial keys).
+    const mappedKey = question.fieldIds
+      .map((fid) => fieldIdToInitialKey.get(fid))
+      .find((key) => key !== undefined);
+
     return {
-      questionKey: question.questionKey,
+      questionKey: mappedKey ?? question.questionKey,
       state,
       currentValue: resolvedAnswer,
       confidence: hasFilledField
@@ -3721,17 +3732,27 @@ export async function fillFormOnPage(
   });
 
   result.questionOutcomes = questionOutcomes;
+
+  // Build required-key set using mapped keys for consistency with outcomes
+  const requiredMappedKeys = new Set(
+    finalSnapshots
+      .filter((q) => q.required)
+      .map((q) => {
+        const mk = q.fieldIds.map((fid) => fieldIdToInitialKey.get(fid)).find((k) => k !== undefined);
+        return mk ?? q.questionKey;
+      }),
+  );
   result.unresolvedQuestionKeys = questionOutcomes
     .filter((outcome) => outcome.state !== 'verified' && outcome.state !== 'filled')
     .map((outcome) => outcome.questionKey)
-    .filter((questionKey) =>
-      finalSnapshots.some(
-        (question) => question.questionKey === questionKey && question.required,
-      ),
-    );
+    .filter((key) => requiredMappedKeys.has(key));
+
   result.riskyQuestionKeys = finalSnapshots
     .filter((question) => !question.required && question.riskLevel !== 'none')
-    .map((question) => question.questionKey);
+    .map((question) => {
+      const mk = question.fieldIds.map((fid) => fieldIdToInitialKey.get(fid)).find((k) => k !== undefined);
+      return mk ?? question.questionKey;
+    });
 
   for (const outcome of questionOutcomes) {
     await notifyObserver(
