@@ -3677,6 +3677,10 @@ export async function fillFormOnPage(
     fieldIdToInitialKey.set(fid, key);
   }
 
+  // outcomeSnapshots will be used for building questionOutcomes (may differ from
+  // finalSnapshots when retirement splitting remaps/splits heuristic snapshots).
+  let outcomeSnapshots = finalSnapshots;
+
   if (finalSnapshots.length > 0) {
     result.questionSnapshots = finalSnapshots;
     if (initialQuestionSnapshots.length === 0) {
@@ -3725,6 +3729,7 @@ export async function fillFormOnPage(
           }
         }
       }
+      outcomeSnapshots = retirementSnapshots;
       await notifyObserver(
         'onQuestionsNormalized',
         observers?.onQuestionsNormalized
@@ -3742,7 +3747,9 @@ export async function fillFormOnPage(
     }
   }
 
-  const questionOutcomes: QuestionOutcome[] = finalSnapshots.map((question) => {
+  // Use outcomeSnapshots (post-split when retirement splitting was applied) so
+  // that each page-context question gets its own outcome, not just the first key.
+  const questionOutcomes: QuestionOutcome[] = outcomeSnapshots.map((question) => {
     const resolvedAnswer = question.fieldIds
       .map((fieldId) => fieldIdToResolvedAnswer[fieldId])
       .find((value) => typeof value === 'string' && value.length > 0);
