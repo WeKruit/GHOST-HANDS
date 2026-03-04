@@ -1383,6 +1383,7 @@ export class JobExecutor {
       logger.warn(failMsg, { jobId: job.id });
 
       await this.updateJobStatus(job.id, 'failed', failMsg);
+      await this.logJobEvent(job.id, 'mastra_unavailable', { message: failMsg });
       await this.supabase
         .from('gh_automation_jobs')
         .update({
