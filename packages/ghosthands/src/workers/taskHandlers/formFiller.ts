@@ -339,6 +339,71 @@ function getAnswerForField(
   return getAnswer(answers, field);
 }
 
+// ── MagnitudeHand neighbor context ───────────────────────────
+
+const NEIGHBOR_RADIUS = 4;
+
+/**
+ * Build a text snippet showing the target field in context of its neighbors.
+ * This helps MagnitudeHand understand ambiguous field labels (e.g. "Yes") by
+ * showing surrounding fields so the visual agent can reason about what the
+ * field actually is.
+ */
+function buildNeighborContext(
+  target: FormField,
+  allVisible: FormField[],
+  answers: AnswerMap,
+  fieldIdMap?: Record<string, string>,
+  filledIds?: Set<string>,
+): string {
+  const idx = allVisible.findIndex((f) => f.id === target.id);
+  if (idx === -1) return '';
+
+  const start = Math.max(0, idx - NEIGHBOR_RADIUS);
+  const end = Math.min(allVisible.length, idx + NEIGHBOR_RADIUS + 1);
+  const neighbors = allVisible.slice(start, end);
+
+  if (neighbors.length <= 1) return '';
+
+  const lines: string[] = [];
+  let lastSection = '';
+
+  for (const f of neighbors) {
+    if (f.section && f.section !== lastSection) {
+      lines.push(`  [${f.section}]`);
+      lastSection = f.section;
+    }
+
+    const isTarget = f.id === target.id;
+    const prefix = isTarget ? '  >>> ' : '      ';
+    let desc = f.name || '(unlabeled)';
+
+    // Add type annotation for disambiguation (skip plain text — too noisy)
+    if (f.type && f.type !== 'text') {
+      desc += ` (${f.type})`;
+    }
+
+    // Show choices for radio/checkbox groups
+    if (f.choices?.length) {
+      desc += ` [${f.choices.join(' | ')}]`;
+    }
+
+    // Show filled value for non-target neighbors
+    if (!isTarget && filledIds?.has(f.id)) {
+      const ans = getAnswerForField(answers, f, fieldIdMap);
+      if (ans) {
+        desc += ` = "${ans.length > 40 ? ans.slice(0, 37) + '...' : ans}"`;
+      } else {
+        desc += ` (filled)`;
+      }
+    }
+
+    lines.push(`${prefix}${desc}`);
+  }
+
+  return lines.join('\n');
+}
+
 // ── Browser-side injection ───────────────────────────────────
 
 async function injectHelpers(page: Page): Promise<void> {
@@ -366,8 +431,11 @@ async function injectHelpers(page: Page): Promise<void> {
             .filter(Boolean).join(' ');
           if (t) return t;
         }
+        var elType = el.type || el.getAttribute('role') || '';
         var al = el.getAttribute('aria-label');
-        if (al) {
+        // For radio/checkbox, aria-label is the option text ("Yes"/"No"), not the
+        // question label.  Skip it here — it's captured separately in itemLabel.
+        if (al && elType !== 'radio' && elType !== 'checkbox') {
           al = al.trim();
           if (el.getAttribute('aria-haspopup') === 'listbox' && el.textContent) {
             var val = el.textContent.trim();
@@ -997,7 +1065,7 @@ async function generateAnswers(fields: FormField[], profileText: string): Promis
     max_tokens: 4096,
     messages: [{
       role: 'user',
-      content: `You are filling out a job application form on behalf of an applicant. Today's date is ${new Date().toISOString().split('T')[0]}.
+      content: `You are filling out a job application form on behalf of an applicant. Today's date is ${new Date().toLocaleDateString('en-CA')}.
 
 Here is their profile:
 
@@ -1379,7 +1447,9 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
       }
 
       // Multi-select values (comma-separated, or skill fields with single/multi values)
-      const values = answer ? answer.split(',').map(v => v.trim()).filter(Boolean) : [];
+      const MAX_SKILL_TAGS = 3; // Cap skill entries to avoid slow typeahead loops
+      const allValues = answer ? answer.split(',').map(v => v.trim()).filter(Boolean) : [];
+      const values = isSkillField ? allValues.slice(0, MAX_SKILL_TAGS) : allValues;
       if ((answer && answer.includes(',')) || (isSkillField && values.length > 0)) {
         let clicked = 0;
         try {
@@ -1832,7 +1902,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
         ({ ffId, text }) => {
           const el = document.querySelector(`[data-ff-id="${ffId}"]`);
           if (!el) return false;
-          const group = el.closest('[role="radiogroup"], .radio-cards, .radio-group') || el;
+          const group = el.closest('[role="radiogroup"], [role="group"], .radio-cards, .radio-group') || el;
           const items = group.querySelectorAll('[role="radio"], label.radio-card, .radio-card');
           if (text) {
             for (const item of items) {
@@ -2517,6 +2587,7 @@ export async function fillFormOnPage(
   const postVisible = postFields.filter((f) => f.visibleByDefault);
 
   const unfilledFields: FormField[] = [];
+  const filledIds = new Set<string>(domFilledOk);
   for (const f of postVisible) {
     // Skip file inputs and non-interactive types from MagnitudeHand
     if (f.type === 'file') continue;
@@ -2531,7 +2602,9 @@ export async function fillFormOnPage(
     if (domFilledOk.has(f.id)) continue;
 
     const filled = await isFieldFilled(page, f.id);
-    if (!filled) {
+    if (filled) {
+      filledIds.add(f.id);
+    } else {
       const answer = getAnswerForField(answers, f, fieldIdMap)
         ?? (isSkillLikeFieldName(f.name) && profileSkillsCsv ? profileSkillsCsv : undefined);
       if (answer !== undefined && answer.trim() === '') continue;
@@ -2561,8 +2634,15 @@ export async function fillFormOnPage(
 
       const answer = getAnswerForField(answers, field, fieldIdMap)
         ?? (isSkillLikeFieldName(field.name) && profileSkillsCsv ? profileSkillsCsv : undefined);
-      let prompt = `You are filling out a job application for this person. Today's date is ${new Date().toISOString().split('T')[0]}.\n${profileText.trim()}\n\n`;
-      prompt += `Fill the form field labeled "${field.name}"`;
+      let prompt = `You are filling out a job application for this person. Today's date is ${new Date().toLocaleDateString('en-CA')}.\n${profileText.trim()}\n\n`;
+
+      const neighborCtx = buildNeighborContext(field, postVisible, answers, fieldIdMap, filledIds);
+      if (neighborCtx) {
+        prompt += `Here are the nearby form fields on this page (the target field is marked with >>>):\n${neighborCtx}\n\n`;
+        prompt += `Fill the form field marked with >>>`;
+      } else {
+        prompt += `Fill the form field labeled "${field.name}"`;
+      }
       if (answer) {
         prompt += ` with the value "${answer}"`;
       } else {
@@ -2590,7 +2670,7 @@ export async function fillFormOnPage(
 
       prompt += ` Focus ONLY on this single field. Do NOT interact with any other fields or buttons.`;
 
-      console.log(`[formFiller] [MagnitudeHand] act() → "${field.name}"…`);
+      console.log(`[formFiller] [MagnitudeHand] act() → "${field.name}"${neighborCtx ? ' (with neighbor context)' : ''}…`);
       try {
         await adapter.act(prompt, { timeoutMs: MAGNITUDE_HAND_ACT_TIMEOUT_MS });
         console.log(`[formFiller] [MagnitudeHand] Filled "${field.name}" OK`);

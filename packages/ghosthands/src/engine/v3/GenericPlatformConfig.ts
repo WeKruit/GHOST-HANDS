@@ -2092,7 +2092,7 @@ ${dataBlock}`;
           const nativeSetter = Object.getOwnPropertyDescriptor(
             HTMLInputElement.prototype, 'value'
           )?.set;
-          const newValue = new Date().toISOString().split('T')[0];
+          const newValue = new Date().toLocaleDateString('en-CA');
           if (nativeSetter) {
             nativeSetter.call(input, newValue);
           } else {
