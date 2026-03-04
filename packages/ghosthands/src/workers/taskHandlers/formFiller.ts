@@ -3089,12 +3089,20 @@ export async function fillFormOnPage(
     for (const field of llmFields) {
       const existing = fieldIdToResolvedAnswer[field.id];
       if (existing && existing.trim()) continue;
-      // Best-effort fallback
+      // Best-effort fallback: choices → options → type-based default
       if (field.choices?.length) {
         fieldIdToResolvedAnswer[field.id] = field.choices[0];
       } else if (field.options?.length) {
         const nonPlaceholder = field.options.filter((o) => !PLACEHOLDER_RE.test(o.trim()));
         if (nonPlaceholder.length) fieldIdToResolvedAnswer[field.id] = nonPlaceholder[0];
+      } else if (field.type === 'number') {
+        fieldIdToResolvedAnswer[field.id] = '0';
+      } else if (field.type === 'date') {
+        fieldIdToResolvedAnswer[field.id] = new Date().toISOString().slice(0, 10);
+      } else if (field.type === 'textarea') {
+        fieldIdToResolvedAnswer[field.id] = 'N/A';
+      } else if (field.type === 'text' || field.type === 'email' || field.type === 'tel' || field.type === 'url') {
+        fieldIdToResolvedAnswer[field.id] = 'N/A';
       }
       if (fieldIdToResolvedAnswer[field.id] && fieldIdToResolvedAnswer[field.id] !== existing) {
         console.log(`[formFiller] Never-empty fallback: "${field.name}" → "${fieldIdToResolvedAnswer[field.id]}"`);
@@ -3110,12 +3118,15 @@ export async function fillFormOnPage(
       if (!questionKey) continue;
       const alreadyDecided = result.answerDecisions?.some((d) => d.questionKey === questionKey);
       if (alreadyDecided) continue;
+      // Determine accurate answerMode based on what kind of fallback was applied
+      const hasChoices = (field.choices?.length ?? 0) > 0 || (field.options?.length ?? 0) > 0;
+      const mode: AnswerMode = hasChoices ? 'default_decline' : 'best_effort_guess';
       fallbackDecisions.push({
         questionKey,
         answer,
-        confidence: 0.3,
+        confidence: hasChoices ? 0.3 : 0.1,
         source: 'dom' as const,
-        answerMode: 'default_decline' as AnswerMode,
+        answerMode: mode,
       });
     }
     if (fallbackDecisions.length > 0) {
@@ -3365,7 +3376,8 @@ export async function fillFormOnPage(
     if (filled) {
       filledIds.add(f.id);
     } else {
-      const answer = getAnswerForField(answers, f, fieldIdMap)
+      const answer = fieldIdToResolvedAnswer[f.id]
+        ?? getAnswerForField(answers, f, fieldIdMap)
         ?? (isSkillLikeFieldName(f.name) && profileSkillsCsv ? profileSkillsCsv : undefined);
       if (answer !== undefined && answer.trim() === '') continue;
       unfilledFields.push(f);
@@ -3392,7 +3404,8 @@ export async function fillFormOnPage(
       }, field.id);
       await page.waitForTimeout(300);
 
-      const answer = getAnswerForField(answers, field, fieldIdMap)
+      const answer = fieldIdToResolvedAnswer[field.id]
+        ?? getAnswerForField(answers, field, fieldIdMap)
         ?? (isSkillLikeFieldName(field.name) && profileSkillsCsv ? profileSkillsCsv : undefined);
       let prompt = `You are filling out a job application for this person. Today's date is ${new Date().toLocaleDateString('en-CA')}.\n${profileText.trim()}\n\n`;
 
