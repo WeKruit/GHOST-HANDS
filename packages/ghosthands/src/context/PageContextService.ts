@@ -13,6 +13,9 @@ import {
 } from './PageContextReducer.js';
 import { RedisPageContextStore } from './RedisPageContextStore.js';
 import { SupabasePageContextFlusher } from './SupabasePageContextFlusher.js';
+import { getLogger } from '../monitoring/logger.js';
+
+const logger = getLogger({ service: 'page-context' });
 import type {
   AnswerDecision,
   ContextReport,
@@ -113,6 +116,7 @@ export interface PageContextService {
 export class LivePageContextService implements PageContextService {
   private session: PageContextSession | null = null;
   private mastraRunId: string | null = null;
+  private conflictCount = 0;
 
   constructor(
     private readonly jobId: string,
@@ -314,16 +318,19 @@ export class LivePageContextService implements PageContextService {
     // Conflict: adopt the persisted state to avoid overwriting concurrent writes.
     // Our local mutations are lost, but this is safer than blindly overwriting
     // another writer's state with our stale snapshot.
+    this.conflictCount += 1;
     const latest = firstAttempt.current;
     const latestVersion = typeof latest?.version === 'number' ? latest.version : 'unknown';
     const expectedLabel =
       typeof expectedVersion === 'number' ? String(expectedVersion) : 'none';
-    console.warn(
-      `[page-context] optimistic write conflict; adopting persisted state `
-        + `(jobId=${this.jobId}, mastraRunId=${this.mastraRunId ?? 'uninitialized'}, `
-        + `expectedVersion=${expectedLabel}, localVersion=${current.version}, `
-        + `persistedVersion=${latestVersion})`,
-    );
+    logger.warn(`Optimistic write conflict #${this.conflictCount}; adopting persisted state`, {
+      jobId: this.jobId,
+      mastraRunId: this.mastraRunId ?? 'uninitialized',
+      expectedVersion: expectedLabel,
+      localVersion: current.version,
+      persistedVersion: latestVersion,
+      conflictCount: this.conflictCount,
+    });
     if (latest) {
       this.session = latest;
     }

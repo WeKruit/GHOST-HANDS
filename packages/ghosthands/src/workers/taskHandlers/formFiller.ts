@@ -117,7 +117,7 @@ const INTERACTIVE_SELECTOR = [
   '[aria-haspopup="listbox"]',
 ].join(', ');
 
-const PLACEHOLDER_RE = /^(select\.{0,3}|select…|please\s+select(\s+one)?|select\s+(one|an?\s+option)|choose\.{0,3}|choose…|please\s+choose(\s+one)?|choose\s+one|pick|start\s+typing|enter\s+(your|an?)\s+\w+|type\s+here|--+\s*(select|choose)?\s*--*|—)$/i;
+const PLACEHOLDER_RE = /^(select\.{0,3}|select…|please\s+select(\s+one)?|select\s+(one|an?\s+option)|choose\.{0,3}|choose…|please\s+choose(\s+one)?|choose\s+one|pick|start\s+typing|enter\s+(your|an?)\s+(name|email|phone|address|city|state|zip|value|number|answer|response|text|url|company|title)|type\s+here|--+\s*(select|choose)?\s*--*|—)$/i;
 
 /** Shared placeholder test — use instead of inline regexes */
 export function isPlaceholderValue(value: string): boolean {

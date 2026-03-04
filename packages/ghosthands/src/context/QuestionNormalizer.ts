@@ -60,7 +60,6 @@ function buildQuestionKey(
   promptText: string,
   questionType: QuestionType,
   optionLabels: string[],
-  ordinal?: number,
 ): QuestionKey {
   const normalizedSection = normalizeText(sectionLabel) || 'root';
   const normalizedPrompt = normalizeText(promptText) || 'unnamed';
@@ -70,8 +69,7 @@ function buildQuestionKey(
       .filter(Boolean)
       .slice(0, 3)
       .join('|') || 'no-options';
-  const base = `${normalizedSection}::${normalizedPrompt}::${questionType}::${optionSignature}`;
-  return ordinal && ordinal > 0 ? `${base}::${ordinal}` : base;
+  return `${normalizedSection}::${normalizedPrompt}::${questionType}::${optionSignature}`;
 }
 
 function buildSnapshot(
@@ -240,13 +238,12 @@ function deduplicateQuestionKeys(questions: QuestionSnapshot[]): QuestionSnapsho
   for (const q of questions) {
     keyCounts.set(q.questionKey, (keyCounts.get(q.questionKey) || 0) + 1);
   }
-  // Only process keys that appear more than once
-  const ordinals = new Map<string, number>();
+  // Only process keys that appear more than once — use sorted fieldIds as a stable
+  // disambiguator instead of position-based ordinals (order-independent)
   return questions.map((q) => {
     if ((keyCounts.get(q.questionKey) || 0) <= 1) return q;
-    const ordinal = ordinals.get(q.questionKey) || 0;
-    ordinals.set(q.questionKey, ordinal + 1);
-    return { ...q, questionKey: `${q.questionKey}::${ordinal}` };
+    const fieldSig = q.fieldIds.slice().sort().join('+') || String(q.orderIndex);
+    return { ...q, questionKey: `${q.questionKey}::${fieldSig}` };
   });
 }
 
