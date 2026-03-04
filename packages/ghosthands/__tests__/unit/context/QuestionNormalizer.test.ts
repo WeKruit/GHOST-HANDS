@@ -157,10 +157,9 @@ describe('QuestionNormalizer', () => {
 
     expect(questions).toHaveLength(2);
     expect(questions[0].questionKey).not.toBe(questions[1].questionKey);
-    // Dedup uses orderIndex as suffix (stable across DOM rerenders)
-    const keys = questions.map((q) => q.questionKey);
-    expect(keys.some((k) => k.endsWith('::0'))).toBe(true);
-    expect(keys.some((k) => k.endsWith('::1'))).toBe(true);
+    // Dedup uses fieldIds as suffix (stable regardless of input order)
+    expect(questions[0].questionKey).toEndWith('::ff-dup-1');
+    expect(questions[1].questionKey).toEndWith('::ff-dup-2');
   });
 
   it('does not append ordinal to unique question keys', () => {
@@ -251,11 +250,12 @@ describe('QuestionNormalizer', () => {
     const result = reconcileNormalizedQuestions(heuristic, llmDrafts, liveFields);
     const phoneQuestions = result.filter((q) => q.promptText === 'Phone number');
     expect(phoneQuestions).toHaveLength(2);
-    // Keys should be distinct via dedup suffix
+    // Keys should be distinct via fieldId-based dedup suffix
     expect(phoneQuestions[0].questionKey).not.toBe(phoneQuestions[1].questionKey);
-    // Both should have ::0 and ::1 suffixes
-    const suffixes = phoneQuestions.map((q) => q.questionKey.match(/::\d+$/)?.[0]).sort();
-    expect(suffixes).toEqual(['::0', '::1']);
+    // Suffixes should be fieldId-based, not counter-based
+    const keys = phoneQuestions.map((q) => q.questionKey).sort();
+    expect(keys.some((k) => k.endsWith('::f1'))).toBe(true);
+    expect(keys.some((k) => k.endsWith('::f2'))).toBe(true);
   });
 
   it('reconciliation discards invalid field IDs from LLM drafts', () => {
@@ -292,5 +292,76 @@ describe('QuestionNormalizer', () => {
     expect(allFieldIds).toContain('f2');
     // Keys must be distinct even though both originate from "Phone"
     expect(result[0].questionKey).not.toBe(result[1].questionKey);
+  });
+
+  it('dedup keys are stable when duplicate DOM order reverses', () => {
+    const forward = normalizeExtractedQuestions([
+      { id: 'ff-phone-1', name: 'Phone', type: 'tel', section: 'Contact', required: true },
+      { id: 'ff-phone-2', name: 'Phone', type: 'tel', section: 'Contact', required: false },
+    ]);
+
+    const reversed = normalizeExtractedQuestions([
+      { id: 'ff-phone-2', name: 'Phone', type: 'tel', section: 'Contact', required: false },
+      { id: 'ff-phone-1', name: 'Phone', type: 'tel', section: 'Contact', required: true },
+    ]);
+
+    // Both scans should produce the same two keys (just in different order)
+    const forwardKeys = forward.map((q) => q.questionKey).sort();
+    const reversedKeys = reversed.map((q) => q.questionKey).sort();
+    expect(forwardKeys).toEqual(reversedKeys);
+
+    // Each key should map to the same fieldId regardless of input order
+    const forwardByKey = new Map(forward.map((q) => [q.questionKey, q]));
+    const reversedByKey = new Map(reversed.map((q) => [q.questionKey, q]));
+    for (const key of forwardKeys) {
+      expect(forwardByKey.get(key)!.fieldIds).toEqual(reversedByKey.get(key)!.fieldIds);
+      expect(forwardByKey.get(key)!.required).toBe(reversedByKey.get(key)!.required);
+    }
+  });
+
+  it('reversed duplicate order does not corrupt merge state', () => {
+    const { syncQuestions, createEmptySession, createPageRecord, applyPageEntry } = require('../../../src/context/PageContextReducer');
+
+    // First scan: Phone(required) then Phone(optional)
+    const scan1 = normalizeExtractedQuestions([
+      { id: 'ff-phone-1', name: 'Phone', type: 'tel', section: 'Contact', required: true },
+      { id: 'ff-phone-2', name: 'Phone', type: 'tel', section: 'Contact', required: false },
+    ]);
+
+    let session = createEmptySession('job-1', 'run-1');
+    const page = createPageRecord({
+      pageType: 'form',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-1',
+      pageStepKey: 'step-1',
+      pageSequence: 0,
+    });
+    session = applyPageEntry(session, page);
+    session = syncQuestions(session, scan1);
+
+    const pageBefore = session.pages[0];
+    const q1Before = pageBefore.questions.find((q: any) => q.fieldIds.includes('ff-phone-1'));
+    const q2Before = pageBefore.questions.find((q: any) => q.fieldIds.includes('ff-phone-2'));
+    expect(q1Before.required).toBe(true);
+    expect(q2Before.required).toBe(false);
+
+    // Second scan: reversed order
+    const scan2 = normalizeExtractedQuestions([
+      { id: 'ff-phone-2', name: 'Phone', type: 'tel', section: 'Contact', required: false },
+      { id: 'ff-phone-1', name: 'Phone', type: 'tel', section: 'Contact', required: true },
+    ]);
+
+    session = syncQuestions(session, scan2);
+
+    const pageAfter = session.pages[0];
+    const q1After = pageAfter.questions.find((q: any) => q.fieldIds.includes('ff-phone-1'));
+    const q2After = pageAfter.questions.find((q: any) => q.fieldIds.includes('ff-phone-2'));
+
+    // required flags must NOT have cross-contaminated
+    expect(q1After.required).toBe(true);
+    expect(q2After.required).toBe(false);
+    // fieldIds must NOT have been unioned across the two questions
+    expect(q1After.fieldIds).toEqual(['ff-phone-1']);
+    expect(q2After.fieldIds).toEqual(['ff-phone-2']);
   });
 });

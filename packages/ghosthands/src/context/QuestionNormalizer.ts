@@ -238,13 +238,18 @@ function deduplicateQuestionKeys(questions: QuestionSnapshot[]): QuestionSnapsho
   for (const q of questions) {
     keyCounts.set(q.questionKey, (keyCounts.get(q.questionKey) || 0) + 1);
   }
-  // Only process keys that appear more than once — use a within-group counter as
-  // suffix. This is stable when unrelated questions are added/removed/reordered,
-  // and only shifts if duplicates themselves change order (unavoidable without a
-  // content-based differentiator, since duplicates share identical content by definition).
+  // Use sorted fieldIds as a content-based differentiator so the suffix is stable
+  // regardless of the order duplicates appear in the input array. If two questions
+  // share identical content (same prompt, type, section, options) their fieldIds
+  // still differ because they map to distinct DOM elements.
+  // Fallback: counter for the (unlikely) case of empty fieldIds.
   const groupCounters = new Map<string, number>();
   return questions.map((q) => {
     if ((keyCounts.get(q.questionKey) || 0) <= 1) return q;
+    if (q.fieldIds.length > 0) {
+      const fieldSig = q.fieldIds.slice().sort().join('+');
+      return { ...q, questionKey: `${q.questionKey}::${fieldSig}` };
+    }
     const counter = groupCounters.get(q.questionKey) || 0;
     groupCounters.set(q.questionKey, counter + 1);
     return { ...q, questionKey: `${q.questionKey}::${counter}` };
