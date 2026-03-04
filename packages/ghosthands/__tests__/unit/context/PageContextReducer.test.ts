@@ -156,6 +156,99 @@ describe('PageContextReducer', () => {
     expect(session.pages[0].questions[0].lastAnswer).toBe('No');
   });
 
+  it('does not retire questions during incremental (non-full) sync', () => {
+    const base = createEmptySession('job-incr', 'run-incr');
+    const page = createPageRecord({
+      pageType: 'questions',
+      pageTitle: 'Mixed',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-incr',
+      pageStepKey: 'questions::mixed',
+      pageSequence: 1,
+    });
+
+    let session = applyPageEntry(base, page);
+    // Full sync with two questions
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::a::text::no-options', fieldIds: ['ff-1'], promptText: 'First name', questionType: 'text' }),
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['ff-2'], promptText: 'Last name', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    expect(session.pages[0].questions).toHaveLength(2);
+
+    // Incremental sync with only ff-2 — ff-1's question should NOT be retired
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['ff-2'], promptText: 'Last name', questionType: 'text' }),
+    ]);
+
+    const q1 = session.pages[0].questions.find((q) => q.questionKey === 'q::a::text::no-options');
+    expect(q1).toBeDefined();
+    expect(q1!.state).not.toBe('skipped');
+  });
+
+  it('retires questions whose fieldIds disappear on full sync', () => {
+    const base = createEmptySession('job-retire', 'run-retire');
+    const page = createPageRecord({
+      pageType: 'questions',
+      pageTitle: 'Mixed',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-retire',
+      pageStepKey: 'questions::mixed',
+      pageSequence: 1,
+    });
+
+    let session = applyPageEntry(base, page);
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::a::text::no-options', fieldIds: ['ff-1'], promptText: 'First name', questionType: 'text' }),
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['ff-2'], promptText: 'Last name', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    // Full sync with only ff-2 — ff-1's question should be retired
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['ff-2'], promptText: 'Last name', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    const q1 = session.pages[0].questions.find((q) => q.questionKey === 'q::a::text::no-options');
+    expect(q1).toBeDefined();
+    expect(q1!.state).toBe('skipped');
+    expect(q1!.warnings).toContain('retired_missing_from_dom');
+  });
+
+  it('un-retires a question when its fieldIds reappear in a later sync', () => {
+    const base = createEmptySession('job-unretire', 'run-unretire');
+    const page = createPageRecord({
+      pageType: 'questions',
+      pageTitle: 'Mixed',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-unretire',
+      pageStepKey: 'questions::mixed',
+      pageSequence: 1,
+    });
+
+    let session = applyPageEntry(base, page);
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::a::text::no-options', fieldIds: ['ff-1'], promptText: 'First name', questionType: 'text' }),
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['ff-2'], promptText: 'Last name', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    // Full sync drops ff-1
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['ff-2'], promptText: 'Last name', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    const retired = session.pages[0].questions.find((q) => q.questionKey === 'q::a::text::no-options');
+    expect(retired!.state).toBe('skipped');
+
+    // Incremental sync brings ff-1 back
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::a::text::no-options', fieldIds: ['ff-1'], promptText: 'First name', questionType: 'text' }),
+    ]);
+
+    const unretired = session.pages[0].questions.find((q) => q.questionKey === 'q::a::text::no-options');
+    expect(unretired!.state).toBe('empty');
+    expect(unretired!.warnings).not.toContain('retired_missing_from_dom');
+  });
+
   it('includes best_effort_guess answers in bestEffortGuesses report', () => {
     const base = createEmptySession('job-beg', 'run-beg');
     const page = createPageRecord({

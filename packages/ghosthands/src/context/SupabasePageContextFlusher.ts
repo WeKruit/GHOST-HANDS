@@ -11,13 +11,17 @@ function redactPageForFlush(page: LogicalPageRecord): LogicalPageRecord {
       currentValue: q.currentValue ? redactSensitiveValue(q.promptText, q.currentValue) : q.currentValue,
     })),
     history: page.history.map((e) => {
-      if (e.after?.answer && typeof e.after.answer === 'string' && e.targetQuestionKey) {
-        const question = page.questions.find((q) => q.questionKey === e.targetQuestionKey);
-        if (question) {
-          return { ...e, after: { ...e.after, answer: redactSensitiveValue(question.promptText, e.after.answer as string) } };
-        }
+      if (!e.after || !e.targetQuestionKey) return e;
+      const question = page.questions.find((q) => q.questionKey === e.targetQuestionKey);
+      if (!question) return e;
+      const patched = { ...e.after };
+      if (typeof patched.answer === 'string') {
+        patched.answer = redactSensitiveValue(question.promptText, patched.answer);
       }
-      return e;
+      if (typeof patched.value === 'string') {
+        patched.value = redactSensitiveValue(question.promptText, patched.value);
+      }
+      return { ...e, after: patched };
     }),
   };
 }

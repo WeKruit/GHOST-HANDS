@@ -93,7 +93,7 @@ function cloneResumedPage(
 export interface PageContextService {
   initializeRun(mastraRunId: string): Promise<void>;
   enterOrResumePage(input: PageEntryInput): Promise<void>;
-  syncQuestions(snapshots: QuestionSnapshot[]): Promise<void>;
+  syncQuestions(snapshots: QuestionSnapshot[], opts?: { isFullSync?: boolean }): Promise<void>;
   recordAnswerPlan(decisions: AnswerDecision[]): Promise<void>;
   recordFieldAttempt(
     questionKey: string,
@@ -195,11 +195,11 @@ export class LivePageContextService implements PageContextService {
     await this.persistCurrent(baseVersion);
   }
 
-  async syncQuestions(snapshots: QuestionSnapshot[]): Promise<void> {
+  async syncQuestions(snapshots: QuestionSnapshot[], opts?: { isFullSync?: boolean }): Promise<void> {
     if (snapshots.length === 0) return;
     const session = await this.ensureSession();
     const baseVersion = session.version;
-    this.session = reduceSyncQuestions(session, snapshots);
+    this.session = reduceSyncQuestions(session, snapshots, opts);
     await this.persistCurrent(baseVersion);
   }
 
@@ -311,22 +311,15 @@ export class LivePageContextService implements PageContextService {
     );
     if (firstAttempt.saved) return;
 
-    // Conflict: retry once — re-read persisted state, bump version, attempt again
+    // Conflict: adopt the persisted state to avoid overwriting concurrent writes.
+    // Our local mutations are lost, but this is safer than blindly overwriting
+    // another writer's state with our stale snapshot.
     const latest = firstAttempt.current;
-    if (latest) {
-      const retrySession = { ...current, version: latest.version + 1 };
-      const retryAttempt = await this.store.write(retrySession, latest.version);
-      if (retryAttempt.saved) {
-        this.session = retrySession;
-        return;
-      }
-    }
-
     const latestVersion = typeof latest?.version === 'number' ? latest.version : 'unknown';
     const expectedLabel =
       typeof expectedVersion === 'number' ? String(expectedVersion) : 'none';
     console.warn(
-      `[page-context] optimistic write conflict after retry; adopting persisted state `
+      `[page-context] optimistic write conflict; adopting persisted state `
         + `(jobId=${this.jobId}, mastraRunId=${this.mastraRunId ?? 'uninitialized'}, `
         + `expectedVersion=${expectedLabel}, localVersion=${current.version}, `
         + `persistedVersion=${latestVersion})`,

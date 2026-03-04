@@ -1506,7 +1506,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
         forceMagnitude: escalate,
         observers: pageContext
           ? {
-              onQuestionsNormalized: async (questions) => pageContext.syncQuestions(questions),
+              onQuestionsNormalized: async (questions, opts) => pageContext.syncQuestions(questions, opts),
               onAnswerPlanned: async (decisions) => pageContext.recordAnswerPlan(decisions),
               onFieldAttempt: async (questionKey, actor, notes) =>
                 pageContext.recordFieldAttempt(questionKey, actor, notes),

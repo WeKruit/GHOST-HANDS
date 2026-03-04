@@ -182,12 +182,15 @@ export function applyPageEntry(
 export function syncQuestions(
   session: PageContextSession,
   snapshots: QuestionSnapshot[],
+  opts?: { isFullSync?: boolean },
 ): PageContextSession {
   const next = cloneSession(session);
   const page = findActivePage(next);
   if (!page) return session;
 
   const now = nowIso();
+  const incomingFieldIds = new Set(snapshots.flatMap((s) => s.fieldIds));
+
   for (const snapshot of snapshots) {
     const questionIndex = page.questions.findIndex(
       (question) => question.questionKey === snapshot.questionKey,
@@ -201,16 +204,26 @@ export function syncQuestions(
     }
   }
 
-  // Retire questions whose field IDs are ALL absent from the incoming snapshot set
-  const incomingFieldIds = new Set(snapshots.flatMap((s) => s.fieldIds));
+  // Un-retire questions whose fieldIds reappear in the incoming set
   for (const question of page.questions) {
-    if (question.state === 'skipped') continue; // already retired
-    const allFieldsMissing = question.fieldIds.length > 0
-      && question.fieldIds.every((id) => !incomingFieldIds.has(id));
-    if (allFieldsMissing) {
-      question.state = 'skipped';
-      if (!question.warnings.includes('retired_missing_from_dom')) {
-        question.warnings.push('retired_missing_from_dom');
+    if (question.state !== 'skipped' || !question.warnings.includes('retired_missing_from_dom')) continue;
+    if (question.fieldIds.some((id) => incomingFieldIds.has(id))) {
+      question.state = 'empty';
+      question.warnings = question.warnings.filter((w) => w !== 'retired_missing_from_dom');
+    }
+  }
+
+  // Only retire on full-page syncs — partial (rerun) syncs contain just new fields
+  if (opts?.isFullSync) {
+    for (const question of page.questions) {
+      if (question.state === 'skipped') continue;
+      const allFieldsMissing = question.fieldIds.length > 0
+        && question.fieldIds.every((id) => !incomingFieldIds.has(id));
+      if (allFieldsMissing) {
+        question.state = 'skipped';
+        if (!question.warnings.includes('retired_missing_from_dom')) {
+          question.warnings.push('retired_missing_from_dom');
+        }
       }
     }
   }

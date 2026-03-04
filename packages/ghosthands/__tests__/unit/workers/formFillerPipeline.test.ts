@@ -305,6 +305,18 @@ describe('formFiller observation pipeline integration', () => {
     expect(isPlaceholderValue('Pick')).toBe(true);
   });
 
+  it('isPlaceholderValue detects expanded R7 placeholder patterns', () => {
+    expect(isPlaceholderValue('Please select one')).toBe(true);
+    expect(isPlaceholderValue('Select an option')).toBe(true);
+    expect(isPlaceholderValue('Select a option')).toBe(true);
+    expect(isPlaceholderValue('Please choose')).toBe(true);
+    expect(isPlaceholderValue('Please choose one')).toBe(true);
+    expect(isPlaceholderValue('Enter your name')).toBe(true);
+    expect(isPlaceholderValue('Enter an email')).toBe(true);
+    expect(isPlaceholderValue('Type here')).toBe(true);
+    expect(isPlaceholderValue('—')).toBe(true);
+  });
+
   it('isPlaceholderValue rejects real values', () => {
     expect(isPlaceholderValue('United States')).toBe(false);
     expect(isPlaceholderValue('Male')).toBe(false);
