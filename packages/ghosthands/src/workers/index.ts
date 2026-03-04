@@ -22,12 +22,3 @@ export { CallbackNotifier, callbackNotifier } from './callbackNotifier.js';
 export type { CallbackPayload } from './callbackNotifier.js';
 export { ResumeDownloader } from './resumeDownloader.js';
 export type { ResumeRef } from './resumeDownloader.js';
-export type {
-  ClaimedJob,
-  JobEventInput,
-  ProgressPayload,
-  JobCompletionPayload,
-  JobFailurePayload,
-  JobSource,
-  JobSink,
-} from './transport.js';
