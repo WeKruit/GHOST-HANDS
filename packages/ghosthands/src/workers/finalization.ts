@@ -69,14 +69,27 @@ async function flushPageContext(
   }
 }
 
+const SENSITIVE_FIELD_RE = /password|passwd|pwd|secret|token|otp|ssn|credit.?card|cvv|pin|social.?security/i;
+
+function redactReportAnswers<T extends { promptText?: string; answer?: string }>(
+  items: T[],
+): T[] {
+  return items.map((item) => {
+    if (item.answer && item.promptText && SENSITIVE_FIELD_RE.test(item.promptText)) {
+      return { ...item, answer: '[REDACTED]' };
+    }
+    return item;
+  });
+}
+
 export function serializeContextReport(report: ContextReport): Record<string, unknown> {
   return {
     pages_visited: report.pagesVisited,
     required_unresolved: report.requiredUnresolved,
-    risky_optional_answers: report.riskyOptionalAnswers,
-    low_confidence_answers: report.lowConfidenceAnswers,
+    risky_optional_answers: redactReportAnswers(report.riskyOptionalAnswers),
+    low_confidence_answers: redactReportAnswers(report.lowConfidenceAnswers),
     ambiguous_question_groups: report.ambiguousQuestionGroups,
-    best_effort_guesses: report.bestEffortGuesses,
+    best_effort_guesses: redactReportAnswers(report.bestEffortGuesses),
     partial_pages: report.partialPages,
     flush_status: report.flushStatus,
     ...(report.flushError ? { flush_error: report.flushError } : {}),
@@ -502,10 +515,8 @@ export async function finalizeHandlerResult(
     return { awaitingReview: true };
   }
 
-  // 6. Build result data (shared by success and failure paths)
-  const contextReport = pageContext
-    ? await pageContext.getContextReport('pending').catch(() => undefined)
-    : undefined;
+  // 6. Build result data (shared by success and failure paths) — flush like awaiting_review
+  const contextReport = await flushPageContext(pageContext, logEvent);
   const resultData: Record<string, unknown> = {
     ...(taskResult.data || {}),
     cost: {
@@ -654,6 +665,7 @@ export async function finalizeHandlerSideEffects(
   screenshotUrls: string[];
   finalCost: CostSnapshot;
   resultData: Record<string, unknown>;
+  contextFlushed: boolean;
 }> {
   const {
     job,
@@ -725,5 +737,5 @@ export async function finalizeHandlerSideEffects(
     ...(contextReport && { context_report: serializeContextReport(contextReport) }),
   };
 
-  return { screenshotUrls, finalCost, resultData };
+  return { screenshotUrls, finalCost, resultData, contextFlushed: !!contextReport };
 }

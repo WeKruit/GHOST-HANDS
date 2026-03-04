@@ -117,7 +117,15 @@ const INTERACTIVE_SELECTOR = [
   '[aria-haspopup="listbox"]',
 ].join(', ');
 
-const PLACEHOLDER_RE = /^(select\.{0,3}|select…|please\s+select|select\s+one|choose\.{0,3}|choose…|please\s+choose|choose\s+one|pick|--+\s*(select|choose)?\s*--*|—)$/i;
+const PLACEHOLDER_RE = /^(select\.{0,3}|select…|please\s+select|select\s+one|choose\.{0,3}|choose…|please\s+choose|choose\s+one|pick|start\s+typing|--+\s*(select|choose)?\s*--*|—)$/i;
+
+/** Shared placeholder test — use instead of inline regexes */
+export function isPlaceholderValue(value: string): boolean {
+  return PLACEHOLDER_RE.test(value.trim());
+}
+
+/** Serialized pattern for browser-context evaluate() calls */
+const PLACEHOLDER_RE_SOURCE = PLACEHOLDER_RE.source;
 
 const MAGNITUDE_HAND_ACT_TIMEOUT_MS = 30_000;
 
@@ -2412,13 +2420,15 @@ async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
       const selectedOpt = sel.options[sel.selectedIndex];
       if (!selectedOpt) return false;
       const text = selectedOpt.textContent?.trim() || '';
-      return val !== '' && !/^(select|choose|pick|--|—)/i.test(text);
+      const placeholderRe = new RegExp('^(select\\.{0,3}|select…|please\\s+select|select\\s+one|choose\\.{0,3}|choose…|please\\s+choose|choose\\s+one|pick|start\\s+typing|--+\\s*(select|choose)?\\s*--*|—)$', 'i');
+      return val !== '' && !placeholderRe.test(text);
     }
     // Custom combobox: check for selected value
     if (role === 'combobox' && tag !== 'INPUT' && tag !== 'SELECT') {
       const trigger = el.querySelector('.custom-select-trigger span');
       const text = trigger?.textContent?.trim() || '';
-      if (text && !/^(select|choose|pick|--|—|start typing)/i.test(text)) return true;
+      const placeholderRe2 = new RegExp('^(select\\.{0,3}|select…|please\\s+select|select\\s+one|choose\\.{0,3}|choose…|please\\s+choose|choose\\s+one|pick|start\\s+typing|--+\\s*(select|choose)?\\s*--*|—)$', 'i');
+      if (text && !placeholderRe2.test(text)) return true;
       // Check Workday pills
       const pills = el.closest('[data-automation-id]')
         ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
@@ -2462,7 +2472,8 @@ async function hasFieldValueForRerender(page: Page, ffId: string): Promise<boole
       const selectedOpt = sel.options[sel.selectedIndex];
       if (!selectedOpt) return false;
       const text = selectedOpt.textContent?.trim() || '';
-      return sel.value !== '' && !/^(select|choose|pick|--|—)/i.test(text);
+      const placeholderRe = new RegExp('^(select\\.{0,3}|select…|please\\s+select|select\\s+one|choose\\.{0,3}|choose…|please\\s+choose|choose\\s+one|pick|start\\s+typing|--+\\s*(select|choose)?\\s*--*|—)$', 'i');
+      return sel.value !== '' && !placeholderRe.test(text);
     }
 
     if (role === 'checkbox' || role === 'radio' || role === 'switch') {
@@ -2873,10 +2884,9 @@ export function applyNeverEmptyFallback(
       result[field.id] = 'N/A';
     } else if (field.type === 'text') {
       result[field.id] = 'N/A';
-    } else if (field.options?.length) {
-      // Last resort: all options were placeholders and no type-based default matched
-      result[field.id] = field.options[0];
     }
+    // Placeholder-only selects are left unresolved — writing a placeholder value
+    // creates false completion and validation bounce loops.
   }
   return result;
 }
@@ -3082,10 +3092,19 @@ export async function fillFormOnPage(
 
   result.questionSnapshots = initialQuestionSnapshots;
 
-  // Map field IDs → question keys
+  // Map field IDs → question keys and thread demographicHint from normalized questions
+  const demographicFieldIds = new Set<string>();
   for (const question of initialQuestionSnapshots) {
+    const isDemographic = DEMOGRAPHIC_RE.test(question.promptText || '');
     for (const fieldId of question.fieldIds) {
       fieldIdToQuestionKey[fieldId] = question.questionKey;
+      if (isDemographic) demographicFieldIds.add(fieldId);
+    }
+  }
+  // Set demographicHint on llmFields for downstream buildFallbackDecisions
+  for (const field of llmFields) {
+    if (demographicFieldIds.has(field.id)) {
+      (field as any).demographicHint = true;
     }
   }
 

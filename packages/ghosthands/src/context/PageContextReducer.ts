@@ -18,6 +18,15 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+const SENSITIVE_FIELD_RE = /password|passwd|pwd|secret|token|otp|ssn|credit.?card|cvv|pin|social.?security/i;
+
+export function redactSensitiveValue(fieldNameOrPrompt: string, value: string): string {
+  if (SENSITIVE_FIELD_RE.test(fieldNameOrPrompt)) {
+    return '[REDACTED]';
+  }
+  return value;
+}
+
 const MAX_PAGE_HISTORY_EVENTS = 200;
 const AMBIGUOUS_GROUPING_THRESHOLD = 0.6;
 const LOW_CONFIDENCE_THRESHOLD = 0.7;
@@ -192,6 +201,20 @@ export function syncQuestions(
     }
   }
 
+  // Retire questions whose field IDs are ALL absent from the incoming snapshot set
+  const incomingFieldIds = new Set(snapshots.flatMap((s) => s.fieldIds));
+  for (const question of page.questions) {
+    if (question.state === 'skipped') continue; // already retired
+    const allFieldsMissing = question.fieldIds.length > 0
+      && question.fieldIds.every((id) => !incomingFieldIds.has(id));
+    if (allFieldsMissing) {
+      question.state = 'skipped';
+      if (!question.warnings.includes('retired_missing_from_dom')) {
+        question.warnings.push('retired_missing_from_dom');
+      }
+    }
+  }
+
   page.questions.sort((a, b) => a.orderIndex - b.orderIndex);
   pushEvent(page, {
     type: 'scan_structured',
@@ -218,10 +241,12 @@ export function applyAnswerDecisions(
       (question) => question.questionKey === decision.questionKey,
     );
     if (index < 0) continue;
+    const promptText = page.questions[index].promptText || '';
+    const safeAnswer = redactSensitiveValue(promptText, decision.answer);
     page.questions[index] = mergeQuestionState(page.questions[index], {
       state: 'planned',
       source: decision.source,
-      lastAnswer: decision.answer,
+      lastAnswer: safeAnswer,
       answerMode: decision.answerMode,
       resolutionConfidence: Math.max(
         page.questions[index].resolutionConfidence,
@@ -229,12 +254,17 @@ export function applyAnswerDecisions(
       ),
       lastUpdatedAt: nowIso(),
     });
+    // Map source directly to actor — don't default everything to 'llm'
+    const actor = decision.source === 'dom' ? 'dom'
+      : decision.source === 'magnitude' ? 'magnitude'
+      : decision.source === 'llm' ? 'llm'
+      : (decision.source as string) || 'llm';
     pushEvent(page, {
       type: 'answer_planned',
-      actor: decision.source === 'magnitude' ? 'magnitude' : 'llm',
+      actor: actor as ContextEvent['actor'],
       targetQuestionKey: decision.questionKey,
       confidence: decision.confidence,
-      after: { answer: decision.answer },
+      after: { answer: safeAnswer },
     });
   }
 
@@ -342,6 +372,8 @@ export function computeCoverage(page: LogicalPageRecord): PageCoverage {
   let ambiguousGrouped = 0;
 
   for (const question of page.questions) {
+    // Retired/skipped questions don't count towards coverage
+    if (question.state === 'skipped' && question.warnings.includes('retired_missing_from_dom')) continue;
     const resolved = question.state === 'filled' || question.state === 'verified';
     if (question.required) {
       requiredTotal++;
@@ -400,12 +432,13 @@ export function auditPage(session: PageContextSession): {
   }
 
   page.coverage = computeCoverage(page);
+  const isRetired = (q: QuestionRecord) => q.state === 'skipped' && q.warnings.includes('retired_missing_from_dom');
   const unresolvedQuestionKeys = page.questions
-    .filter((question) => question.required && page.coverage.requiredUnresolved > 0)
+    .filter((question) => question.required && !isRetired(question))
     .filter((question) => question.state !== 'filled' && question.state !== 'verified')
     .map((question) => question.questionKey);
   const riskyQuestionKeys = page.questions
-    .filter((question) => !question.required && question.riskLevel !== 'none')
+    .filter((question) => !question.required && question.riskLevel !== 'none' && !isRetired(question))
     .map((question) => question.questionKey);
 
   const result: PageAuditResult = {
@@ -521,7 +554,7 @@ export function buildContextReport(
           promptText: question.promptText,
           questionKey: question.questionKey,
           riskLevel: question.riskLevel,
-          answer: question.lastAnswer,
+          answer: redactSensitiveValue(question.promptText, question.lastAnswer || ''),
         });
       }
 
@@ -536,7 +569,7 @@ export function buildContextReport(
           promptText: question.promptText,
           questionKey: question.questionKey,
           confidence: question.resolutionConfidence,
-          answer: question.lastAnswer,
+          answer: redactSensitiveValue(question.promptText, question.lastAnswer || ''),
         });
       }
 
@@ -559,7 +592,7 @@ export function buildContextReport(
           pageSequence: page.sequence,
           questionKey: question.questionKey,
           promptText: question.promptText,
-          answer: question.lastAnswer,
+          answer: redactSensitiveValue(question.promptText, question.lastAnswer || ''),
           answerMode: question.answerMode,
         });
       }
