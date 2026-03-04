@@ -19,6 +19,14 @@ export interface CreateMastraOptions {
   storeFactory?: WorkflowStoreFactory;
 }
 
+function isHostedWorker(): boolean {
+  return !!(
+    process.env.AWS_ASG_NAME ||
+    process.env.EC2_INSTANCE_ID ||
+    process.env.NODE_ENV === 'production'
+  );
+}
+
 function hasHostedConnectionString(): boolean {
   return Boolean(process.env.DATABASE_URL || process.env.SUPABASE_DIRECT_URL);
 }
@@ -29,7 +37,7 @@ function createDefaultStore(mode: 'hosted' | 'desktop'): MastraStorage | undefin
     process.env.SUPABASE_DIRECT_URL;
 
   if (connectionString) {
-    return new PostgresStore({ id: 'ghosthands', connectionString });
+    return new PostgresStore({ id: 'ghosthands', connectionString }) as MastraStorage;
   }
 
   if (mode === 'desktop') {
@@ -76,10 +84,43 @@ export function createMastra(options: CreateMastraOptions = {}): Mastra {
   return _mastra;
 }
 
-export function getMastra(): Mastra {
+/**
+ * Get or lazily create the Mastra singleton.
+ *
+ * - **Hosted workers** (EC2 / production): throws a P0-level error when the
+ *   database connection string is missing — this is a deployment misconfiguration.
+ * - **Desktop workers**: logs a warning and returns `null` — desktop mode does
+ *   not require Mastra/Postgres workflows.
+ */
+export function getMastra(): Mastra | null {
   if (_mastra) return _mastra;
+
+  const hosted = isHostedWorker();
+
+  if (!hasHostedConnectionString() && !hosted) {
+    logger.warn(
+      'getMastra(): no DATABASE_URL / SUPABASE_DIRECT_URL — returning null (desktop mode)',
+    );
+    return null;
+  }
+
+  if (!hasHostedConnectionString() && hosted) {
+    throw new Error(
+      '[P0] HOSTED WORKER MISSING DATABASE CONNECTION\n' +
+      '─────────────────────────────────────────────\n' +
+      'getMastra() was called on a hosted worker (EC2/production) but neither\n' +
+      'DATABASE_URL nor SUPABASE_DIRECT_URL is set.\n\n' +
+      'Remediation steps:\n' +
+      '  1. Check the env_file / docker-compose env section on this instance\n' +
+      '  2. Verify Infisical / AWS Secrets Manager has the DATABASE_URL secret\n' +
+      '  3. Re-deploy the worker: `deploy.sh` or trigger CD pipeline\n' +
+      '  4. If this is intentional, unset AWS_ASG_NAME and EC2_INSTANCE_ID\n' +
+      '     to run in desktop mode.\n',
+    );
+  }
+
   return createMastra({
-    mode: hasHostedConnectionString() ? 'hosted' : 'desktop',
+    mode: hosted ? 'hosted' : 'desktop',
   });
 }
 

@@ -1378,6 +1378,14 @@ export class JobExecutor {
     const workflow = buildApplyWorkflow(rt);
     const mastra = getMastra();
 
+    if (!mastra) {
+      throw new Error(
+        `Cannot execute Mastra workflow for job ${job.id}: ` +
+        'getMastra() returned null (desktop mode — no database connection). ' +
+        'Mastra workflows require a hosted worker with DATABASE_URL configured.',
+      );
+    }
+
     // Register workflow with Mastra for this execution.
     // Use per-job key to avoid addWorkflow's silent skip on duplicate keys
     // (a new workflow is built per job with a unique RuntimeContext closure).

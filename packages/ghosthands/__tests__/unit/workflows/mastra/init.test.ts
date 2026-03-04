@@ -45,6 +45,9 @@ describe('getMastra / resetMastra', () => {
     // Reset env vars to a clean state
     delete process.env.DATABASE_URL;
     delete process.env.SUPABASE_DIRECT_URL;
+    delete process.env.AWS_ASG_NAME;
+    delete process.env.EC2_INSTANCE_ID;
+    delete process.env.NODE_ENV;
 
     // Reset mock call counts
     vi.mocked(Mastra).mockClear();
@@ -56,13 +59,29 @@ describe('getMastra / resetMastra', () => {
     process.env = { ...ORIGINAL_ENV };
   });
 
-  // ─── Test 1 ──────────────────────────────────────────────────────────
+  // ─── Test 1a ─────────────────────────────────────────────────────────
 
-  test('throws when both DATABASE_URL and SUPABASE_DIRECT_URL are missing', () => {
-    // Neither env var is set (both deleted in beforeEach)
-    expect(() => getMastra()).toThrowError(
-      /DATABASE_URL or SUPABASE_DIRECT_URL/,
-    );
+  test('returns null in desktop mode when DB connection strings are missing', () => {
+    // Neither env var is set (both deleted in beforeEach), no hosted env vars
+    const result = getMastra();
+    expect(result).toBeNull();
+  });
+
+  // ─── Test 1b ─────────────────────────────────────────────────────────
+
+  test('throws P0 error on hosted worker when DB connection strings are missing', () => {
+    process.env.AWS_ASG_NAME = 'ghosthands-worker-asg';
+    expect(() => getMastra()).toThrowError(/P0.*HOSTED WORKER MISSING DATABASE CONNECTION/);
+  });
+
+  test('throws P0 error when EC2_INSTANCE_ID is set but no DB URL', () => {
+    process.env.EC2_INSTANCE_ID = 'i-0de0d236d543467f0';
+    expect(() => getMastra()).toThrowError(/P0/);
+  });
+
+  test('throws P0 error when NODE_ENV=production but no DB URL', () => {
+    process.env.NODE_ENV = 'production';
+    expect(() => getMastra()).toThrowError(/P0/);
   });
 
   // ─── Test 2 ──────────────────────────────────────────────────────────
