@@ -18,7 +18,6 @@
     "dist",
     "../ghosthands/src/__tests__/**",
     "../ghosthands/src/scripts/**",
-    "../ghosthands/src/workflows/**",
     "../ghosthands/__tests__/**"
   ]
 }
