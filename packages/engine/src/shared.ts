@@ -16,6 +16,7 @@ export interface LocalWorkerState {
   status: 'stopped' | 'starting' | 'running' | 'draining' | 'error';
   desktopWorkerId?: string;
   activeJobId?: string | null;
+  activeLeaseId?: string | null;
   lastError?: string | null;
   startedAt?: number;
 }
@@ -81,9 +82,12 @@ export type WorkerCommand =
   | { type: 'refresh_secrets'; secrets: WorkerBootstrapPayload['providerSecrets'] };
 
 export type WorkerEvent =
-  | { type: 'ready' }
+  | { type: 'ready'; desktopWorkerId?: string; userId?: string }
+  | { type: 'stopped'; reason: string | null }
+  | { type: 'draining' }
   | { type: 'status'; message: string }
   | { type: 'progress'; jobId: string; payload: ProgressEvent }
+  | { type: 'job_submitted'; jobId: string; requestId: string }
   | { type: 'job_event'; jobId: string; payload: Record<string, unknown> }
   | { type: 'job_awaiting_review'; jobId: string }
   | { type: 'job_claimed'; jobId: string }
@@ -99,7 +103,7 @@ export interface LocalWorkerManager {
   stop(reason?: string): Promise<void>;
   drain(): Promise<void>;
   submitSmartApply(input: SmartApplySubmission): Promise<{ requestId: string }>;
-  cancel(jobId: string): Promise<void>;
+  cancel(input: { jobId: string; leaseId: string }): Promise<void>;
   getState(): LocalWorkerState;
   on(
     event: 'status' | 'progress' | 'job_event' | 'error',
