@@ -695,6 +695,7 @@ export async function finalizeHandlerSideEffects(
   finalCost: CostSnapshot;
   resultData: Record<string, unknown>;
   contextFlushed: boolean;
+  currentMetadata: Record<string, unknown>;
 }> {
   const {
     job,
@@ -779,5 +780,5 @@ export async function finalizeHandlerSideEffects(
       .eq('id', job.id);
   }
 
-  return { screenshotUrls, finalCost, resultData, contextFlushed: !!contextReport && !sideEffectFlushFailed };
+  return { screenshotUrls, finalCost, resultData, contextFlushed: !!contextReport && !sideEffectFlushFailed, currentMetadata };
 }

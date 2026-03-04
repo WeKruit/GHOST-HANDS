@@ -65,6 +65,8 @@ interface HandleJobErrorInput {
   resultData?: Record<string, unknown>;
   pageContext?: PageContextService;
   contextFlushed?: boolean;
+  /** Fresh metadata accumulator from finalizeHandlerSideEffects — use instead of stale job.metadata */
+  currentMetadata?: Record<string, unknown>;
 }
 
 export interface JobExecutorOptions {
@@ -1764,6 +1766,7 @@ export class JobExecutor {
           resultData: sideEffects.resultData,
           pageContext,
           contextFlushed: sideEffects.contextFlushed,
+          currentMetadata: sideEffects.currentMetadata,
         });
         return;
       }
@@ -1808,6 +1811,7 @@ export class JobExecutor {
     resultData,
     pageContext,
     contextFlushed,
+    currentMetadata: incomingMetadata,
   }: HandleJobErrorInput): Promise<void> {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorCode = this.classifyError(errorMessage);
@@ -1883,7 +1887,7 @@ export class JobExecutor {
           error_details: { message: errorMessage },
           ...(finalResultData && { result_data: finalResultData }),
           ...(flushFailed && {
-            metadata: { ...(job.metadata || {}), page_context_flush_pending: true },
+            metadata: { ...(incomingMetadata ?? job.metadata ?? {}), page_context_flush_pending: true },
           }),
           action_count: actionCount,
           total_tokens: totalTokens,

@@ -3651,12 +3651,19 @@ export async function fillFormOnPage(
   );
   if (finalSnapshots.length > 0) {
     result.questionSnapshots = finalSnapshots;
-    await notifyObserver(
-      'onQuestionsNormalized',
-      observers?.onQuestionsNormalized
-        ? () => observers.onQuestionsNormalized!(finalSnapshots, { isFullSync: true })
-        : undefined,
-    );
+    // Only emit a full-sync observer notification if NO questions were synced to
+    // context earlier.  The initial sync (line ~3109) uses LLM-reconciled keys;
+    // this heuristic-only pass would produce different keys and cause duplicates.
+    // When questions were already synced, the context already has the authoritative
+    // set — we just update result.questionSnapshots for the handler return.
+    if (initialQuestionSnapshots.length === 0) {
+      await notifyObserver(
+        'onQuestionsNormalized',
+        observers?.onQuestionsNormalized
+          ? () => observers.onQuestionsNormalized!(finalSnapshots, { isFullSync: true })
+          : undefined,
+      );
+    }
   }
 
   const finalFilledIds = new Set<string>(filledIds);
