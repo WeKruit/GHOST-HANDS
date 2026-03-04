@@ -1409,6 +1409,47 @@ export class JobExecutor {
     const workflow = buildApplyWorkflow(rt);
     const mastra = getMastra();
 
+    if (!mastra) {
+      const failMsg = 'Mastra workflows are not available in desktop mode (no DATABASE_URL)';
+      logger.warn(failMsg, { jobId: job.id });
+
+      await this.updateJobStatus(job.id, 'failed', failMsg);
+      await this.logJobEvent(job.id, 'mastra_unavailable', { message: failMsg });
+      await this.supabase
+        .from('gh_automation_jobs')
+        .update({
+          status: 'failed',
+          completed_at: new Date().toISOString(),
+          error_code: 'mastra_unavailable',
+          error_details: { message: failMsg },
+          llm_cost_cents: 0,
+          action_count: 0,
+          total_tokens: 0,
+        })
+        .eq('id', job.id);
+
+      if (job.callback_url) {
+        callbackNotifier.notifyFromJob({
+          id: job.id,
+          valet_task_id: job.valet_task_id,
+          callback_url: job.callback_url,
+          status: 'failed',
+          worker_id: this.workerId,
+          error_code: 'mastra_unavailable',
+          error_details: { message: failMsg },
+          llm_cost_cents: 0,
+          action_count: 0,
+          total_tokens: 0,
+        }).catch((err) => {
+          logger.warn('Mastra unavailable failure callback failed', {
+            jobId: job.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+      return;
+    }
+
     // Register workflow with Mastra for this execution.
     // Use per-job key to avoid addWorkflow's silent skip on duplicate keys
     // (a new workflow is built per job with a unique RuntimeContext closure).
