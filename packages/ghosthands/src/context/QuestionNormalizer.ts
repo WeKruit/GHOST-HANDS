@@ -238,12 +238,16 @@ function deduplicateQuestionKeys(questions: QuestionSnapshot[]): QuestionSnapsho
   for (const q of questions) {
     keyCounts.set(q.questionKey, (keyCounts.get(q.questionKey) || 0) + 1);
   }
-  // Only process keys that appear more than once — use orderIndex as suffix since it
-  // represents visual position on the page, which is stable across DOM rerenders
-  // (unlike fieldIds which change when the DOM reconstructs elements)
+  // Only process keys that appear more than once — use a within-group counter as
+  // suffix. This is stable when unrelated questions are added/removed/reordered,
+  // and only shifts if duplicates themselves change order (unavoidable without a
+  // content-based differentiator, since duplicates share identical content by definition).
+  const groupCounters = new Map<string, number>();
   return questions.map((q) => {
     if ((keyCounts.get(q.questionKey) || 0) <= 1) return q;
-    return { ...q, questionKey: `${q.questionKey}::${q.orderIndex}` };
+    const counter = groupCounters.get(q.questionKey) || 0;
+    groupCounters.set(q.questionKey, counter + 1);
+    return { ...q, questionKey: `${q.questionKey}::${counter}` };
   });
 }
 

@@ -249,6 +249,108 @@ describe('PageContextReducer', () => {
     expect(unretired!.warnings).not.toContain('retired_missing_from_dom');
   });
 
+  it('protects filled questions from retirement during full sync', () => {
+    const base = createEmptySession('job-fill-prot', 'run-fill-prot');
+    const page = createPageRecord({
+      pageType: 'questions',
+      pageTitle: 'Mixed',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-fill-prot',
+      pageStepKey: 'questions::mixed',
+      pageSequence: 1,
+    });
+
+    let session = applyPageEntry(base, page);
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::a::text::no-options', fieldIds: ['ff-1'], promptText: 'First name', questionType: 'text' }),
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['ff-2'], promptText: 'Last name', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    // Simulate answer planning + DOM write success (sets state to 'filled')
+    session = applyAnswerDecisions(session, [
+      { questionKey: 'q::a::text::no-options', answer: 'John', confidence: 0.95, source: 'llm' },
+    ]);
+    // applyAnswerDecisions sets 'planned'; simulate DOM write success
+    const q1Pre = session.pages[0].questions.find((q) => q.questionKey === 'q::a::text::no-options');
+    if (q1Pre) q1Pre.state = 'filled';
+
+    // Full sync drops ff-1 — filled question should survive
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['ff-2'], promptText: 'Last name', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    const q1 = session.pages[0].questions.find((q) => q.questionKey === 'q::a::text::no-options');
+    expect(q1).toBeDefined();
+    expect(q1!.state).toBe('filled');
+    expect(q1!.warnings).not.toContain('retired_missing_from_dom');
+  });
+
+  it('protects planned questions from retirement during full sync', () => {
+    const base = createEmptySession('job-plan-prot', 'run-plan-prot');
+    const page = createPageRecord({
+      pageType: 'questions',
+      pageTitle: 'Mixed',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-plan-prot',
+      pageStepKey: 'questions::mixed',
+      pageSequence: 1,
+    });
+
+    let session = applyPageEntry(base, page);
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::a::text::no-options', fieldIds: ['ff-1'], promptText: 'First name', questionType: 'text' }),
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['ff-2'], promptText: 'Last name', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    // Plan an answer for the first question (sets state to 'planned')
+    session = applyAnswerDecisions(session, [
+      { questionKey: 'q::a::text::no-options', answer: 'John', confidence: 0.95, source: 'llm' },
+    ]);
+    // Manually set state to 'planned' to simulate answer planning without DOM write
+    const q1Before = session.pages[0].questions.find((q) => q.questionKey === 'q::a::text::no-options');
+    if (q1Before) q1Before.state = 'planned';
+
+    // Full sync drops ff-1 — planned question should survive
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['ff-2'], promptText: 'Last name', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    const q1 = session.pages[0].questions.find((q) => q.questionKey === 'q::a::text::no-options');
+    expect(q1).toBeDefined();
+    expect(q1!.state).toBe('planned');
+    expect(q1!.warnings).not.toContain('retired_missing_from_dom');
+  });
+
+  it('buildContextReport excludes retired questions from requiredUnresolved', () => {
+    const base = createEmptySession('job-report-retire', 'run-report-retire');
+    const page = createPageRecord({
+      pageType: 'questions',
+      pageTitle: 'Mixed',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-report-retire',
+      pageStepKey: 'questions::mixed',
+      pageSequence: 1,
+    });
+
+    let session = applyPageEntry(base, page);
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::a::text::no-options', fieldIds: ['ff-1'], promptText: 'First name', questionType: 'text', required: true }),
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['ff-2'], promptText: 'Last name', questionType: 'text', required: true }),
+    ], { isFullSync: true });
+
+    // Full sync drops ff-1 — retires it
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['ff-2'], promptText: 'Last name', questionType: 'text', required: true }),
+    ], { isFullSync: true });
+
+    const report = buildContextReport(session);
+    // Retired question should NOT appear in requiredUnresolved
+    const keys = report.requiredUnresolved.map((r) => r.questionKey);
+    expect(keys).not.toContain('q::a::text::no-options');
+    // Non-retired unresolved question should still appear
+    expect(keys).toContain('q::b::text::no-options');
+  });
+
   it('includes best_effort_guess answers in bestEffortGuesses report', () => {
     const base = createEmptySession('job-beg', 'run-beg');
     const page = createPageRecord({

@@ -234,6 +234,30 @@ describe('QuestionNormalizer', () => {
     expect(secondDraft!.warnings).toContain('duplicate_field_id_skipped');
   });
 
+  it('reconciliation deduplicates colliding question keys with stable within-group counters', () => {
+    const liveFields = [
+      { id: 'f1', name: 'Phone', type: 'tel', section: 'Contact', required: true },
+      { id: 'f2', name: 'Phone', type: 'tel', section: 'Contact', required: false },
+      { id: 'f3', name: 'Email', type: 'email', section: 'Contact', required: true },
+    ];
+    const heuristic = normalizeExtractedQuestions(liveFields);
+    // LLM groups both Phone fields into two separate questions with same prompt
+    const llmDrafts: NormalizedQuestionDraft[] = [
+      { promptText: 'Phone number', questionType: 'tel', required: true, fieldIds: ['f1'], options: [], groupingConfidence: 0.9, warnings: [] },
+      { promptText: 'Phone number', questionType: 'tel', required: false, fieldIds: ['f2'], options: [], groupingConfidence: 0.9, warnings: [] },
+      { promptText: 'Email address', questionType: 'email', required: true, fieldIds: ['f3'], options: [], groupingConfidence: 0.95, warnings: [] },
+    ];
+
+    const result = reconcileNormalizedQuestions(heuristic, llmDrafts, liveFields);
+    const phoneQuestions = result.filter((q) => q.promptText === 'Phone number');
+    expect(phoneQuestions).toHaveLength(2);
+    // Keys should be distinct via dedup suffix
+    expect(phoneQuestions[0].questionKey).not.toBe(phoneQuestions[1].questionKey);
+    // Both should have ::0 and ::1 suffixes
+    const suffixes = phoneQuestions.map((q) => q.questionKey.match(/::\d+$/)?.[0]).sort();
+    expect(suffixes).toEqual(['::0', '::1']);
+  });
+
   it('reconciliation discards invalid field IDs from LLM drafts', () => {
     const liveFields = [
       { id: 'f1', name: 'Email', type: 'email', section: '', required: true },

@@ -214,9 +214,11 @@ export function syncQuestions(
   }
 
   // Only retire on full-page syncs — partial (rerun) syncs contain just new fields.
-  // Protect only confirmed progress (filled/verified) — retire everything else
-  // including attempted/failed to prevent stale hidden fields from blocking forever.
-  const PROTECTED_STATES = new Set(['filled', 'verified']);
+  // Protect confirmed progress (filled/verified) and planned answers from retirement.
+  // 'planned' is protected because it means an answer was computed but not yet written
+  // to the DOM — retiring it would lose the planned answer and re-add it as 'empty'.
+  // Attempted/failed are NOT protected to prevent stale hidden fields from blocking forever.
+  const PROTECTED_STATES = new Set(['filled', 'verified', 'planned']);
   if (opts?.isFullSync) {
     for (const question of page.questions) {
       if (question.state === 'skipped') continue;
@@ -553,6 +555,11 @@ export function buildContextReport(
     }
 
     for (const question of page.questions) {
+      // Skip retired questions — they've been removed from the DOM and should not
+      // appear in the report (consistent with auditPage which also skips them)
+      if (question.state === 'skipped' && question.warnings.includes('retired_missing_from_dom')) {
+        continue;
+      }
       const resolved = question.state === 'filled' || question.state === 'verified';
       if (question.required && !resolved) {
         report.requiredUnresolved.push({
