@@ -238,12 +238,12 @@ function deduplicateQuestionKeys(questions: QuestionSnapshot[]): QuestionSnapsho
   for (const q of questions) {
     keyCounts.set(q.questionKey, (keyCounts.get(q.questionKey) || 0) + 1);
   }
-  // Only process keys that appear more than once — use sorted fieldIds as a stable
-  // disambiguator instead of position-based ordinals (order-independent)
+  // Only process keys that appear more than once — use orderIndex as suffix since it
+  // represents visual position on the page, which is stable across DOM rerenders
+  // (unlike fieldIds which change when the DOM reconstructs elements)
   return questions.map((q) => {
     if ((keyCounts.get(q.questionKey) || 0) <= 1) return q;
-    const fieldSig = q.fieldIds.slice().sort().join('+') || String(q.orderIndex);
-    return { ...q, questionKey: `${q.questionKey}::${fieldSig}` };
+    return { ...q, questionKey: `${q.questionKey}::${q.orderIndex}` };
   });
 }
 
@@ -377,5 +377,5 @@ export function reconcileNormalizedQuestions(
   }
 
   results.sort((a, b) => a.orderIndex - b.orderIndex);
-  return results;
+  return deduplicateQuestionKeys(results);
 }
