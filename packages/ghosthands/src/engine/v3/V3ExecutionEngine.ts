@@ -226,7 +226,7 @@ export class V3ExecutionEngine {
       cookbook: params.cookbook,
       logger: {
         info: (msg, meta) => { params.logEvent('v3_info', { message: msg, ...meta }).catch(() => {}); },
-        warn: (msg, meta) => { params.logEvent('v3_warn', { message: `TestingAlex ${msg}`, ...meta }).catch(() => {}); },
+        warn: (msg, meta) => { params.logEvent('v3_warn', { message: msg, ...meta }).catch(() => {}); },
         error: (msg, meta) => { params.logEvent('v3_error', { message: msg, ...meta }).catch(() => {}); },
         debug: (msg, meta) => { params.logEvent('v3_debug', { message: msg, ...meta }).catch(() => {}); },
       },
