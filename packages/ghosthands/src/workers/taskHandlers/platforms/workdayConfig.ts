@@ -1323,7 +1323,7 @@ MY EXPERIENCE PAGE DATA:
 WORK EXPERIENCE (click "Add" under Work Experience section first):
   Job Title: ${exp.title}
   Company: ${exp.company}
-  Location: ${exp.location || ''}
+  Location: ${exp.location || ''} (this is a TYPEAHEAD — type "${(exp.location || '').split(',')[0]?.trim() || exp.location || ''}", press Enter, wait for suggestions to load, then click the matching option. If "No results" appear, try a shorter search term)
   I currently work here: ${exp.currently_work_here ? 'YES — check the checkbox' : 'No'}
   From date: ${fromDate} — IMPORTANT: The date field has TWO parts side by side: MM on the LEFT and YYYY on the RIGHT. You MUST click on the LEFT part (the MM box) first, NOT the right part (YYYY). Then type "${fromDate.replace('/', '')}" as continuous digits — Workday will auto-advance from the MM box to the YYYY box as you type.
   Role Description: ${exp.description}
@@ -1333,7 +1333,7 @@ WORK EXPERIENCE (click "Add" under Work Experience section first):
     if (edu) {
       dataBlock += `
 EDUCATION (click "Add" under Education section first):
-  School or University: ${edu.school}
+  School or University: ${edu.school} (this is a TYPEAHEAD — type "${edu.school}", press Enter, wait for suggestions to load, then click the matching option)
   Degree: ${edu.degree} (this is a DROPDOWN — click it, then type "${edu.degree}" to filter and select)
   Field of Study: ${edu.field_of_study} (this is a TYPEAHEAD — type "${edu.field_of_study}", wait for suggestions to load, then press Enter to select the first match)
 `;
@@ -1381,7 +1381,12 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
     for (let round = 1; round <= MAX_SCROLL_ROUNDS; round++) {
       if (llmCallCount < MAX_LLM_CALLS) {
         console.log(`[Workday] [MyExperience] LLM fill round ${round} (call ${llmCallCount + 1}/${MAX_LLM_CALLS})...`);
-        await adapter.act(fillPrompt);
+        try {
+          await adapter.act(fillPrompt);
+        } catch (err) {
+          console.warn(`[Workday] [MyExperience] act() failed on round ${round}: ${err instanceof Error ? err.message : String(err)}`);
+          // Continue to next scroll position — subsequent rounds may fill remaining fields
+        }
         llmCallCount++;
         await adapter.page.waitForTimeout(1000);
       }
