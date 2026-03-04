@@ -21,9 +21,11 @@ import * as path from 'path';
 import * as fs from 'fs';
 import Anthropic from '@anthropic-ai/sdk';
 
+import { z } from 'zod';
 import type { BrowserAutomationAdapter } from '../../adapters/types.js';
-import { buildAnswerDecisionsFromFieldAnswers, normalizeExtractedQuestions } from '../../context/QuestionNormalizer.js';
-import type { AnswerDecision, QuestionOutcome, QuestionSnapshot } from '../../context/types.js';
+import { buildAnswerDecisionsFromFieldAnswers, normalizeExtractedQuestions, reconcileNormalizedQuestions } from '../../context/QuestionNormalizer.js';
+import type { NormalizedQuestionDraft } from '../../context/QuestionNormalizer.js';
+import type { AnswerDecision, AnswerMode, QuestionOutcome, QuestionSnapshot } from '../../context/types.js';
 import type { WorkdayUserProfile } from './workday/workdayTypes.js';
 
 // ── Types ────────────────────────────────────────────────────
@@ -41,6 +43,18 @@ export interface FormField {
   isMultiSelect?: boolean;
   visibleByDefault: boolean;
   visibleWhen?: any[];
+  /** Original label text before asterisk/required stripping */
+  rawLabel?: string;
+  /** Where the label was sourced from (e.g. 'prevSibling', 'ariaLabel', 'parentText') */
+  labelSources?: string[];
+  /** Signals that contributed to required detection */
+  requiredSignals?: string[];
+  /** Warnings about observation quality */
+  observationWarning?: string[];
+  /** True if the label was generated synthetically */
+  syntheticLabel?: boolean;
+  /** Stable fingerprint for identity tracking */
+  fieldFingerprint?: string;
 }
 
 export type AnswerMap = Record<string, string>;
@@ -834,6 +848,9 @@ async function extractFields(page: Page): Promise<FormField[]> {
 
       if (!questionLabel) continue;
 
+      // Preserve raw label before sanitization
+      const rawQuestionLabel = questionLabel;
+
       questionLabel = questionLabel
         .replace(/\s*\*\s*/g, ' ')
         .replace(/\s*Required\s*/gi, '')
@@ -852,17 +869,23 @@ async function extractFields(page: Page): Promise<FormField[]> {
       }
 
       const containerId = ff.tag(container);
-      let isRequired = false;
-      if (prevSib) {
-        isRequired = (prevSib.textContent || '').includes('*');
-      }
+      // Multi-signal required detection
+      const requiredSignals: string[] = [];
+      if (rawQuestionLabel.includes('*')) requiredSignals.push('label_asterisk');
+      if (prevSib && (prevSib.textContent || '').includes('*')) requiredSignals.push('sibling_asterisk');
+      if (container.getAttribute('aria-required') === 'true') requiredSignals.push('aria_required');
+      if (container.closest('[aria-required="true"]')) requiredSignals.push('ancestor_aria_required');
+      if (/required/i.test(rawQuestionLabel)) requiredSignals.push('label_required_text');
+      const isRequired = requiredSignals.length > 0;
 
       results.push({
         id: containerId,
         name: questionLabel,
+        rawLabel: rawQuestionLabel,
         type: 'button-group',
         section: ff.getSection(container),
         required: isRequired,
+        requiredSignals,
         visible: true,
         isNative: false,
         choices,
@@ -885,6 +908,8 @@ async function extractFields(page: Page): Promise<FormField[]> {
       isNative: false,
       choices: bg.choices,
       visibleByDefault: true,
+      rawLabel: (bg as any).rawLabel,
+      requiredSignals: (bg as any).requiredSignals,
     });
   }
 
@@ -2666,6 +2691,133 @@ async function expandRepeaters(page: Page, profileText: string): Promise<void> {
   await page.waitForTimeout(500);
 }
 
+// ── LLM Normalization + Answer Planning via adapter.extract ──
+
+const NormalizedQuestionSchema = z.object({
+  questions: z.array(z.object({
+    promptText: z.string().describe('The human-readable question text'),
+    questionType: z.string().describe('One of: text, textarea, email, tel, url, number, date, select, radio, checkbox, unknown'),
+    required: z.boolean().describe('Whether this question is required'),
+    fieldIds: z.array(z.string()).describe('The data-ff-id values of every form control that belongs to this question'),
+    options: z.array(z.string()).describe('Available choices/options if any, otherwise empty array'),
+    groupingConfidence: z.number().min(0).max(1).describe('How confident you are in this grouping (0-1)'),
+    warnings: z.array(z.string()).describe('Any issues or ambiguities detected'),
+  })),
+});
+
+const AnswerPlanSchema = z.object({
+  answers: z.array(z.object({
+    questionKey: z.string().describe('The questionKey from the normalized question'),
+    answer: z.string().min(1).describe('The answer value — MUST NOT be empty for non-file questions'),
+    confidence: z.number().min(0).max(1).describe('How confident you are (0-1)'),
+    answerMode: z.enum(['profile_backed', 'best_effort_guess', 'default_decline', 'system_attachment'])
+      .describe('profile_backed if from profile data, best_effort_guess if inferred, default_decline for neutral decline choices'),
+  })),
+});
+
+/**
+ * Use the Mastra-managed adapter.extract() to normalize raw observed fields
+ * into logical questions. Falls back gracefully on failure.
+ */
+async function normalizeObservedQuestions(
+  fields: FormField[],
+  adapter: BrowserAutomationAdapter,
+): Promise<NormalizedQuestionDraft[]> {
+  const fieldDescriptions = fields.map((f) => {
+    let desc = `- id="${f.id}" name="${f.name}" type="${f.type}"`;
+    if (f.required) desc += ' REQUIRED';
+    if (f.options?.length) desc += ` options=[${f.options.slice(0, 20).join(', ')}]`;
+    if (f.choices?.length) desc += ` choices=[${f.choices.join(', ')}]`;
+    if (f.section) desc += ` section="${f.section}"`;
+    if (f.syntheticLabel) desc += ' [synthetic_label]';
+    return desc;
+  }).join('\n');
+
+  const instruction = `You are analyzing a job application form. Below is a list of every visible form control on the current page. Your job is to group them into logical questions.
+
+Form controls:
+${fieldDescriptions}
+
+Rules:
+- Every field id MUST appear in exactly one question's fieldIds. Do not omit any field.
+- Group related controls (e.g. Yes/No radio buttons, checkbox sets) into a single question.
+- For button-group controls (Yes/No toggles), treat them as radio-like questions with the choices as options.
+- Short yes/no-like labels are likely options of a parent question, not standalone prompts.
+- If you cannot confidently group a field, keep it as a standalone question with low groupingConfidence.
+- Prefer preserving the page order.
+- Never silently drop a field.`;
+
+  try {
+    const result = await adapter.extract(instruction, NormalizedQuestionSchema);
+    return result.questions.map((q) => ({
+      promptText: q.promptText,
+      questionType: q.questionType,
+      required: q.required,
+      fieldIds: q.fieldIds,
+      options: q.options,
+      groupingConfidence: q.groupingConfidence,
+      warnings: q.warnings,
+    }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`[formFiller] LLM normalization failed, falling back to heuristics: ${msg.slice(0, 120)}`);
+    return [];
+  }
+}
+
+/**
+ * Use the Mastra-managed adapter.extract() to plan answers for normalized questions.
+ * Returns structured answer plans with confidence and answer mode.
+ */
+async function planAnswersForQuestions(
+  questions: QuestionSnapshot[],
+  profileText: string,
+  adapter: BrowserAutomationAdapter,
+): Promise<Array<{ questionKey: string; answer: string; confidence: number; answerMode: AnswerMode }>> {
+  if (questions.length === 0) return [];
+
+  const questionDescriptions = questions.map((q) => {
+    let desc = `- key="${q.questionKey}" prompt="${q.promptText}" type=${q.questionType}`;
+    if (q.required) desc += ' (REQUIRED)';
+    if (q.options.length) desc += ` options=[${q.options.map(o => o.label).join(', ')}]`;
+    if (q.sectionLabel) desc += ` section="${q.sectionLabel}"`;
+    return desc;
+  }).join('\n');
+
+  const instruction = `You are filling out a job application form. Today's date is ${new Date().toLocaleDateString('en-CA')}.
+
+Applicant profile:
+${profileText}
+
+Questions to answer:
+${questionDescriptions}
+
+Rules:
+- For EVERY question, provide a non-empty answer. NEVER return an empty answer for any non-file question.
+- Use answerMode "profile_backed" when the answer comes directly from the profile.
+- Use answerMode "best_effort_guess" when you infer a plausible answer not explicitly in the profile.
+- Use answerMode "default_decline" for demographic/EEO fields where the profile lacks info — choose a neutral decline option like "Prefer not to say", "Decline to self-identify".
+- For questions with listed options, pick the EXACT text of one available option.
+- For Yes/No questions about relocation, sponsorship, authorization — answer based on profile data.
+- For textarea fields, write 2-4 thoughtful sentences. Never a single letter or placeholder.
+- NEVER select placeholder options like "Select One", "Choose one", "Please select".
+- Fields marked (REQUIRED) MUST have a meaningful answer.`;
+
+  try {
+    const result = await adapter.extract(instruction, AnswerPlanSchema);
+    return result.answers.map((a) => ({
+      questionKey: a.questionKey,
+      answer: a.answer,
+      confidence: a.confidence,
+      answerMode: a.answerMode as AnswerMode,
+    }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`[formFiller] LLM answer planning failed: ${msg.slice(0, 120)}`);
+    return [];
+  }
+}
+
 // ── Main entry point ─────────────────────────────────────────
 
 /**
@@ -2729,7 +2881,22 @@ export async function fillFormOnPage(
   console.log('[formFiller] Extracting form fields…');
   const allFields = await extractFields(page);
   const visibleFields = allFields.filter((f) => f.visibleByDefault && (f.name || f.type === 'file'));
-  const llmFields = visibleFields.filter((f) => f.type !== 'file' && !!f.name);
+
+  // Assign synthetic labels to unlabeled visible non-file controls so they reach normalization
+  let syntheticCounter = 0;
+  const visibleNonFileFields: FormField[] = [];
+  for (const f of visibleFields) {
+    if (f.type === 'file') continue;
+    if (!f.name || !f.name.trim()) {
+      syntheticCounter++;
+      f.name = `Unlabeled control #${syntheticCounter}`;
+      f.syntheticLabel = true;
+      f.observationWarning = [...(f.observationWarning || []), 'missing_label'];
+    }
+    visibleNonFileFields.push(f);
+  }
+  // llmFields now includes ALL visible non-file controls (including synthetic-labeled)
+  const llmFields = visibleNonFileFields;
   const profileSkills = parseProfileSkills(profileText);
   const profileSkillsCsv = profileSkills.join(', ');
   const observers = opts?.observers;
@@ -2745,14 +2912,69 @@ export async function fillFormOnPage(
       console.warn(`[formFiller] observer ${String(label)} failed: ${message}`);
     }
   };
-  const initialQuestionSnapshots = normalizeExtractedQuestions(visibleFields);
-  result.questionSnapshots = initialQuestionSnapshots;
+
+  // 4a. Heuristic seed normalization (deterministic, fast)
+  const heuristicSnapshots = normalizeExtractedQuestions(visibleFields);
   result.totalFields = visibleFields.length;
-  console.log(`[formFiller] Found ${visibleFields.length} visible fields.`);
+  console.log(`[formFiller] Found ${visibleFields.length} visible fields (${llmFields.length} non-file).`);
 
   if (visibleFields.length === 0) {
     console.log('[formFiller] No visible fields found — skipping fill.');
     return result;
+  }
+
+  // 5. Discover dropdown options (including hierarchical Workday dropdowns)
+  console.log('[formFiller] Discovering dropdown options…');
+  await discoverDropdownOptions(page, allFields);
+
+  // 6. LLM Normalization → Reconciliation → Answer Planning (new observation pipeline)
+  let answers: AnswerMap = {};
+  const fieldIdMap: Record<string, string> = {};
+  const fieldIdToQuestionKey: Record<string, string> = {};
+  const fieldIdToResolvedAnswer: Record<string, string> = {};
+  const fieldIdToFillSource = new Map<string, 'dom' | 'magnitude'>();
+
+  // Build normalizer-compatible field list for reconciliation
+  const normalizerFields = llmFields.map((f) => ({
+    id: f.id,
+    name: f.name,
+    type: f.type,
+    section: f.section,
+    required: f.required,
+    options: f.options,
+    choices: f.choices,
+  }));
+
+  let initialQuestionSnapshots: QuestionSnapshot[];
+  let usedNewPipeline = false;
+
+  if (llmFields.length > 0) {
+    // 6a. LLM normalization via adapter.extract
+    console.log('[formFiller] Running LLM normalization…');
+    const llmDrafts = await normalizeObservedQuestions(llmFields, adapter);
+    result.llmCalls++;
+
+    if (llmDrafts.length > 0) {
+      // 6b. Reconcile LLM drafts with heuristic seeds
+      console.log(`[formFiller] Reconciling ${llmDrafts.length} LLM drafts with ${heuristicSnapshots.length} heuristic snapshots…`);
+      initialQuestionSnapshots = reconcileNormalizedQuestions(heuristicSnapshots, llmDrafts, normalizerFields);
+      usedNewPipeline = true;
+    } else {
+      // LLM normalization failed — fall back to heuristic snapshots
+      console.log('[formFiller] LLM normalization returned empty — using heuristic snapshots.');
+      initialQuestionSnapshots = heuristicSnapshots;
+    }
+  } else {
+    initialQuestionSnapshots = heuristicSnapshots;
+  }
+
+  result.questionSnapshots = initialQuestionSnapshots;
+
+  // Map field IDs → question keys
+  for (const question of initialQuestionSnapshots) {
+    for (const fieldId of question.fieldIds) {
+      fieldIdToQuestionKey[fieldId] = question.questionKey;
+    }
   }
 
   if (initialQuestionSnapshots.length > 0) {
@@ -2764,52 +2986,125 @@ export async function fillFormOnPage(
     );
   }
 
-  // 5. Discover dropdown options (including hierarchical Workday dropdowns)
-  console.log('[formFiller] Discovering dropdown options…');
-  await discoverDropdownOptions(page, allFields);
-
-  // 6. Ask LLM for answers
-  let answers: AnswerMap = {};
-  const fieldIdMap: Record<string, string> = {};
-  const fieldIdToQuestionKey: Record<string, string> = {};
-  const fieldIdToResolvedAnswer: Record<string, string> = {};
-  const fieldIdToFillSource = new Map<string, 'dom' | 'magnitude'>();
-  for (const question of initialQuestionSnapshots) {
-    for (const fieldId of question.fieldIds) {
-      fieldIdToQuestionKey[fieldId] = question.questionKey;
-    }
-  }
   if (llmFields.length > 0) {
-    console.log('[formFiller] Asking LLM for answers…');
-    const genResult = await generateAnswers(llmFields, profileText);
-    answers = { ...genResult.answers };
-    Object.assign(fieldIdMap, genResult.fieldIdToKey);
-    result.llmCalls++;
-    result.inputTokens += genResult.inputTokens;
-    result.outputTokens += genResult.outputTokens;
-    for (const field of llmFields) {
-      const answer = getAnswerForField(answers, field, fieldIdMap);
-      if (answer !== undefined) {
-        fieldIdToResolvedAnswer[field.id] = answer;
+    if (usedNewPipeline) {
+      // 6c. LLM answer planning via adapter.extract on normalized questions
+      console.log('[formFiller] Running LLM answer planning on normalized questions…');
+      const answerPlans = await planAnswersForQuestions(initialQuestionSnapshots, profileText, adapter);
+      result.llmCalls++;
+
+      if (answerPlans.length > 0) {
+        // Map planned answers back to field IDs
+        for (const plan of answerPlans) {
+          const snapshot = initialQuestionSnapshots.find((q) => q.questionKey === plan.questionKey);
+          if (!snapshot) continue;
+          for (const fieldId of snapshot.fieldIds) {
+            fieldIdToResolvedAnswer[fieldId] = plan.answer;
+          }
+        }
+
+        // Build answer decisions with answerMode
+        const initialDecisions: AnswerDecision[] = answerPlans
+          .filter((plan) => initialQuestionSnapshots.some((q) => q.questionKey === plan.questionKey))
+          .map((plan) => ({
+            questionKey: plan.questionKey,
+            answer: plan.answer,
+            confidence: plan.confidence,
+            source: 'llm' as const,
+            answerMode: plan.answerMode,
+          }));
+        result.answerDecisions = initialDecisions;
+
+        if (initialDecisions.length > 0) {
+          await notifyObserver(
+            'onAnswerPlanned',
+            observers?.onAnswerPlanned
+              ? () => observers.onAnswerPlanned!(initialDecisions)
+              : undefined,
+          );
+        }
+        console.log(`[formFiller] LLM answer planning provided ${answerPlans.length} answers.`);
+      } else {
+        // Answer planning failed — fall back to generateAnswers
+        console.log('[formFiller] LLM answer planning returned empty — falling back to legacy generateAnswers…');
+        const genResult = await generateAnswers(llmFields, profileText);
+        answers = { ...genResult.answers };
+        Object.assign(fieldIdMap, genResult.fieldIdToKey);
+        result.llmCalls++;
+        result.inputTokens += genResult.inputTokens;
+        result.outputTokens += genResult.outputTokens;
+        for (const field of llmFields) {
+          const answer = getAnswerForField(answers, field, fieldIdMap);
+          if (answer !== undefined) {
+            fieldIdToResolvedAnswer[field.id] = answer;
+          }
+        }
+        const initialDecisions = buildAnswerDecisionsFromFieldAnswers(
+          initialQuestionSnapshots,
+          fieldIdToResolvedAnswer,
+          'llm',
+        );
+        result.answerDecisions = initialDecisions;
+        if (initialDecisions.length > 0) {
+          await notifyObserver(
+            'onAnswerPlanned',
+            observers?.onAnswerPlanned
+              ? () => observers.onAnswerPlanned!(initialDecisions)
+              : undefined,
+          );
+        }
+      }
+    } else {
+      // Heuristic-only path — use legacy generateAnswers
+      console.log('[formFiller] Using legacy generateAnswers (heuristic path)…');
+      const genResult = await generateAnswers(llmFields, profileText);
+      answers = { ...genResult.answers };
+      Object.assign(fieldIdMap, genResult.fieldIdToKey);
+      result.llmCalls++;
+      result.inputTokens += genResult.inputTokens;
+      result.outputTokens += genResult.outputTokens;
+      for (const field of llmFields) {
+        const answer = getAnswerForField(answers, field, fieldIdMap);
+        if (answer !== undefined) {
+          fieldIdToResolvedAnswer[field.id] = answer;
+        }
+      }
+      const initialDecisions = buildAnswerDecisionsFromFieldAnswers(
+        initialQuestionSnapshots,
+        fieldIdToResolvedAnswer,
+        'llm',
+      );
+      result.answerDecisions = initialDecisions;
+      if (initialDecisions.length > 0) {
+        await notifyObserver(
+          'onAnswerPlanned',
+          observers?.onAnswerPlanned
+            ? () => observers.onAnswerPlanned!(initialDecisions)
+            : undefined,
+        );
       }
     }
-    const initialDecisions = buildAnswerDecisionsFromFieldAnswers(
-      initialQuestionSnapshots,
-      fieldIdToResolvedAnswer,
-      'llm',
-    );
-    result.answerDecisions = initialDecisions;
-    if (initialDecisions.length > 0) {
-      await notifyObserver(
-        'onAnswerPlanned',
-        observers?.onAnswerPlanned
-          ? () => observers.onAnswerPlanned!(initialDecisions)
-          : undefined,
-      );
+
+    // Never-empty policy: sweep required non-file fields and fill deterministically if empty
+    for (const field of llmFields) {
+      if (!field.required) continue;
+      const existing = fieldIdToResolvedAnswer[field.id];
+      if (existing && existing.trim()) continue;
+      // Best-effort fallback
+      if (field.choices?.length) {
+        fieldIdToResolvedAnswer[field.id] = field.choices[0];
+      } else if (field.options?.length) {
+        const nonPlaceholder = field.options.filter((o) => !PLACEHOLDER_RE.test(o.trim()));
+        if (nonPlaceholder.length) fieldIdToResolvedAnswer[field.id] = nonPlaceholder[0];
+      }
+      if (fieldIdToResolvedAnswer[field.id] && fieldIdToResolvedAnswer[field.id] !== existing) {
+        console.log(`[formFiller] Required fallback: "${field.name}" → "${fieldIdToResolvedAnswer[field.id]}"`);
+      }
     }
-    console.log(`[formFiller] LLM provided ${Object.keys(answers).length} answers.`);
+
+    console.log(`[formFiller] Total resolved answers: ${Object.keys(fieldIdToResolvedAnswer).length}.`);
   } else {
-    console.log('[formFiller] No named non-file fields for LLM — skipping answer generation.');
+    console.log('[formFiller] No non-file fields for LLM — skipping answer generation.');
   }
 
   // 7. Iterative fill loop
@@ -2850,48 +3145,81 @@ export async function fillFormOnPage(
     }
     if (toFill.length === 0) break;
 
-    // If new fields appeared that the LLM hasn't seen, ask again
+    // If new fields appeared that the LLM hasn't seen, re-normalize the FULL visible set
     const unseen = toFill.filter(
       (f) => {
         if (f.type === 'file') return false;
         if (isSkillLikeFieldName(f.name) && profileSkillsCsv) return false;
-        return getAnswerForField(answers, f, fieldIdMap) === undefined;
+        return fieldIdToResolvedAnswer[f.id] === undefined
+          && getAnswerForField(answers, f, fieldIdMap) === undefined;
       }
     );
     if (unseen.length > 0 && round > 1) {
-      console.log(`[formFiller] ${unseen.length} new fields discovered — asking LLM…`);
-      const extraResult = await generateAnswers(unseen, profileText);
-      Object.assign(answers, extraResult.answers);
-      Object.assign(fieldIdMap, extraResult.fieldIdToKey);
+      // Assign synthetic labels to newly-discovered unlabeled controls
+      for (const f of unseen) {
+        if (!f.name || !f.name.trim()) {
+          syntheticCounter++;
+          f.name = `Unlabeled control #${syntheticCounter}`;
+          f.syntheticLabel = true;
+          f.observationWarning = [...(f.observationWarning || []), 'missing_label'];
+        }
+      }
+
+      // Re-normalize the FULL current visible non-file set (not just unseen)
+      const currentVisibleNonFile = visible.filter((f) => f.type !== 'file' && f.name);
+      console.log(`[formFiller] ${unseen.length} new fields discovered — re-normalizing full set of ${currentVisibleNonFile.length}…`);
+
+      const currentNormFields = currentVisibleNonFile.map((f) => ({
+        id: f.id, name: f.name, type: f.type, section: f.section,
+        required: f.required, options: f.options, choices: f.choices,
+      }));
+      const heuristicRerun = normalizeExtractedQuestions(currentNormFields);
+      const llmRerunDrafts = await normalizeObservedQuestions(currentVisibleNonFile, adapter);
       result.llmCalls++;
-      result.inputTokens += extraResult.inputTokens;
-      result.outputTokens += extraResult.outputTokens;
-      const unseenSnapshots = normalizeExtractedQuestions(unseen);
-      if (unseenSnapshots.length > 0) {
+
+      const reconciledSnapshots = llmRerunDrafts.length > 0
+        ? reconcileNormalizedQuestions(heuristicRerun, llmRerunDrafts, currentNormFields)
+        : heuristicRerun;
+
+      // Find snapshots that cover new (unseen) field IDs
+      const unseenIds = new Set(unseen.map((f) => f.id));
+      const newSnapshots = reconciledSnapshots.filter((q) =>
+        q.fieldIds.some((fid) => unseenIds.has(fid)),
+      );
+
+      if (newSnapshots.length > 0) {
         await notifyObserver(
           'onQuestionsNormalized',
           observers?.onQuestionsNormalized
-            ? () => observers.onQuestionsNormalized!(unseenSnapshots)
+            ? () => observers.onQuestionsNormalized!(newSnapshots)
             : undefined,
         );
-        for (const question of unseenSnapshots) {
+        for (const question of newSnapshots) {
           for (const fieldId of question.fieldIds) {
             fieldIdToQuestionKey[fieldId] = question.questionKey;
           }
         }
       }
-      for (const field of unseen) {
-        const answer = getAnswerForField(answers, field, fieldIdMap);
-        if (answer !== undefined) {
-          fieldIdToResolvedAnswer[field.id] = answer;
+
+      // Plan answers for the new snapshots
+      const newAnswerPlans = await planAnswersForQuestions(newSnapshots, profileText, adapter);
+      result.llmCalls++;
+
+      if (newAnswerPlans.length > 0) {
+        for (const plan of newAnswerPlans) {
+          const snapshot = newSnapshots.find((q) => q.questionKey === plan.questionKey);
+          if (!snapshot) continue;
+          for (const fieldId of snapshot.fieldIds) {
+            fieldIdToResolvedAnswer[fieldId] = plan.answer;
+          }
         }
-      }
-      const extraDecisions = buildAnswerDecisionsFromFieldAnswers(
-        unseenSnapshots,
-        fieldIdToResolvedAnswer,
-        'llm',
-      );
-      if (extraDecisions.length > 0) {
+        const extraDecisions: AnswerDecision[] = newAnswerPlans.map((plan) => ({
+          questionKey: plan.questionKey,
+          answer: plan.answer,
+          confidence: plan.confidence,
+          source: 'llm' as const,
+          answerMode: plan.answerMode,
+        }));
         result.answerDecisions = [...(result.answerDecisions || []), ...extraDecisions];
         await notifyObserver(
           'onAnswerPlanned',
@@ -2899,6 +3227,34 @@ export async function fillFormOnPage(
             ? () => observers.onAnswerPlanned!(extraDecisions)
             : undefined,
         );
+      } else {
+        // Fallback to legacy generateAnswers for unseen fields
+        const extraResult = await generateAnswers(unseen, profileText);
+        Object.assign(answers, extraResult.answers);
+        Object.assign(fieldIdMap, extraResult.fieldIdToKey);
+        result.llmCalls++;
+        result.inputTokens += extraResult.inputTokens;
+        result.outputTokens += extraResult.outputTokens;
+        for (const field of unseen) {
+          const answer = getAnswerForField(answers, field, fieldIdMap);
+          if (answer !== undefined) {
+            fieldIdToResolvedAnswer[field.id] = answer;
+          }
+        }
+        const extraDecisions = buildAnswerDecisionsFromFieldAnswers(
+          newSnapshots,
+          fieldIdToResolvedAnswer,
+          'llm',
+        );
+        if (extraDecisions.length > 0) {
+          result.answerDecisions = [...(result.answerDecisions || []), ...extraDecisions];
+          await notifyObserver(
+            'onAnswerPlanned',
+            observers?.onAnswerPlanned
+              ? () => observers.onAnswerPlanned!(extraDecisions)
+              : undefined,
+          );
+        }
       }
     }
 

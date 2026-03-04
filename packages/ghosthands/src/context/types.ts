@@ -32,6 +32,8 @@ export type QuestionRiskLevel =
 
 export type QuestionSource = 'dom' | 'llm' | 'magnitude' | 'manual' | 'merged';
 
+export type AnswerMode = 'profile_backed' | 'best_effort_guess' | 'default_decline' | 'system_attachment';
+
 export type QuestionType =
   | 'text'
   | 'textarea'
@@ -128,6 +130,7 @@ export interface QuestionRecord {
   currentValue?: string;
   selectedOptions: string[];
   lastAnswer?: string;
+  answerMode?: AnswerMode;
   attemptCount: number;
   verificationCount: number;
   warnings: string[];
@@ -189,6 +192,14 @@ export interface ContextReport {
     questionKey: QuestionKey;
     warnings: string[];
   }>;
+  bestEffortGuesses: Array<{
+    pageId: string;
+    pageSequence: number;
+    questionKey: QuestionKey;
+    promptText: string;
+    answer?: string;
+    answerMode?: AnswerMode;
+  }>;
   partialPages: Array<{
     pageId: string;
     pageSequence: number;
@@ -237,6 +248,7 @@ export interface AnswerDecision {
   answer: string;
   confidence: number;
   source: Exclude<QuestionSource, 'merged'>;
+  answerMode?: AnswerMode;
 }
 
 export interface QuestionOutcome {
