@@ -64,6 +64,7 @@ interface HandleJobErrorInput {
   totalCost: number;
   resultData?: Record<string, unknown>;
   pageContext?: PageContextService;
+  contextFlushed?: boolean;
 }
 
 export interface JobExecutorOptions {
@@ -1721,6 +1722,7 @@ export class JobExecutor {
           totalCost: sideEffects.finalCost.totalCost,
           resultData: sideEffects.resultData,
           pageContext,
+          contextFlushed: sideEffects.contextFlushed,
         });
         return;
       }
@@ -1764,6 +1766,7 @@ export class JobExecutor {
     totalCost,
     resultData,
     pageContext,
+    contextFlushed,
   }: HandleJobErrorInput): Promise<void> {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorCode = this.classifyError(errorMessage);
@@ -1806,7 +1809,8 @@ export class JobExecutor {
       getLogger().info('Job re-queued for retry', { jobId: job.id, retryCount: job.retry_count + 1, maxRetries: job.max_retries, backoffSeconds });
     } else {
       let finalResultData = resultData;
-      if (pageContext) {
+      // Only flush if finalizeHandlerSideEffects hasn't already flushed
+      if (pageContext && !contextFlushed) {
         try {
           const report = await pageContext.flushToSupabase();
           finalResultData = {

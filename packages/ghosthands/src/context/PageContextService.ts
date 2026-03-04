@@ -185,6 +185,11 @@ export class LivePageContextService implements PageContextService {
         visitCount: nextPage.visitCount,
       },
     });
+    // Apply the same history cap as pushEvent to prevent unbounded growth
+    const MAX_HISTORY = 200;
+    if (nextPage.history.length > MAX_HISTORY) {
+      nextPage.history.splice(0, nextPage.history.length - MAX_HISTORY);
+    }
 
     this.session = applyPageEntry(nextSession, nextPage);
     await this.persistCurrent(baseVersion);
@@ -306,12 +311,22 @@ export class LivePageContextService implements PageContextService {
     );
     if (firstAttempt.saved) return;
 
+    // Conflict: retry once — re-read persisted state, bump version, attempt again
     const latest = firstAttempt.current;
+    if (latest) {
+      const retrySession = { ...current, version: latest.version + 1 };
+      const retryAttempt = await this.store.write(retrySession, latest.version);
+      if (retryAttempt.saved) {
+        this.session = retrySession;
+        return;
+      }
+    }
+
     const latestVersion = typeof latest?.version === 'number' ? latest.version : 'unknown';
     const expectedLabel =
       typeof expectedVersion === 'number' ? String(expectedVersion) : 'none';
     console.warn(
-      `[page-context] optimistic write conflict; discarding in-memory session update `
+      `[page-context] optimistic write conflict after retry; adopting persisted state `
         + `(jobId=${this.jobId}, mastraRunId=${this.mastraRunId ?? 'uninitialized'}, `
         + `expectedVersion=${expectedLabel}, localVersion=${current.version}, `
         + `persistedVersion=${latestVersion})`,

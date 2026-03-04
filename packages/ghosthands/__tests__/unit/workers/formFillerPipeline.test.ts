@@ -6,7 +6,9 @@ import {
   applyNeverEmptyFallback,
   buildFallbackDecisions,
   classifyFallbackAnswerMode,
+  isPlaceholderValue,
 } from '../../../src/workers/taskHandlers/formFiller';
+import { redactSensitiveValue } from '../../../src/context/PageContextReducer';
 
 /**
  * Integration-style tests for the formFiller observation pipeline.
@@ -172,7 +174,7 @@ describe('formFiller observation pipeline integration', () => {
     expect(decisions[0].questionKey).toBe('q2');
   });
 
-  it('applyNeverEmptyFallback with all-placeholder options still produces a non-empty fallback', () => {
+  it('applyNeverEmptyFallback with all-placeholder options leaves select unresolved', () => {
     const fields = [
       { id: 'f1', type: 'select', options: ['Select...', '-- Select --', 'Please select'] },
       { id: 'f2', type: 'text', options: ['Choose one', 'Choose...'] },
@@ -180,9 +182,8 @@ describe('formFiller observation pipeline integration', () => {
 
     const resolved = applyNeverEmptyFallback(fields, {});
 
-    // f1 is type 'select' — no type-based default, so last-resort uses options[0]
-    expect(resolved['f1']).toBeTruthy();
-    expect(resolved['f1']).toBe('Select...');
+    // f1 is type 'select' with only placeholder options — left unresolved (no options[0] fallback)
+    expect(resolved['f1']).toBeUndefined();
 
     // f2 is type 'text' — falls through to type-based 'N/A'
     expect(resolved['f2']).toBe('N/A');
@@ -273,5 +274,53 @@ describe('formFiller observation pipeline integration', () => {
 
     expect(decisions).toHaveLength(1);
     expect(decisions[0].answerMode).toBe('default_decline');
+  });
+
+  // --- Round 6 tests ---
+
+  it('redactSensitiveValue masks password/ssn/token fields', () => {
+    expect(redactSensitiveValue('password', 'hunter2')).toBe('[REDACTED]');
+    expect(redactSensitiveValue('SSN', '123-45-6789')).toBe('[REDACTED]');
+    expect(redactSensitiveValue('api_token', 'sk-abc123')).toBe('[REDACTED]');
+    expect(redactSensitiveValue('credit_card', '4111111111111111')).toBe('[REDACTED]');
+    expect(redactSensitiveValue('cvv', '123')).toBe('[REDACTED]');
+    expect(redactSensitiveValue('social security number', '111-22-3333')).toBe('[REDACTED]');
+  });
+
+  it('redactSensitiveValue passes through non-sensitive fields', () => {
+    expect(redactSensitiveValue('First name', 'Adam')).toBe('Adam');
+    expect(redactSensitiveValue('Email', 'adam@example.com')).toBe('adam@example.com');
+    expect(redactSensitiveValue('Country', 'US')).toBe('US');
+    expect(redactSensitiveValue('Willing to relocate?', 'Yes')).toBe('Yes');
+  });
+
+  it('isPlaceholderValue detects common placeholder patterns', () => {
+    expect(isPlaceholderValue('Select...')).toBe(true);
+    expect(isPlaceholderValue('-- Select --')).toBe(true);
+    expect(isPlaceholderValue('Please select')).toBe(true);
+    expect(isPlaceholderValue('Choose one')).toBe(true);
+    expect(isPlaceholderValue('Select one')).toBe(true);
+    expect(isPlaceholderValue('Start typing')).toBe(true);
+    expect(isPlaceholderValue('Choose...')).toBe(true);
+    expect(isPlaceholderValue('Pick')).toBe(true);
+  });
+
+  it('isPlaceholderValue rejects real values', () => {
+    expect(isPlaceholderValue('United States')).toBe(false);
+    expect(isPlaceholderValue('Male')).toBe(false);
+    expect(isPlaceholderValue('Yes')).toBe(false);
+    expect(isPlaceholderValue('Software Engineer')).toBe(false);
+    expect(isPlaceholderValue('42')).toBe(false);
+  });
+
+  it('applyNeverEmptyFallback leaves placeholder-only select unresolved instead of using options[0]', () => {
+    const fields = [
+      { id: 'f1', type: 'select', options: ['Select...', '-- Select --', 'Choose...'] },
+    ];
+
+    const resolved = applyNeverEmptyFallback(fields, {});
+
+    // All options are placeholders — no fallback, left unresolved
+    expect(resolved['f1']).toBeUndefined();
   });
 });
