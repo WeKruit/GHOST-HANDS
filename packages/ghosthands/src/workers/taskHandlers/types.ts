@@ -1,4 +1,5 @@
 import type { BrowserAutomationAdapter } from '../../adapters/types.js';
+import type { PageContextService } from '../../context/PageContextService.js';
 import type { CostTracker } from '../costControl.js';
 import type { ProgressTracker } from '../progressTracker.js';
 
@@ -43,6 +44,8 @@ export interface TaskContext {
   dataPrompt: string;
   /** Local file path to the downloaded resume, if a resume_ref was provided */
   resumeFilePath?: string | null;
+  /** Per-run page context tracker used by the Mastra apply flow. */
+  pageContext?: PageContextService;
   /** Block handler execution until human completes a manual action (email verification, manual sign-in, etc.) */
   waitForManualAction?: (options: {
     type: string;

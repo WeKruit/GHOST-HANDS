@@ -440,6 +440,7 @@ export function buildSteps(rt: RuntimeContext) {
         credentials: rt.credentials,
         dataPrompt: rt.dataPrompt,
         resumeFilePath: rt.resumeFilePath,
+        pageContext: rt.pageContext,
         waitForManualAction: rt.waitForManualAction,
       };
 

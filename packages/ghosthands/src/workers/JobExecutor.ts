@@ -31,6 +31,9 @@ import { buildApplyWorkflow } from '../workflows/mastra/applyWorkflow.js';
 import { isMastraResume, claimResume, persistMastraRunId } from '../workflows/mastra/resumeCoordinator.js';
 import { workflowState, type RuntimeContext, type WorkflowState } from '../workflows/mastra/types.js';
 import { finalizeCookbookSuccess, finalizeHandlerResult, finalizeHandlerSideEffects } from './finalization.js';
+import { LivePageContextService, type PageContextService } from '../context/PageContextService.js';
+import { RedisPageContextStore } from '../context/RedisPageContextStore.js';
+import { SupabasePageContextFlusher } from '../context/SupabasePageContextFlusher.js';
 
 const logger = getLogger({ service: 'job-executor' });
 
@@ -1265,6 +1268,11 @@ export class JobExecutor {
   }): Promise<void> {
     const { job, adapter, handler, costTracker, progress, credentials, dataPrompt, resumeFilePath, logEventFn } = opts;
     const logger = getLogger({ service: 'mastra-executor' });
+    const pageContext = new LivePageContextService(
+      job.id,
+      new RedisPageContextStore(this.redis, job.id),
+      new SupabasePageContextFlusher(this.supabase),
+    );
 
     // Build RuntimeContext (closure-injected, never serialized)
     const rt: RuntimeContext = {
@@ -1276,6 +1284,7 @@ export class JobExecutor {
       credentials,
       dataPrompt,
       resumeFilePath,
+      pageContext,
       supabase: this.supabase,
       logEvent: logEventFn,
       workerId: this.workerId,
@@ -1420,6 +1429,7 @@ export class JobExecutor {
       }
 
       run = await registeredWf.createRun({ runId: job.metadata.mastra_run_id });
+      await pageContext.initializeRun(run.runId);
       result = await run.resume({
         step: 'check_blockers_checkpoint',
         resumeData: {
@@ -1471,6 +1481,7 @@ export class JobExecutor {
         job.metadata = { ...job.metadata, mastra_run_id: run.runId };
       }
 
+      await pageContext.initializeRun(run.runId);
       logger.info('Mastra fresh execution', { jobId: job.id, runId: run.runId });
 
       const initialState = workflowState.parse({
@@ -1611,6 +1622,7 @@ export class JobExecutor {
         supabase: this.supabase,
         logEvent: logEventFn,
         uploadScreenshot: (jid, name, buf) => this.uploadScreenshot(jid, name, buf),
+        pageContext,
         engineResult: {
           success: true,
           mode: 'cookbook',
@@ -1651,6 +1663,7 @@ export class JobExecutor {
             supabase: this.supabase,
             logEvent: logEventFn,
             uploadScreenshot: (jid, name, buf) => this.uploadScreenshot(jid, name, buf),
+            pageContext,
             taskResult,
             finalMode,
             engineResult,
@@ -1664,7 +1677,7 @@ export class JobExecutor {
 
         // True failure — perform side effects then throw so the outer catch
         // runs handleJobError() with classification + retry + backoff.
-        await finalizeHandlerSideEffects({
+        const sideEffects = await finalizeHandlerSideEffects({
           job,
           adapter,
           costTracker,
@@ -1674,11 +1687,21 @@ export class JobExecutor {
           supabase: this.supabase,
           logEvent: logEventFn,
           uploadScreenshot: (jid, name, buf) => this.uploadScreenshot(jid, name, buf),
+          pageContext,
           taskResult,
           finalMode,
           engineResult,
         });
-        throw new Error(taskResult.error || 'Handler returned success: false');
+        await this.handleJobError(
+          job,
+          new Error(taskResult.error || 'Handler returned success: false'),
+          sideEffects.finalCost.actionCount,
+          sideEffects.finalCost.inputTokens + sideEffects.finalCost.outputTokens,
+          sideEffects.finalCost.totalCost,
+          sideEffects.resultData,
+          pageContext,
+        );
+        return;
       }
 
       // Handler succeeded (or awaiting review) — use standard finalization
@@ -1692,6 +1715,7 @@ export class JobExecutor {
         supabase: this.supabase,
         logEvent: logEventFn,
         uploadScreenshot: (jid, name, buf) => this.uploadScreenshot(jid, name, buf),
+        pageContext,
         taskResult,
         finalMode,
         engineResult,
@@ -1717,6 +1741,8 @@ export class JobExecutor {
     actionCount: number,
     totalTokens: number,
     totalCost: number,
+    resultData?: Record<string, unknown>,
+    pageContext?: PageContextService,
   ): Promise<void> {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorCode = this.classifyError(errorMessage);
@@ -1758,6 +1784,44 @@ export class JobExecutor {
 
       getLogger().info('Job re-queued for retry', { jobId: job.id, retryCount: job.retry_count + 1, maxRetries: job.max_retries, backoffSeconds });
     } else {
+      let finalResultData = resultData;
+      if (pageContext) {
+        try {
+          const report = await pageContext.flushToSupabase();
+          finalResultData = {
+            ...(finalResultData || {}),
+            context_report: {
+              pages_visited: report.pagesVisited,
+              required_unresolved: report.requiredUnresolved,
+              risky_optional_answers: report.riskyOptionalAnswers,
+              low_confidence_answers: report.lowConfidenceAnswers,
+              ambiguous_question_groups: report.ambiguousQuestionGroups,
+              partial_pages: report.partialPages,
+              flush_status: report.flushStatus,
+            },
+          };
+        } catch (flushErr) {
+          const message = flushErr instanceof Error ? flushErr.message : String(flushErr);
+          await pageContext.markFlushPending(message).catch(() => {});
+          await this.logJobEvent(job.id, 'page_context_flush_failed', { error: message }).catch(() => {});
+          const pendingReport = await pageContext.getContextReport('pending').catch(() => undefined);
+          if (pendingReport) {
+            finalResultData = {
+              ...(finalResultData || {}),
+              context_report: {
+                pages_visited: pendingReport.pagesVisited,
+                required_unresolved: pendingReport.requiredUnresolved,
+                risky_optional_answers: pendingReport.riskyOptionalAnswers,
+                low_confidence_answers: pendingReport.lowConfidenceAnswers,
+                ambiguous_question_groups: pendingReport.ambiguousQuestionGroups,
+                partial_pages: pendingReport.partialPages,
+                flush_status: pendingReport.flushStatus,
+              },
+            };
+          }
+        }
+      }
+
       await this.supabase
         .from('gh_automation_jobs')
         .update({
@@ -1765,6 +1829,7 @@ export class JobExecutor {
           completed_at: new Date().toISOString(),
           error_code: errorCode,
           error_details: { message: errorMessage },
+          ...(finalResultData && { result_data: finalResultData }),
           action_count: actionCount,
           total_tokens: totalTokens,
           llm_cost_cents: Math.round(totalCost * 100),
