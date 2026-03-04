@@ -233,34 +233,58 @@ export function syncQuestions(
       }
     }
 
-    // Consolidate overlapping fieldIds — if a fieldId belongs to multiple live
-    // questions (e.g. from a rerun that regrouped an existing field), the
-    // FIRST (by orderIndex) live question keeps the fieldId, and later duplicates
-    // have it stripped. If stripping leaves a question with no fieldIds, retire it.
-    const claimedFieldIds = new Map<string, number>(); // fieldId → question index
-    const liveQuestions = page.questions
-      .map((q, idx) => ({ q, idx }))
-      .filter(({ q }) => q.state !== 'skipped')
-      .sort((a, b) => a.q.orderIndex - b.q.orderIndex);
+  }
 
-    for (const { q, idx } of liveQuestions) {
-      const keptFieldIds: string[] = [];
-      for (const fid of q.fieldIds) {
-        if (!claimedFieldIds.has(fid)) {
-          claimedFieldIds.set(fid, idx);
-          keptFieldIds.push(fid);
-        }
+  // Consolidate overlapping fieldIds on EVERY sync (not just fullSync).
+  // Incremental syncs can introduce overlaps via mergeQuestionSnapshot's fieldId union
+  // and the un-retire loop resurrecting questions with contested fieldIds.
+  //
+  // Two-pass approach: protected-state questions (filled/verified/planned) claim
+  // fieldIds first regardless of orderIndex, then remaining questions claim by orderIndex.
+  // This prevents a newly-synced empty question from stealing a fieldId that was
+  // already successfully filled on another question.
+  const CONSOLIDATION_PROTECTED = new Set(['filled', 'verified', 'planned']);
+  const claimedFieldIds = new Map<string, number>(); // fieldId → question array index
+  const liveForConsolidation = page.questions
+    .map((q, idx) => ({ q, idx }))
+    .filter(({ q }) => q.state !== 'skipped');
+
+  // Pass 1: protected-state questions claim first (by orderIndex within protected set)
+  const protectedLive = liveForConsolidation
+    .filter(({ q }) => CONSOLIDATION_PROTECTED.has(q.state))
+    .sort((a, b) => a.q.orderIndex - b.q.orderIndex);
+  for (const { q, idx } of protectedLive) {
+    for (const fid of q.fieldIds) {
+      if (!claimedFieldIds.has(fid)) {
+        claimedFieldIds.set(fid, idx);
       }
-      if (keptFieldIds.length < q.fieldIds.length) {
-        q.fieldIds = keptFieldIds;
-        if (!q.warnings.includes('overlap_fieldids_stripped')) {
-          q.warnings.push('overlap_fieldids_stripped');
-        }
-        if (keptFieldIds.length === 0) {
-          q.state = 'skipped';
-          if (!q.warnings.includes('retired_missing_from_dom')) {
-            q.warnings.push('retired_missing_from_dom');
-          }
+    }
+  }
+
+  // Pass 2: non-protected questions claim remaining fieldIds (by orderIndex)
+  const nonProtectedLive = liveForConsolidation
+    .filter(({ q }) => !CONSOLIDATION_PROTECTED.has(q.state))
+    .sort((a, b) => a.q.orderIndex - b.q.orderIndex);
+  for (const { q, idx } of nonProtectedLive) {
+    for (const fid of q.fieldIds) {
+      if (!claimedFieldIds.has(fid)) {
+        claimedFieldIds.set(fid, idx);
+      }
+    }
+  }
+
+  // Strip unclaimed fieldIds from all live questions
+  for (const { q, idx } of liveForConsolidation) {
+    const keptFieldIds = q.fieldIds.filter((fid) => claimedFieldIds.get(fid) === idx);
+    if (keptFieldIds.length < q.fieldIds.length) {
+      q.fieldIds = keptFieldIds;
+      if (!q.warnings.includes('overlap_fieldids_stripped')) {
+        q.warnings.push('overlap_fieldids_stripped');
+      }
+      if (keptFieldIds.length === 0) {
+        q.state = 'skipped';
+        if (!q.warnings.includes('retired_missing_from_dom')) {
+          q.warnings.push('retired_missing_from_dom');
         }
       }
     }

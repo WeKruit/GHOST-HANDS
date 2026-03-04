@@ -529,4 +529,77 @@ describe('PageContextReducer', () => {
     expect(qB!.warnings).toContain('overlap_fieldids_stripped');
     expect(qB!.warnings).toContain('retired_missing_from_dom');
   });
+
+  it('overlap consolidation: filled question keeps fieldId over lower-orderIndex empty question', () => {
+    const base = createEmptySession('job-prot-overlap', 'run-prot-overlap');
+    const page = createPageRecord({
+      pageType: 'form',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-prot-overlap',
+      pageStepKey: 'step-prot-overlap',
+      pageSequence: 0,
+    });
+
+    let session = applyPageEntry(base, page);
+
+    // Initial sync: Q-B owns f1 and is filled
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['f1', 'f2'], orderIndex: 1, promptText: 'B', questionType: 'text' }),
+    ], { isFullSync: true });
+    // Mark Q-B as filled
+    const qBPre = session.pages[0].questions.find((q) => q.questionKey === 'q::b::text::no-options');
+    if (qBPre) qBPre.state = 'filled';
+
+    // Full sync: Q-A (lower orderIndex) also claims f1
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::a::text::no-options', fieldIds: ['f1'], orderIndex: 0, promptText: 'A', questionType: 'text' }),
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['f1', 'f2'], orderIndex: 1, promptText: 'B', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    const qA = session.pages[0].questions.find((q) => q.questionKey === 'q::a::text::no-options');
+    const qB = session.pages[0].questions.find((q) => q.questionKey === 'q::b::text::no-options');
+
+    // B is filled — it should keep f1 despite having higher orderIndex
+    expect(qB!.fieldIds).toContain('f1');
+    expect(qB!.state).toBe('filled');
+    // A (empty, lower orderIndex) should NOT steal f1 from filled B
+    expect(qA!.fieldIds).not.toContain('f1');
+    expect(qA!.warnings).toContain('overlap_fieldids_stripped');
+  });
+
+  it('overlap consolidation: incremental sync also deduplicates overlapping fieldIds', () => {
+    const base = createEmptySession('job-incr-overlap', 'run-incr-overlap');
+    const page = createPageRecord({
+      pageType: 'form',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-incr-overlap',
+      pageStepKey: 'step-incr-overlap',
+      pageSequence: 0,
+    });
+
+    let session = applyPageEntry(base, page);
+
+    // Full sync: Q-A owns f1
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::a::text::no-options', fieldIds: ['f1'], orderIndex: 0, promptText: 'A', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    // Incremental sync: Q-B also claims f1 + f2
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['f1', 'f2'], orderIndex: 1, promptText: 'B', questionType: 'text' }),
+    ]);
+
+    const qA = session.pages[0].questions.find((q) => q.questionKey === 'q::a::text::no-options');
+    const qB = session.pages[0].questions.find((q) => q.questionKey === 'q::b::text::no-options');
+
+    // f1 should only be owned by Q-A (lower orderIndex), not Q-B
+    expect(qA!.fieldIds).toContain('f1');
+    expect(qB!.fieldIds).not.toContain('f1');
+    expect(qB!.fieldIds).toContain('f2');
+
+    // No two live questions should share a fieldId
+    const live = session.pages[0].questions.filter((q) => q.state !== 'skipped');
+    const allFieldIds = live.flatMap((q) => q.fieldIds);
+    expect(allFieldIds.length).toBe(new Set(allFieldIds).size);
+  });
 });
