@@ -1,20 +1,8 @@
+import type { EngineProfile, ProgressEvent } from './types';
+
 export type DesktopExecutionMode = 'direct_runner' | 'local_queue_worker';
 
-export interface NormalizedUserProfile {
-  firstName: string;
-  lastName: string;
-  email: string;
-  phone?: string;
-  linkedIn?: string;
-  address?: string;
-  city?: string;
-  state?: string;
-  zipCode?: string;
-  education: Array<Record<string, unknown>>;
-  experience: Array<Record<string, unknown>>;
-  skills?: string[];
-  qaAnswers?: Record<string, string>;
-}
+export type NormalizedUserProfile = EngineProfile;
 
 export interface SmartApplySubmission {
   userId: string;
@@ -38,14 +26,14 @@ export interface CreateLocalWorkerManagerOptions {
     accessToken: string;
   };
   desktopWorkerId: string;
-  secrets: {
+  secrets?: {
     getProviderKey(provider: 'anthropic'): Promise<string | null>;
     getWorkflowKey(): Promise<string>;
   };
-  storage: {
+  storage?: {
     mastraStatePath: string;
   };
-  workerBinaryPath: string;
+  workerBinaryPath?: string;
   logger?: {
     info?: (message: string, metadata?: Record<string, unknown>) => void;
     warn?: (message: string, metadata?: Record<string, unknown>) => void;
@@ -77,8 +65,8 @@ export interface BrokeredLocalWorkerJob {
   jobId: string;
   leaseId: string;
   targetUrl: string;
-  jobType: 'apply' | string;
-  executionMode: 'mastra' | string;
+  jobType: 'apply' | 'custom';
+  executionMode: string;
   profile: NormalizedUserProfile;
   resumePath?: string;
   metadata?: Record<string, unknown>;
@@ -86,6 +74,7 @@ export interface BrokeredLocalWorkerJob {
 
 export type WorkerCommand =
   | { type: 'start'; payload: WorkerBootstrapPayload }
+  | { type: 'refresh_session'; accessToken: string }
   | { type: 'cancel_job'; jobId: string }
   | { type: 'drain' }
   | { type: 'shutdown' }
@@ -94,8 +83,9 @@ export type WorkerCommand =
 export type WorkerEvent =
   | { type: 'ready' }
   | { type: 'status'; message: string }
-  | { type: 'progress'; jobId: string; payload: Record<string, unknown> }
+  | { type: 'progress'; jobId: string; payload: ProgressEvent }
   | { type: 'job_event'; jobId: string; payload: Record<string, unknown> }
+  | { type: 'job_awaiting_review'; jobId: string }
   | { type: 'job_claimed'; jobId: string }
   | { type: 'job_completed'; jobId: string }
   | { type: 'job_failed'; jobId: string; error: string }
@@ -113,6 +103,6 @@ export interface LocalWorkerManager {
   getState(): LocalWorkerState;
   on(
     event: 'status' | 'progress' | 'job_event' | 'error',
-    handler: (payload: unknown) => void,
+    handler: (payload: WorkerEvent | LocalWorkerState) => void,
   ): this;
 }

@@ -93,13 +93,14 @@ export class GhostHandsBrokerClient {
     desktopWorkerId: string,
     sessionToken: string,
     activeJobId?: string,
+    leaseId?: string,
   ): Promise<void> {
     const response = await fetch(
       `${this.apiBaseUrl}/api/v1/local-workers/${desktopWorkerId}/heartbeat`,
       {
         method: 'POST',
         headers: this.headers({ 'X-Local-Worker-Session': sessionToken }),
-        body: JSON.stringify(activeJobId ? { activeJobId } : {}),
+        body: JSON.stringify(activeJobId && leaseId ? { activeJobId, leaseId } : {}),
       },
     );
     await this.readJson<{ ok: true }>(response);
@@ -108,20 +109,41 @@ export class GhostHandsBrokerClient {
   async sendEvents(
     jobId: string,
     sessionToken: string,
+    leaseId: string,
     events: Array<Record<string, unknown>>,
   ): Promise<void> {
     const response = await fetch(`${this.apiBaseUrl}/api/v1/local-workers/jobs/${jobId}/events`, {
       method: 'POST',
       headers: this.headers({ 'X-Local-Worker-Session': sessionToken }),
-      body: JSON.stringify({ events }),
+      body: JSON.stringify({ leaseId, events }),
     });
+    await this.readJson<{ ok: true }>(response);
+  }
+
+  async awaitingReview(
+    jobId: string,
+    sessionToken: string,
+    payload: { leaseId: string; summary?: string },
+  ): Promise<void> {
+    const response = await fetch(
+      `${this.apiBaseUrl}/api/v1/local-workers/jobs/${jobId}/awaiting-review`,
+      {
+        method: 'POST',
+        headers: this.headers({ 'X-Local-Worker-Session': sessionToken }),
+        body: JSON.stringify(payload),
+      },
+    );
     await this.readJson<{ ok: true }>(response);
   }
 
   async complete(
     jobId: string,
     sessionToken: string,
-    payload: Record<string, unknown>,
+    payload: {
+      leaseId: string;
+      result?: Record<string, unknown>;
+      summary?: string;
+    },
   ): Promise<void> {
     const response = await fetch(`${this.apiBaseUrl}/api/v1/local-workers/jobs/${jobId}/complete`, {
       method: 'POST',
@@ -134,7 +156,12 @@ export class GhostHandsBrokerClient {
   async fail(
     jobId: string,
     sessionToken: string,
-    payload: Record<string, unknown>,
+    payload: {
+      leaseId: string;
+      error: string;
+      code?: string;
+      details?: Record<string, unknown>;
+    },
   ): Promise<void> {
     const response = await fetch(`${this.apiBaseUrl}/api/v1/local-workers/jobs/${jobId}/fail`, {
       method: 'POST',
@@ -147,7 +174,7 @@ export class GhostHandsBrokerClient {
   async release(
     jobId: string,
     sessionToken: string,
-    payload: Record<string, unknown>,
+    payload: { leaseId: string; reason: string },
   ): Promise<void> {
     const response = await fetch(`${this.apiBaseUrl}/api/v1/local-workers/jobs/${jobId}/release`, {
       method: 'POST',
