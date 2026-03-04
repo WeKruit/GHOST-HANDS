@@ -22,6 +22,8 @@ import * as fs from 'fs';
 import Anthropic from '@anthropic-ai/sdk';
 
 import type { BrowserAutomationAdapter } from '../../adapters/types.js';
+import { buildAnswerDecisionsFromFieldAnswers, normalizeExtractedQuestions } from '../../context/QuestionNormalizer.js';
+import type { AnswerDecision, QuestionOutcome, QuestionSnapshot } from '../../context/types.js';
 import type { WorkdayUserProfile } from './workday/workdayTypes.js';
 
 // ── Types ────────────────────────────────────────────────────
@@ -53,6 +55,28 @@ export interface FillResult {
   inputTokens: number;
   /** Total output tokens consumed by formFiller LLM calls */
   outputTokens: number;
+  questionSnapshots?: QuestionSnapshot[];
+  answerDecisions?: AnswerDecision[];
+  questionOutcomes?: QuestionOutcome[];
+  unresolvedQuestionKeys?: string[];
+  riskyQuestionKeys?: string[];
+}
+
+export interface FillObservers {
+  onQuestionsNormalized?(questions: QuestionSnapshot[]): Promise<void> | void;
+  onAnswerPlanned?(decisions: AnswerDecision[]): Promise<void> | void;
+  onFieldAttempt?(
+    questionKey: string,
+    actor: 'dom' | 'magnitude' | 'human',
+    notes?: string,
+  ): Promise<void> | void;
+  onFieldResult?(outcome: QuestionOutcome): Promise<void> | void;
+  onVerification?(outcome: QuestionOutcome): Promise<void> | void;
+}
+
+export interface FillFormOptions {
+  forceMagnitude?: boolean;
+  observers?: FillObservers;
 }
 
 interface GenerateResult {
@@ -688,16 +712,16 @@ async function extractFields(page: Page): Promise<FormField[]> {
     const ff = (window as any).__ff;
     const results: any[] = [];
 
-    // Find all visible buttons that could be answer choices
     const allBtnEls = document.querySelectorAll('button, [role="button"]');
-    // Group buttons by parent container
-    const parentMap: Record<string, { parent: HTMLElement; buttons: Array<{ el: HTMLElement; text: string }> }> = {};
+    const parentMap: Record<
+      string,
+      { parent: HTMLElement; buttons: Array<{ el: HTMLElement; text: string }> }
+    > = {};
 
     for (let i = 0; i < allBtnEls.length; i++) {
       const btn = allBtnEls[i] as HTMLElement;
       if (!ff.isVisible(btn)) continue;
       if ((btn as any).disabled) continue;
-      // Skip combobox/dropdown triggers
       if (btn.getAttribute('role') === 'combobox') continue;
       if (btn.getAttribute('aria-haspopup') === 'listbox') continue;
       if (btn.tagName.toLowerCase() === 'input') continue;
@@ -705,15 +729,36 @@ async function extractFields(page: Page): Promise<FormField[]> {
       const btnText = (btn.textContent || '').trim();
       if (!btnText || btnText.length > 30) continue;
 
-      // Skip navigation/submit/utility buttons
       const btnLower = btnText.toLowerCase();
-      if (['save and continue', 'next', 'continue', 'submit', 'submit application',
-        'apply', 'add', 'add another', 'replace', 'upload', 'browse', 'remove',
-        'delete', 'cancel', 'back', 'previous', 'close', 'save', 'select one',
-        'choose file'].includes(btnLower) ||
-        btnLower.startsWith('add ') || btnLower.includes('save & continue')) continue;
+      if (
+        [
+          'save and continue',
+          'next',
+          'continue',
+          'submit',
+          'submit application',
+          'apply',
+          'add',
+          'add another',
+          'replace',
+          'upload',
+          'browse',
+          'remove',
+          'delete',
+          'cancel',
+          'back',
+          'previous',
+          'close',
+          'save',
+          'select one',
+          'choose file',
+        ].includes(btnLower) ||
+        btnLower.startsWith('add ') ||
+        btnLower.includes('save & continue')
+      ) {
+        continue;
+      }
 
-      // Find the nearest container with 2-4 visible buttons
       let parent = btn.parentElement as HTMLElement | null;
       for (let pu = 0; pu < 3 && parent; pu++) {
         const childBtns = parent.querySelectorAll('button, [role="button"]');
@@ -726,30 +771,25 @@ async function extractFields(page: Page): Promise<FormField[]> {
       }
       if (!parent) continue;
 
-      const parentKey = parent.getAttribute('data-ff-btn-group') || ('btngrp-' + i);
+      const parentKey = parent.getAttribute('data-ff-btn-group') || `btngrp-${i}`;
       parent.setAttribute('data-ff-btn-group', parentKey);
 
       if (!parentMap[parentKey]) {
         parentMap[parentKey] = { parent, buttons: [] };
       }
-      // Avoid duplicates
-      if (!parentMap[parentKey].buttons.some(b => b.el === btn)) {
+      if (!parentMap[parentKey].buttons.some((entry) => entry.el === btn)) {
         parentMap[parentKey].buttons.push({ el: btn, text: btnText });
       }
     }
 
-    // Process each button group
     for (const groupKey in parentMap) {
       const group = parentMap[groupKey];
       if (group.buttons.length < 2 || group.buttons.length > 4) continue;
-      if (group.buttons.some(b => b.text.length > 30)) continue;
+      if (group.buttons.some((entry) => entry.text.length > 30)) continue;
 
       const container = group.parent;
-
-      // Extract question label
       let questionLabel = '';
 
-      // Strategy 1: Preceding sibling with question text
       const prevSib = container.previousElementSibling;
       if (prevSib) {
         const prevText = (prevSib.textContent || '').trim();
@@ -758,7 +798,6 @@ async function extractFields(page: Page): Promise<FormField[]> {
         }
       }
 
-      // Strategy 2: Walk up to find text before the button container
       if (!questionLabel) {
         let labelContainer = container.parentElement;
         for (let lc = 0; lc < 5 && labelContainer && !questionLabel; lc++) {
@@ -776,7 +815,6 @@ async function extractFields(page: Page): Promise<FormField[]> {
         }
       }
 
-      // Strategy 3: aria-label
       if (!questionLabel) {
         const ariaContainer = container.closest('[aria-label]');
         if (ariaContainer) {
@@ -787,27 +825,24 @@ async function extractFields(page: Page): Promise<FormField[]> {
 
       if (!questionLabel) continue;
 
-      // Clean label
       questionLabel = questionLabel
         .replace(/\s*\*\s*/g, ' ')
         .replace(/\s*Required\s*/gi, '')
         .replace(/\s+/g, ' ')
         .trim();
-      if (questionLabel.length > 200) questionLabel = questionLabel.substring(0, 200).trim();
+      if (questionLabel.length > 200) {
+        questionLabel = questionLabel.substring(0, 200).trim();
+      }
 
-      // Tag each button with data-ff-id and collect choices
       const choices: string[] = [];
       const btnIds: string[] = [];
-      for (const b of group.buttons) {
-        const id = ff.tag(b.el);
-        choices.push(b.text);
+      for (const entry of group.buttons) {
+        const id = ff.tag(entry.el);
+        choices.push(entry.text);
         btnIds.push(id);
       }
 
-      // Tag the container too
       const containerId = ff.tag(container);
-
-      // Check required
       let isRequired = false;
       if (prevSib) {
         isRequired = (prevSib.textContent || '').includes('*');
@@ -825,6 +860,7 @@ async function extractFields(page: Page): Promise<FormField[]> {
         btnIds,
       });
     }
+
     return results;
   });
 
@@ -2092,14 +2128,14 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
           const container = document.querySelector(`[data-ff-id="${ffId}"]`);
           if (!container) return false;
           const textLower = text.toLowerCase().trim();
-          // Find all buttons in this container
           const btns = container.querySelectorAll('button, [role="button"]');
-          // Exact match
           for (const btn of btns) {
             const btnText = (btn.textContent || '').trim().toLowerCase();
-            if (btnText === textLower) { (btn as HTMLElement).click(); return true; }
+            if (btnText === textLower) {
+              (btn as HTMLElement).click();
+              return true;
+            }
           }
-          // Contains match
           for (const btn of btns) {
             const btnText = (btn.textContent || '').trim().toLowerCase();
             if (btnText.includes(textLower) || textLower.includes(btnText)) {
@@ -2111,7 +2147,10 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
         },
         { ffId: field.id, text: choice }
       );
-      if (clicked) { console.log(`[formFiller]   button-group ${tag} → "${choice}"`); return true; }
+      if (clicked) {
+        console.log(`[formFiller]   button-group ${tag} → "${choice}"`);
+        return true;
+      }
       console.log(`[formFiller]   skip ${tag} (button-group, no matching button)`);
       return false;
     }
@@ -2296,13 +2335,20 @@ async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
     const role = el.getAttribute('role') || '';
 
     // Button group: check if any button has pressed/selected state
-    if (el.hasAttribute('data-ff-btn-group') || el.getAttribute('data-gh-scan-idx')?.startsWith('btngrp-')) {
+    if (
+      el.hasAttribute('data-ff-btn-group') ||
+      el.getAttribute('data-gh-scan-idx')?.startsWith('btngrp-')
+    ) {
       const btns = el.querySelectorAll('button, [role="button"]');
       for (const btn of btns) {
-        if (btn.getAttribute('aria-pressed') === 'true' ||
-            btn.getAttribute('aria-selected') === 'true' ||
-            btn.classList.contains('active') ||
-            btn.classList.contains('selected')) return true;
+        if (
+          btn.getAttribute('aria-pressed') === 'true' ||
+          btn.getAttribute('aria-selected') === 'true' ||
+          btn.classList.contains('active') ||
+          btn.classList.contains('selected')
+        ) {
+          return true;
+        }
       }
       return false;
     }
@@ -2627,7 +2673,7 @@ export async function fillFormOnPage(
   adapter: BrowserAutomationAdapter,
   profileText: string,
   resumePath?: string | null,
-  opts?: { forceMagnitude?: boolean },
+  opts?: FillFormOptions,
 ): Promise<FillResult> {
   const result: FillResult = {
     domFilled: 0,
@@ -2677,12 +2723,19 @@ export async function fillFormOnPage(
   const llmFields = visibleFields.filter((f) => f.type !== 'file' && !!f.name);
   const profileSkills = parseProfileSkills(profileText);
   const profileSkillsCsv = profileSkills.join(', ');
+  const observers = opts?.observers;
+  const initialQuestionSnapshots = normalizeExtractedQuestions(visibleFields);
+  result.questionSnapshots = initialQuestionSnapshots;
   result.totalFields = visibleFields.length;
   console.log(`[formFiller] Found ${visibleFields.length} visible fields.`);
 
   if (visibleFields.length === 0) {
     console.log('[formFiller] No visible fields found — skipping fill.');
     return result;
+  }
+
+  if (initialQuestionSnapshots.length > 0) {
+    await observers?.onQuestionsNormalized?.(initialQuestionSnapshots);
   }
 
   // 5. Discover dropdown options (including hierarchical Workday dropdowns)
@@ -2692,6 +2745,13 @@ export async function fillFormOnPage(
   // 6. Ask LLM for answers
   let answers: AnswerMap = {};
   const fieldIdMap: Record<string, string> = {};
+  const fieldIdToQuestionKey: Record<string, string> = {};
+  const fieldIdToResolvedAnswer: Record<string, string> = {};
+  for (const question of initialQuestionSnapshots) {
+    for (const fieldId of question.fieldIds) {
+      fieldIdToQuestionKey[fieldId] = question.questionKey;
+    }
+  }
   if (llmFields.length > 0) {
     console.log('[formFiller] Asking LLM for answers…');
     const genResult = await generateAnswers(llmFields, profileText);
@@ -2700,6 +2760,21 @@ export async function fillFormOnPage(
     result.llmCalls++;
     result.inputTokens += genResult.inputTokens;
     result.outputTokens += genResult.outputTokens;
+    for (const field of llmFields) {
+      const answer = getAnswerForField(answers, field, fieldIdMap);
+      if (answer !== undefined) {
+        fieldIdToResolvedAnswer[field.id] = answer;
+      }
+    }
+    const initialDecisions = buildAnswerDecisionsFromFieldAnswers(
+      initialQuestionSnapshots,
+      fieldIdToResolvedAnswer,
+      'llm',
+    );
+    result.answerDecisions = initialDecisions;
+    if (initialDecisions.length > 0) {
+      await observers?.onAnswerPlanned?.(initialDecisions);
+    }
     console.log(`[formFiller] LLM provided ${Object.keys(answers).length} answers.`);
   } else {
     console.log('[formFiller] No named non-file fields for LLM — skipping answer generation.');
@@ -2759,6 +2834,30 @@ export async function fillFormOnPage(
       result.llmCalls++;
       result.inputTokens += extraResult.inputTokens;
       result.outputTokens += extraResult.outputTokens;
+      const unseenSnapshots = normalizeExtractedQuestions(unseen);
+      if (unseenSnapshots.length > 0) {
+        await observers?.onQuestionsNormalized?.(unseenSnapshots);
+        for (const question of unseenSnapshots) {
+          for (const fieldId of question.fieldIds) {
+            fieldIdToQuestionKey[fieldId] = question.questionKey;
+          }
+        }
+      }
+      for (const field of unseen) {
+        const answer = getAnswerForField(answers, field, fieldIdMap);
+        if (answer !== undefined) {
+          fieldIdToResolvedAnswer[field.id] = answer;
+        }
+      }
+      const extraDecisions = buildAnswerDecisionsFromFieldAnswers(
+        unseenSnapshots,
+        fieldIdToResolvedAnswer,
+        'llm',
+      );
+      if (extraDecisions.length > 0) {
+        result.answerDecisions = [...(result.answerDecisions || []), ...extraDecisions];
+        await observers?.onAnswerPlanned?.(extraDecisions);
+      }
     }
 
     console.log(`[formFiller] Round ${round}: ${toFill.length} new fields to fill…`);
@@ -2769,11 +2868,27 @@ export async function fillFormOnPage(
       if (!resolved && isSkillLikeFieldName(field.name) && profileSkillsCsv) {
         resolved = profileSkillsCsv;
       }
+      if (resolved !== undefined) {
+        fieldIdToResolvedAnswer[field.id] = resolved;
+      }
+      const questionKey = fieldIdToQuestionKey[field.id];
+      if (questionKey) {
+        await observers?.onFieldAttempt?.(questionKey, 'dom');
+      }
       const fieldAnswers = resolved !== undefined ? { ...answers, [field.name]: resolved } : answers;
       const ok = await fillField(page, field, fieldAnswers, resumePath, resumeAlreadyUploaded);
       if (ok) {
         domFilledOk.add(field.id);
         if (field.type === 'file') resumeAlreadyUploaded = true;
+      }
+      if (questionKey) {
+        await observers?.onFieldResult?.({
+          questionKey,
+          state: ok ? 'filled' : 'failed',
+          currentValue: ok ? resolved : undefined,
+          confidence: ok ? 0.8 : 0.35,
+          source: 'dom',
+        });
       }
     }
 
@@ -2879,14 +2994,42 @@ export async function fillFormOnPage(
 
       console.log(`[formFiller] [MagnitudeHand] act() → "${field.name}"${neighborCtx ? ' (with neighbor context)' : ''}…`);
       try {
+        const questionKey = fieldIdToQuestionKey[field.id];
+        if (questionKey) {
+          await observers?.onFieldAttempt?.(
+            questionKey,
+            'magnitude',
+            neighborCtx ? 'neighbor_context' : undefined,
+          );
+        }
         await adapter.act(prompt, { timeoutMs: MAGNITUDE_HAND_ACT_TIMEOUT_MS });
         console.log(`[formFiller] [MagnitudeHand] Filled "${field.name}" OK`);
         filledCount++;
+        filledIds.add(field.id);
         adapterBusyCount = 0;
+        if (questionKey) {
+          await observers?.onFieldResult?.({
+            questionKey,
+            state: 'filled',
+            currentValue: answer,
+            confidence: 0.7,
+            source: 'magnitude',
+          });
+        }
       } catch (e: any) {
         const msg = e?.message ? String(e.message) : String(e);
         const shortMsg = msg.slice(0, 160);
         console.log(`[formFiller] [MagnitudeHand] ERROR on "${field.name}": ${shortMsg}`);
+        const questionKey = fieldIdToQuestionKey[field.id];
+        if (questionKey) {
+          await observers?.onFieldResult?.({
+            questionKey,
+            state: 'failed',
+            currentValue: undefined,
+            confidence: 0.25,
+            source: 'magnitude',
+          });
+        }
 
         const isBusy = msg.includes('adapter busy: previous act() still running')
           || msg.includes('adapter busy: act() already in flight');
@@ -2918,6 +3061,61 @@ export async function fillFormOnPage(
     console.log(`[formFiller] [MagnitudeHand] Done! Filled ${filledCount}/${unfilledFields.length} field(s) via visual agent.`);
   } else {
     console.log('[formFiller] [MagnitudeHand] No unfilled fields — DOM filler handled everything.');
+  }
+
+  const finalSnapshots = normalizeExtractedQuestions(
+    postVisible.filter((field) => field.name || field.type === 'file'),
+  );
+  if (finalSnapshots.length > 0) {
+    result.questionSnapshots = finalSnapshots;
+    await observers?.onQuestionsNormalized?.(finalSnapshots);
+  }
+
+  const finalFilledIds = new Set<string>(filledIds);
+  for (const field of postVisible) {
+    if (finalFilledIds.has(field.id)) continue;
+    if (await isFieldFilled(page, field.id)) {
+      finalFilledIds.add(field.id);
+    }
+  }
+
+  const questionOutcomes: QuestionOutcome[] = finalSnapshots.map((question) => {
+    const resolvedAnswer = question.fieldIds
+      .map((fieldId) => fieldIdToResolvedAnswer[fieldId])
+      .find((value) => typeof value === 'string' && value.length > 0);
+    const hasFilledField = question.fieldIds.some((fieldId) => finalFilledIds.has(fieldId));
+    const state = hasFilledField
+      ? 'verified'
+      : question.required
+        ? 'empty'
+        : question.riskLevel !== 'none'
+          ? 'uncertain'
+          : 'empty';
+
+    return {
+      questionKey: question.questionKey,
+      state,
+      currentValue: resolvedAnswer,
+      confidence: hasFilledField ? 0.85 : 0.3,
+      source: hasFilledField ? 'dom' : 'dom',
+    };
+  });
+
+  result.questionOutcomes = questionOutcomes;
+  result.unresolvedQuestionKeys = questionOutcomes
+    .filter((outcome) => outcome.state !== 'verified' && outcome.state !== 'filled')
+    .map((outcome) => outcome.questionKey)
+    .filter((questionKey) =>
+      finalSnapshots.some(
+        (question) => question.questionKey === questionKey && question.required,
+      ),
+    );
+  result.riskyQuestionKeys = finalSnapshots
+    .filter((question) => !question.required && question.riskLevel !== 'none')
+    .map((question) => question.questionKey);
+
+  for (const outcome of questionOutcomes) {
+    await observers?.onVerification?.(outcome);
   }
 
   return result;

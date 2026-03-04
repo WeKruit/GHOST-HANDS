@@ -23,6 +23,8 @@ import type { ExecutionResult } from '../engine/ExecutionEngine.js';
 import { callbackNotifier } from './callbackNotifier.js';
 import type { SessionManager } from '../sessions/SessionManager.js';
 import { getLogger } from '../monitoring/logger.js';
+import type { PageContextService } from '../context/PageContextService.js';
+import type { ContextReport } from '../context/types.js';
 
 // ---------------------------------------------------------------------------
 // Shared input interface
@@ -38,6 +40,7 @@ export interface CommonFinalizationInput {
   supabase: SupabaseClient;
   logEvent: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
   uploadScreenshot: (jobId: string, name: string, buffer: Buffer) => Promise<string>;
+  pageContext?: PageContextService;
 }
 
 // ---------------------------------------------------------------------------
@@ -45,6 +48,38 @@ export interface CommonFinalizationInput {
 // ---------------------------------------------------------------------------
 
 const logger = getLogger({ service: 'finalization' });
+
+async function flushPageContext(
+  pageContext: PageContextService | undefined,
+  logEvent: CommonFinalizationInput['logEvent'],
+): Promise<ContextReport | undefined> {
+  if (!pageContext) return undefined;
+
+  try {
+    return await pageContext.flushToSupabase();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    try {
+      await pageContext.markFlushPending(message);
+    } catch {
+      // swallow
+    }
+    await logEvent('page_context_flush_failed', { error: message }).catch(() => {});
+    return pageContext.getContextReport('pending').catch(() => undefined);
+  }
+}
+
+function serializeContextReport(report: ContextReport): Record<string, unknown> {
+  return {
+    pages_visited: report.pagesVisited,
+    required_unresolved: report.requiredUnresolved,
+    risky_optional_answers: report.riskyOptionalAnswers,
+    low_confidence_answers: report.lowConfidenceAnswers,
+    ambiguous_question_groups: report.ambiguousQuestionGroups,
+    partial_pages: report.partialPages,
+    flush_status: report.flushStatus,
+  };
+}
 
 /**
  * Take a screenshot via the adapter and upload it. Returns the URL on success,
@@ -224,6 +259,7 @@ export async function finalizeCookbookSuccess(
     supabase,
     logEvent,
     uploadScreenshot,
+    pageContext,
     engineResult,
   } = input;
 
@@ -269,6 +305,7 @@ export async function finalizeCookbookSuccess(
   await progress.flush();
 
   // 6. Build result_data with cost info
+  const contextReport = await flushPageContext(pageContext, logEvent);
   const resultData = {
     success_message: 'Task completed via cookbook replay',
     cost: {
@@ -277,6 +314,7 @@ export async function finalizeCookbookSuccess(
       total_cost_usd: finalCost.totalCost,
       action_count: finalCost.actionCount,
     },
+    ...(contextReport && { context_report: serializeContextReport(contextReport) }),
   };
 
   // 7. Update job status to 'completed'
@@ -356,6 +394,7 @@ export async function finalizeHandlerResult(
     supabase,
     logEvent,
     uploadScreenshot,
+    pageContext,
     taskResult,
     finalMode,
     engineResult,
@@ -416,6 +455,7 @@ export async function finalizeHandlerResult(
     await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
     await progress.flush();
 
+    const contextReport = await flushPageContext(pageContext, logEvent);
     const resultData: Record<string, unknown> = {
       ...(taskResult.data || {}),
       cost: {
@@ -424,6 +464,7 @@ export async function finalizeHandlerResult(
         total_cost_usd: finalCost.totalCost,
         action_count: finalCost.actionCount,
       },
+      ...(contextReport && { context_report: serializeContextReport(contextReport) }),
     };
 
     await supabase
@@ -460,6 +501,9 @@ export async function finalizeHandlerResult(
   }
 
   // 6. Build result data (shared by success and failure paths)
+  const contextReport = pageContext
+    ? await pageContext.getContextReport('pending').catch(() => undefined)
+    : undefined;
   const resultData: Record<string, unknown> = {
     ...(taskResult.data || {}),
     cost: {
@@ -468,6 +512,7 @@ export async function finalizeHandlerResult(
       total_cost_usd: finalCost.totalCost,
       action_count: finalCost.actionCount,
     },
+    ...(contextReport && { context_report: serializeContextReport(contextReport) }),
   };
 
   // 7. Handler failure — mark job as failed, not completed
@@ -603,7 +648,11 @@ export async function finalizeHandlerSideEffects(
     finalMode: string;
     engineResult: ExecutionResult;
   },
-): Promise<{ screenshotUrls: string[]; finalCost: CostSnapshot }> {
+): Promise<{
+  screenshotUrls: string[];
+  finalCost: CostSnapshot;
+  resultData: Record<string, unknown>;
+}> {
   const {
     job,
     adapter,
@@ -612,6 +661,7 @@ export async function finalizeHandlerSideEffects(
     supabase,
     logEvent,
     uploadScreenshot,
+    pageContext,
     taskResult,
     finalMode,
     engineResult,
@@ -661,5 +711,17 @@ export async function finalizeHandlerSideEffects(
     })
     .eq('id', job.id);
 
-  return { screenshotUrls, finalCost };
+  const contextReport = await flushPageContext(pageContext, logEvent);
+  const resultData: Record<string, unknown> = {
+    ...(taskResult.data || {}),
+    cost: {
+      input_tokens: finalCost.inputTokens,
+      output_tokens: finalCost.outputTokens,
+      total_cost_usd: finalCost.totalCost,
+      action_count: finalCost.actionCount,
+    },
+    ...(contextReport && { context_report: serializeContextReport(contextReport) }),
+  };
+
+  return { screenshotUrls, finalCost, resultData };
 }
