@@ -2818,6 +2818,98 @@ Rules:
   }
 }
 
+// ── Exported pure helpers (testable without browser) ─────────
+
+/** Decline/opt-out lexicon for EEO-style fields */
+const DECLINE_LEXICON = /prefer\s*not|decline|do\s*not\s*wish|rather\s*not/i;
+
+export interface FallbackField {
+  id: string;
+  type: string;
+  choices?: string[];
+  options?: string[];
+}
+
+/**
+ * Apply never-empty fallback defaults to fields without answers.
+ * Returns a new map with fallback values filled in.
+ */
+export function applyNeverEmptyFallback(
+  fields: FallbackField[],
+  resolved: Record<string, string>,
+): Record<string, string> {
+  const result = { ...resolved };
+  for (const field of fields) {
+    const existing = result[field.id];
+    if (existing && existing.trim()) continue;
+    if (field.choices?.length) {
+      result[field.id] = field.choices[0];
+    } else if (field.options?.length) {
+      const nonPlaceholder = field.options.filter((o) => !PLACEHOLDER_RE.test(o.trim()));
+      if (nonPlaceholder.length) result[field.id] = nonPlaceholder[0];
+    } else if (field.type === 'number') {
+      result[field.id] = '0';
+    } else if (field.type === 'date') {
+      result[field.id] = new Date().toISOString().slice(0, 10);
+    } else if (field.type === 'email') {
+      result[field.id] = 'n/a@example.com';
+    } else if (field.type === 'tel') {
+      result[field.id] = '0000000000';
+    } else if (field.type === 'url') {
+      result[field.id] = 'https://example.com';
+    } else if (field.type === 'textarea') {
+      result[field.id] = 'N/A';
+    } else if (field.type === 'text') {
+      result[field.id] = 'N/A';
+    }
+  }
+  return result;
+}
+
+/**
+ * Classify answerMode for a fallback-filled answer.
+ * default_decline is ONLY used when the field has choices AND
+ * the selected answer matches a decline/opt-out lexicon (EEO fields).
+ * Everything else is best_effort_guess.
+ */
+export function classifyFallbackAnswerMode(
+  answer: string,
+  hasChoices: boolean,
+): AnswerMode {
+  if (hasChoices && DECLINE_LEXICON.test(answer)) {
+    return 'default_decline';
+  }
+  return 'best_effort_guess';
+}
+
+/**
+ * Emit AnswerDecisions for fallback-filled answers not covered by LLM planning.
+ */
+export function buildFallbackDecisions(
+  fields: FallbackField[],
+  resolved: Record<string, string>,
+  fieldIdToQuestionKey: Record<string, string>,
+  existingDecisionKeys: Set<string>,
+): AnswerDecision[] {
+  const decisions: AnswerDecision[] = [];
+  for (const field of fields) {
+    const answer = resolved[field.id];
+    if (!answer || !answer.trim()) continue;
+    const questionKey = fieldIdToQuestionKey[field.id];
+    if (!questionKey) continue;
+    if (existingDecisionKeys.has(questionKey)) continue;
+    const hasChoices = (field.choices?.length ?? 0) > 0 || (field.options?.length ?? 0) > 0;
+    decisions.push({
+      questionKey,
+      answer,
+      confidence: hasChoices ? 0.3 : 0.1,
+      source: 'dom' as const,
+      answerMode: classifyFallbackAnswerMode(answer, hasChoices),
+    });
+  }
+  return decisions;
+}
+
 // ── Main entry point ─────────────────────────────────────────
 
 /**
@@ -3086,57 +3178,25 @@ export async function fillFormOnPage(
     }
 
     // Never-empty policy: sweep ALL non-file fields and fill deterministically if empty
+    const preFallback = { ...fieldIdToResolvedAnswer };
+    const postFallback = applyNeverEmptyFallback(llmFields, fieldIdToResolvedAnswer);
     for (const field of llmFields) {
-      const existing = fieldIdToResolvedAnswer[field.id];
-      if (existing && existing.trim()) continue;
-      // Best-effort fallback: choices → options → type-based default
-      if (field.choices?.length) {
-        fieldIdToResolvedAnswer[field.id] = field.choices[0];
-      } else if (field.options?.length) {
-        const nonPlaceholder = field.options.filter((o) => !PLACEHOLDER_RE.test(o.trim()));
-        if (nonPlaceholder.length) fieldIdToResolvedAnswer[field.id] = nonPlaceholder[0];
-      } else if (field.type === 'number') {
-        fieldIdToResolvedAnswer[field.id] = '0';
-      } else if (field.type === 'date') {
-        fieldIdToResolvedAnswer[field.id] = new Date().toISOString().slice(0, 10);
-      } else if (field.type === 'email') {
-        fieldIdToResolvedAnswer[field.id] = 'n/a@example.com';
-      } else if (field.type === 'tel') {
-        fieldIdToResolvedAnswer[field.id] = '0000000000';
-      } else if (field.type === 'url') {
-        fieldIdToResolvedAnswer[field.id] = 'https://example.com';
-      } else if (field.type === 'textarea') {
-        fieldIdToResolvedAnswer[field.id] = 'N/A';
-      } else if (field.type === 'text') {
-        fieldIdToResolvedAnswer[field.id] = 'N/A';
-      }
-      if (fieldIdToResolvedAnswer[field.id] && fieldIdToResolvedAnswer[field.id] !== existing) {
-        console.log(`[formFiller] Never-empty fallback: "${field.name}" → "${fieldIdToResolvedAnswer[field.id]}"`);
+      if (postFallback[field.id] && postFallback[field.id] !== preFallback[field.id]) {
+        fieldIdToResolvedAnswer[field.id] = postFallback[field.id];
+        console.log(`[formFiller] Never-empty fallback: "${field.name}" → "${postFallback[field.id]}"`);
       }
     }
 
     // Emit AnswerDecisions for fallback-filled answers
-    const fallbackDecisions: AnswerDecision[] = [];
-    for (const field of llmFields) {
-      const answer = fieldIdToResolvedAnswer[field.id];
-      if (!answer || !answer.trim()) continue;
-      const questionKey = fieldIdToQuestionKey[field.id];
-      if (!questionKey) continue;
-      const alreadyDecided = result.answerDecisions?.some((d) => d.questionKey === questionKey);
-      if (alreadyDecided) continue;
-      // Determine accurate answerMode: default_decline only when the answer
-      // matches a decline/opt-out lexicon; otherwise best_effort_guess.
-      const isDecline = /prefer\s*not|decline|do\s*not\s*wish|rather\s*not|n\/a/i.test(answer);
-      const hasChoices = (field.choices?.length ?? 0) > 0 || (field.options?.length ?? 0) > 0;
-      const mode: AnswerMode = isDecline ? 'default_decline' : 'best_effort_guess';
-      fallbackDecisions.push({
-        questionKey,
-        answer,
-        confidence: hasChoices ? 0.3 : 0.1,
-        source: 'dom' as const,
-        answerMode: mode,
-      });
-    }
+    const existingDecisionKeys = new Set(
+      (result.answerDecisions || []).map((d) => d.questionKey),
+    );
+    const fallbackDecisions = buildFallbackDecisions(
+      llmFields,
+      fieldIdToResolvedAnswer,
+      fieldIdToQuestionKey,
+      existingDecisionKeys,
+    );
     if (fallbackDecisions.length > 0) {
       result.answerDecisions = [...(result.answerDecisions || []), ...fallbackDecisions];
       await notifyObserver(
