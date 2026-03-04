@@ -567,6 +567,76 @@ describe('PageContextReducer', () => {
     expect(qA!.warnings).toContain('overlap_fieldids_stripped');
   });
 
+  it('overlap consolidation: verified question keeps fieldId over lower-orderIndex planned question', () => {
+    const base = createEmptySession('job-verified-priority', 'run-verified-priority');
+    const page = createPageRecord({
+      pageType: 'form',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-verified-priority',
+      pageStepKey: 'step-verified-priority',
+      pageSequence: 0,
+    });
+
+    let session = applyPageEntry(base, page);
+    session = syncQuestions(session, [
+      makeSnapshot({
+        questionKey: 'q::planned::text::no-options',
+        fieldIds: ['f1'],
+        orderIndex: 0,
+        promptText: 'Planned first',
+        questionType: 'text',
+      }),
+      makeSnapshot({
+        questionKey: 'q::verified::text::no-options',
+        fieldIds: ['f1'],
+        orderIndex: 1,
+        promptText: 'Verified second',
+        questionType: 'text',
+      }),
+    ], { isFullSync: true });
+
+    const planned = session.pages[0].questions.find(
+      (q) => q.questionKey === 'q::planned::text::no-options',
+    );
+    const verified = session.pages[0].questions.find(
+      (q) => q.questionKey === 'q::verified::text::no-options',
+    );
+    if (!planned || !verified) throw new Error('expected both overlap questions');
+
+    planned.state = 'planned';
+    verified.state = 'verified';
+
+    session = syncQuestions(session, [
+      makeSnapshot({
+        questionKey: 'q::planned::text::no-options',
+        fieldIds: ['f1'],
+        orderIndex: 0,
+        promptText: 'Planned first',
+        questionType: 'text',
+      }),
+      makeSnapshot({
+        questionKey: 'q::verified::text::no-options',
+        fieldIds: ['f1'],
+        orderIndex: 1,
+        promptText: 'Verified second',
+        questionType: 'text',
+      }),
+    ], { isFullSync: true });
+
+    const plannedAfter = session.pages[0].questions.find(
+      (q) => q.questionKey === 'q::planned::text::no-options',
+    );
+    const verifiedAfter = session.pages[0].questions.find(
+      (q) => q.questionKey === 'q::verified::text::no-options',
+    );
+    if (!plannedAfter || !verifiedAfter) throw new Error('expected both overlap questions after sync');
+
+    expect(verifiedAfter.fieldIds).toContain('f1');
+    expect(verifiedAfter.state).toBe('verified');
+    expect(plannedAfter.fieldIds).not.toContain('f1');
+    expect(plannedAfter.warnings).toContain('overlap_fieldids_stripped');
+  });
+
   it('overlap consolidation: incremental sync also deduplicates overlapping fieldIds', () => {
     const base = createEmptySession('job-incr-overlap', 'run-incr-overlap');
     const page = createPageRecord({
