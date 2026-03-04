@@ -201,8 +201,10 @@ export function mapToWorkdayProfile(
   const lastName = nameParts.slice(1).join(' ') || '';
 
   const address = parseLocation(data.location, defaults.address);
-  const linkedinUrl = data.websites?.find((w) => w.includes('linkedin')) || '';
-  const websiteUrl = data.websites?.find((w) => !w.includes('linkedin')) || '';
+  const rawLinkedin = data.websites?.find((w) => w.includes('linkedin')) || '';
+  const rawWebsite = data.websites?.find((w) => !w.includes('linkedin')) || '';
+  const linkedinUrl = rawLinkedin && !rawLinkedin.startsWith('http') ? `https://${rawLinkedin}` : rawLinkedin;
+  const websiteUrl = rawWebsite && !rawWebsite.startsWith('http') ? `https://${rawWebsite}` : rawWebsite;
 
   // Most recent work experience is current role
   const currentJob = data.workHistory?.[0];

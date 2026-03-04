@@ -1514,7 +1514,10 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       const hasErrors = await config.detectValidationErrors(adapter);
       if (hasErrors) {
         console.log(`[SmartApply] Validation errors after clicking Next — re-filling.`);
-        return this.fillPage(adapter, config, resumePath, profileText, _depth + 1, false, costTracker);
+        // Pass null for resumePath on retries — resume was already uploaded on first attempt.
+        // Workday replaces the file input after processing, creating a fresh one for "add another file",
+        // so re-passing resumePath would cause a duplicate upload.
+        return this.fillPage(adapter, config, null, profileText, _depth + 1, false, costTracker);
       }
 
       // Verify page changed
@@ -1538,7 +1541,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       const scrollAfterClick = await adapter.page.evaluate(() => window.scrollY);
       if (Math.abs(scrollAfterClick - scrollBeforeClick) > 50) {
         console.log(`[SmartApply] Clicked Next — page auto-scrolled to unfilled fields. Re-filling.`);
-        return this.fillPage(adapter, config, resumePath, profileText, _depth + 1, false, costTracker);
+        return this.fillPage(adapter, config, null, profileText, _depth + 1, false, costTracker);
       }
 
       console.log(`[SmartApply] Clicked Next but page unchanged.`);
