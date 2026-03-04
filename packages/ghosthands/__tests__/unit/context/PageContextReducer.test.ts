@@ -415,4 +415,118 @@ describe('PageContextReducer', () => {
     expect(report.bestEffortGuesses[0].questionKey).toBe('demo::gender::select::male|female');
     expect(report.bestEffortGuesses[0].answerMode).toBe('best_effort_guess');
   });
+
+  it('overlap consolidation: rerun regrouping with shared fieldIds does not leave duplicate live records', () => {
+    // Regression test for the exact scenario reproduced:
+    // syncQuestions(full old key) → syncQuestions(incremental new key with overlapping fieldIds) → syncQuestions(full remapped old key)
+    // This previously ended with two live records for the same field set.
+    const base = createEmptySession('job-overlap', 'run-overlap');
+    const page = createPageRecord({
+      pageType: 'form',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-overlap',
+      pageStepKey: 'step-overlap',
+      pageSequence: 0,
+    });
+
+    let session = applyPageEntry(base, page);
+
+    // Step 1: Initial full sync — two questions, each owns one fieldId
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::name::text::no-options', fieldIds: ['f1'], orderIndex: 0, promptText: 'Name', questionType: 'text' }),
+      makeSnapshot({ questionKey: 'q::phone::tel::no-options', fieldIds: ['f2'], orderIndex: 1, promptText: 'Phone', questionType: 'tel' }),
+    ], { isFullSync: true });
+
+    expect(session.pages[0].questions.filter((q) => q.state !== 'skipped')).toHaveLength(2);
+
+    // Step 2: Incremental sync — a new question arrives that groups f2 + f3 (f2 overlaps)
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::contact::tel::no-options', fieldIds: ['f2', 'f3'], orderIndex: 2, promptText: 'Contact', questionType: 'tel' }),
+    ]);
+
+    // Step 3: Full sync — the original questions come back with f1, f2, f3 all present
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::name::text::no-options', fieldIds: ['f1'], orderIndex: 0, promptText: 'Name', questionType: 'text' }),
+      makeSnapshot({ questionKey: 'q::phone::tel::no-options', fieldIds: ['f2'], orderIndex: 1, promptText: 'Phone', questionType: 'tel' }),
+      makeSnapshot({ questionKey: 'q::contact::tel::no-options', fieldIds: ['f3'], orderIndex: 2, promptText: 'Contact', questionType: 'tel' }),
+    ], { isFullSync: true });
+
+    const live = session.pages[0].questions.filter((q) => q.state !== 'skipped');
+    // Each fieldId must appear exactly once across all live questions
+    const allFieldIds = live.flatMap((q) => q.fieldIds);
+    const uniqueFieldIds = new Set(allFieldIds);
+    expect(allFieldIds.length).toBe(uniqueFieldIds.size); // no duplicates
+
+    // All three fieldIds must still be covered
+    expect(uniqueFieldIds.has('f1')).toBe(true);
+    expect(uniqueFieldIds.has('f2')).toBe(true);
+    expect(uniqueFieldIds.has('f3')).toBe(true);
+
+    // No two live questions should own the same fieldId
+    const fieldOwners = new Map<string, string>();
+    for (const q of live) {
+      for (const fid of q.fieldIds) {
+        expect(fieldOwners.has(fid)).toBe(false);
+        fieldOwners.set(fid, q.questionKey);
+      }
+    }
+  });
+
+  it('overlap consolidation: first question by orderIndex wins shared fieldIds', () => {
+    const base = createEmptySession('job-overlap-order', 'run-overlap-order');
+    const page = createPageRecord({
+      pageType: 'form',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-overlap-order',
+      pageStepKey: 'step-overlap-order',
+      pageSequence: 0,
+    });
+
+    let session = applyPageEntry(base, page);
+
+    // Two questions both claim f1 — first by orderIndex should win
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::a::text::no-options', fieldIds: ['f1', 'f2'], orderIndex: 0, promptText: 'A', questionType: 'text' }),
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['f1', 'f3'], orderIndex: 1, promptText: 'B', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    const qA = session.pages[0].questions.find((q) => q.questionKey === 'q::a::text::no-options');
+    const qB = session.pages[0].questions.find((q) => q.questionKey === 'q::b::text::no-options');
+
+    expect(qA).toBeDefined();
+    expect(qB).toBeDefined();
+
+    // A (orderIndex 0) keeps f1
+    expect(qA!.fieldIds).toContain('f1');
+    // B has f1 stripped, keeps only f3
+    expect(qB!.fieldIds).not.toContain('f1');
+    expect(qB!.fieldIds).toContain('f3');
+    expect(qB!.warnings).toContain('overlap_fieldids_stripped');
+  });
+
+  it('overlap consolidation: question with all fieldIds stripped is retired', () => {
+    const base = createEmptySession('job-overlap-retire', 'run-overlap-retire');
+    const page = createPageRecord({
+      pageType: 'form',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-overlap-retire',
+      pageStepKey: 'step-overlap-retire',
+      pageSequence: 0,
+    });
+
+    let session = applyPageEntry(base, page);
+
+    // Q-B only has f1, which is also owned by Q-A (lower orderIndex) — Q-B should be fully stripped and retired
+    session = syncQuestions(session, [
+      makeSnapshot({ questionKey: 'q::a::text::no-options', fieldIds: ['f1'], orderIndex: 0, promptText: 'A', questionType: 'text' }),
+      makeSnapshot({ questionKey: 'q::b::text::no-options', fieldIds: ['f1'], orderIndex: 1, promptText: 'B', questionType: 'text' }),
+    ], { isFullSync: true });
+
+    const qB = session.pages[0].questions.find((q) => q.questionKey === 'q::b::text::no-options');
+    expect(qB).toBeDefined();
+    expect(qB!.fieldIds).toEqual([]);
+    expect(qB!.state).toBe('skipped');
+    expect(qB!.warnings).toContain('overlap_fieldids_stripped');
+    expect(qB!.warnings).toContain('retired_missing_from_dom');
+  });
 });

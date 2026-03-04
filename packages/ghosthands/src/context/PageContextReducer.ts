@@ -232,6 +232,38 @@ export function syncQuestions(
         }
       }
     }
+
+    // Consolidate overlapping fieldIds — if a fieldId belongs to multiple live
+    // questions (e.g. from a rerun that regrouped an existing field), the
+    // FIRST (by orderIndex) live question keeps the fieldId, and later duplicates
+    // have it stripped. If stripping leaves a question with no fieldIds, retire it.
+    const claimedFieldIds = new Map<string, number>(); // fieldId → question index
+    const liveQuestions = page.questions
+      .map((q, idx) => ({ q, idx }))
+      .filter(({ q }) => q.state !== 'skipped')
+      .sort((a, b) => a.q.orderIndex - b.q.orderIndex);
+
+    for (const { q, idx } of liveQuestions) {
+      const keptFieldIds: string[] = [];
+      for (const fid of q.fieldIds) {
+        if (!claimedFieldIds.has(fid)) {
+          claimedFieldIds.set(fid, idx);
+          keptFieldIds.push(fid);
+        }
+      }
+      if (keptFieldIds.length < q.fieldIds.length) {
+        q.fieldIds = keptFieldIds;
+        if (!q.warnings.includes('overlap_fieldids_stripped')) {
+          q.warnings.push('overlap_fieldids_stripped');
+        }
+        if (keptFieldIds.length === 0) {
+          q.state = 'skipped';
+          if (!q.warnings.includes('retired_missing_from_dom')) {
+            q.warnings.push('retired_missing_from_dom');
+          }
+        }
+      }
+    }
   }
 
   page.questions.sort((a, b) => a.orderIndex - b.orderIndex);
