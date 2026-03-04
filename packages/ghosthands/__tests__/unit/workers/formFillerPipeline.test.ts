@@ -97,10 +97,14 @@ describe('formFiller observation pipeline integration', () => {
     expect(resolved['f2']).toBe('Engineer');
   });
 
-  it('classifyFallbackAnswerMode uses decline lexicon only for choice-based fields', () => {
-    // Decline text + choices → default_decline
-    expect(classifyFallbackAnswerMode('Prefer not to say', true)).toBe('default_decline');
-    expect(classifyFallbackAnswerMode('Decline to self-identify', true)).toBe('default_decline');
+  it('classifyFallbackAnswerMode uses decline lexicon only for demographic choice-based fields', () => {
+    // Decline text + choices + demographic → default_decline
+    expect(classifyFallbackAnswerMode('Prefer not to say', true, true)).toBe('default_decline');
+    expect(classifyFallbackAnswerMode('Decline to self-identify', true, true)).toBe('default_decline');
+
+    // Decline text + choices but NOT demographic → best_effort_guess
+    expect(classifyFallbackAnswerMode('Prefer not to say', true, false)).toBe('best_effort_guess');
+    expect(classifyFallbackAnswerMode('Do not wish to relocate', true, false)).toBe('best_effort_guess');
 
     // Decline text but NO choices (free-text fallback) → best_effort_guess
     expect(classifyFallbackAnswerMode('N/A', false)).toBe('best_effort_guess');
@@ -118,10 +122,10 @@ describe('formFiller observation pipeline integration', () => {
 
   it('buildFallbackDecisions classifies provenance accurately', () => {
     const fields = [
-      { id: 'f1', type: 'radio', choices: ['Male', 'Female'] },
-      { id: 'f2', type: 'text' },
-      { id: 'f3', type: 'select', options: ['Select...', 'US', 'UK'] },
-      { id: 'f4', type: 'radio', choices: ['Yes', 'No', 'Decline to self-identify'] },
+      { id: 'f1', type: 'radio', name: 'Gender', choices: ['Male', 'Female'] },
+      { id: 'f2', type: 'text', name: 'Notes' },
+      { id: 'f3', type: 'select', name: 'Country', options: ['Select...', 'US', 'UK'] },
+      { id: 'f4', type: 'radio', name: 'Gender identity', choices: ['Yes', 'No', 'Decline to self-identify'] },
     ];
     const resolved: Record<string, string> = {
       'f1': 'Male',
@@ -133,7 +137,7 @@ describe('formFiller observation pipeline integration', () => {
 
     const decisions = buildFallbackDecisions(fields, resolved, fieldIdToQuestionKey, new Set());
 
-    // "Male" — normal value with choices → best_effort_guess
+    // "Male" — normal value with choices (demographic name but not decline text) → best_effort_guess
     const d1 = decisions.find((d) => d.questionKey === 'q1')!;
     expect(d1.answerMode).toBe('best_effort_guess');
     expect(d1.confidence).toBe(0.3);
@@ -148,7 +152,7 @@ describe('formFiller observation pipeline integration', () => {
     expect(d3.answerMode).toBe('best_effort_guess');
     expect(d3.confidence).toBe(0.3);
 
-    // "Decline to self-identify" — decline lexicon with choices → default_decline
+    // "Decline to self-identify" — decline lexicon + choices + demographic name → default_decline
     const d4 = decisions.find((d) => d.questionKey === 'q4')!;
     expect(d4.answerMode).toBe('default_decline');
     expect(d4.confidence).toBe(0.3);
@@ -166,6 +170,33 @@ describe('formFiller observation pipeline integration', () => {
 
     expect(decisions).toHaveLength(1);
     expect(decisions[0].questionKey).toBe('q2');
+  });
+
+  it('applyNeverEmptyFallback with all-placeholder options still produces a non-empty fallback', () => {
+    const fields = [
+      { id: 'f1', type: 'select', options: ['Select...', '-- Select --', 'Please select'] },
+      { id: 'f2', type: 'text', options: ['Choose one', 'Choose...'] },
+    ];
+
+    const resolved = applyNeverEmptyFallback(fields, {});
+
+    // f1 is type 'select' — no type-based default, so last-resort uses options[0]
+    expect(resolved['f1']).toBeTruthy();
+    expect(resolved['f1']).toBe('Select...');
+
+    // f2 is type 'text' — falls through to type-based 'N/A'
+    expect(resolved['f2']).toBe('N/A');
+  });
+
+  it('applyNeverEmptyFallback filters "Please select" as a placeholder', () => {
+    const fields = [
+      { id: 'f1', type: 'select', options: ['Please select', 'United States', 'Canada'] },
+    ];
+
+    const resolved = applyNeverEmptyFallback(fields, {});
+
+    // Should pick first non-placeholder option
+    expect(resolved['f1']).toBe('United States');
   });
 
   it('LLM normalization omission is recovered by heuristic fallback', () => {
@@ -199,5 +230,48 @@ describe('formFiller observation pipeline integration', () => {
 
     const answer = fieldIdToResolvedAnswer['f1'] ?? legacyAnswers['Relocate?'] ?? undefined;
     expect(answer).toBe('Yes');
+  });
+
+  it('buildFallbackDecisions deduplicates fields mapped to the same questionKey', () => {
+    const fields = [
+      { id: 'f1', type: 'text', name: 'First name' },
+      { id: 'f2', type: 'text', name: 'First name (duplicate)' },
+    ];
+    const resolved: Record<string, string> = { 'f1': 'Adam', 'f2': 'Adam' };
+    // Both field IDs map to the same questionKey
+    const fieldIdToQuestionKey: Record<string, string> = { 'f1': 'q1', 'f2': 'q1' };
+
+    const decisions = buildFallbackDecisions(fields, resolved, fieldIdToQuestionKey, new Set());
+
+    // Should produce exactly one decision, not two
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0].questionKey).toBe('q1');
+  });
+
+  it('non-EEO "do not wish to relocate" choice => best_effort_guess, not default_decline', () => {
+    const fields = [
+      { id: 'f1', type: 'radio', name: 'Willing to relocate?', choices: ['Yes', 'No', 'Do not wish to relocate'] },
+    ];
+    const resolved: Record<string, string> = { 'f1': 'Do not wish to relocate' };
+    const fieldIdToQuestionKey: Record<string, string> = { 'f1': 'q1' };
+
+    const decisions = buildFallbackDecisions(fields, resolved, fieldIdToQuestionKey, new Set());
+
+    // "Willing to relocate?" is not a demographic field — decline text should NOT trigger default_decline
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0].answerMode).toBe('best_effort_guess');
+  });
+
+  it('EEO "Decline to self-identify" on a gender field with demographicHint => default_decline', () => {
+    const fields = [
+      { id: 'f1', type: 'radio', name: 'What is your gender?', demographicHint: true, choices: ['Male', 'Female', 'Decline to self-identify'] },
+    ];
+    const resolved: Record<string, string> = { 'f1': 'Decline to self-identify' };
+    const fieldIdToQuestionKey: Record<string, string> = { 'f1': 'q1' };
+
+    const decisions = buildFallbackDecisions(fields, resolved, fieldIdToQuestionKey, new Set());
+
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0].answerMode).toBe('default_decline');
   });
 });

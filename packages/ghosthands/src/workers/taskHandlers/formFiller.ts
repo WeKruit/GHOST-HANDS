@@ -117,7 +117,7 @@ const INTERACTIVE_SELECTOR = [
   '[aria-haspopup="listbox"]',
 ].join(', ');
 
-const PLACEHOLDER_RE = /^(select|choose|pick|--|—)/i;
+const PLACEHOLDER_RE = /^(select\.{0,3}|select…|please\s+select|select\s+one|choose\.{0,3}|choose…|please\s+choose|choose\s+one|pick|--+\s*(select|choose)?\s*--*|—)$/i;
 
 const MAGNITUDE_HAND_ACT_TIMEOUT_MS = 30_000;
 
@@ -2823,11 +2823,16 @@ Rules:
 /** Decline/opt-out lexicon for EEO-style fields */
 const DECLINE_LEXICON = /prefer\s*not|decline|do\s*not\s*wish|rather\s*not/i;
 
+/** Heuristic to detect demographic/EEO field names */
+const DEMOGRAPHIC_RE = /\b(gender|race|ethnicity|ethnic|veteran|disability|sex|pronoun|orientation|eeo|equal.?employment|demographic|self.?identify|self.?identification)\b/i;
+
 export interface FallbackField {
   id: string;
   type: string;
   choices?: string[];
   options?: string[];
+  name?: string;
+  demographicHint?: boolean;
 }
 
 /**
@@ -2844,10 +2849,17 @@ export function applyNeverEmptyFallback(
     if (existing && existing.trim()) continue;
     if (field.choices?.length) {
       result[field.id] = field.choices[0];
-    } else if (field.options?.length) {
+      continue;
+    }
+    if (field.options?.length) {
       const nonPlaceholder = field.options.filter((o) => !PLACEHOLDER_RE.test(o.trim()));
-      if (nonPlaceholder.length) result[field.id] = nonPlaceholder[0];
-    } else if (field.type === 'number') {
+      if (nonPlaceholder.length) {
+        result[field.id] = nonPlaceholder[0];
+        continue;
+      }
+      // All options are placeholders — fall through to type-based defaults
+    }
+    if (field.type === 'number') {
       result[field.id] = '0';
     } else if (field.type === 'date') {
       result[field.id] = new Date().toISOString().slice(0, 10);
@@ -2861,6 +2873,9 @@ export function applyNeverEmptyFallback(
       result[field.id] = 'N/A';
     } else if (field.type === 'text') {
       result[field.id] = 'N/A';
+    } else if (field.options?.length) {
+      // Last resort: all options were placeholders and no type-based default matched
+      result[field.id] = field.options[0];
     }
   }
   return result;
@@ -2869,14 +2884,16 @@ export function applyNeverEmptyFallback(
 /**
  * Classify answerMode for a fallback-filled answer.
  * default_decline is ONLY used when the field has choices AND
- * the selected answer matches a decline/opt-out lexicon (EEO fields).
+ * the field is demographic/EEO AND the selected answer matches
+ * a decline/opt-out lexicon.
  * Everything else is best_effort_guess.
  */
 export function classifyFallbackAnswerMode(
   answer: string,
   hasChoices: boolean,
+  isDemographic: boolean = false,
 ): AnswerMode {
-  if (hasChoices && DECLINE_LEXICON.test(answer)) {
+  if (hasChoices && isDemographic && DECLINE_LEXICON.test(answer)) {
     return 'default_decline';
   }
   return 'best_effort_guess';
@@ -2891,21 +2908,24 @@ export function buildFallbackDecisions(
   fieldIdToQuestionKey: Record<string, string>,
   existingDecisionKeys: Set<string>,
 ): AnswerDecision[] {
+  const seenQuestionKeys = new Set(existingDecisionKeys);
   const decisions: AnswerDecision[] = [];
   for (const field of fields) {
     const answer = resolved[field.id];
     if (!answer || !answer.trim()) continue;
     const questionKey = fieldIdToQuestionKey[field.id];
     if (!questionKey) continue;
-    if (existingDecisionKeys.has(questionKey)) continue;
+    if (seenQuestionKeys.has(questionKey)) continue;
     const hasChoices = (field.choices?.length ?? 0) > 0 || (field.options?.length ?? 0) > 0;
+    const isDemographic = field.demographicHint ?? DEMOGRAPHIC_RE.test(field.name ?? '');
     decisions.push({
       questionKey,
       answer,
       confidence: hasChoices ? 0.3 : 0.1,
       source: 'dom' as const,
-      answerMode: classifyFallbackAnswerMode(answer, hasChoices),
+      answerMode: classifyFallbackAnswerMode(answer, hasChoices, isDemographic),
     });
+    seenQuestionKeys.add(questionKey);
   }
   return decisions;
 }
