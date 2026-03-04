@@ -24,6 +24,10 @@ import type {
   QuestionSnapshot,
 } from './types.js';
 
+const RESUME_SAME_STEP_MIN_FINGERPRINT_SIMILARITY = 0.7;
+const RESUME_SAME_PATH_MIN_FINGERPRINT_SIMILARITY = 0.85;
+const RESUME_SAME_TITLE_MIN_FINGERPRINT_SIMILARITY = 0.85;
+
 function normalizeTitle(value: string | undefined): string {
   return (value || '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
@@ -50,6 +54,40 @@ function fingerprintSimilarity(a: string, b: string): number {
   }
 
   return (intersection * 2) / (aTokens.size + bTokens.size);
+}
+
+function cloneResumedPage(
+  page: PageContextSession['pages'][number],
+  input: PageEntryInput,
+): PageContextSession['pages'][number] {
+  return {
+    ...page,
+    pageTitle: input.pageTitle || page.pageTitle,
+    url: input.url,
+    latestFingerprint: input.fingerprint,
+    lastSeenAt: new Date().toISOString(),
+    visitCount: page.visitCount + 1,
+    domSummary: input.domSummary || page.domSummary,
+    questions: page.questions.map((question) => ({
+      ...question,
+      selectors: [...question.selectors],
+      options: question.options.map((option) => ({ ...option })),
+      selectedOptions: [...question.selectedOptions],
+      warnings: [...question.warnings],
+      fieldIds: [...question.fieldIds],
+    })),
+    actionables: page.actionables.map((actionable) => ({ ...actionable })),
+    history: page.history.map((event) => ({
+      ...event,
+      before: event.before ? { ...event.before } : undefined,
+      after: event.after ? { ...event.after } : undefined,
+    })),
+    coverage: { ...page.coverage },
+    mergeStats: {
+      ...page.mergeStats,
+      resumedCount: page.mergeStats.resumedCount + 1,
+    },
+  };
 }
 
 export interface PageContextService {
@@ -94,6 +132,7 @@ export class LivePageContextService implements PageContextService {
 
   async enterOrResumePage(input: PageEntryInput): Promise<void> {
     const session = await this.ensureSession();
+    const baseVersion = session.version;
     const activePage = session.pages.find((page) => page.pageId === session.activePageId);
     const samePath = activePage ? urlPathname(activePage.url) === urlPathname(input.url) : false;
     const sameType = activePage ? activePage.pageType === input.pageType : false;
@@ -106,39 +145,27 @@ export class LivePageContextService implements PageContextService {
 
     let nextSession = session;
     let nextPage = activePage;
-    if (activePage && sameType && sameStep && similarFingerprint >= 0.7) {
-      nextPage = {
-        ...activePage,
-        latestFingerprint: input.fingerprint,
-        lastSeenAt: new Date().toISOString(),
-        visitCount: activePage.visitCount + 1,
-        pageTitle: input.pageTitle || activePage.pageTitle,
-        url: input.url,
-        domSummary: input.domSummary || activePage.domSummary,
-      };
-      nextPage.mergeStats.resumedCount += 1;
-    } else if (activePage && sameType && samePath && similarFingerprint >= 0.85) {
-      nextPage = {
-        ...activePage,
-        latestFingerprint: input.fingerprint,
-        lastSeenAt: new Date().toISOString(),
-        visitCount: activePage.visitCount + 1,
-        pageTitle: input.pageTitle || activePage.pageTitle,
-        url: input.url,
-        domSummary: input.domSummary || activePage.domSummary,
-      };
-      nextPage.mergeStats.resumedCount += 1;
-    } else if (activePage && sameType && sameTitle && similarFingerprint >= 0.85) {
-      nextPage = {
-        ...activePage,
-        latestFingerprint: input.fingerprint,
-        lastSeenAt: new Date().toISOString(),
-        visitCount: activePage.visitCount + 1,
-        pageTitle: input.pageTitle || activePage.pageTitle,
-        url: input.url,
-        domSummary: input.domSummary || activePage.domSummary,
-      };
-      nextPage.mergeStats.resumedCount += 1;
+    if (
+      activePage &&
+      sameType &&
+      sameStep &&
+      similarFingerprint >= RESUME_SAME_STEP_MIN_FINGERPRINT_SIMILARITY
+    ) {
+      nextPage = cloneResumedPage(activePage, input);
+    } else if (
+      activePage &&
+      sameType &&
+      samePath &&
+      similarFingerprint >= RESUME_SAME_PATH_MIN_FINGERPRINT_SIMILARITY
+    ) {
+      nextPage = cloneResumedPage(activePage, input);
+    } else if (
+      activePage &&
+      sameType &&
+      sameTitle &&
+      similarFingerprint >= RESUME_SAME_TITLE_MIN_FINGERPRINT_SIMILARITY
+    ) {
+      nextPage = cloneResumedPage(activePage, input);
     } else {
       if (activePage) {
         nextSession = reduceFinalizeActivePage(session);
@@ -160,21 +187,23 @@ export class LivePageContextService implements PageContextService {
     });
 
     this.session = applyPageEntry(nextSession, nextPage);
-    await this.persistCurrent();
+    await this.persistCurrent(baseVersion);
   }
 
   async syncQuestions(snapshots: QuestionSnapshot[]): Promise<void> {
     if (snapshots.length === 0) return;
     const session = await this.ensureSession();
+    const baseVersion = session.version;
     this.session = reduceSyncQuestions(session, snapshots);
-    await this.persistCurrent();
+    await this.persistCurrent(baseVersion);
   }
 
   async recordAnswerPlan(decisions: AnswerDecision[]): Promise<void> {
     if (decisions.length === 0) return;
     const session = await this.ensureSession();
+    const baseVersion = session.version;
     this.session = applyAnswerDecisions(session, decisions);
-    await this.persistCurrent();
+    await this.persistCurrent(baseVersion);
   }
 
   async recordFieldAttempt(
@@ -183,63 +212,76 @@ export class LivePageContextService implements PageContextService {
     notes?: string,
   ): Promise<void> {
     const session = await this.ensureSession();
+    const baseVersion = session.version;
     this.session = recordAttempt(session, questionKey, actor, notes);
-    await this.persistCurrent();
+    await this.persistCurrent(baseVersion);
   }
 
   async recordFieldResult(outcome: QuestionOutcome): Promise<void> {
     const session = await this.ensureSession();
+    const baseVersion = session.version;
     this.session = recordOutcome(session, outcome);
-    await this.persistCurrent();
+    await this.persistCurrent(baseVersion);
   }
 
   async auditBeforeAdvance(): Promise<PageAuditResult> {
     const session = await this.ensureSession();
+    const baseVersion = session.version;
     const result = auditPage(session);
     this.session = result.session;
-    await this.persistCurrent();
+    await this.persistCurrent(baseVersion);
     return result.result;
   }
 
   async finalizeActivePage(input?: PageFinalizeInput): Promise<void> {
     const session = await this.ensureSession();
+    const baseVersion = session.version;
     this.session = reduceFinalizeActivePage(session, input);
-    await this.persistCurrent();
+    await this.persistCurrent(baseVersion);
   }
 
   async markAwaitingReview(): Promise<void> {
     const session = await this.ensureSession();
+    const baseVersion = session.version;
     this.session = markSessionStatus(session, 'awaiting_review', 'awaiting_review');
-    await this.persistCurrent();
+    await this.persistCurrent(baseVersion);
   }
 
   async markFailed(): Promise<void> {
     const session = await this.ensureSession();
+    const baseVersion = session.version;
     this.session = markSessionStatus(session, 'failed', 'failed');
-    await this.persistCurrent();
+    await this.persistCurrent(baseVersion);
   }
 
-  async markFlushPending(_error: string): Promise<void> {
+  async markFlushPending(error: string): Promise<void> {
     const session = await this.ensureSession();
-    this.session = attachReport(session, 'pending');
-    await this.persistCurrent();
+    const baseVersion = session.version;
+    this.session = attachReport(session, 'pending', error);
+    await this.persistCurrent(baseVersion);
   }
 
   async getContextReport(
     flushStatus: ContextReport['flushStatus'] = 'pending',
   ): Promise<ContextReport> {
     const session = await this.ensureSession();
-    const next = attachReport(session, flushStatus);
+    const baseVersion = session.version;
+    const next = attachReport(
+      session,
+      flushStatus,
+      flushStatus === 'pending' ? session.reportDraft.flushError : undefined,
+    );
     this.session = next;
-    await this.persistCurrent();
+    await this.persistCurrent(baseVersion);
     return next.reportDraft;
   }
 
   async flushToSupabase(): Promise<ContextReport> {
     const session = await this.ensureSession();
+    const baseVersion = session.version;
     const report = await this.flusher.flush(session);
     this.session = attachReport(session, 'flushed');
-    await this.persistCurrent();
+    await this.persistCurrent(baseVersion);
     await this.store.retain(this.session, this.keepDebugRetention);
     return report;
   }
@@ -254,27 +296,19 @@ export class LivePageContextService implements PageContextService {
     return this.session;
   }
 
-  private async persistCurrent(): Promise<void> {
+  private async persistCurrent(expectedVersion?: number): Promise<void> {
     const current = this.session;
     if (!current) return;
 
-    const expectedVersion = current.version - 1;
-    const firstAttempt = await this.store.write(current, expectedVersion >= 0 ? expectedVersion : undefined);
+    const firstAttempt = await this.store.write(
+      current,
+      typeof expectedVersion === 'number' ? expectedVersion : undefined,
+    );
     if (firstAttempt.saved) return;
 
     const latest = firstAttempt.current;
-    if (!latest) {
-      await this.store.write(current);
-      return;
+    if (latest) {
+      this.session = latest;
     }
-
-    // Re-apply the newest in-memory session after a single optimistic retry.
-    // The worker is single-job, so this is enough for suspend/resume races.
-    this.session = {
-      ...current,
-      version: latest.version + 1,
-      updatedAt: new Date().toISOString(),
-    };
-    await this.store.write(this.session);
   }
 }

@@ -1,5 +1,5 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { buildContextReport, computeCoverage } from './PageContextReducer.js';
+import { buildContextReport } from './PageContextReducer.js';
 import type { ContextReport, PageContextSession } from './types.js';
 
 export class SupabasePageContextFlusher {
@@ -7,7 +7,7 @@ export class SupabasePageContextFlusher {
 
   async flush(session: PageContextSession): Promise<ContextReport> {
     const rows = session.pages.map((page) => {
-      const coverage = computeCoverage(page);
+      const coverage = page.coverage;
       return {
         job_id: session.jobId,
         mastra_run_id: session.mastraRunId,
@@ -32,6 +32,7 @@ export class SupabasePageContextFlusher {
         history: page.history,
         entered_at: page.enteredAt,
         exited_at: page.exitedAt || null,
+        updated_at: new Date().toISOString(),
       };
     });
 

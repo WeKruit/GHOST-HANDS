@@ -16,6 +16,12 @@ export interface QuestionNormalizerField {
   choices?: string[];
 }
 
+const MAX_SHORT_OPTION_LABEL_LENGTH = 24;
+const DEFAULT_GROUPING_CONFIDENCE = 1;
+const GROUPED_CONTROL_CONFIDENCE = 0.95;
+const AMBIGUOUS_SINGLE_OPTION_CONFIDENCE = 0.45;
+const AMBIGUOUS_CLUSTER_CONFIDENCE = 0.4;
+
 function normalizeText(value: string | undefined): string {
   return (value || '')
     .toLowerCase()
@@ -27,7 +33,7 @@ function normalizeText(value: string | undefined): string {
 function isShortOptionLabel(value: string): boolean {
   const normalized = normalizeText(value);
   if (!normalized) return false;
-  if (normalized.length > 24) return false;
+  if (normalized.length > MAX_SHORT_OPTION_LABEL_LENGTH) return false;
   return /^(yes|no|n\/a|na|prefer not to say|decline|male|female|other|true|false)$/i.test(
     normalized,
   );
@@ -52,7 +58,6 @@ function buildQuestionKey(
   sectionLabel: string,
   promptText: string,
   questionType: QuestionType,
-  ordinalCluster: number,
   optionLabels: string[],
 ): QuestionKey {
   const normalizedSection = normalizeText(sectionLabel) || 'root';
@@ -63,7 +68,7 @@ function buildQuestionKey(
       .filter(Boolean)
       .slice(0, 3)
       .join('|') || 'no-options';
-  return `${normalizedSection}::${normalizedPrompt}::${questionType}::ord-${ordinalCluster}::${optionSignature}`;
+  return `${normalizedSection}::${normalizedPrompt}::${questionType}::${optionSignature}`;
 }
 
 function buildSnapshot(
@@ -81,7 +86,14 @@ function buildSnapshot(
   const options: QuestionSnapshot['options'] = [];
 
   for (const field of fields) {
-    const labels = field.choices?.length ? field.choices : field.options?.length ? field.options : [];
+    const labels =
+      field.choices?.length
+        ? field.choices
+        : field.options?.length
+          ? field.options
+          : fields.length > 1 && (field.type === 'radio' || field.type === 'checkbox')
+            ? [field.name]
+            : [];
     for (const label of labels) {
       if (!label || optionLabels.has(label)) continue;
       optionLabels.add(label);
@@ -93,7 +105,6 @@ function buildSnapshot(
     sectionLabel,
     promptText,
     questionType,
-    orderIndex,
     options.map((option) => option.label),
   );
 
@@ -120,12 +131,12 @@ function buildSingleFieldSnapshot(
 ): QuestionSnapshot {
   const questionType = classifyQuestionType(field.type);
   const warnings: string[] = [];
-  let groupingConfidence = 1;
+  let groupingConfidence = DEFAULT_GROUPING_CONFIDENCE;
   let riskLevel: QuestionRiskLevel = 'none';
   let promptText = field.name || 'Unlabeled question';
 
   if ((questionType === 'radio' || questionType === 'checkbox') && isShortOptionLabel(promptText)) {
-    groupingConfidence = 0.45;
+    groupingConfidence = AMBIGUOUS_SINGLE_OPTION_CONFIDENCE;
     riskLevel = 'ambiguous_grouping';
     warnings.push('ambiguous_prompt_anchor');
   }
@@ -170,7 +181,7 @@ function consumeAmbiguousOptionCluster(
     startIndex,
     promptText,
     first.type === 'checkbox' ? 'checkbox' : 'radio',
-    0.4,
+    AMBIGUOUS_CLUSTER_CONFIDENCE,
     ['ambiguous_prompt_anchor'],
     'ambiguous_grouping',
   );
@@ -207,7 +218,7 @@ export function normalizeExtractedQuestions(
           index,
           field.name || 'Grouped question',
           classifyQuestionType(field.type),
-          0.95,
+          GROUPED_CONTROL_CONFIDENCE,
           [],
           'none',
         ),

@@ -197,6 +197,7 @@ export interface ContextReport {
     requiredUnresolved: number;
   }>;
   flushStatus: 'flushed' | 'pending';
+  flushError?: string;
 }
 
 export interface PageContextSession {

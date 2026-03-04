@@ -51,13 +51,29 @@ export class RedisPageContextStore {
     }
 
     const key = this.sessionKey(session.mastraRunId);
-    const current = await this.read(session.mastraRunId);
-    if (typeof expectedVersion === 'number' && current && current.version !== expectedVersion) {
-      return { saved: false, current };
-    }
+    await this.redis.watch(key);
+    try {
+      const raw = await this.redis.get(key);
+      const current = raw ? (JSON.parse(raw) as PageContextSession) : null;
 
-    await this.redis.set(key, JSON.stringify(session), 'EX', DEFAULT_TTL_SECONDS);
-    return { saved: true, current: session };
+      if (typeof expectedVersion === 'number') {
+        if (!current || current.version !== expectedVersion) {
+          await this.redis.unwatch();
+          return { saved: false, current };
+        }
+      }
+
+      const transaction = this.redis.multi();
+      transaction.set(key, JSON.stringify(session), 'EX', DEFAULT_TTL_SECONDS);
+      const result = await transaction.exec();
+      if (!result) {
+        return { saved: false, current };
+      }
+
+      return { saved: true, current: session };
+    } finally {
+      await this.redis.unwatch().catch(() => {});
+    }
   }
 
   async retain(session: PageContextSession, keepDebug = false): Promise<void> {

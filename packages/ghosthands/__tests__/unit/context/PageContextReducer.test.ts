@@ -57,6 +57,24 @@ describe('PageContextReducer', () => {
     expect(session.pages[0].questions[0].groupingConfidence).toBe(0.95);
   });
 
+  it('does not mutate the previous session snapshot when syncing questions', () => {
+    const base = createEmptySession('job-immut', 'run-immut');
+    const page = createPageRecord({
+      pageType: 'questions',
+      pageTitle: 'Eligibility',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-immut',
+      pageStepKey: 'questions::eligibility',
+      pageSequence: 1,
+    });
+
+    const sessionBeforeSync = applyPageEntry(base, page);
+    const sessionAfterSync = syncQuestions(sessionBeforeSync, [makeSnapshot()]);
+
+    expect(sessionBeforeSync.pages[0].questions).toHaveLength(0);
+    expect(sessionAfterSync.pages[0].questions).toHaveLength(1);
+  });
+
   it('blocks navigation when required questions remain unresolved', () => {
     const base = createEmptySession('job-2', 'run-2');
     const page = createPageRecord({

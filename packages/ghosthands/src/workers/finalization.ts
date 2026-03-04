@@ -69,7 +69,7 @@ async function flushPageContext(
   }
 }
 
-function serializeContextReport(report: ContextReport): Record<string, unknown> {
+export function serializeContextReport(report: ContextReport): Record<string, unknown> {
   return {
     pages_visited: report.pagesVisited,
     required_unresolved: report.requiredUnresolved,
@@ -78,6 +78,7 @@ function serializeContextReport(report: ContextReport): Record<string, unknown> 
     ambiguous_question_groups: report.ambiguousQuestionGroups,
     partial_pages: report.partialPages,
     flush_status: report.flushStatus,
+    ...(report.flushError ? { flush_error: report.flushError } : {}),
   };
 }
 
