@@ -26,7 +26,9 @@
     "ioredis": "^5.4.0",
     "@supabase/supabase-js": "^2.95.3",
     "@actionbookdev/sdk": "^0.3.0",
-    "magnitude-extract": "^0.0.2"
+    "magnitude-extract": "^0.0.2",
+    "@mastra/core": "^1.7.0",
+    "@mastra/pg": "^1.7.0"
   },
   "peerDependenciesMeta": {
     "hono": { "optional": true },
@@ -35,7 +37,9 @@
     "ioredis": { "optional": true },
     "@supabase/supabase-js": { "optional": true },
     "@actionbookdev/sdk": { "optional": true },
-    "magnitude-extract": { "optional": true }
+    "magnitude-extract": { "optional": true },
+    "@mastra/core": { "optional": true },
+    "@mastra/pg": { "optional": true }
   },
   "devDependencies": {
     "typescript": "~5.7.2",

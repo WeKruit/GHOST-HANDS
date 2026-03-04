@@ -100,6 +100,29 @@ export type { TaskContext, TaskResult, TaskHandler }
 export type { WorkdayUserProfile } from '../../ghosthands/src/workers/taskHandlers/workday/workdayTypes';
 export type { PageState as WorkdayPageState } from '../../ghosthands/src/workers/taskHandlers/workday/constants';
 
+// ── Mastra workflow orchestration ──────────────────────────────────
+export { buildApplyWorkflow } from '../../ghosthands/src/workflows/mastra/applyWorkflow';
+export { getMastra, resetMastra } from '../../ghosthands/src/workflows/mastra/init';
+export {
+  isMastraResume,
+  claimResume,
+  readResolutionData,
+  persistMastraRunId,
+  getDispatchMode,
+  isQueueModeResumeSupported,
+} from '../../ghosthands/src/workflows/mastra/resumeCoordinator';
+export {
+  workflowState,
+  blockerResumeSchema,
+  FORBIDDEN_SCHEMA_KEYS,
+} from '../../ghosthands/src/workflows/mastra/types';
+export type {
+  WorkflowState,
+  BlockerResumeData,
+  RuntimeContext,
+} from '../../ghosthands/src/workflows/mastra/types';
+export { buildSteps } from '../../ghosthands/src/workflows/mastra/steps/factory';
+
 // ── Full module namespace exports (lazy-loaded) ─────────────────────
 // These namespaces are lazy-loaded via getters so that requiring the main
 // entry point doesn't crash when optional peer dependencies (hono, pg,
