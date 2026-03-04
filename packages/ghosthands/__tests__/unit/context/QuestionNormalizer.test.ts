@@ -137,6 +137,57 @@ describe('QuestionNormalizer', () => {
     expect(questions[0].groupingConfidence).toBe(0.95);
   });
 
+  it('deduplicates question keys when repeated prompts would collide', () => {
+    const questions = normalizeExtractedQuestions([
+      {
+        id: 'ff-dup-1',
+        name: 'Phone',
+        type: 'tel',
+        section: 'Contact',
+        required: true,
+      },
+      {
+        id: 'ff-dup-2',
+        name: 'Phone',
+        type: 'tel',
+        section: 'Contact',
+        required: false,
+      },
+    ]);
+
+    expect(questions).toHaveLength(2);
+    expect(questions[0].questionKey).not.toBe(questions[1].questionKey);
+    // One should have ::0 ordinal appended, the other ::1
+    const keys = questions.map((q) => q.questionKey);
+    expect(keys.some((k) => k.endsWith('::0'))).toBe(true);
+    expect(keys.some((k) => k.endsWith('::1'))).toBe(true);
+  });
+
+  it('does not append ordinal to unique question keys', () => {
+    const questions = normalizeExtractedQuestions([
+      {
+        id: 'ff-uniq-1',
+        name: 'First name',
+        type: 'text',
+        section: 'Profile',
+        required: true,
+      },
+      {
+        id: 'ff-uniq-2',
+        name: 'Last name',
+        type: 'text',
+        section: 'Profile',
+        required: true,
+      },
+    ]);
+
+    expect(questions).toHaveLength(2);
+    // Neither should have ordinal suffix
+    for (const q of questions) {
+      expect(q.questionKey).not.toMatch(/::\d+$/);
+    }
+  });
+
   it('reconciliation ensures every live field ID appears in final snapshots', () => {
     const liveFields = [
       { id: 'f1', name: 'First name', type: 'text', section: '', required: true },

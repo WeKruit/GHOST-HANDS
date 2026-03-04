@@ -77,7 +77,7 @@ export interface FillResult {
 }
 
 export interface FillObservers {
-  onQuestionsNormalized?(questions: QuestionSnapshot[]): Promise<void> | void;
+  onQuestionsNormalized?(questions: QuestionSnapshot[], opts?: { isFullSync?: boolean }): Promise<void> | void;
   onAnswerPlanned?(decisions: AnswerDecision[]): Promise<void> | void;
   onFieldAttempt?(
     questionKey: string,
@@ -117,7 +117,7 @@ const INTERACTIVE_SELECTOR = [
   '[aria-haspopup="listbox"]',
 ].join(', ');
 
-const PLACEHOLDER_RE = /^(select\.{0,3}|select…|please\s+select|select\s+one|choose\.{0,3}|choose…|please\s+choose|choose\s+one|pick|start\s+typing|--+\s*(select|choose)?\s*--*|—)$/i;
+const PLACEHOLDER_RE = /^(select\.{0,3}|select…|please\s+select(\s+one)?|select\s+(one|an?\s+option)|choose\.{0,3}|choose…|please\s+choose(\s+one)?|choose\s+one|pick|start\s+typing|enter\s+(your|an?)\s+\w+|type\s+here|--+\s*(select|choose)?\s*--*|—)$/i;
 
 /** Shared placeholder test — use instead of inline regexes */
 export function isPlaceholderValue(value: string): boolean {
@@ -2369,7 +2369,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
 // ── Unfilled field detection ─────────────────────────────────
 
 async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
-  return page.evaluate((ffId) => {
+  return page.evaluate(([ffId, phSource]) => {
     const el = document.querySelector(`[data-ff-id="${ffId}"]`);
     if (!el) return true;
     const tag = el.tagName;
@@ -2420,15 +2420,14 @@ async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
       const selectedOpt = sel.options[sel.selectedIndex];
       if (!selectedOpt) return false;
       const text = selectedOpt.textContent?.trim() || '';
-      const placeholderRe = new RegExp('^(select\\.{0,3}|select…|please\\s+select|select\\s+one|choose\\.{0,3}|choose…|please\\s+choose|choose\\s+one|pick|start\\s+typing|--+\\s*(select|choose)?\\s*--*|—)$', 'i');
+      const placeholderRe = new RegExp(phSource, 'i');
       return val !== '' && !placeholderRe.test(text);
     }
     // Custom combobox: check for selected value
     if (role === 'combobox' && tag !== 'INPUT' && tag !== 'SELECT') {
       const trigger = el.querySelector('.custom-select-trigger span');
       const text = trigger?.textContent?.trim() || '';
-      const placeholderRe2 = new RegExp('^(select\\.{0,3}|select…|please\\s+select|select\\s+one|choose\\.{0,3}|choose…|please\\s+choose|choose\\s+one|pick|start\\s+typing|--+\\s*(select|choose)?\\s*--*|—)$', 'i');
-      if (text && !placeholderRe2.test(text)) return true;
+      if (text && !new RegExp(phSource, 'i').test(text)) return true;
       // Check Workday pills
       const pills = el.closest('[data-automation-id]')
         ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
@@ -2448,11 +2447,11 @@ async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
       if (innerInput && innerInput.value.trim()) return true;
     }
     return (el.textContent?.trim() || '').length > 0;
-  }, ffId);
+  }, [ffId, PLACEHOLDER_RE_SOURCE]);
 }
 
 async function hasFieldValueForRerender(page: Page, ffId: string): Promise<boolean> {
-  return page.evaluate((id) => {
+  return page.evaluate(([id, phSource]) => {
     const el = document.querySelector(`[data-ff-id="${id}"]`) as HTMLElement | null;
     if (!el) return false;
 
@@ -2472,8 +2471,7 @@ async function hasFieldValueForRerender(page: Page, ffId: string): Promise<boole
       const selectedOpt = sel.options[sel.selectedIndex];
       if (!selectedOpt) return false;
       const text = selectedOpt.textContent?.trim() || '';
-      const placeholderRe = new RegExp('^(select\\.{0,3}|select…|please\\s+select|select\\s+one|choose\\.{0,3}|choose…|please\\s+choose|choose\\s+one|pick|start\\s+typing|--+\\s*(select|choose)?\\s*--*|—)$', 'i');
-      return sel.value !== '' && !placeholderRe.test(text);
+      return sel.value !== '' && !new RegExp(phSource, 'i').test(text);
     }
 
     if (role === 'checkbox' || role === 'radio' || role === 'switch') {
@@ -2491,7 +2489,7 @@ async function hasFieldValueForRerender(page: Page, ffId: string): Promise<boole
       const trigger = el.querySelector('.custom-select-trigger span');
       if (trigger && trigger.textContent?.trim()) {
         const t = trigger.textContent.trim();
-        if (!/^(select|choose|pick|--|—|start typing)/i.test(t)) return true;
+        if (!new RegExp(phSource, 'i').test(t)) return true;
       }
       return false;
     }
@@ -2501,7 +2499,7 @@ async function hasFieldValueForRerender(page: Page, ffId: string): Promise<boole
     }
 
     return false;
-  }, ffId);
+  }, [ffId, PLACEHOLDER_RE_SOURCE]);
 }
 
 // ── Repeater section handling (Work Experience / Education "Add" buttons) ──
@@ -3112,7 +3110,7 @@ export async function fillFormOnPage(
     await notifyObserver(
       'onQuestionsNormalized',
       observers?.onQuestionsNormalized
-        ? () => observers.onQuestionsNormalized!(initialQuestionSnapshots)
+        ? () => observers.onQuestionsNormalized!(initialQuestionSnapshots, { isFullSync: true })
         : undefined,
     );
   }
@@ -3335,12 +3333,20 @@ export async function fillFormOnPage(
         await notifyObserver(
           'onQuestionsNormalized',
           observers?.onQuestionsNormalized
-            ? () => observers.onQuestionsNormalized!(newSnapshots)
+            ? () => observers.onQuestionsNormalized!(newSnapshots, { isFullSync: false })
             : undefined,
         );
         for (const question of newSnapshots) {
+          const isDemographic = DEMOGRAPHIC_RE.test(question.promptText || '');
           for (const fieldId of question.fieldIds) {
             fieldIdToQuestionKey[fieldId] = question.questionKey;
+            if (isDemographic) demographicFieldIds.add(fieldId);
+          }
+        }
+        // Re-thread demographicHint for newly discovered fields
+        for (const field of llmFields) {
+          if (demographicFieldIds.has(field.id) && !(field as any).demographicHint) {
+            (field as any).demographicHint = true;
           }
         }
       }
@@ -3641,14 +3647,14 @@ export async function fillFormOnPage(
   }
 
   const finalSnapshots = normalizeExtractedQuestions(
-    postVisible.filter((field) => field.name || field.type === 'file'),
+    postVisible.filter((field) => field.type !== 'file'),
   );
   if (finalSnapshots.length > 0) {
     result.questionSnapshots = finalSnapshots;
     await notifyObserver(
       'onQuestionsNormalized',
       observers?.onQuestionsNormalized
-        ? () => observers.onQuestionsNormalized!(finalSnapshots)
+        ? () => observers.onQuestionsNormalized!(finalSnapshots, { isFullSync: true })
         : undefined,
     );
   }

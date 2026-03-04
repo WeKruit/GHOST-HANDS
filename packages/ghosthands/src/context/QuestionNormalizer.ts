@@ -60,6 +60,7 @@ function buildQuestionKey(
   promptText: string,
   questionType: QuestionType,
   optionLabels: string[],
+  ordinal?: number,
 ): QuestionKey {
   const normalizedSection = normalizeText(sectionLabel) || 'root';
   const normalizedPrompt = normalizeText(promptText) || 'unnamed';
@@ -69,7 +70,8 @@ function buildQuestionKey(
       .filter(Boolean)
       .slice(0, 3)
       .join('|') || 'no-options';
-  return `${normalizedSection}::${normalizedPrompt}::${questionType}::${optionSignature}`;
+  const base = `${normalizedSection}::${normalizedPrompt}::${questionType}::${optionSignature}`;
+  return ordinal && ordinal > 0 ? `${base}::${ordinal}` : base;
 }
 
 function buildSnapshot(
@@ -230,7 +232,22 @@ export function normalizeExtractedQuestions(
     questions.push(buildSingleFieldSnapshot(field, index));
   }
 
-  return questions;
+  return deduplicateQuestionKeys(questions);
+}
+
+function deduplicateQuestionKeys(questions: QuestionSnapshot[]): QuestionSnapshot[] {
+  const keyCounts = new Map<string, number>();
+  for (const q of questions) {
+    keyCounts.set(q.questionKey, (keyCounts.get(q.questionKey) || 0) + 1);
+  }
+  // Only process keys that appear more than once
+  const ordinals = new Map<string, number>();
+  return questions.map((q) => {
+    if ((keyCounts.get(q.questionKey) || 0) <= 1) return q;
+    const ordinal = ordinals.get(q.questionKey) || 0;
+    ordinals.set(q.questionKey, ordinal + 1);
+    return { ...q, questionKey: `${q.questionKey}::${ordinal}` };
+  });
 }
 
 export function buildAnswerDecisionsFromFieldAnswers(

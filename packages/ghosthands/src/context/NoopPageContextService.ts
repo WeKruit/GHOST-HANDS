@@ -13,7 +13,7 @@ import { createEmptyContextReport } from './PageContextReducer.js';
 export class NoopPageContextService implements PageContextService {
   async initializeRun(_mastraRunId: string): Promise<void> {}
   async enterOrResumePage(_input: PageEntryInput): Promise<void> {}
-  async syncQuestions(_snapshots: QuestionSnapshot[]): Promise<void> {}
+  async syncQuestions(_snapshots: QuestionSnapshot[], _opts?: { isFullSync?: boolean }): Promise<void> {}
   async recordAnswerPlan(_decisions: AnswerDecision[]): Promise<void> {}
   async recordFieldAttempt(
     _questionKey: string,

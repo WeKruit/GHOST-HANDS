@@ -49,14 +49,19 @@ export interface CommonFinalizationInput {
 
 const logger = getLogger({ service: 'finalization' });
 
+interface FlushResult {
+  report: ContextReport | undefined;
+  flushFailed: boolean;
+}
+
 async function flushPageContext(
   pageContext: PageContextService | undefined,
   logEvent: CommonFinalizationInput['logEvent'],
-): Promise<ContextReport | undefined> {
-  if (!pageContext) return undefined;
+): Promise<FlushResult> {
+  if (!pageContext) return { report: undefined, flushFailed: false };
 
   try {
-    return await pageContext.flushToSupabase();
+    return { report: await pageContext.flushToSupabase(), flushFailed: false };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     try {
@@ -65,7 +70,8 @@ async function flushPageContext(
       // swallow
     }
     await logEvent('page_context_flush_failed', { error: message }).catch(() => {});
-    return pageContext.getContextReport('pending').catch(() => undefined);
+    const pending = await pageContext.getContextReport('pending').catch(() => undefined);
+    return { report: pending, flushFailed: true };
   }
 }
 
@@ -320,7 +326,7 @@ export async function finalizeCookbookSuccess(
   await progress.flush();
 
   // 6. Build result_data with cost info
-  const contextReport = await flushPageContext(pageContext, logEvent);
+  const { report: contextReport, flushFailed } = await flushPageContext(pageContext, logEvent);
   const resultData = {
     success_message: 'Task completed via cookbook replay',
     cost: {
@@ -331,6 +337,19 @@ export async function finalizeCookbookSuccess(
     },
     ...(contextReport && { context_report: serializeContextReport(contextReport) }),
   };
+
+  // 6.5. Propagate flush-failure flag into job metadata
+  if (flushFailed) {
+    await supabase
+      .from('gh_automation_jobs')
+      .update({
+        metadata: {
+          ...(job.metadata || {}),
+          page_context_flush_pending: true,
+        },
+      })
+      .eq('id', job.id);
+  }
 
   // 7. Update job status to 'completed'
   await supabase
@@ -470,7 +489,7 @@ export async function finalizeHandlerResult(
     await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
     await progress.flush();
 
-    const contextReport = await flushPageContext(pageContext, logEvent);
+    const { report: contextReport, flushFailed: awaitingFlushFailed } = await flushPageContext(pageContext, logEvent);
     const resultData: Record<string, unknown> = {
       ...(taskResult.data || {}),
       cost: {
@@ -486,6 +505,9 @@ export async function finalizeHandlerResult(
       .from('gh_automation_jobs')
       .update({
         status: 'awaiting_review',
+        ...(awaitingFlushFailed && {
+          metadata: { ...(job.metadata || {}), page_context_flush_pending: true },
+        }),
         result_data: resultData,
         result_summary: 'Application filled — waiting for user to review and submit',
         screenshot_urls: screenshotUrls,
@@ -516,7 +538,7 @@ export async function finalizeHandlerResult(
   }
 
   // 6. Build result data (shared by success and failure paths) — flush like awaiting_review
-  const contextReport = await flushPageContext(pageContext, logEvent);
+  const { report: contextReport, flushFailed: handlerFlushFailed } = await flushPageContext(pageContext, logEvent);
   const resultData: Record<string, unknown> = {
     ...(taskResult.data || {}),
     cost: {
@@ -527,6 +549,19 @@ export async function finalizeHandlerResult(
     },
     ...(contextReport && { context_report: serializeContextReport(contextReport) }),
   };
+
+  // 6.5. Propagate flush-failure flag into job metadata
+  if (handlerFlushFailed) {
+    await supabase
+      .from('gh_automation_jobs')
+      .update({
+        metadata: {
+          ...(job.metadata || {}),
+          page_context_flush_pending: true,
+        },
+      })
+      .eq('id', job.id);
+  }
 
   // 7. Handler failure — mark job as failed, not completed
   if (!taskResult.success) {
@@ -725,7 +760,7 @@ export async function finalizeHandlerSideEffects(
     })
     .eq('id', job.id);
 
-  const contextReport = await flushPageContext(pageContext, logEvent);
+  const { report: contextReport, flushFailed: sideEffectFlushFailed } = await flushPageContext(pageContext, logEvent);
   const resultData: Record<string, unknown> = {
     ...(taskResult.data || {}),
     cost: {
@@ -736,6 +771,19 @@ export async function finalizeHandlerSideEffects(
     },
     ...(contextReport && { context_report: serializeContextReport(contextReport) }),
   };
+
+  // Propagate flush-failure flag into job metadata
+  if (sideEffectFlushFailed) {
+    await supabase
+      .from('gh_automation_jobs')
+      .update({
+        metadata: {
+          ...(job.metadata || {}),
+          page_context_flush_pending: true,
+        },
+      })
+      .eq('id', job.id);
+  }
 
   return { screenshotUrls, finalCost, resultData, contextFlushed: !!contextReport };
 }
