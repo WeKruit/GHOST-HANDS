@@ -95,11 +95,18 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
         ? { launchOptions: options.browserOptions }
         : undefined;
 
+    // Build the system prompt, injecting scroll guidance so the LLM uses
+    // meaningful scroll amounts instead of tiny increments like 5px.
+    const scrollGuidance = `SCROLLING: When you use mouse:scroll, use deltaY values of around 300 to actually reveal new content. A typical viewport is ~900px tall, so deltaY of 5 or 10 is less than 1% of the screen and accomplishes nothing.`;
+    const systemPrompt = options.systemPrompt
+      ? `${options.systemPrompt}\n\n${scrollGuidance}`
+      : scrollGuidance;
+
     this.agent = await startBrowserAgent({
       url: options.url,
       llm: llmConfig,
       connectors: options.connectors,
-      prompt: options.systemPrompt,
+      prompt: systemPrompt,
       narrate: false,
       ...(browserConfig && { browser: browserConfig }),
     });
