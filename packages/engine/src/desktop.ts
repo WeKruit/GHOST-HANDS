@@ -116,7 +116,7 @@ class LocalWorkerManagerImpl extends EventEmitter implements LocalWorkerManager 
     }
     await this.broker.release(input.jobId, this.sessionToken, {
       leaseId: input.leaseId,
-      reason: 'cancelled_by_client',
+      reason: 'cancelled',
     });
     this.state = {
       ...this.state,
