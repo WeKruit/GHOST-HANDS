@@ -3,6 +3,28 @@
   "version": "0.2.1-spencer-magnitude-hand.448327c",
   "main": "dist/packages/engine/src/index.js",
   "types": "dist/packages/engine/src/index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/packages/engine/src/index.js",
+      "types": "./dist/packages/engine/src/index.d.ts"
+    },
+    "./desktop": {
+      "require": "./dist/packages/engine/src/desktop.js",
+      "types": "./dist/packages/engine/src/desktop.d.ts"
+    },
+    "./worker": {
+      "require": "./dist/packages/engine/src/worker.js",
+      "types": "./dist/packages/engine/src/worker.d.ts"
+    },
+    "./shared": {
+      "require": "./dist/packages/engine/src/shared.js",
+      "types": "./dist/packages/engine/src/shared.d.ts"
+    },
+    "./broker": {
+      "require": "./dist/packages/engine/src/broker.js",
+      "types": "./dist/packages/engine/src/broker.d.ts"
+    }
+  },
   "files": ["dist", "MANIFEST.json"],
   "description": "Job application automation engine for GH-Desktop-App",
   "scripts": {
