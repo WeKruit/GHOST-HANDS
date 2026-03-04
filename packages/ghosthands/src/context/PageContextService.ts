@@ -106,7 +106,7 @@ export class LivePageContextService implements PageContextService {
 
     let nextSession = session;
     let nextPage = activePage;
-    if (activePage && sameType && sameStep) {
+    if (activePage && sameType && sameStep && similarFingerprint >= 0.7) {
       nextPage = {
         ...activePage,
         latestFingerprint: input.fingerprint,
@@ -128,7 +128,7 @@ export class LivePageContextService implements PageContextService {
         domSummary: input.domSummary || activePage.domSummary,
       };
       nextPage.mergeStats.resumedCount += 1;
-    } else if (activePage && sameType && sameTitle) {
+    } else if (activePage && sameType && sameTitle && similarFingerprint >= 0.85) {
       nextPage = {
         ...activePage,
         latestFingerprint: input.fingerprint,
