@@ -3339,7 +3339,12 @@ export async function fillFormOnPage(
         for (const question of newSnapshots) {
           const isDemographic = DEMOGRAPHIC_RE.test(question.promptText || '');
           for (const fieldId of question.fieldIds) {
-            fieldIdToQuestionKey[fieldId] = question.questionKey;
+            // Only write new entries — don't overwrite already-synced field mappings.
+            // If the LLM regroups an existing field with a new field, the existing
+            // field's key must stay pointing to the question already in page context.
+            if (!fieldIdToQuestionKey[fieldId]) {
+              fieldIdToQuestionKey[fieldId] = question.questionKey;
+            }
             if (isDemographic) demographicFieldIds.add(fieldId);
           }
         }
@@ -3651,11 +3656,12 @@ export async function fillFormOnPage(
   );
   // Build a fieldId → questionKey map for remapping heuristic keys back to
   // LLM-reconciled keys. Used for both the retirement sync and outcome dispatch.
+  // Use fieldIdToQuestionKey (populated at both initial normalization AND rerun
+  // normalization) so that late-appearing fields discovered in reruns are also
+  // remapped to their LLM-reconciled keys, not just the initial set.
   const fieldIdToInitialKey = new Map<string, string>();
-  if (initialQuestionSnapshots.length > 0) {
-    for (const snap of initialQuestionSnapshots) {
-      for (const fid of snap.fieldIds) fieldIdToInitialKey.set(fid, snap.questionKey);
-    }
+  for (const [fid, key] of Object.entries(fieldIdToQuestionKey)) {
+    fieldIdToInitialKey.set(fid, key);
   }
 
   if (finalSnapshots.length > 0) {
