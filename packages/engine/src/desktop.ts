@@ -21,6 +21,7 @@ class LocalWorkerManagerImpl extends EventEmitter implements LocalWorkerManager 
       status: 'stopped',
       desktopWorkerId: options.desktopWorkerId,
       activeJobId: null,
+      activeLeaseId: null,
       lastError: null,
     };
   }
@@ -81,6 +82,7 @@ class LocalWorkerManagerImpl extends EventEmitter implements LocalWorkerManager 
       ...this.state,
       status: 'stopped',
       activeJobId: null,
+      activeLeaseId: null,
       lastError: reason ?? null,
     };
     this.sessionToken = null;
@@ -108,11 +110,19 @@ class LocalWorkerManagerImpl extends EventEmitter implements LocalWorkerManager 
     return { requestId: result.requestId };
   }
 
-  async cancel(jobId: string): Promise<void> {
+  async cancel(input: { jobId: string; leaseId: string }): Promise<void> {
     if (!this.sessionToken) {
       throw new Error('Local worker is not started');
     }
-    await this.broker.release(jobId, this.sessionToken, { reason: 'cancelled_by_client' });
+    await this.broker.release(input.jobId, this.sessionToken, {
+      leaseId: input.leaseId,
+      reason: 'cancelled_by_client',
+    });
+    this.state = {
+      ...this.state,
+      activeJobId: this.state.activeJobId === input.jobId ? null : this.state.activeJobId,
+      activeLeaseId: this.state.activeLeaseId === input.leaseId ? null : this.state.activeLeaseId,
+    };
   }
 
   getState(): LocalWorkerState {
