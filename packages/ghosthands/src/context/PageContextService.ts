@@ -307,6 +307,15 @@ export class LivePageContextService implements PageContextService {
     if (firstAttempt.saved) return;
 
     const latest = firstAttempt.current;
+    const latestVersion = typeof latest?.version === 'number' ? latest.version : 'unknown';
+    const expectedLabel =
+      typeof expectedVersion === 'number' ? String(expectedVersion) : 'none';
+    console.warn(
+      `[page-context] optimistic write conflict; discarding in-memory session update `
+        + `(jobId=${this.jobId}, mastraRunId=${this.mastraRunId ?? 'uninitialized'}, `
+        + `expectedVersion=${expectedLabel}, localVersion=${current.version}, `
+        + `persistedVersion=${latestVersion})`,
+    );
     if (latest) {
       this.session = latest;
     }
