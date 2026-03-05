@@ -7,6 +7,7 @@ import {
   buildFallbackDecisions,
   classifyFallbackAnswerMode,
   isPlaceholderValue,
+  sanitizeNoGuessAnswer,
 } from '../../../src/workers/taskHandlers/formFiller';
 import { redactSensitiveValue } from '../../../src/context/PageContextReducer';
 
@@ -334,5 +335,32 @@ describe('formFiller observation pipeline integration', () => {
 
     // All options are placeholders — no fallback, left unresolved
     expect(resolved['f1']).toBeUndefined();
+  });
+
+  it('sanitizeNoGuessAnswer blanks missing optional social handles', () => {
+    const out = sanitizeNoGuessAnswer(
+      { name: 'Twitter Handle', required: false } as any,
+      '@totallyguessed',
+      {},
+    );
+    expect(out).toBe('');
+  });
+
+  it('sanitizeNoGuessAnswer returns N/A for missing required social handles', () => {
+    const out = sanitizeNoGuessAnswer(
+      { name: 'GitHub Username', required: true } as any,
+      'madeup-user',
+      {},
+    );
+    expect(out).toBe('N/A');
+  });
+
+  it('sanitizeNoGuessAnswer prefers explicit profile evidence for LinkedIn', () => {
+    const out = sanitizeNoGuessAnswer(
+      { name: 'LinkedIn URL', required: false } as any,
+      'https://linkedin.com/in/not-real',
+      { linkedin: 'https://linkedin.com/in/real-profile' } as any,
+    );
+    expect(out).toBe('https://linkedin.com/in/real-profile');
   });
 });
