@@ -1150,39 +1150,86 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
    */
   async clickNextButton(adapter: BrowserAutomationAdapter): Promise<'clicked' | 'review_detected' | 'not_found'> {
     const result = await adapter.page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll('button, [role="button"], a'));
+      const NAV_EXCLUDE =
+        'nav, header, [role="navigation"], [role="menubar"], [role="menu"], [role="toolbar"], [data-automation-id*="header"], [data-automation-id*="navigation"]';
+      const vh = window.innerHeight;
+      const elements = Array.from(
+        document.querySelectorAll<HTMLElement>('button, [role="button"], input[type="submit"]'),
+      );
 
-      // Priority 1: Safe buttons that never submit
-      const safePriorities = ['save and continue', 'next', 'continue'];
-      for (const target of safePriorities) {
-        const btn = buttons.find(b => (b.textContent?.trim().toLowerCase() || '') === target);
-        if (btn) {
-          (btn as HTMLElement).click();
+      const candidates = elements
+        .map((el) => {
+          const rect = el.getBoundingClientRect();
+          const text = (el.textContent || (el as HTMLInputElement).value || el.getAttribute('aria-label') || '')
+            .trim()
+            .toLowerCase();
+          const style = window.getComputedStyle(el);
+          const visible =
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            style.opacity !== '0';
+          return {
+            el,
+            text,
+            rectTop: rect.top,
+            absY: rect.top + window.scrollY,
+            visible,
+            inForm: !!el.closest('form, [role="form"], [data-automation-id*="form"]'),
+            inMain: !!el.closest('main, [role="main"], [data-automation-id*="main"]'),
+            inBottomBand: rect.top >= vh * 0.45,
+            inNav: !!el.closest(NAV_EXCLUDE),
+            disabled:
+              el.hasAttribute('disabled') ||
+              el.getAttribute('aria-disabled') === 'true' ||
+              (el as HTMLInputElement).disabled === true,
+          };
+        })
+        .filter((c) => c.visible && !c.disabled && !c.inNav && c.text.length > 0);
+
+      const score = (c: (typeof candidates)[number]): number =>
+        (c.inForm ? 1000 : 0) + (c.inMain ? 400 : 0) + (c.inBottomBand ? 250 : 0) + c.absY;
+
+      const pickBest = (match: (text: string, c: (typeof candidates)[number]) => boolean) => {
+        const matched = candidates.filter((c) => match(c.text, c));
+        if (matched.length === 0) return null;
+        matched.sort((a, b) => score(b) - score(a));
+        return matched[0];
+      };
+
+      // Priority 1: explicit non-submit navigation controls
+      const exactTargets = ['save and continue', 'next'];
+      for (const target of exactTargets) {
+        const best = pickBest((text) => text === target);
+        if (best) {
+          best.el.click();
           return 'clicked';
         }
       }
-      // Partial match for safe buttons
-      const fallback = buttons.find(b => {
-        const text = b.textContent?.trim().toLowerCase() || '';
-        return text.includes('save and continue') || text.includes('next');
-      });
-      if (fallback) {
-        (fallback as HTMLElement).click();
+
+      // Priority 1b: fuzzy match, but avoid top-header "continue application" links.
+      const fuzzy = pickBest((text, c) =>
+        (text.includes('save and continue') ||
+          text.includes('save & continue') ||
+          text === 'next' ||
+          text.startsWith('next ') ||
+          (text === 'continue' && (c.inBottomBand || c.inForm))),
+      );
+      if (fuzzy) {
+        fuzzy.el.click();
         return 'clicked';
       }
 
       // Priority 2: "Submit" — only if NOT on the review page
-      const submitBtn = buttons.find(b => {
-        const text = b.textContent?.trim().toLowerCase() || '';
-        return text === 'submit' || text === 'submit application';
-      });
+      const submitBtn = pickBest((text) => text === 'submit' || text === 'submit application' || text.startsWith('submit'));
       if (submitBtn) {
         const headings = Array.from(document.querySelectorAll('h1, h2, h3'));
         const isReviewHeading = headings.some(h => (h.textContent || '').toLowerCase().includes('review'));
         const hasEditableInputs = document.querySelectorAll(
           'input[type="text"]:not([readonly]), textarea:not([readonly]), input[type="email"], input[type="tel"]'
         ).length > 0;
-        const hasSelectOne = buttons.some(b => (b.textContent?.trim() || '') === 'Select One');
+        const hasSelectOne = candidates.some(b => b.text === 'select one');
         // Only count VISIBLE unchecked checkboxes as blocking review
         const hasUncheckedRequired = Array.from(document.querySelectorAll('input[type="checkbox"]:not(:checked)')).some(cb => {
           const rect = (cb as HTMLElement).getBoundingClientRect();
@@ -1193,7 +1240,7 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
           return 'review_detected';
         }
 
-        (submitBtn as HTMLElement).click();
+        submitBtn.el.click();
         return 'clicked';
       }
 
