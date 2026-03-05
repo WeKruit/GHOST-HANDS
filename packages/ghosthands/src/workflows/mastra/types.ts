@@ -3,6 +3,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import type { BrowserAutomationAdapter, HitlCapableAdapter } from '../../adapters/types.js';
 import type { CostTracker } from '../../workers/costControl.js';
 import type { ProgressTracker } from '../../workers/progressTracker.js';
+import type { EmailVerificationService } from '../../workers/emailVerification/types.js';
 import type { TaskHandler, AutomationJob } from '../../workers/taskHandlers/types.js';
 
 // ---------------------------------------------------------------------------
@@ -74,6 +75,7 @@ export interface RuntimeContext {
   credentials: Record<string, string> | null;
   dataPrompt: string;
   resumeFilePath: string | null;
+  emailVerification?: EmailVerificationService;
   supabase: SupabaseClient;
   logEvent: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
   workerId: string;
@@ -83,6 +85,7 @@ export interface RuntimeContext {
     type: string;
     description: string;
     timeoutSeconds?: number;
+    metadata?: Record<string, unknown>;
   }) => Promise<{ resumed: boolean }>;
 }
 

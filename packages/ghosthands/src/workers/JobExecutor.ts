@@ -31,6 +31,8 @@ import { buildApplyWorkflow } from '../workflows/mastra/applyWorkflow.js';
 import { isMastraResume, claimResume, persistMastraRunId } from '../workflows/mastra/resumeCoordinator.js';
 import { workflowState, type RuntimeContext, type WorkflowState } from '../workflows/mastra/types.js';
 import { finalizeCookbookSuccess, finalizeHandlerResult, finalizeHandlerSideEffects } from './finalization.js';
+import { createEmailVerificationServiceFromEnv } from './emailVerification/service.js';
+import type { EmailVerificationService } from './emailVerification/types.js';
 
 const logger = getLogger({ service: 'job-executor' });
 
@@ -186,6 +188,7 @@ export class JobExecutor {
     let resumeFilePath: string | null = null;
     let fileChooserHandler: ((chooser: any) => Promise<void>) | null = null;
     let cancelListenClient: pg.PoolClient | null = null;
+    let emailVerification: EmailVerificationService | null = null;
 
     // Initialize cost tracker with budget limits
     const qualityPreset = resolveQualityPreset(job.input_data, job.metadata);
@@ -388,7 +391,29 @@ export class JobExecutor {
       // 5. Build data prompt from input_data
       const dataPrompt = buildDataPrompt(job.input_data);
 
-      // 5a. Download resume if resume_ref is provided
+      // 5a. Optional per-user Gmail verification automation (Mastra + SmartApply scope)
+      if (handler.type === 'smart_apply' && process.env.GH_EMAIL_AUTOMATION_ENABLED === 'true') {
+        try {
+          emailVerification = createEmailVerificationServiceFromEnv({
+            supabase: this.supabase,
+            userId: job.user_id,
+          });
+          if (emailVerification) {
+            await this.logJobEvent(job.id, 'email_verification_service_enabled', {
+              provider: process.env.GH_EMAIL_PROVIDER || 'gmail_api',
+            });
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          logger.warn('Email verification service init failed (continuing without it)', { jobId: job.id, error: message });
+          await this.logJobEvent(job.id, 'email_verification_service_init_failed', {
+            error: message,
+          });
+          emailVerification = null;
+        }
+      }
+
+      // 5b. Download resume if resume_ref is provided
       const resumeRef = this.resolveResumeRef(job);
       if (resumeRef) {
         try {
@@ -572,6 +597,7 @@ export class JobExecutor {
           credentials,
           dataPrompt,
           resumeFilePath,
+          emailVerification,
           logEventFn,
         });
         return;
@@ -802,6 +828,8 @@ export class JobExecutor {
           credentials,
           dataPrompt,
           resumeFilePath,
+          emailVerification: emailVerification || undefined,
+          logEvent: logEventFn,
         };
 
         try {
@@ -1238,6 +1266,13 @@ export class JobExecutor {
       if (fileChooserHandler && adapter) {
         try { adapter.page.off('filechooser', fileChooserHandler); } catch { /* page may be closed */ }
       }
+      if (emailVerification) {
+        try {
+          await emailVerification.close?.();
+        } catch {
+          // Non-fatal cleanup.
+        }
+      }
       // Clean up downloaded resume file
       if (resumeFilePath) {
         this.resumeDownloader.cleanup(resumeFilePath).catch((err) => {
@@ -1261,9 +1296,21 @@ export class JobExecutor {
     credentials: Record<string, string> | null;
     dataPrompt: string;
     resumeFilePath: string | null;
+    emailVerification?: EmailVerificationService | null;
     logEventFn: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
   }): Promise<void> {
-    const { job, adapter, handler, costTracker, progress, credentials, dataPrompt, resumeFilePath, logEventFn } = opts;
+    const {
+      job,
+      adapter,
+      handler,
+      costTracker,
+      progress,
+      credentials,
+      dataPrompt,
+      resumeFilePath,
+      emailVerification,
+      logEventFn,
+    } = opts;
     const logger = getLogger({ service: 'mastra-executor' });
 
     // Build RuntimeContext (closure-injected, never serialized)
@@ -1276,6 +1323,7 @@ export class JobExecutor {
       credentials,
       dataPrompt,
       resumeFilePath,
+      emailVerification: emailVerification || undefined,
       supabase: this.supabase,
       logEvent: logEventFn,
       workerId: this.workerId,
@@ -1303,6 +1351,7 @@ export class JobExecutor {
             interaction_data: {
               type: actionOpts.type,
               description: actionOpts.description,
+              metadata: actionOpts.metadata || null,
               screenshot_url: screenshotUrl,
               page_url: pageUrl,
               detected_at: new Date().toISOString(),
@@ -1329,6 +1378,7 @@ export class JobExecutor {
               page_url: pageUrl,
               timeout_seconds: timeout,
               description: actionOpts.description,
+              metadata: actionOpts.metadata as any,
             },
             job.valet_task_id,
             this.workerId,

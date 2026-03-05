@@ -1,6 +1,7 @@
 import type { BrowserAutomationAdapter } from '../../adapters/types.js';
 import type { CostTracker } from '../costControl.js';
 import type { ProgressTracker } from '../progressTracker.js';
+import type { EmailVerificationService } from '../emailVerification/types.js';
 
 /** Job record as fetched from gh_automation_jobs */
 export interface AutomationJob {
@@ -43,11 +44,16 @@ export interface TaskContext {
   dataPrompt: string;
   /** Local file path to the downloaded resume, if a resume_ref was provided */
   resumeFilePath?: string | null;
+  /** Optional email verification automation service (per-user Gmail API). */
+  emailVerification?: EmailVerificationService;
+  /** Structured job-event logger injected by JobExecutor. */
+  logEvent?: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
   /** Block handler execution until human completes a manual action (email verification, manual sign-in, etc.) */
   waitForManualAction?: (options: {
     type: string;
     description: string;
     timeoutSeconds?: number;
+    metadata?: Record<string, unknown>;
   }) => Promise<{ resumed: boolean }>;
 }
 
