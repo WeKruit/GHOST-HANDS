@@ -28,7 +28,8 @@
       "import": "./dist/packages/engine/src/broker.js",
       "require": "./dist/packages/engine/src/broker.js",
       "types": "./dist/packages/engine/src/broker.d.ts"
-    }
+    },
+    "./dist/*": "./dist/*"
   },
   "files": ["dist", "MANIFEST.json"],
   "description": "Job application automation engine for GH-Desktop-App",
