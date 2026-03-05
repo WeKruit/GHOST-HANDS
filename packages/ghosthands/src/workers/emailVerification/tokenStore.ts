@@ -4,7 +4,7 @@ import { CredentialEncryption } from '../../db/encryption.js';
 export interface StoredGmailConnection {
   userId: string;
   provider: string;
-  emailAddress: string;
+  emailAddress?: string;
   refreshToken: string;
   accessToken?: string;
   accessTokenExpiresAt?: string;
@@ -14,10 +14,8 @@ export interface StoredGmailConnection {
   lastUsedAt?: string;
 }
 
-interface GMailConnectionRow {
+interface GmailTokenRow {
   user_id: string;
-  provider: string;
-  email_address: string;
   encrypted_refresh_token: string;
   encrypted_access_token: string | null;
   access_token_expires_at: string | null;
@@ -41,11 +39,9 @@ export class GmailConnectionStore {
 
   async getConnection(userId: string): Promise<StoredGmailConnection | null> {
     const { data, error } = await this.supabase
-      .from('gh_user_email_connections')
+      .from('gh_user_google_tokens')
       .select([
         'user_id',
-        'provider',
-        'email_address',
         'encrypted_refresh_token',
         'encrypted_access_token',
         'access_token_expires_at',
@@ -55,7 +51,6 @@ export class GmailConnectionStore {
         'last_used_at',
       ].join(','))
       .eq('user_id', userId)
-      .eq('provider', 'google')
       .is('revoked_at', null)
       .maybeSingle();
 
@@ -64,7 +59,7 @@ export class GmailConnectionStore {
     }
     if (!data) return null;
 
-    const row = data as unknown as GMailConnectionRow;
+    const row = data as unknown as GmailTokenRow;
     const refreshToken = this.encryption.decrypt(row.encrypted_refresh_token);
     const accessToken = row.encrypted_access_token
       ? this.encryption.decrypt(row.encrypted_access_token)
@@ -72,8 +67,7 @@ export class GmailConnectionStore {
 
     return {
       userId: row.user_id,
-      provider: row.provider,
-      emailAddress: row.email_address,
+      provider: 'google',
       refreshToken,
       accessToken,
       accessTokenExpiresAt: row.access_token_expires_at || undefined,
@@ -84,9 +78,22 @@ export class GmailConnectionStore {
     };
   }
 
+  async getUserEmail(userId: string): Promise<string | null> {
+    const authApi = (this.supabase.auth as any)?.admin;
+    if (!authApi?.getUserById) {
+      return null;
+    }
+
+    const { data, error } = await authApi.getUserById(userId);
+    if (error) {
+      throw new Error(`Failed to resolve user email: ${error.message}`);
+    }
+    const email = data?.user?.email;
+    return typeof email === 'string' && email.length > 0 ? email : null;
+  }
+
   async upsertConnection(input: {
     userId: string;
-    emailAddress: string;
     refreshToken: string;
     accessToken?: string;
     accessTokenExpiresAt?: string;
@@ -100,8 +107,6 @@ export class GmailConnectionStore {
 
     const payload = {
       user_id: input.userId,
-      provider: 'google',
-      email_address: input.emailAddress,
       encrypted_refresh_token: encryptedRefresh.ciphertext,
       encrypted_access_token: encryptedAccess?.ciphertext ?? null,
       access_token_expires_at: input.accessTokenExpiresAt ?? null,
@@ -113,8 +118,8 @@ export class GmailConnectionStore {
     };
 
     const { error } = await this.supabase
-      .from('gh_user_email_connections')
-      .upsert(payload, { onConflict: 'user_id,provider' });
+      .from('gh_user_google_tokens')
+      .upsert(payload, { onConflict: 'user_id' });
 
     if (error) {
       throw new Error(`Failed to save Gmail connection: ${error.message}`);
@@ -130,7 +135,7 @@ export class GmailConnectionStore {
   }): Promise<void> {
     const encryptedAccess = this.encryption.encrypt(input.accessToken);
     const { error } = await this.supabase
-      .from('gh_user_email_connections')
+      .from('gh_user_google_tokens')
       .update({
         encrypted_access_token: encryptedAccess.ciphertext,
         access_token_expires_at: input.accessTokenExpiresAt ?? null,
@@ -139,7 +144,6 @@ export class GmailConnectionStore {
         last_used_at: new Date().toISOString(),
       })
       .eq('user_id', input.userId)
-      .eq('provider', 'google')
       .is('revoked_at', null);
 
     if (error) {
@@ -149,10 +153,9 @@ export class GmailConnectionStore {
 
   async markUsed(userId: string): Promise<void> {
     const { error } = await this.supabase
-      .from('gh_user_email_connections')
+      .from('gh_user_google_tokens')
       .update({ last_used_at: new Date().toISOString() })
       .eq('user_id', userId)
-      .eq('provider', 'google')
       .is('revoked_at', null);
 
     if (error) {
@@ -162,10 +165,9 @@ export class GmailConnectionStore {
 
   async revokeConnection(userId: string): Promise<void> {
     const { error } = await this.supabase
-      .from('gh_user_email_connections')
+      .from('gh_user_google_tokens')
       .update({ revoked_at: new Date().toISOString() })
       .eq('user_id', userId)
-      .eq('provider', 'google')
       .is('revoked_at', null);
 
     if (error) {

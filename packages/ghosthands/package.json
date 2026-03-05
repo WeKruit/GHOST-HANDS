@@ -25,9 +25,11 @@
         "submit-test-job": "bun src/scripts/submit-test-job.ts",
         "test-google": "bun src/scripts/submit-test-job.ts",
         "test:gmail-verification": "bun src/scripts/test-gmail-verification.ts",
+        "test:gmail-approval": "bun src/scripts/test-gmail-oauth-approval.ts",
         "kill-workers": "bun src/scripts/kill-workers.ts",
         "test:worker": "./test-worker.sh",
-        "job": "bun src/scripts/job.ts"
+        "job": "bun src/scripts/job.ts",
+        "test:llm-email-tool": "bun src/scripts/test-llm-email-tool.ts"
     },
     "dependencies": {
         "@actionbookdev/sdk": "^0.3.0",
