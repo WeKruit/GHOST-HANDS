@@ -94,6 +94,16 @@ export interface BrowserAutomationAdapter {
   /** Whether the agent is currently paused */
   isPaused?(): boolean;
 
+  // -- Act Mutex --
+
+  /**
+   * Wait for any in-flight act() call to settle (complete or fail).
+   * Call this before navigating or clicking Next to prevent zombie act()
+   * calls from interfering with the new page.
+   * Returns true if settled within the timeout, false if still running.
+   */
+  waitForActSettle?(timeoutMs?: number): Promise<boolean>;
+
   // -- Events --
 
   /** Subscribe to adapter lifecycle events */
