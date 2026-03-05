@@ -5,6 +5,7 @@ export * as api from './api';
 export * as client from './client';
 export * as config from './config';
 export * as connectors from './connectors';
+export * as context from './context';
 export * as db from './db';
 export * as detection from './detection';
 export * as engine from './engine';

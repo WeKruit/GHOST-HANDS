@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { BrowserAutomationAdapter, HitlCapableAdapter } from '../../adapters/types.js';
+import type { PageContextService } from '../../context/PageContextService.js';
 import type { CostTracker } from '../../workers/costControl.js';
 import type { ProgressTracker } from '../../workers/progressTracker.js';
 import type { TaskHandler, AutomationJob } from '../../workers/taskHandlers/types.js';
@@ -74,6 +75,7 @@ export interface RuntimeContext {
   credentials: Record<string, string> | null;
   dataPrompt: string;
   resumeFilePath: string | null;
+  pageContext: PageContextService;
   supabase: SupabaseClient;
   logEvent: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
   workerId: string;

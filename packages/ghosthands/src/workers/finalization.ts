@@ -23,6 +23,8 @@ import type { ExecutionResult } from '../engine/ExecutionEngine.js';
 import { callbackNotifier } from './callbackNotifier.js';
 import type { SessionManager } from '../sessions/SessionManager.js';
 import { getLogger } from '../monitoring/logger.js';
+import type { PageContextService } from '../context/PageContextService.js';
+import type { ContextReport } from '../context/types.js';
 
 // ---------------------------------------------------------------------------
 // Shared input interface
@@ -38,6 +40,7 @@ export interface CommonFinalizationInput {
   supabase: SupabaseClient;
   logEvent: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
   uploadScreenshot: (jobId: string, name: string, buffer: Buffer) => Promise<string>;
+  pageContext?: PageContextService;
 }
 
 // ---------------------------------------------------------------------------
@@ -45,6 +48,59 @@ export interface CommonFinalizationInput {
 // ---------------------------------------------------------------------------
 
 const logger = getLogger({ service: 'finalization' });
+
+interface FlushResult {
+  report: ContextReport | undefined;
+  flushFailed: boolean;
+}
+
+async function flushPageContext(
+  pageContext: PageContextService | undefined,
+  logEvent: CommonFinalizationInput['logEvent'],
+): Promise<FlushResult> {
+  if (!pageContext) return { report: undefined, flushFailed: false };
+
+  try {
+    return { report: await pageContext.flushToSupabase(), flushFailed: false };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    try {
+      await pageContext.markFlushPending(message);
+    } catch {
+      // swallow
+    }
+    await logEvent('page_context_flush_failed', { error: message }).catch(() => {});
+    const pending = await pageContext.getContextReport('pending').catch(() => undefined);
+    return { report: pending, flushFailed: true };
+  }
+}
+
+const SENSITIVE_FIELD_RE = /password|passwd|pwd|secret|token|otp|ssn|credit.?card|cvv|pin|social.?security/i;
+
+function redactReportAnswers<T extends { promptText?: string; answer?: string }>(
+  items: T[],
+): T[] {
+  return items.map((item) => {
+    if (item.answer && item.promptText && SENSITIVE_FIELD_RE.test(item.promptText)) {
+      return { ...item, answer: '[REDACTED]' };
+    }
+    return item;
+  });
+}
+
+export function serializeContextReport(report: ContextReport): Record<string, unknown> {
+  return {
+    pages_visited: report.pagesVisited,
+    required_unresolved: report.requiredUnresolved,
+    risky_optional_answers: redactReportAnswers(report.riskyOptionalAnswers),
+    low_confidence_answers: redactReportAnswers(report.lowConfidenceAnswers),
+    ambiguous_question_groups: report.ambiguousQuestionGroups,
+    best_effort_guesses: redactReportAnswers(report.bestEffortGuesses),
+    partial_pages: report.partialPages,
+    flush_status: report.flushStatus,
+    ...(report.flushError ? { flush_error: report.flushError } : {}),
+  };
+}
 
 /**
  * Take a screenshot via the adapter and upload it. Returns the URL on success,
@@ -224,31 +280,33 @@ export async function finalizeCookbookSuccess(
     supabase,
     logEvent,
     uploadScreenshot,
+    pageContext,
     engineResult,
   } = input;
 
+  // Track metadata locally to avoid stale-base clobber across sequential writes
+  let currentMetadata: Record<string, unknown> = { ...(job.metadata || {}) };
+
   // 1. Update job metadata with engine result
+  currentMetadata = {
+    ...currentMetadata,
+    engine: {
+      manual_id: engineResult.manualId,
+      manual_status: 'cookbook_success',
+      health_score: engineResult.cookbookSteps > 0 ? 95 : null,
+    },
+    cost_breakdown: {
+      cookbook_steps: engineResult.cookbookSteps,
+      magnitude_steps: 0,
+      cookbook_cost_usd: costTracker.getSnapshot().totalCost,
+      magnitude_cost_usd: 0,
+      image_cost_usd: costTracker.getSnapshot().imageCost,
+      reasoning_cost_usd: costTracker.getSnapshot().reasoningCost,
+    },
+  };
   await supabase
     .from('gh_automation_jobs')
-    .update({
-      final_mode: engineResult.mode,
-      metadata: {
-        ...(job.metadata || {}),
-        engine: {
-          manual_id: engineResult.manualId,
-          manual_status: 'cookbook_success',
-          health_score: engineResult.cookbookSteps > 0 ? 95 : null,
-        },
-        cost_breakdown: {
-          cookbook_steps: engineResult.cookbookSteps,
-          magnitude_steps: 0,
-          cookbook_cost_usd: costTracker.getSnapshot().totalCost,
-          magnitude_cost_usd: 0,
-          image_cost_usd: costTracker.getSnapshot().imageCost,
-          reasoning_cost_usd: costTracker.getSnapshot().reasoningCost,
-        },
-      },
-    })
+    .update({ final_mode: engineResult.mode, metadata: currentMetadata })
     .eq('id', job.id);
 
   // 2. Take final screenshot and upload
@@ -269,6 +327,7 @@ export async function finalizeCookbookSuccess(
   await progress.flush();
 
   // 6. Build result_data with cost info
+  const { report: contextReport, flushFailed } = await flushPageContext(pageContext, logEvent);
   const resultData = {
     success_message: 'Task completed via cookbook replay',
     cost: {
@@ -277,7 +336,17 @@ export async function finalizeCookbookSuccess(
       total_cost_usd: finalCost.totalCost,
       action_count: finalCost.actionCount,
     },
+    ...(contextReport && { context_report: serializeContextReport(contextReport) }),
   };
+
+  // 6.5. Propagate flush-failure flag into job metadata
+  if (flushFailed) {
+    currentMetadata = { ...currentMetadata, page_context_flush_pending: true };
+    await supabase
+      .from('gh_automation_jobs')
+      .update({ metadata: currentMetadata })
+      .eq('id', job.id);
+  }
 
   // 7. Update job status to 'completed'
   await supabase
@@ -356,10 +425,14 @@ export async function finalizeHandlerResult(
     supabase,
     logEvent,
     uploadScreenshot,
+    pageContext,
     taskResult,
     finalMode,
     engineResult,
   } = input;
+
+  // Track metadata locally to avoid stale-base clobber across sequential writes
+  let currentMetadata: Record<string, unknown> = { ...(job.metadata || {}) };
 
   // 1. Take final screenshot and upload (prepend handler screenshot if present)
   const screenshotUrls: string[] = [];
@@ -388,27 +461,25 @@ export async function finalizeHandlerResult(
   await saveFreshSessionCookies(adapter, sessionManager, job.user_id, job.target_url);
 
   // 4.5. Persist final_mode and engine/cost metadata (parity with legacy path)
+  currentMetadata = {
+    ...currentMetadata,
+    engine: {
+      manual_id: engineResult.manualId || null,
+      manual_status: engineResult.manualId ? 'cookbook_failed_fallback' : 'no_manual_available',
+      fallback_reason: engineResult.error || null,
+    },
+    cost_breakdown: {
+      cookbook_steps: engineResult.cookbookSteps,
+      magnitude_steps: finalCost.actionCount,
+      cookbook_cost_usd: 0,
+      magnitude_cost_usd: finalCost.totalCost,
+      image_cost_usd: finalCost.imageCost,
+      reasoning_cost_usd: finalCost.reasoningCost,
+    },
+  };
   await supabase
     .from('gh_automation_jobs')
-    .update({
-      final_mode: finalMode,
-      metadata: {
-        ...(job.metadata || {}),
-        engine: {
-          manual_id: engineResult.manualId || null,
-          manual_status: engineResult.manualId ? 'cookbook_failed_fallback' : 'no_manual_available',
-          fallback_reason: engineResult.error || null,
-        },
-        cost_breakdown: {
-          cookbook_steps: engineResult.cookbookSteps,
-          magnitude_steps: finalCost.actionCount,
-          cookbook_cost_usd: 0,
-          magnitude_cost_usd: finalCost.totalCost,
-          image_cost_usd: finalCost.imageCost,
-          reasoning_cost_usd: finalCost.reasoningCost,
-        },
-      },
-    })
+    .update({ final_mode: finalMode, metadata: currentMetadata })
     .eq('id', job.id);
 
   // 5. Handle awaiting_review vs normal completion
@@ -416,6 +487,7 @@ export async function finalizeHandlerResult(
     await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
     await progress.flush();
 
+    const { report: contextReport, flushFailed: awaitingFlushFailed } = await flushPageContext(pageContext, logEvent);
     const resultData: Record<string, unknown> = {
       ...(taskResult.data || {}),
       cost: {
@@ -424,12 +496,16 @@ export async function finalizeHandlerResult(
         total_cost_usd: finalCost.totalCost,
         action_count: finalCost.actionCount,
       },
+      ...(contextReport && { context_report: serializeContextReport(contextReport) }),
     };
 
     await supabase
       .from('gh_automation_jobs')
       .update({
         status: 'awaiting_review',
+        ...(awaitingFlushFailed && {
+          metadata: { ...currentMetadata, page_context_flush_pending: true },
+        }),
         result_data: resultData,
         result_summary: 'Application filled — waiting for user to review and submit',
         screenshot_urls: screenshotUrls,
@@ -459,7 +535,8 @@ export async function finalizeHandlerResult(
     return { awaitingReview: true };
   }
 
-  // 6. Build result data (shared by success and failure paths)
+  // 6. Build result data (shared by success and failure paths) — flush like awaiting_review
+  const { report: contextReport, flushFailed: handlerFlushFailed } = await flushPageContext(pageContext, logEvent);
   const resultData: Record<string, unknown> = {
     ...(taskResult.data || {}),
     cost: {
@@ -468,7 +545,17 @@ export async function finalizeHandlerResult(
       total_cost_usd: finalCost.totalCost,
       action_count: finalCost.actionCount,
     },
+    ...(contextReport && { context_report: serializeContextReport(contextReport) }),
   };
+
+  // 6.5. Propagate flush-failure flag into job metadata
+  if (handlerFlushFailed) {
+    currentMetadata = { ...currentMetadata, page_context_flush_pending: true };
+    await supabase
+      .from('gh_automation_jobs')
+      .update({ metadata: currentMetadata })
+      .eq('id', job.id);
+  }
 
   // 7. Handler failure — mark job as failed, not completed
   if (!taskResult.success) {
@@ -603,7 +690,13 @@ export async function finalizeHandlerSideEffects(
     finalMode: string;
     engineResult: ExecutionResult;
   },
-): Promise<{ screenshotUrls: string[]; finalCost: CostSnapshot }> {
+): Promise<{
+  screenshotUrls: string[];
+  finalCost: CostSnapshot;
+  resultData: Record<string, unknown>;
+  contextFlushed: boolean;
+  currentMetadata: Record<string, unknown>;
+}> {
   const {
     job,
     adapter,
@@ -612,10 +705,14 @@ export async function finalizeHandlerSideEffects(
     supabase,
     logEvent,
     uploadScreenshot,
+    pageContext,
     taskResult,
     finalMode,
     engineResult,
   } = input;
+
+  // Track metadata locally to avoid stale-base clobber across sequential writes
+  let currentMetadata: Record<string, unknown> = { ...(job.metadata || {}) };
 
   // 1. Take final screenshot and upload
   const screenshotUrls: string[] = [];
@@ -637,29 +734,51 @@ export async function finalizeHandlerSideEffects(
   await saveFreshSessionCookies(adapter, sessionManager, job.user_id, job.target_url);
 
   // 5. Persist final_mode and engine/cost metadata
+  currentMetadata = {
+    ...currentMetadata,
+    engine: {
+      manual_id: engineResult.manualId || null,
+      manual_status: engineResult.manualId ? 'cookbook_failed_fallback' : 'no_manual_available',
+      fallback_reason: engineResult.error || null,
+    },
+    cost_breakdown: {
+      cookbook_steps: engineResult.cookbookSteps,
+      magnitude_steps: finalCost.actionCount,
+      cookbook_cost_usd: 0,
+      magnitude_cost_usd: finalCost.totalCost,
+      image_cost_usd: finalCost.imageCost,
+      reasoning_cost_usd: finalCost.reasoningCost,
+    },
+  };
   await supabase
     .from('gh_automation_jobs')
     .update({
       final_mode: finalMode,
       screenshot_urls: screenshotUrls,
-      metadata: {
-        ...(job.metadata || {}),
-        engine: {
-          manual_id: engineResult.manualId || null,
-          manual_status: engineResult.manualId ? 'cookbook_failed_fallback' : 'no_manual_available',
-          fallback_reason: engineResult.error || null,
-        },
-        cost_breakdown: {
-          cookbook_steps: engineResult.cookbookSteps,
-          magnitude_steps: finalCost.actionCount,
-          cookbook_cost_usd: 0,
-          magnitude_cost_usd: finalCost.totalCost,
-          image_cost_usd: finalCost.imageCost,
-          reasoning_cost_usd: finalCost.reasoningCost,
-        },
-      },
+      metadata: currentMetadata,
     })
     .eq('id', job.id);
 
-  return { screenshotUrls, finalCost };
+  const { report: contextReport, flushFailed: sideEffectFlushFailed } = await flushPageContext(pageContext, logEvent);
+  const resultData: Record<string, unknown> = {
+    ...(taskResult.data || {}),
+    cost: {
+      input_tokens: finalCost.inputTokens,
+      output_tokens: finalCost.outputTokens,
+      total_cost_usd: finalCost.totalCost,
+      action_count: finalCost.actionCount,
+    },
+    ...(contextReport && { context_report: serializeContextReport(contextReport) }),
+  };
+
+  // Propagate flush-failure flag into job metadata
+  if (sideEffectFlushFailed) {
+    currentMetadata = { ...currentMetadata, page_context_flush_pending: true };
+    await supabase
+      .from('gh_automation_jobs')
+      .update({ metadata: currentMetadata })
+      .eq('id', job.id);
+  }
+
+  return { screenshotUrls, finalCost, resultData, contextFlushed: !!contextReport && !sideEffectFlushFailed, currentMetadata };
 }
