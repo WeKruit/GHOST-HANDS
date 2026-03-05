@@ -2827,6 +2827,22 @@ Rules:
   }
 }
 
+/**
+ * Fuzzy-match an answer plan's questionKey back to the original snapshot.
+ * The LLM may return the display prompt text instead of the normalized key.
+ */
+function findSnapshotForPlan(
+  snapshots: QuestionSnapshot[],
+  planKey: string,
+): QuestionSnapshot | undefined {
+  const exact = snapshots.find((q) => q.questionKey === planKey);
+  if (exact) return exact;
+  const normalized = planKey.toLowerCase().replace(/\s+/g, ' ').trim();
+  return snapshots.find(
+    (q) => q.normalizedPrompt === normalized || q.promptText === planKey,
+  );
+}
+
 // ── Exported pure helpers (testable without browser) ─────────
 
 /** Decline/opt-out lexicon for EEO-style fields */
@@ -3125,57 +3141,54 @@ export async function fillFormOnPage(
 
   if (llmFields.length > 0) {
     if (usedNewPipeline) {
-      // 6c. LLM answer planning via adapter.extract on normalized questions
+      // 6c-i. Generate actual fill answers via proven legacy path
+      console.log('[formFiller] Asking LLM for answers…');
+      const genResult = await generateAnswers(llmFields, profileText);
+      answers = { ...genResult.answers };
+      Object.assign(fieldIdMap, genResult.fieldIdToKey);
+      result.llmCalls++;
+      result.inputTokens += genResult.inputTokens;
+      result.outputTokens += genResult.outputTokens;
+      for (const field of llmFields) {
+        const answer = getAnswerForField(answers, field, fieldIdMap);
+        if (answer !== undefined) {
+          fieldIdToResolvedAnswer[field.id] = answer;
+        }
+      }
+      console.log(`[formFiller] LLM provided ${Object.keys(answers).length} answers.`);
+
+      // 6c-ii. Run observation answer planning for metadata (answerMode, confidence)
       console.log('[formFiller] Running LLM answer planning on normalized questions…');
       const answerPlans = await planAnswersForQuestions(initialQuestionSnapshots, profileText, adapter);
       result.llmCalls++;
 
+      // Build answer decisions — prefer observation metadata if we can match keys
       if (answerPlans.length > 0) {
-        // Map planned answers back to field IDs
+        const matchedDecisions: AnswerDecision[] = [];
         for (const plan of answerPlans) {
-          const snapshot = initialQuestionSnapshots.find((q) => q.questionKey === plan.questionKey);
+          const snapshot = findSnapshotForPlan(initialQuestionSnapshots, plan.questionKey);
           if (!snapshot) continue;
-          for (const fieldId of snapshot.fieldIds) {
-            fieldIdToResolvedAnswer[fieldId] = plan.answer;
-          }
-        }
-
-        // Build answer decisions with answerMode
-        const initialDecisions: AnswerDecision[] = answerPlans
-          .filter((plan) => initialQuestionSnapshots.some((q) => q.questionKey === plan.questionKey))
-          .map((plan) => ({
-            questionKey: plan.questionKey,
+          matchedDecisions.push({
+            questionKey: snapshot.questionKey,
             answer: plan.answer,
             confidence: plan.confidence,
             source: 'llm' as const,
             answerMode: plan.answerMode,
-          }));
-        result.answerDecisions = initialDecisions;
-
-        if (initialDecisions.length > 0) {
+          });
+        }
+        if (matchedDecisions.length > 0) {
+          result.answerDecisions = matchedDecisions;
           await notifyObserver(
             'onAnswerPlanned',
             observers?.onAnswerPlanned
-              ? () => observers.onAnswerPlanned!(initialDecisions)
+              ? () => observers.onAnswerPlanned!(matchedDecisions)
               : undefined,
           );
         }
         console.log(`[formFiller] LLM answer planning provided ${answerPlans.length} answers.`);
-      } else {
-        // Answer planning failed — fall back to generateAnswers
-        console.log('[formFiller] LLM answer planning returned empty — falling back to legacy generateAnswers…');
-        const genResult = await generateAnswers(llmFields, profileText);
-        answers = { ...genResult.answers };
-        Object.assign(fieldIdMap, genResult.fieldIdToKey);
-        result.llmCalls++;
-        result.inputTokens += genResult.inputTokens;
-        result.outputTokens += genResult.outputTokens;
-        for (const field of llmFields) {
-          const answer = getAnswerForField(answers, field, fieldIdMap);
-          if (answer !== undefined) {
-            fieldIdToResolvedAnswer[field.id] = answer;
-          }
-        }
+      }
+      // Fallback: build decisions from generateAnswers results if observation didn't match
+      if (!result.answerDecisions || result.answerDecisions.length === 0) {
         const initialDecisions = buildAnswerDecisionsFromFieldAnswers(
           initialQuestionSnapshots,
           fieldIdToResolvedAnswer,
@@ -3378,46 +3391,51 @@ export async function fillFormOnPage(
         }
       }
 
-      // Plan answers for the new snapshots
+      // Generate actual fill answers for unseen fields via proven legacy path
+      const extraResult = await generateAnswers(unseen, profileText);
+      Object.assign(answers, extraResult.answers);
+      Object.assign(fieldIdMap, extraResult.fieldIdToKey);
+      result.llmCalls++;
+      result.inputTokens += extraResult.inputTokens;
+      result.outputTokens += extraResult.outputTokens;
+      for (const field of unseen) {
+        const answer = getAnswerForField(answers, field, fieldIdMap);
+        if (answer !== undefined) {
+          fieldIdToResolvedAnswer[field.id] = answer;
+        }
+      }
+
+      // Run observation answer planning for metadata on new snapshots
       const newAnswerPlans = await planAnswersForQuestions(newSnapshots, profileText, adapter);
       result.llmCalls++;
 
+      let extraDecisionsAdded = false;
       if (newAnswerPlans.length > 0) {
+        const matchedDecisions: AnswerDecision[] = [];
         for (const plan of newAnswerPlans) {
-          const snapshot = newSnapshots.find((q) => q.questionKey === plan.questionKey);
+          const snapshot = findSnapshotForPlan(newSnapshots, plan.questionKey);
           if (!snapshot) continue;
-          for (const fieldId of snapshot.fieldIds) {
-            fieldIdToResolvedAnswer[fieldId] = plan.answer;
-          }
+          matchedDecisions.push({
+            questionKey: snapshot.questionKey,
+            answer: plan.answer,
+            confidence: plan.confidence,
+            source: 'llm' as const,
+            answerMode: plan.answerMode,
+          });
         }
-        const extraDecisions: AnswerDecision[] = newAnswerPlans.map((plan) => ({
-          questionKey: plan.questionKey,
-          answer: plan.answer,
-          confidence: plan.confidence,
-          source: 'llm' as const,
-          answerMode: plan.answerMode,
-        }));
-        result.answerDecisions = [...(result.answerDecisions || []), ...extraDecisions];
-        await notifyObserver(
-          'onAnswerPlanned',
-          observers?.onAnswerPlanned
-            ? () => observers.onAnswerPlanned!(extraDecisions)
-            : undefined,
-        );
-      } else {
-        // Fallback to legacy generateAnswers for unseen fields
-        const extraResult = await generateAnswers(unseen, profileText);
-        Object.assign(answers, extraResult.answers);
-        Object.assign(fieldIdMap, extraResult.fieldIdToKey);
-        result.llmCalls++;
-        result.inputTokens += extraResult.inputTokens;
-        result.outputTokens += extraResult.outputTokens;
-        for (const field of unseen) {
-          const answer = getAnswerForField(answers, field, fieldIdMap);
-          if (answer !== undefined) {
-            fieldIdToResolvedAnswer[field.id] = answer;
-          }
+        if (matchedDecisions.length > 0) {
+          result.answerDecisions = [...(result.answerDecisions || []), ...matchedDecisions];
+          extraDecisionsAdded = true;
+          await notifyObserver(
+            'onAnswerPlanned',
+            observers?.onAnswerPlanned
+              ? () => observers.onAnswerPlanned!(matchedDecisions)
+              : undefined,
+          );
         }
+      }
+      // Fallback: build decisions from generateAnswers results if observation didn't match
+      if (!extraDecisionsAdded) {
         const extraDecisions = buildAnswerDecisionsFromFieldAnswers(
           newSnapshots,
           fieldIdToResolvedAnswer,
