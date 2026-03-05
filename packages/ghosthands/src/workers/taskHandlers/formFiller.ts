@@ -128,6 +128,8 @@ export function isPlaceholderValue(value: string): boolean {
 const PLACEHOLDER_RE_SOURCE = PLACEHOLDER_RE.source;
 
 const MAGNITUDE_HAND_ACT_TIMEOUT_MS = 30_000;
+const NAV_CONTROL_RE =
+  /\b(kla careers|search for jobs|candidate home|job alerts|privacy policy|follow us|about us|navigation menu|careers home|menu)\b/i;
 
 const FIELD_RESULT_CONFIDENCE = {
   domFilled: 0.8,
@@ -367,6 +369,24 @@ async function uploadResumeIfPresent(page: Page, resumePath?: string | null): Pr
 
 function normalizeName(s: string): string {
   return s.replace(/\*/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function isLikelyNavigationField(
+  field: Pick<FormField, 'name' | 'section' | 'choices' | 'type'> & { options?: string[] },
+): boolean {
+  const name = field.name || '';
+  const section = field.section || '';
+  const labels = [name, section, ...(field.choices || []), ...(field.options || [])].map((v) =>
+    normalizeName(v || ''),
+  );
+  const navHitCount = labels.filter((v) => NAV_CONTROL_RE.test(v)).length;
+  if (navHitCount >= 2) return true;
+
+  const sectionIsNav = /\b(header|footer|navigation|menu|follow us)\b/i.test(section);
+  const buttonLike = field.type === 'button-group' || field.type === 'radio-group';
+  if (sectionIsNav && buttonLike) return true;
+
+  return false;
 }
 
 function getAnswer(answers: AnswerMap, field: FormField): string | undefined {
@@ -753,6 +773,8 @@ async function extractFields(page: Page): Promise<FormField[]> {
       const btn = allBtnEls[i] as HTMLElement;
       if (!ff.isVisible(btn)) continue;
       if ((btn as any).disabled) continue;
+      if (btn.closest('nav, header, [role="navigation"], [role="menubar"], [role="menu"], [role="toolbar"], [data-automation-id*="header"], [data-automation-id*="navigation"]')) continue;
+      if (btn.tagName === 'A' || btn.closest('a[href]')) continue;
       if (btn.getAttribute('role') === 'combobox') continue;
       if (btn.getAttribute('aria-haspopup') === 'listbox') continue;
       if (btn.tagName.toLowerCase() === 'input') continue;
@@ -864,6 +886,7 @@ async function extractFields(page: Page): Promise<FormField[]> {
         .replace(/\s*Required\s*/gi, '')
         .replace(/\s+/g, ' ')
         .trim();
+      if (/\b(follow us|privacy policy|job alerts)\b/i.test(questionLabel)) continue;
       if (questionLabel.length > 200) {
         questionLabel = questionLabel.substring(0, 200).trim();
       }
@@ -875,6 +898,10 @@ async function extractFields(page: Page): Promise<FormField[]> {
         choices.push(entry.text);
         btnIds.push(id);
       }
+      const navChoiceHits = choices.filter((c) =>
+        /\b(careers|search for jobs|candidate home|job alerts|privacy policy|follow us|about us)\b/i.test(c),
+      ).length;
+      if (navChoiceHits >= 2) continue;
 
       const containerId = ff.tag(container);
       // Multi-signal required detection
@@ -1365,6 +1392,11 @@ Example response:
         // Find the matching field to get its options
         const fieldIdx = disambiguatedNames.indexOf(key);
         const field = fieldIdx >= 0 ? fields[fieldIdx] : undefined;
+        // Optional fields should remain unresolved rather than guessed to random values.
+        if (!field?.required) {
+          (parsed as any)[key] = '';
+          continue;
+        }
         const options = field?.options ?? field?.choices ?? [];
         // Find best neutral "decline" option
         const neutral = options.find(o => declinePatterns.some(p => p.test(o)));
@@ -2159,7 +2191,83 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
       return false;
     }
 
+    case 'radio': {
+      const choice = getAnswer(answers, field);
+      if (!choice) {
+        console.log(`[formFiller]   skip ${tag} (radio, no answer)`);
+        return false;
+      }
+      const status = await page.evaluate(
+        ({ ffId, text }) => {
+          const normalize = (v: string) => v.trim().toLowerCase();
+          const target = normalize(text);
+          const el = document.querySelector(`[data-ff-id="${ffId}"]`) as HTMLElement | null;
+          if (!el) return { clicked: false, alreadyChecked: false };
+
+          const ownInput = (el.tagName === 'INPUT' ? el : el.querySelector('input[type="radio"]')) as HTMLInputElement | null;
+          let radios: Array<HTMLInputElement | HTMLElement> = [];
+          if (ownInput?.name) {
+            const root: ParentNode = ownInput.form || document;
+            radios = Array.from(root.querySelectorAll<HTMLInputElement>(`input[type="radio"][name="${CSS.escape(ownInput.name)}"]`));
+          } else {
+            const group = el.closest('[role="radiogroup"], [role="group"], fieldset, .radio-group') || el.parentElement || el;
+            radios = Array.from(group.querySelectorAll('input[type="radio"], [role="radio"]')) as Array<HTMLInputElement | HTMLElement>;
+          }
+          if (radios.length === 0) radios = [el];
+
+          const getLabel = (node: HTMLInputElement | HTMLElement): string => {
+            if (node instanceof HTMLInputElement && node.id) {
+              const byFor = document.querySelector(`label[for="${CSS.escape(node.id)}"]`);
+              if (byFor?.textContent?.trim()) return byFor.textContent.trim();
+            }
+            const nodeEl = node as HTMLElement;
+            const ariaLabel = nodeEl.getAttribute('aria-label');
+            if (ariaLabel?.trim()) return ariaLabel.trim();
+            const wrap = nodeEl.closest('label, [role="radio"], .radio-card, .radio-option');
+            return (wrap?.textContent || nodeEl.textContent || '').trim();
+          };
+
+          const isChecked = (node: HTMLInputElement | HTMLElement): boolean => {
+            if (node instanceof HTMLInputElement) return node.checked;
+            const ariaChecked = (node as HTMLElement).getAttribute('aria-checked');
+            if (ariaChecked === 'true') return true;
+            const nested = (node as HTMLElement).querySelector('input[type="radio"]') as HTMLInputElement | null;
+            return !!nested?.checked;
+          };
+
+          for (const radio of radios) {
+            const label = normalize(getLabel(radio));
+            if (!label) continue;
+            if (label === target || label.includes(target) || target.includes(label)) {
+              if (isChecked(radio)) return { clicked: true, alreadyChecked: true };
+              if (radio instanceof HTMLInputElement) radio.click();
+              else (radio as HTMLElement).click();
+              return { clicked: true, alreadyChecked: false };
+            }
+          }
+
+          return { clicked: false, alreadyChecked: false };
+        },
+        { ffId: field.id, text: choice },
+      );
+
+      if (status.clicked && status.alreadyChecked) {
+        console.log(`[formFiller]   skip ${tag} (already selected)`);
+        return true;
+      }
+      if (status.clicked) {
+        console.log(`[formFiller]   radio ${tag} → "${choice}"`);
+        return true;
+      }
+      console.log(`[formFiller]   skip ${tag} (no matching radio option for "${choice}")`);
+      return false;
+    }
+
     case 'button-group': {
+      if (isLikelyNavigationField(field)) {
+        console.log(`[formFiller]   skip ${tag} (navigation-like button group)`);
+        return false;
+      }
       const choice = getAnswer(answers, field) ?? field.choices?.[0];
       if (!choice) {
         console.log(`[formFiller]   skip ${tag} (button-group, no answer)`);
@@ -2838,9 +2946,21 @@ function findSnapshotForPlan(
   const exact = snapshots.find((q) => q.questionKey === planKey);
   if (exact) return exact;
   const normalized = planKey.toLowerCase().replace(/\s+/g, ' ').trim();
-  return snapshots.find(
-    (q) => q.normalizedPrompt === normalized || q.promptText === planKey,
-  );
+  const prefixMatch = snapshots.find((q) => q.questionKey.toLowerCase().startsWith(`${normalized}::`));
+  if (prefixMatch) return prefixMatch;
+
+  if (normalized.includes('::')) {
+    const parts = normalized.split('::').filter(Boolean);
+    const coarsePrefix = parts.slice(0, 3).join('::');
+    if (coarsePrefix) {
+      const coarseMatch = snapshots.find((q) =>
+        q.questionKey.toLowerCase().startsWith(`${coarsePrefix}::`),
+      );
+      if (coarseMatch) return coarseMatch;
+    }
+  }
+
+  return snapshots.find((q) => q.normalizedPrompt === normalized || q.promptText === planKey);
 }
 
 // ── Exported pure helpers (testable without browser) ─────────
@@ -2854,6 +2974,8 @@ const DEMOGRAPHIC_RE = /\b(gender|race|ethnicity|ethnic|veteran|disability|sex|p
 export interface FallbackField {
   id: string;
   type: string;
+  required?: boolean;
+  section?: string;
   choices?: string[];
   options?: string[];
   name?: string;
@@ -2869,9 +2991,12 @@ export function applyNeverEmptyFallback(
   resolved: Record<string, string>,
 ): Record<string, string> {
   const result = { ...resolved };
+  const FREE_TEXT_TYPES = new Set(['text', 'textarea', 'email', 'tel', 'url', 'number', 'date', 'password', 'search']);
   for (const field of fields) {
     const existing = result[field.id];
     if (existing && existing.trim()) continue;
+    if (isLikelyNavigationField(field as any)) continue;
+    if (!field.required && FREE_TEXT_TYPES.has(field.type)) continue;
     if (field.choices?.length) {
       result[field.id] = field.choices[0];
       continue;
@@ -3023,6 +3148,7 @@ export async function fillFormOnPage(
   const visibleNonFileFields: FormField[] = [];
   for (const f of visibleFields) {
     if (f.type === 'file') continue;
+    if (isLikelyNavigationField(f)) continue;
     if (!f.name || !f.name.trim()) {
       syntheticCounter++;
       f.name = `Unlabeled control #${syntheticCounter}`;
@@ -3165,12 +3291,19 @@ export async function fillFormOnPage(
       // Build answer decisions — prefer observation metadata if we can match keys
       if (answerPlans.length > 0) {
         const matchedDecisions: AnswerDecision[] = [];
+        let mappedFieldAnswers = 0;
         for (const plan of answerPlans) {
           const snapshot = findSnapshotForPlan(initialQuestionSnapshots, plan.questionKey);
           if (!snapshot) continue;
+          const normalizedAnswer = (plan.answer || '').trim();
+          if (!normalizedAnswer) continue;
+          for (const fieldId of snapshot.fieldIds) {
+            fieldIdToResolvedAnswer[fieldId] = normalizedAnswer;
+            mappedFieldAnswers++;
+          }
           matchedDecisions.push({
             questionKey: snapshot.questionKey,
-            answer: plan.answer,
+            answer: normalizedAnswer,
             confidence: plan.confidence,
             source: 'llm' as const,
             answerMode: plan.answerMode,
@@ -3184,6 +3317,9 @@ export async function fillFormOnPage(
               ? () => observers.onAnswerPlanned!(matchedDecisions)
               : undefined,
           );
+        }
+        if (mappedFieldAnswers > 0) {
+          console.log(`[formFiller] Applied ${mappedFieldAnswers} planned answers to field map.`);
         }
         console.log(`[formFiller] LLM answer planning provided ${answerPlans.length} answers.`);
       }
@@ -3296,6 +3432,10 @@ export async function fillFormOnPage(
     // Skip React re-rendered replacements that already contain a value.
     const toFill: FormField[] = [];
     for (const field of candidates) {
+      if (isLikelyNavigationField(field)) {
+        attempted.add(field.id);
+        continue;
+      }
       if (round > 1) {
         const hasValue = await hasFieldValueForRerender(page, field.id);
         if (hasValue) {
@@ -3518,6 +3658,7 @@ export async function fillFormOnPage(
   const unfilledFields: FormField[] = [];
   const filledIds = new Set<string>(domFilledOk);
   for (const f of postVisible) {
+    if (isLikelyNavigationField(f)) continue;
     // Skip file inputs and non-interactive types from MagnitudeHand
     if (f.type === 'file') continue;
 

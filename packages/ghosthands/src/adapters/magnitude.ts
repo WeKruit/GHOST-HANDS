@@ -175,39 +175,58 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
 
     const start = Date.now();
     const ACT_TIMEOUT_MS = context?.timeoutMs ?? 60_000;
-    try {
-      const actPromise = this.requireAgent().act(instruction, {
-        prompt: context?.prompt,
-        data: context?.data,
-      });
-      this._actMutex.pendingAct = actPromise;
-      await Promise.race([
-        actPromise,
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`act() timed out after ${ACT_TIMEOUT_MS}ms`)), ACT_TIMEOUT_MS),
-        ),
-      ]);
-      releaseActMutex(this._actMutex);
-      return {
-        success: true,
-        message: `Completed: ${instruction}`,
-        durationMs: Date.now() - start,
-      };
-    } catch (error) {
-      const msg = (error as Error).message;
-      if (msg.includes('timed out')) {
-        // Timeout — poison the mutex and THROW so ALL callers see the failure.
-        // Returning { success: false } is silently ignored by smartApplyHandler.safeAct()
-        // and bare adapter.act() call sites. Throwing propagates through every code path.
-        poisonActMutex(this._actMutex, this._actMutex.pendingAct!);
+    const MAX_SCHEMA_RETRIES = 1;
+    let instructionWithFormatHint = instruction;
+
+    for (let attempt = 0; attempt <= MAX_SCHEMA_RETRIES; attempt++) {
+      try {
+        const actPromise = this.requireAgent().act(instructionWithFormatHint, {
+          prompt: context?.prompt,
+          data: context?.data,
+        });
+        this._actMutex.pendingAct = actPromise;
+        await Promise.race([
+          actPromise,
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`act() timed out after ${ACT_TIMEOUT_MS}ms`)), ACT_TIMEOUT_MS),
+          ),
+        ]);
+        releaseActMutex(this._actMutex);
+        return {
+          success: true,
+          message: `Completed: ${instruction}`,
+          durationMs: Date.now() - start,
+        };
+      } catch (error) {
+        const msg = (error as Error).message;
+        if (msg.includes('timed out')) {
+          // Timeout — poison the mutex and THROW so ALL callers see the failure.
+          // Returning { success: false } is silently ignored by smartApplyHandler.safeAct()
+          // and bare adapter.act() call sites. Throwing propagates through every code path.
+          poisonActMutex(this._actMutex, this._actMutex.pendingAct!);
+          throw error;
+        }
+
+        const missingReasoningField =
+          /missing required field:\s*reasoning/i.test(msg)
+          || (/failed while parsing required fields/i.test(msg) && /reasoning/i.test(msg));
+
+        if (missingReasoningField && attempt < MAX_SCHEMA_RETRIES) {
+          instructionWithFormatHint =
+            `${instruction}\n\nFORMAT REQUIREMENT: Include a non-empty "reasoning" field and exactly one action.`;
+          continue;
+        }
+
+        releaseActMutex(this._actMutex);
+        // Non-timeout failure — throw so callers see the failure.
+        // Same rationale as timeout: returning { success: false } is silently
+        // ignored by smartApplyHandler.safeAct() and bare adapter.act() call sites.
         throw error;
       }
-      releaseActMutex(this._actMutex);
-      // Non-timeout failure — throw so callers see the failure.
-      // Same rationale as timeout: returning { success: false } is silently
-      // ignored by smartApplyHandler.safeAct() and bare adapter.act() call sites.
-      throw error;
     }
+
+    releaseActMutex(this._actMutex);
+    throw new Error('act() failed after schema retry');
   }
 
   async extract<T>(instruction: string, schema: ZodSchema<T>): Promise<T> {

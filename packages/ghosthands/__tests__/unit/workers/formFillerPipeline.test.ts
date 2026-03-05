@@ -61,14 +61,14 @@ describe('formFiller observation pipeline integration', () => {
 
   it('applyNeverEmptyFallback produces type-valid defaults for all field types', () => {
     const fields = [
-      { id: 'f1', type: 'text' },
-      { id: 'f2', type: 'textarea' },
-      { id: 'f3', type: 'number' },
-      { id: 'f4', type: 'date' },
-      { id: 'f5', type: 'email' },
-      { id: 'f6', type: 'tel' },
-      { id: 'f7', type: 'url' },
-      { id: 'f8', type: 'radio', choices: ['Male', 'Female', 'Other'] },
+      { id: 'f1', type: 'text', required: true },
+      { id: 'f2', type: 'textarea', required: true },
+      { id: 'f3', type: 'number', required: true },
+      { id: 'f4', type: 'date', required: true },
+      { id: 'f5', type: 'email', required: true },
+      { id: 'f6', type: 'tel', required: true },
+      { id: 'f7', type: 'url', required: true },
+      { id: 'f8', type: 'radio', required: true, choices: ['Male', 'Female', 'Other'] },
     ];
 
     const resolved = applyNeverEmptyFallback(fields, {});
@@ -185,8 +185,8 @@ describe('formFiller observation pipeline integration', () => {
     // f1 is type 'select' with only placeholder options — left unresolved (no options[0] fallback)
     expect(resolved['f1']).toBeUndefined();
 
-    // f2 is type 'text' — falls through to type-based 'N/A'
-    expect(resolved['f2']).toBe('N/A');
+    // f2 is optional text — do not invent fallback text
+    expect(resolved['f2']).toBeUndefined();
   });
 
   it('applyNeverEmptyFallback filters "Please select" as a placeholder', () => {

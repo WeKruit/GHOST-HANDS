@@ -1,0 +1,52 @@
+diff --git a/dist/index.cjs b/dist/index.cjs
+index 2c55beafada638f586844509dad5544df1f9cf53..15f32dc267f1d0f7e46f258fc6c523fdb22326ed 100644
+--- a/dist/index.cjs
++++ b/dist/index.cjs
+@@ -487,7 +487,7 @@ class PartialRecipe {
+ 
+     // Simplifying CoT - seemed to be causing underplanning on Claude
+     //observations string @description(#"What important clues or key information are worth considering?"#)
+-    reasoning string @description(#"Given the current screen, what is the single best next action to take?"#)
++    reasoning string? @description(#"Given the current screen, what is the single best next action to take?"#)
+ 
+     //actions ActionIntent[]
+     @@dynamic
+@@ -3312,8 +3312,10 @@ class BrowserAgent {
+         );
+       }
+       logger.info({ reasoning, actions }, `Partial recipe created`);
+-      this.events.emit("thought", reasoning);
+-      memory.recordThought(reasoning);
++      if (typeof reasoning === "string" && reasoning.length > 0) {
++        this.events.emit("thought", reasoning);
++        memory.recordThought(reasoning);
++      }
+       // Execute ONLY the first action, then re-observe before acting again.
+       // This prevents stale-screenshot bugs (e.g. toggling a checkbox twice).
+       if (actions.length > 0) {
+diff --git a/dist/index.mjs b/dist/index.mjs
+index 48726f53042f0e6b50eb9ca5f556f1f7708e31f6..cefd499dc28ee95834aad8e6c99a6ddba8a8f336 100644
+--- a/dist/index.mjs
++++ b/dist/index.mjs
+@@ -463,7 +463,7 @@ class PartialRecipe {
+ 
+     // Simplifying CoT - seemed to be causing underplanning on Claude
+     //observations string @description(#"What important clues or key information are worth considering?"#)
+-    reasoning string @description(#"Given the current screen, what is the single best next action to take?"#)
++    reasoning string? @description(#"Given the current screen, what is the single best next action to take?"#)
+ 
+     //actions ActionIntent[]
+     @@dynamic
+@@ -3288,8 +3288,10 @@ class BrowserAgent {
+         );
+       }
+       logger.info({ reasoning, actions }, `Partial recipe created`);
+-      this.events.emit("thought", reasoning);
+-      memory.recordThought(reasoning);
++      if (typeof reasoning === "string" && reasoning.length > 0) {
++        this.events.emit("thought", reasoning);
++        memory.recordThought(reasoning);
++      }
+       // Execute ONLY the first action, then re-observe before acting again.
+       // This prevents stale-screenshot bugs (e.g. toggling a checkbox twice).
+       if (actions.length > 0) {

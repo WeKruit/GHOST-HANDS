@@ -1644,13 +1644,18 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a.btn'));
       return btns.some(b => {
         const text = (b.textContent || (b as HTMLInputElement).value || '').trim().toLowerCase();
-        return text.includes('submit') || text === 'apply' || text === 'apply now' || text === 'send application';
+        return text.includes('submit') || text === 'send application';
       });
     });
     if (hasSubmitFallback) {
-      console.log(`[SmartApply] Submit button present — treating as review.`);
-      await pageContext?.markAwaitingReview();
-      return 'review';
+      const domReview = await this.checkIfReviewPage(adapter);
+      const verifiedReview = domReview ? true : await this.verifyReviewPage(adapter);
+      if (verifiedReview) {
+        console.log(`[SmartApply] Submit button present and review verified — stopping before submit.`);
+        await pageContext?.markAwaitingReview();
+        return 'review';
+      }
+      console.log('[SmartApply] Submit-like button present, but page is not verified as final review.');
     }
 
     console.log(`[SmartApply] Page complete.`);

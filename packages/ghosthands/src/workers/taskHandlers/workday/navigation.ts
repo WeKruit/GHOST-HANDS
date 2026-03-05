@@ -36,7 +36,8 @@ export async function waitForPageLoad(adapter: BrowserAutomationAdapter): Promis
  */
 export async function clickSaveAndContinueDOM(adapter: BrowserAutomationAdapter): Promise<void> {
   const result = await adapter.page.evaluate(() => {
-    const buttons = Array.from(document.querySelectorAll('button, [role="button"], a'));
+    const buttons = Array.from(document.querySelectorAll<HTMLElement>('button, [role="button"], input[type="submit"]'))
+      .filter((el) => !el.closest('nav, header, [role="navigation"], [role="menubar"], [role="menu"], [role="toolbar"], [data-automation-id*="header"], [data-automation-id*="navigation"]'));
 
     // Priority 1: Safe buttons that never submit the application
     const safePriorities = ['save and continue', 'next', 'continue'];
@@ -60,7 +61,7 @@ export async function clickSaveAndContinueDOM(adapter: BrowserAutomationAdapter)
     // Priority 2: "Submit" — but ONLY if this is NOT the review page.
     // The review page is a read-only summary with no editable form fields.
     const submitBtn = buttons.find(b => {
-      const text = b.textContent?.trim().toLowerCase() || '';
+      const text = (b.textContent?.trim().toLowerCase() || (b as HTMLInputElement).value?.trim().toLowerCase() || '');
       return text === 'submit' || text === 'submit application';
     });
     if (submitBtn) {
