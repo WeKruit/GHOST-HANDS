@@ -146,29 +146,16 @@ export class LivePageContextService implements PageContextService {
       : 0;
     const sameTitle =
       activePage && normalizeTitle(activePage.pageTitle) === normalizeTitle(input.pageTitle);
+    const shouldResume =
+      !!activePage &&
+      sameType &&
+      ((sameStep && similarFingerprint >= RESUME_SAME_STEP_MIN_FINGERPRINT_SIMILARITY) ||
+        (samePath && similarFingerprint >= RESUME_SAME_PATH_MIN_FINGERPRINT_SIMILARITY) ||
+        (sameTitle && similarFingerprint >= RESUME_SAME_TITLE_MIN_FINGERPRINT_SIMILARITY));
 
     let nextSession = session;
     let nextPage = activePage;
-    if (
-      activePage &&
-      sameType &&
-      sameStep &&
-      similarFingerprint >= RESUME_SAME_STEP_MIN_FINGERPRINT_SIMILARITY
-    ) {
-      nextPage = cloneResumedPage(activePage, input);
-    } else if (
-      activePage &&
-      sameType &&
-      samePath &&
-      similarFingerprint >= RESUME_SAME_PATH_MIN_FINGERPRINT_SIMILARITY
-    ) {
-      nextPage = cloneResumedPage(activePage, input);
-    } else if (
-      activePage &&
-      sameType &&
-      sameTitle &&
-      similarFingerprint >= RESUME_SAME_TITLE_MIN_FINGERPRINT_SIMILARITY
-    ) {
+    if (shouldResume && activePage) {
       nextPage = cloneResumedPage(activePage, input);
     } else {
       if (activePage) {
