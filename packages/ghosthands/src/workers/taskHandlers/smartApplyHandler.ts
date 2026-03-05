@@ -216,7 +216,7 @@ export class SmartApplyHandler implements TaskHandler {
             break;
 
           case 'verification_code':
-            await this.handleVerificationCode(adapter);
+            await this.handleVerificationCode(adapter, userProfile, ctx);
             break;
 
           case 'phone_2fa':
@@ -873,6 +873,44 @@ export class SmartApplyHandler implements TaskHandler {
     });
   }
 
+  /**
+   * Pause for manual auth recovery (HITL) when automatic login/account creation
+   * has exhausted deterministic fallbacks.
+   */
+  private async emitAuthEvent(
+    ctx: TaskContext | undefined,
+    eventType: string,
+    metadata: Record<string, unknown>,
+  ): Promise<void> {
+    if (!ctx?.logEvent) return;
+    try {
+      await ctx.logEvent(eventType, metadata);
+    } catch {
+      // Best effort event logging; never fail auth flow on logger errors.
+    }
+  }
+
+  /**
+   * Pause for manual auth recovery (HITL) when automatic login/account creation
+   * has exhausted deterministic fallbacks.
+   */
+  private async pauseForManualAuth(
+    ctx: TaskContext | undefined,
+    type: string,
+    description: string,
+    timeoutSeconds = 600,
+    metadata?: Record<string, unknown>,
+  ): Promise<boolean> {
+    if (!ctx?.waitForManualAction) return false;
+    const hitlResult = await ctx.waitForManualAction({
+      type,
+      description,
+      timeoutSeconds,
+      metadata,
+    });
+    return hitlResult.resumed;
+  }
+
   private async handleGenericLogin(
     adapter: BrowserAutomationAdapter,
     profile: Record<string, any>,
@@ -1066,7 +1104,19 @@ Click only ONE button, then report the task as done.`,
     // (no DOM clicking of "Sign In" links — that can open modals and cause loops)
     if (formState.isCreateAccountForm) {
       console.log('[SmartApply] On Create Account form — creating account...');
-      await this.handleAccountCreation(adapter, dataPrompt, profile);
+      try {
+        await this.handleAccountCreation(adapter, dataPrompt, profile);
+        (profile as any)._accountCreationCompleted = true;
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const resumed = await this.pauseForManualAuth(
+          ctx,
+          'account_creation_failed',
+          `Automatic account creation failed (${errMsg}). Please complete account creation and sign in manually, then click Resume.`,
+        );
+        if (resumed) return;
+        throw err;
+      }
       return;
     }
 
@@ -1080,12 +1130,65 @@ Click only ONE button, then report the task as done.`,
     });
 
     if (needsEmailVerification) {
+      const alreadyRetriedAfterAutoVerification = Boolean((profile as any)._postVerificationLoginRetryAttempted);
+      let autoVerifyReason: string | null = null;
+
+      if (ctx?.emailVerification && !alreadyRetriedAfterAutoVerification) {
+        console.log('[SmartApply] Email verification required — attempting automatic inbox verification...');
+        const currentPage = await adapter.getCurrentUrl().catch(() => '');
+        const autoResult = await ctx.emailVerification.tryAutoVerify({
+          adapter,
+          loginEmail: email,
+          pageUrl: currentPage,
+          onEvent: async (eventType, metadata) => {
+            await this.emitAuthEvent(ctx, eventType, metadata);
+          },
+        });
+
+        if (autoResult.success) {
+          console.log(`[SmartApply] Email verification automation succeeded via ${autoResult.method}. Retrying sign-in once...`);
+          (profile as any)._postVerificationLoginRetryAttempted = true;
+
+          // Move back to sign-in path and perform one explicit retry.
+          const switchedToSignIn = await this.clickPlatformSpecificSignIn(
+            adapter,
+            await adapter.getCurrentUrl(),
+          );
+          if (switchedToSignIn) {
+            await adapter.page.waitForTimeout(1200);
+          }
+
+          await this.waitForPageLoad(adapter);
+          await this.handleGenericLogin(adapter, profile, dataPrompt, ctx);
+          return;
+        }
+
+        autoVerifyReason = autoResult.reason || null;
+        console.log(`[SmartApply] Email verification automation failed: ${autoResult.reason || 'unknown reason'}`);
+      }
+
       if (ctx?.waitForManualAction) {
         console.log('[SmartApply] Email verification required — pausing for human action...');
+        const pauseType = autoVerifyReason === 'missing_connection'
+          ? 'connect_gmail_required'
+          : 'email_verification';
+        const pauseDescription = autoVerifyReason === 'missing_connection'
+          ? 'No Gmail connection found for this user. Connect Gmail, complete verification/sign-in, then click Resume.'
+          : 'Please verify your email and sign in manually, then click Resume.';
+        await this.emitAuthEvent(ctx, 'email_verification_fallback_human', {
+          reason: alreadyRetriedAfterAutoVerification ? 'post_auto_retry_still_blocked' : 'auto_verification_unavailable_or_failed',
+          auto_verification_reason: autoVerifyReason,
+        });
         const hitlResult = await ctx.waitForManualAction({
-          type: 'email_verification',
-          description: 'Please verify your email and sign in manually, then click Resume.',
+          type: pauseType,
+          description: pauseDescription,
           timeoutSeconds: 600,
+          metadata: {
+            source: 'smart_apply',
+            auto_verification_attempted: Boolean(ctx.emailVerification),
+            post_auto_retry_attempted: alreadyRetriedAfterAutoVerification,
+            auto_verification_reason: autoVerifyReason,
+          },
         });
         if (!hitlResult.resumed) {
           throw new Error('Email verification timed out — user did not respond within 10 minutes.');
@@ -1170,34 +1273,49 @@ Click only ONE button, then report the task as done.`,
       });
 
       if (loginError) {
-        // Check if the error suggests a locked/unverified account — trigger HITL
-        const isLockedOrUnverified = loginError.includes('locked') || loginError.includes('verify')
-          || loginError.includes('verified') || loginError.includes('confirm your email');
-        if (isLockedOrUnverified && ctx?.waitForManualAction) {
-          console.log(`[SmartApply] Account appears locked/unverified: "${loginError}" — pausing for human action...`);
-          const hitlResult = await ctx.waitForManualAction({
-            type: 'account_locked',
-            description: 'Account appears locked or unverified. Please verify your email, sign in manually, then click Resume.',
-            timeoutSeconds: 600,
-          });
-          if (!hitlResult.resumed) {
-            throw new Error('Account locked/unverified — user did not respond within 10 minutes.');
+        const alreadyTriedAccountPath = Boolean(
+          (profile as any)._createAccountAttempted || (profile as any)._accountCreationCompleted
+        );
+
+        // First failure: route to create-account path.
+        // Subsequent failure after create-account path: pause for manual action.
+        if (alreadyTriedAccountPath) {
+          console.log(`[SmartApply] Login failed after account-creation attempt: "${loginError}" — pausing for human action...`);
+          const resumed = await this.pauseForManualAuth(
+            ctx,
+            'account_locked',
+            `Login still failing after account-creation flow (${loginError}). Please sign in manually (or recover account) and click Resume.`,
+          );
+          if (resumed) {
+            console.log('[SmartApply] Resumed after manual sign-in — continuing page loop.');
+            return;
           }
-          console.log('[SmartApply] Resumed after manual sign-in — continuing page loop.');
-          return;
+          throw new Error(`Login failed after account-creation attempt: ${loginError}`);
         }
 
         console.log(`[SmartApply] Login failed: "${loginError}" — moving to account creation path...`);
-        const clickedCreate = await this.clickPlatformSpecificCreateAccount(
-          adapter,
-          await adapter.getCurrentUrl(),
-        );
-        if (!clickedCreate) {
-          await adapter.act(
-            'The login failed. Look for a "Create Account", "Sign Up", "Register", or "Don\'t have an account?" link and click it. Click ONLY ONE link.',
+        try {
+          (profile as any)._createAccountAttempted = true;
+          const clickedCreate = await this.clickPlatformSpecificCreateAccount(
+            adapter,
+            await adapter.getCurrentUrl(),
           );
+          if (!clickedCreate) {
+            await adapter.act(
+              'The login failed. Look for a "Create Account", "Sign Up", "Register", or "Don\'t have an account?" link and click it. Click ONLY ONE link.',
+            );
+          }
+          await this.waitForPageLoad(adapter);
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          const resumed = await this.pauseForManualAuth(
+            ctx,
+            'account_creation_failed',
+            `Could not transition to account creation after login failure (${errMsg}). Please create/sign in manually, then click Resume.`,
+          );
+          if (resumed) return;
+          throw err;
         }
-        await this.waitForPageLoad(adapter);
       }
       return;
     }
@@ -1213,45 +1331,47 @@ Click only ONE button, then report the task as done.`,
     await this.waitForPageLoad(adapter);
   }
 
-  private async handleVerificationCode(adapter: BrowserAutomationAdapter): Promise<void> {
-    console.log('[SmartApply] Verification code required. Checking Gmail for code...');
+  private async handleVerificationCode(
+    adapter: BrowserAutomationAdapter,
+    profile: Record<string, any>,
+    ctx?: TaskContext,
+  ): Promise<void> {
+    const loginEmail = process.env.TEST_GMAIL_EMAIL || profile.email || '';
+    let autoVerifyReason: string | null = null;
 
-    const gmailPage = await adapter.page.context().newPage();
-    let code: string | null = null;
-
-    try {
-      await gmailPage.goto('https://mail.google.com', { waitUntil: 'domcontentloaded' });
-      await gmailPage.waitForTimeout(3000);
-
-      const bodyText = await gmailPage.evaluate(() => document.body.innerText);
-      const codeMatch = bodyText.match(
-        /(?:verification|security|confirm|one-time|otp|2fa)\s*(?:code|pin|number)[:\s]*(\d{4,8})/i,
-      ) ?? bodyText.match(
-        /(\d{4,8})\s*(?:is your|is the)\s*(?:verification|security|confirm)/i,
-      );
-
-      if (codeMatch) {
-        code = codeMatch[1];
+    if (ctx?.emailVerification) {
+      console.log('[SmartApply] Verification code page detected — attempting automatic inbox verification...');
+      const autoResult = await ctx.emailVerification.tryAutoVerify({
+        adapter,
+        loginEmail,
+        pageUrl: await adapter.getCurrentUrl().catch(() => ''),
+        onEvent: async (eventType, metadata) => {
+          await this.emitAuthEvent(ctx, eventType, metadata);
+        },
+      });
+      if (autoResult.success) {
+        return;
       }
-    } finally {
-      await gmailPage.close();
+      autoVerifyReason = autoResult.reason || null;
+      console.log(`[SmartApply] Auto verification attempt failed: ${autoResult.reason || 'unknown reason'}`);
     }
 
-    if (!code) {
-      throw new Error('Could not find verification code in Gmail');
-    }
-
-    console.log(`[SmartApply] Found verification code: ${code}`);
-
-    const enterResult = await adapter.act(
-      `Enter the verification code "${code}" into the verification code input field, then click the "Next", "Verify", "Continue", or "Submit" button. Report the task as done after clicking.`,
+    const resumed = await this.pauseForManualAuth(
+      ctx,
+      autoVerifyReason === 'missing_connection' ? 'connect_gmail_required' : 'verification_code_required',
+      autoVerifyReason === 'missing_connection'
+        ? 'No Gmail connection found for this user. Connect Gmail, enter the verification code manually, then click Resume.'
+        : 'Verification code required. Enter the received code manually, then click Resume.',
+      600,
+      {
+        source: 'smart_apply',
+        auto_verification_attempted: Boolean(ctx?.emailVerification),
+        auto_verification_reason: autoVerifyReason,
+      },
     );
-
-    if (!enterResult.success) {
-      throw new Error(`Failed to enter verification code: ${enterResult.message}`);
+    if (!resumed) {
+      throw new Error('Verification code required and no manual resolution was provided.');
     }
-
-    await this.waitForPageLoad(adapter);
   }
 
   private async handlePhone2FA(adapter: BrowserAutomationAdapter): Promise<void> {

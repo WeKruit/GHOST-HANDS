@@ -440,6 +440,8 @@ export function buildSteps(rt: RuntimeContext) {
         credentials: rt.credentials,
         dataPrompt: rt.dataPrompt,
         resumeFilePath: rt.resumeFilePath,
+        emailVerification: rt.emailVerification,
+        logEvent: rt.logEvent,
         waitForManualAction: rt.waitForManualAction,
       };
 
