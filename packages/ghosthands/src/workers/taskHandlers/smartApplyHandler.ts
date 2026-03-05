@@ -1552,6 +1552,17 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
     }
 
     // ── ADVANCE PHASE: Click Next or detect review page ──
+
+    // Wait for any in-flight Magnitude act() to fully settle before navigating.
+    // Without this, a timed-out act() keeps running in the background and can
+    // take rogue actions (e.g. clicking "Back") on the next page.
+    if (adapter.waitForActSettle) {
+      const settled = await adapter.waitForActSettle(10_000);
+      if (!settled) {
+        console.warn('[SmartApply] In-flight act() did not settle within 10s — proceeding anyway.');
+      }
+    }
+
     // Clean up any data-ff-id attributes (formFiller tags elements)
     // and also clean up legacy scan attributes
     await adapter.page.evaluate(() => {
