@@ -233,6 +233,77 @@ function parseProfileSkills(profileText: string): string[] {
   return [...deduped];
 }
 
+interface ProfileEvidence {
+  email?: string;
+  phone?: string;
+  linkedin?: string;
+  portfolio?: string;
+  github?: string;
+  twitter?: string;
+}
+
+function parseProfileEvidence(profileText: string): ProfileEvidence {
+  const readLine = (label: string): string | undefined => {
+    const re = new RegExp(`^\\s*${label}:\\s*(.+)$`, 'im');
+    const m = profileText.match(re);
+    const value = m?.[1]?.trim();
+    return value && value.length > 0 ? value : undefined;
+  };
+
+  const linkedin = readLine('LinkedIn');
+  const portfolio = readLine('Portfolio') || readLine('Website');
+  const githubFromText = profileText.match(/https?:\/\/(?:www\.)?github\.com\/[^\s)]+/i)?.[0];
+  const twitterFromText = profileText.match(/https?:\/\/(?:www\.)?(?:twitter\.com|x\.com)\/[^\s)]+/i)?.[0];
+
+  return {
+    email: readLine('Email'),
+    phone: readLine('Phone'),
+    linkedin,
+    portfolio,
+    github: githubFromText,
+    twitter: twitterFromText,
+  };
+}
+
+const SOCIAL_OR_ID_NO_GUESS_RE =
+  /\b(twitter|x(\.com)?\s*(handle|username|profile)?|github|gitlab|linkedin|instagram|tiktok|facebook|social\s*(media|profile)?|handle|username|user\s*name|passport|driver'?s?\s*license|license\s*number|national\s*id|id\s*number|tax\s*id|itin|ein|ssn|social security)\b/i;
+
+function knownProfileValueForField(fieldName: string, evidence: ProfileEvidence): string | undefined {
+  const name = normalizeName(fieldName);
+  if (!name) return undefined;
+  if (name.includes('email')) return evidence.email;
+  if (name.includes('phone') || name.includes('mobile') || name.includes('telephone')) return evidence.phone;
+  if (name.includes('linkedin')) return evidence.linkedin;
+  if (name.includes('github')) return evidence.github;
+  if (name.includes('twitter') || /\bx\b/.test(name) || name.includes('x handle')) return evidence.twitter;
+  if (name.includes('portfolio') || name.includes('website') || name.includes('personal site') || name.includes('blog')) {
+    return evidence.portfolio;
+  }
+  return undefined;
+}
+
+export function sanitizeNoGuessAnswer(
+  field: Pick<FormField, 'name' | 'required'>,
+  answer: string | undefined,
+  evidence: ProfileEvidence,
+): string {
+  const proposed = (answer || '').trim();
+  const known = knownProfileValueForField(field.name || '', evidence);
+  if (known) return known;
+
+  const noGuessField = SOCIAL_OR_ID_NO_GUESS_RE.test(field.name || '');
+  if (!noGuessField) return proposed;
+
+  if (!proposed) return field.required ? 'N/A' : '';
+
+  if (isPlaceholderValue(proposed) || /^(n\/a|na|none|unknown|not applicable|prefer not|decline)/i.test(proposed)) {
+    return field.required ? proposed : '';
+  }
+
+  // Sensitive field without profile evidence: never fabricate.
+  return field.required ? 'N/A' : '';
+}
+
 function resolveExistingFilePath(candidate?: string | null): string | null {
   if (!candidate) return null;
   try {
@@ -1299,6 +1370,7 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
 
 async function generateAnswers(fields: FormField[], profileText: string): Promise<GenerateResult> {
   const client = new Anthropic();
+  const profileEvidence = parseProfileEvidence(profileText);
 
   // Disambiguate duplicate field names by appending "#2", "#3", etc.
   const nameCounts = new Map<string, number>();
@@ -1342,8 +1414,9 @@ ${fieldDescriptions}
 
 Rules:
 - For each field, decide what value to put based on the profile.
-- Fields marked with * are REQUIRED. NEVER return "" for required fields. Always provide a value from the profile or make up a plausible one.
+- Fields marked with * are REQUIRED. NEVER return "" for required fields. Use profile-backed values first; for non-identity fields you may use careful contextual inference.
 - For optional fields, still fill them in if the profile has any relevant info. Only return "" for optional fields where there is truly nothing relevant to put (e.g. phone extension when none exists, middle name when none provided).
+- NEVER fabricate personal identifiers or social handles/URLs that are not explicitly present in the profile (Twitter/X handle, GitHub username, social username, passport/license/ID numbers, etc.). If missing: return "" for optional fields, and "N/A" for required fields.
 - For dropdowns/radio groups with listed options, you MUST pick the EXACT text of one of the available options.
 - For hierarchical dropdown options (format "Category > SubOption"), pick the EXACT full path including the " > " separator.
 - For dropdowns WITHOUT listed options, provide your best guess for the value.
@@ -1413,6 +1486,14 @@ Example response:
           }
         }
       }
+    }
+
+    // Enforce strict no-fabrication policy for sensitive identity/social fields.
+    for (let i = 0; i < fields.length; i++) {
+      const field = fields[i];
+      const key = disambiguatedNames[i];
+      if (!key || typeof parsed[key] !== 'string') continue;
+      (parsed as any)[key] = sanitizeNoGuessAnswer(field, parsed[key], profileEvidence);
     }
 
     return { answers: parsed, fieldIdToKey, inputTokens, outputTokens };
@@ -2825,7 +2906,7 @@ const NormalizedQuestionSchema = z.object({
 const AnswerPlanSchema = z.object({
   answers: z.array(z.object({
     questionKey: z.string().describe('The questionKey from the normalized question'),
-    answer: z.string().min(1).describe('The answer value — MUST NOT be empty for non-file questions'),
+    answer: z.string().describe('The answer value. May be empty only for optional no-guess fields.'),
     confidence: z.number().min(0).max(1).describe('How confident you are (0-1)'),
     answerMode: z.enum(['profile_backed', 'best_effort_guess', 'default_decline', 'system_attachment'])
       .describe('profile_backed if from profile data, best_effort_guess if inferred, default_decline for neutral decline choices'),
@@ -2910,13 +2991,15 @@ Questions to answer:
 ${questionDescriptions}
 
 Rules:
-- For EVERY question, provide a non-empty answer. NEVER return an empty answer for any non-file question.
+- For REQUIRED questions, provide a non-empty answer.
+- For optional questions, you may return an empty answer only when the profile truly lacks the requested info.
 - Use answerMode "profile_backed" when the answer comes directly from the profile.
 - Use answerMode "best_effort_guess" when you infer a plausible answer not explicitly in the profile.
 - Use answerMode "default_decline" for demographic/EEO fields where the profile lacks info — choose a neutral decline option like "Prefer not to say", "Decline to self-identify".
 - For questions with listed options, pick the EXACT text of one available option.
 - For Yes/No questions about relocation, sponsorship, authorization — answer based on profile data.
 - For textarea fields, write 2-4 thoughtful sentences. Never a single letter or placeholder.
+- NEVER fabricate identity/contact handles or IDs (Twitter/X handle, GitHub username, social username, passport/license/ID numbers). If missing: optional -> empty answer, required -> "N/A".
 - NEVER select placeholder options like "Select One", "Choose one", "Please select".
 - Fields marked (REQUIRED) MUST have a meaningful answer.`;
 
@@ -3159,8 +3242,10 @@ export async function fillFormOnPage(
   }
   // llmFields now includes ALL visible non-file controls (including synthetic-labeled)
   const llmFields = visibleNonFileFields;
+  const llmFieldById = new Map(llmFields.map((f) => [f.id, f]));
   const profileSkills = parseProfileSkills(profileText);
   const profileSkillsCsv = profileSkills.join(', ');
+  const profileEvidence = parseProfileEvidence(profileText);
   const observers = opts?.observers;
   const notifyObserver = async (
     label: keyof FillObservers,
@@ -3296,14 +3381,23 @@ export async function fillFormOnPage(
           const snapshot = findSnapshotForPlan(initialQuestionSnapshots, plan.questionKey);
           if (!snapshot) continue;
           const normalizedAnswer = (plan.answer || '').trim();
-          if (!normalizedAnswer) continue;
+          let decisionAnswer = '';
           for (const fieldId of snapshot.fieldIds) {
-            fieldIdToResolvedAnswer[fieldId] = normalizedAnswer;
+            const field = llmFieldById.get(fieldId);
+            const safeAnswer = sanitizeNoGuessAnswer(
+              field || { name: snapshot.promptText, required: snapshot.required },
+              normalizedAnswer,
+              profileEvidence,
+            );
+            if (!safeAnswer) continue;
+            fieldIdToResolvedAnswer[fieldId] = safeAnswer;
+            if (!decisionAnswer) decisionAnswer = safeAnswer;
             mappedFieldAnswers++;
           }
+          if (!decisionAnswer) continue;
           matchedDecisions.push({
             questionKey: snapshot.questionKey,
-            answer: normalizedAnswer,
+            answer: decisionAnswer,
             confidence: plan.confidence,
             source: 'llm' as const,
             answerMode: plan.answerMode,
