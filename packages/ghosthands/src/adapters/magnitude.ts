@@ -1,8 +1,10 @@
 import {
   BrowserAgent,
+  BrowserConnector,
   startBrowserAgent,
 } from 'magnitude-core';
 import type { ModelUsage } from 'magnitude-core';
+import { partitionHtml, serializeToMarkdown } from 'magnitude-extract';
 import type {
   HitlCapableAdapter,
   AdapterStartOptions,
@@ -209,7 +211,53 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
   }
 
   async extract<T>(instruction: string, schema: ZodSchema<T>): Promise<T> {
-    return this.requireAgent().extract(instruction, schema);
+    const agent = this.requireAgent();
+    const agentAny = agent as any;
+    const legacyExtract = () => agent.extract(instruction, schema);
+
+    // Use a non-mutating extract path. magnitude-core's BrowserAgent.extract()
+    // currently mutates the live page when expanding iframe content.
+    if (typeof agentAny.require !== 'function'
+      || !agentAny.models
+      || typeof agentAny.models.extract !== 'function') {
+      return legacyExtract();
+    }
+
+    const browserConnector = agentAny.require(BrowserConnector as any);
+    const harness = browserConnector?.getHarness?.();
+    if (!harness || !harness.page || typeof harness.screenshot !== 'function') {
+      return legacyExtract();
+    }
+
+    agentAny.browserAgentEvents?.emit?.('extractStarted', instruction, schema);
+
+    const htmlContent = await harness.page.content();
+    const partitionOptions = {
+      extractImages: true,
+      extractForms: true,
+      extractLinks: true,
+      skipNavigation: false,
+      minTextLength: 3,
+      includeOriginalHtml: false,
+      includeMetadata: true,
+    };
+    const partitioned = partitionHtml(htmlContent, partitionOptions);
+    const markdownOptions = {
+      includeMetadata: false,
+      includePageNumbers: true,
+      includeElementIds: false,
+      includeCoordinates: false,
+      preserveHierarchy: true,
+      escapeSpecialChars: true,
+      includeFormFields: true,
+      includeImageMetadata: true,
+    };
+    const markdown = serializeToMarkdown(partitioned, markdownOptions);
+    const screenshot = await harness.screenshot();
+    const data = await agentAny.models.extract(instruction, schema, screenshot, markdown);
+
+    agentAny.browserAgentEvents?.emit?.('extractDone', instruction, data);
+    return data as T;
   }
 
   /**
