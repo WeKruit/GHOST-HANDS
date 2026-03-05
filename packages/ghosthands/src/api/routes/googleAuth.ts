@@ -65,11 +65,12 @@ export function createGoogleAuthRoutes(): Hono {
 
     const store = buildTokenStore();
     const connection = await store.getConnection(targetUserId);
+    const userEmail = await store.getUserEmail(targetUserId).catch(() => null);
     return c.json({
       provider: 'google',
       user_id: targetUserId,
       connected: Boolean(connection),
-      email: connection?.emailAddress || null,
+      email: userEmail,
       connected_at: connection?.connectedAt || null,
       last_used_at: connection?.lastUsedAt || null,
     });
@@ -137,6 +138,10 @@ export function createGoogleOAuthPublicRoutes(): Hono {
       }
 
       const gmailProfile = await fetchGmailProfile(tokens.access_token);
+      const userEmail = await tokenStore.getUserEmail(statePayload.userId).catch(() => null);
+      if (userEmail && gmailProfile.emailAddress.toLowerCase() !== userEmail.toLowerCase()) {
+        throw new Error(`Google account mismatch. Expected ${userEmail}, got ${gmailProfile.emailAddress}`);
+      }
       const existing = await tokenStore.getConnection(statePayload.userId);
       const refreshToken = tokens.refresh_token || existing?.refreshToken;
       if (!refreshToken) {
@@ -149,7 +154,6 @@ export function createGoogleOAuthPublicRoutes(): Hono {
 
       await tokenStore.upsertConnection({
         userId: statePayload.userId,
-        emailAddress: gmailProfile.emailAddress,
         refreshToken,
         accessToken: tokens.access_token,
         accessTokenExpiresAt,
