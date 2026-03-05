@@ -24,6 +24,7 @@
         "delete-jobs": "bun src/scripts/delete-all-jobs.ts",
         "submit-test-job": "bun src/scripts/submit-test-job.ts",
         "test-google": "bun src/scripts/submit-test-job.ts",
+        "test:gmail-verification": "bun src/scripts/test-gmail-verification.ts",
         "kill-workers": "bun src/scripts/kill-workers.ts",
         "test:worker": "./test-worker.sh",
         "job": "bun src/scripts/job.ts"
