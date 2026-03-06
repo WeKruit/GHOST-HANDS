@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { BrowserAutomationAdapter } from '../../../adapters/types.js';
 import type { PlatformConfig, PageState, PageType, ScannedField, ScanResult } from './types.js';
+import { VERIFICATION_INPUT_SELECTOR_QUERY } from '../../verificationSelectors.js';
 
 // ---------------------------------------------------------------------------
 // Base rules (generic — works for most ATS platforms)
@@ -172,13 +173,23 @@ export class GenericPlatformConfig implements PlatformConfig {
   }
 
   async detectPageByDOM(adapter: BrowserAutomationAdapter): Promise<PageState | null> {
-    const signals = await adapter.page.evaluate(() => {
+    const signals = await adapter.page.evaluate((verificationSelectorQuery: string) => {
+      const isVisible = (el: Element | null): el is HTMLElement => {
+        if (!el) return false;
+        const node = el as HTMLElement;
+        if (node.closest('[hidden], [aria-hidden="true"]')) return false;
+        const style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
       const bodyText = document.body.innerText.toLowerCase();
 
       // Scan ALL clickable elements — buttons, links, role="button", submit inputs
       const clickables = Array.from(document.querySelectorAll(
         'button, [role="button"], input[type="submit"], a[href], a[role="link"]'
-      ));
+      )).filter((el) => isVisible(el));
       const clickableTexts = clickables.map(el => {
         const raw = (el.textContent || el.getAttribute('value') || el.getAttribute('aria-label') || '').trim();
         return raw.replace(/\s+/g, ' ').substring(0, 60).toLowerCase();
@@ -207,9 +218,21 @@ export class GenericPlatformConfig implements PlatformConfig {
         || bodyText.includes('about this job') || bodyText.includes('what you\'ll do');
 
       // Sign-in / account creation detection
-      const passwordFieldCount = document.querySelectorAll('input[type="password"]').length;
+      const passwordFieldCount = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="password"]'))
+        .filter((input) => isVisible(input) && !input.disabled).length;
       const hasPasswordField = passwordFieldCount > 0;
-      const hasEmailField = document.querySelectorAll('input[type="email"]').length > 0;
+      const hasEmailField = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="email"]'))
+        .some((input) => isVisible(input) && !input.disabled);
+      const hasVerificationKeyword = bodyText.includes('verification code')
+        || bodyText.includes('enter the code')
+        || bodyText.includes('security code')
+        || bodyText.includes('one-time')
+        || bodyText.includes('otp')
+        || bodyText.includes('verify your email')
+        || bodyText.includes('check your email');
+      const hasVerificationInput = Array.from(document.querySelectorAll<HTMLInputElement>(
+        verificationSelectorQuery,
+      )).some((input) => isVisible(input) && !input.disabled);
       const hasSignInWithGoogle = bodyText.includes('sign in with google') || bodyText.includes('continue with google');
       const hasSignInClickable = clickableTexts.some(t =>
         t === 'sign in' || t === 'log in' || t === 'login' ||
@@ -222,20 +245,33 @@ export class GenericPlatformConfig implements PlatformConfig {
         || headingText.includes('create account')
         || headingText.includes('register')
         || headingText.includes('sign up');
+      const isVerificationCodePage = (hasVerificationInput || hasVerificationKeyword) && !hasPasswordField;
       // Require password field OR Google SSO OR (email + sign-in button).
       // A standalone "Sign In" link in a nav bar should NOT classify as login.
       const isLoginPage = (hasPasswordField && !isAccountCreation) || hasSignInWithGoogle ||
         (hasEmailField && hasSignInClickable && !isAccountCreation);
 
       // Native inputs + ARIA-based form controls
-      const hasFormInputs = document.querySelectorAll(
+      const hasFormInputs = Array.from(document.querySelectorAll(
         'input[type="text"], input[type="email"], input[type="tel"], textarea, select, [role="combobox"], [role="radiogroup"], [role="radio"]:not([aria-checked="true"]), [role="listbox"], [contenteditable="true"], input[type="file"]'
-      ).length > 2;
+      )).filter((el) => isVisible(el)).length > 2;
 
       const hasConfirmation = bodyText.includes('thank you') || bodyText.includes('application received') || bodyText.includes('successfully submitted');
 
-      return { hasApplyButton, hasSubmitButton, hasReviewSignals, hasJobDescription, isLoginPage, isAccountCreation, hasSignInClickable, hasSignInWithGoogle, hasFormInputs, hasConfirmation };
-    });
+      return {
+        hasApplyButton,
+        hasSubmitButton,
+        hasReviewSignals,
+        hasJobDescription,
+        isVerificationCodePage,
+        isLoginPage,
+        isAccountCreation,
+        hasSignInClickable,
+        hasSignInWithGoogle,
+        hasFormInputs,
+        hasConfirmation,
+      };
+    }, VERIFICATION_INPUT_SELECTOR_QUERY);
 
     if (signals.hasConfirmation && !signals.hasFormInputs) {
       return { page_type: 'confirmation', page_title: 'Confirmation' };
@@ -251,6 +287,10 @@ export class GenericPlatformConfig implements PlatformConfig {
     // or no form fields). NOT a review page (checked above).
     if (signals.hasApplyButton && (signals.hasJobDescription || !signals.hasFormInputs)) {
       return { page_type: 'job_listing', page_title: 'Job Listing', has_apply_button: true };
+    }
+
+    if (signals.isVerificationCodePage) {
+      return { page_type: 'verification_code', page_title: 'Verification' };
     }
 
     // Account creation: 2+ password fields or "Create Account" heading
@@ -292,22 +332,32 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
   }
 
   async classifyByDOMFallback(adapter: BrowserAutomationAdapter): Promise<PageType> {
-    return adapter.page.evaluate(() => {
+    return adapter.page.evaluate((verificationSelectorQuery: string) => {
+      const isVisible = (el: Element | null): el is HTMLElement => {
+        if (!el) return false;
+        const node = el as HTMLElement;
+        if (node.closest('[hidden], [aria-hidden="true"]')) return false;
+        const style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
       const bodyText = document.body.innerText.toLowerCase();
       const headings = Array.from(document.querySelectorAll('h1, h2, h3'));
       const headingText = headings.map(h => (h.textContent || '').toLowerCase()).join(' ');
       const allText = headingText + ' ' + bodyText.substring(0, 3000);
 
       // Native inputs + ARIA-based form controls (Google Careers, Workday, etc.)
-      const allEditableInputs = document.querySelectorAll(
+      const allEditableInputs = Array.from(document.querySelectorAll(
         'input[type="text"]:not([readonly]):not([disabled]), textarea:not([readonly]):not([disabled]), input[type="email"]:not([readonly]):not([disabled]), input[type="tel"]:not([readonly]):not([disabled]), select:not([disabled]), [role="combobox"], [role="listbox"], [role="radiogroup"], [role="radio"], [contenteditable="true"], input[type="file"]'
-      );
+      )).filter((el) => isVisible(el));
       const hasAnyEditableInputs = allEditableInputs.length > 0;
 
       // Scan ALL clickable elements — buttons, links, role="button", submit inputs
       const clickables = Array.from(document.querySelectorAll(
         'button, [role="button"], input[type="submit"], a[href], a[role="link"]'
-      ));
+      )).filter((el) => isVisible(el));
       const clickableTexts = clickables.map(el => {
         const raw = (el.textContent || el.getAttribute('value') || el.getAttribute('aria-label') || '').trim();
         return raw.replace(/\s+/g, ' ').substring(0, 60).toLowerCase();
@@ -319,7 +369,18 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
         t === 'apply' || t === 'apply now' || t === 'apply for this job' ||
         t === 'apply on company site' || t === 'apply to this job'
       );
-      const hasPasswordField = document.querySelectorAll('input[type="password"]').length > 0;
+      const hasPasswordField = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="password"]'))
+        .some((input) => isVisible(input) && !input.disabled);
+      const hasVerificationKeyword = allText.includes('verification code')
+        || allText.includes('enter the code')
+        || allText.includes('security code')
+        || allText.includes('one-time')
+        || allText.includes('otp')
+        || allText.includes('verify your email')
+        || allText.includes('check your email');
+      const hasVerificationInput = Array.from(document.querySelectorAll<HTMLInputElement>(
+        verificationSelectorQuery,
+      )).some((input) => isVisible(input) && !input.disabled);
       const hasSignInClickable = clickableTexts.some(t =>
         t === 'sign in' || t === 'log in' || t === 'login' || t === 'sign in with google'
       );
@@ -331,6 +392,9 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
 
       // Job listing: has an Apply button
       if (hasApplyButton) return 'job_listing' as PageType;
+
+      // Verification code challenge
+      if ((hasVerificationInput || hasVerificationKeyword) && !hasPasswordField) return 'verification_code' as PageType;
 
       // Login: has a sign-in button/link or password field
       if (hasPasswordField || hasSignInClickable) return 'login' as PageType;
@@ -344,7 +408,7 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
       }
 
       return 'unknown' as PageType;
-    });
+    }, VERIFICATION_INPUT_SELECTOR_QUERY);
   }
 
   // --- Form Filling ---
