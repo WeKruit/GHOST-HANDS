@@ -23,6 +23,7 @@
  *   GH_TEST_MAIL_SMTP_PORT=465
  *   GH_TEST_MAIL_FROM=<defaults to GH_TEST_MAIL_SMTP_USER>
  *   GH_TEST_MAIL_SMTP_SECURE=true
+ *   GH_TEST_GOOGLE_CODE_MODE=numeric|phrase (default: numeric)
  */
 
 import * as tls from 'node:tls';
@@ -77,6 +78,8 @@ interface SmtpResponse {
   code: number;
   lines: string[];
 }
+
+type GoogleCodeMode = 'numeric' | 'phrase';
 
 const pendingSignups = new Map<string, PendingSignup>();
 const verifiedAccounts = new Map<string, AccountRecord>();
@@ -195,7 +198,7 @@ app.post('/api/verify', async (c) => {
     return c.json({ error: 'Too many attempts. Request a new code.' }, 429);
   }
 
-  if (codeInput !== pending.code) {
+  if (normalizeVerificationCode(codeInput) !== normalizeVerificationCode(pending.code)) {
     pending.attempts += 1;
     return c.json({
       error: 'Incorrect verification code',
@@ -292,7 +295,7 @@ app.post('/api/auth/google/verify', async (c) => {
     return c.json({ error: 'Too many attempts. Request a new code.' }, 429);
   }
 
-  if (codeInput !== pending.code) {
+  if (normalizeVerificationCode(codeInput) !== normalizeVerificationCode(pending.code)) {
     pending.attempts += 1;
     return c.json({
       error: 'Incorrect verification code',
@@ -356,9 +359,41 @@ function generateVerificationCode(): string {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
+function resolveGoogleCodeMode(): GoogleCodeMode {
+  const raw = (process.env.GH_TEST_GOOGLE_CODE_MODE || 'numeric').trim().toLowerCase();
+  if (['phrase', 'words', 'text', 'nonnumeric'].includes(raw)) {
+    return 'phrase';
+  }
+  return 'numeric';
+}
+
+function generateGoogleVerificationCode(mode: GoogleCodeMode): string {
+  if (mode === 'numeric') {
+    return generateVerificationCode();
+  }
+
+  const words = [
+    'amber', 'cinder', 'orchid', 'falcon', 'maple', 'river',
+    'sable', 'vertex', 'copper', 'harbor', 'lunar', 'willow',
+    'pioneer', 'jetstream', 'canyon', 'zenith', 'solstice', 'meadow',
+  ];
+  const pick = () => words[Math.floor(Math.random() * words.length)]!;
+  return `${pick()} ${pick()} ${pick()}`;
+}
+
+function normalizeVerificationCode(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 async function issueGoogleVerificationCode(email: string): Promise<void> {
   const smtp = getSmtpConfigFromEnv();
-  const code = generateVerificationCode();
+  const mode = resolveGoogleCodeMode();
+  const code = generateGoogleVerificationCode(mode);
   const now = Date.now();
   pendingGoogleLogins.set(email, {
     email,
@@ -381,7 +416,7 @@ async function issueGoogleVerificationCode(email: string): Promise<void> {
     throw new Error(`Failed to send Google verification email: ${message}`);
   }
 
-  console.log(`[verify-site] sent Google login verification code to ${email}`);
+  console.log(`[verify-site] sent Google login verification code to ${email} (mode=${mode}, code="${code}")`);
 }
 
 async function readJsonBody(c: Context): Promise<Record<string, unknown>> {
