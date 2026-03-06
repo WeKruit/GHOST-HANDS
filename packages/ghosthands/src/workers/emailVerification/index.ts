@@ -3,6 +3,8 @@ export type {
   VerificationResult,
   EmailProvider,
   EmailSearchOptions,
+  RecentInboxMessage,
+  RecentInboxOptions,
   AutoVerifyOptions,
   EmailVerificationService,
 } from './types.js';

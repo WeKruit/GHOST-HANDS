@@ -1,6 +1,12 @@
 import { MissingEmailConnectionError, TokenRefreshFailedError } from './errors.js';
 import { refreshGoogleAccessToken, type GoogleOAuthConfig } from './googleOAuth.js';
-import type { EmailProvider, EmailSearchOptions, VerificationSignal } from './types.js';
+import type {
+  EmailProvider,
+  EmailSearchOptions,
+  RecentInboxMessage,
+  RecentInboxOptions,
+  VerificationSignal,
+} from './types.js';
 import type { GmailConnectionStore } from './tokenStore.js';
 
 interface GmailApiProviderOptions {
@@ -39,6 +45,8 @@ interface GmailMessageResponse {
 }
 
 const DEFAULT_MAX_CANDIDATES = 5;
+const DEFAULT_RECENT_INBOX_LIMIT = 5;
+const MAX_RECENT_INBOX_LIMIT = 10;
 const MIN_TOKEN_TTL_SECONDS = 60;
 
 export class GmailApiProvider implements EmailProvider {
@@ -80,6 +88,36 @@ export class GmailApiProvider implements EmailProvider {
     }
 
     return null;
+  }
+
+  async listRecentInboxMessages(options: RecentInboxOptions = {}): Promise<RecentInboxMessage[]> {
+    const accessToken = await this.ensureAccessToken();
+    const limit = clampRecentInboxLimit(options.limit);
+    const query = buildRecentInboxQuery(options.lookbackMinutes);
+
+    let list = await this.listMessages(accessToken, query, limit);
+    if ((!list.messages || list.messages.length === 0) && query !== 'in:inbox') {
+      list = await this.listMessages(accessToken, 'in:inbox', limit);
+    }
+
+    const messageIds = (list.messages || []).map((message) => message.id).slice(0, limit);
+    if (messageIds.length === 0) return [];
+
+    const emails = await Promise.all(messageIds.map(async (messageId) => {
+      const message = await this.getMessage(accessToken, messageId);
+      return {
+        messageId: message.id,
+        threadId: message.threadId,
+        subject: getHeader(message.payload?.headers, 'subject'),
+        from: getHeader(message.payload?.headers, 'from'),
+        receivedAt: toIsoTimestamp(message.internalDate, getHeader(message.payload?.headers, 'date')),
+        snippet: message.snippet,
+        bodyText: extractMessageText(message),
+      } satisfies RecentInboxMessage;
+    }));
+
+    await this.tokenStore.markUsed(this.userId);
+    return sortRecentInboxMessages(emails);
   }
 
   private async ensureAccessToken(): Promise<string> {
@@ -124,10 +162,12 @@ export class GmailApiProvider implements EmailProvider {
     return refreshed.access_token;
   }
 
-  private async listMessages(accessToken: string, query: string): Promise<GmailMessageListResponse> {
+  private async listMessages(accessToken: string, query: string, maxResults = this.maxCandidates): Promise<GmailMessageListResponse> {
     const url = new URL('https://gmail.googleapis.com/gmail/v1/users/me/messages');
-    url.searchParams.set('q', query);
-    url.searchParams.set('maxResults', String(this.maxCandidates));
+    if (query.trim()) {
+      url.searchParams.set('q', query.trim());
+    }
+    url.searchParams.set('maxResults', String(Math.max(1, maxResults)));
 
     const response = await fetch(url.toString(), {
       method: 'GET',
@@ -180,6 +220,21 @@ function buildVerificationQuery(loginEmail: string, lookbackMinutes: number): st
     '(verify OR verification OR confirm OR activation OR otp OR "one-time" OR "sign in" OR "security code")',
     `newer_than:${lookbackHours}h`,
   ].filter(Boolean).join(' ');
+}
+
+function buildRecentInboxQuery(lookbackMinutes: number | undefined): string {
+  if (!lookbackMinutes || !Number.isFinite(lookbackMinutes) || lookbackMinutes <= 0) {
+    return 'in:inbox';
+  }
+  const lookbackHours = Math.max(1, Math.ceil(lookbackMinutes / 60));
+  return `in:inbox newer_than:${lookbackHours}h`;
+}
+
+function clampRecentInboxLimit(raw: number | undefined): number {
+  if (!raw || !Number.isFinite(raw)) return DEFAULT_RECENT_INBOX_LIMIT;
+  const rounded = Math.floor(raw);
+  if (rounded <= 0) return DEFAULT_RECENT_INBOX_LIMIT;
+  return Math.min(rounded, MAX_RECENT_INBOX_LIMIT);
 }
 
 function detectSignal(
@@ -248,7 +303,7 @@ function collectMessageText(part: GmailMessagePart | undefined): string[] {
   if (part.body?.data && (mime.includes('text/plain') || mime.includes('text/html') || !mime)) {
     const decoded = decodeBase64Url(part.body.data);
     if (decoded) {
-      output.push(mime.includes('text/html') ? stripHtml(decoded) : decoded);
+      output.push(mime.includes('text/html') ? htmlToTextPreserveLinks(decoded) : decoded);
     }
   }
 
@@ -265,11 +320,23 @@ function decodeBase64Url(value: string): string {
   return Buffer.from(padded, 'base64').toString('utf8');
 }
 
+function htmlToTextPreserveLinks(html: string): string {
+  const withLinks = html.replace(
+    /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi,
+    (_match, href: string, text: string) => `${text} ${href}`,
+  );
+  return stripHtml(withLinks);
+}
+
 function stripHtml(html: string): string {
   return html
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -303,4 +370,20 @@ function safeJson(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function sortRecentInboxMessages(messages: RecentInboxMessage[]): RecentInboxMessage[] {
+  return messages
+    .map((message, index) => ({ message, index }))
+    .sort((a, b) => {
+      const aTime = Date.parse(a.message.receivedAt || '');
+      const bTime = Date.parse(b.message.receivedAt || '');
+      const aValid = Number.isFinite(aTime);
+      const bValid = Number.isFinite(bTime);
+      if (aValid && bValid) return bTime - aTime;
+      if (aValid) return -1;
+      if (bValid) return 1;
+      return a.index - b.index;
+    })
+    .map((entry) => entry.message);
 }

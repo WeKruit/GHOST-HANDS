@@ -608,6 +608,64 @@
     }
     .toast.show { transform: translateX(-50%) translateY(0); }
 
+    /* ── Auth gate (Google login + email verification) ── */
+    .auth-card p {
+      font-size: 0.92rem;
+      color: #4f5d75;
+      margin-bottom: 0.9rem;
+    }
+    .google-login-btn {
+      width: 100%;
+      border: 0;
+      border-radius: 10px;
+      padding: 0.75rem 1rem;
+      font-size: 0.95rem;
+      font-weight: 700;
+      cursor: pointer;
+      color: #fff;
+      background: linear-gradient(135deg, #1a73e8, #1557b0);
+      transition: transform 0.15s, box-shadow 0.15s, opacity 0.2s;
+    }
+    .google-login-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(26, 115, 232, 0.35); }
+    .google-login-btn:disabled { opacity: 0.65; cursor: not-allowed; transform: none; box-shadow: none; }
+    .auth-btn-row {
+      display: flex;
+      gap: 0.7rem;
+    }
+    .auth-btn-row .nav-btn {
+      flex: 1;
+      text-align: center;
+    }
+    .auth-status {
+      margin-top: 1rem;
+      border-radius: 8px;
+      padding: 0.65rem 0.8rem;
+      font-size: 0.9rem;
+      display: none;
+    }
+    .auth-status.info {
+      display: block;
+      background: #eef1ff;
+      border: 1px solid #c7d2fe;
+      color: #2a3f9f;
+    }
+    .auth-status.success {
+      display: block;
+      background: #ebf9ef;
+      border: 1px solid #bfe8c8;
+      color: #1f7a36;
+    }
+    .auth-status.error {
+      display: block;
+      background: #fff0f0;
+      border: 1px solid #f3c6c6;
+      color: #9f2f2f;
+    }
+    .mono-text {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.88rem;
+    }
+
     @media (max-width: 600px) {
       .form-row { grid-template-columns: 1fr; }
       .card { padding: 1.25rem; }
@@ -622,7 +680,71 @@
   <p>Join our team — Submit your application below</p>
 </header>
 
-<div class="container">
+<div class="container" id="authContainer">
+  <div class="card auth-card" id="googleLoginCard">
+    <h2>Sign In to Continue</h2>
+    <p>Continue with Google first. Then enter the verification code sent to your inbox.</p>
+    <form id="googleLoginForm">
+      <div class="form-row">
+        <div class="form-group full-width">
+          <label for="googleLoginEmail">Google Email <span class="required">*</span></label>
+          <input
+            type="email"
+            id="googleLoginEmail"
+            name="google_login_email"
+            autocomplete="email"
+            value="__DEFAULT_EMAIL__"
+            placeholder="you@gmail.com"
+            required
+          >
+        </div>
+        <div class="form-group full-width">
+          <label for="googleLoginPassword">Google Password <span class="required">*</span></label>
+          <input
+            type="password"
+            id="googleLoginPassword"
+            name="google_login_password"
+            autocomplete="current-password"
+            placeholder="Enter password"
+            required
+          >
+          <div class="help-text">Test-only mock Google login. Password is accepted as-is.</div>
+        </div>
+      </div>
+      <button type="submit" class="google-login-btn" id="googleLoginBtn">Continue with Google</button>
+    </form>
+  </div>
+
+  <div class="card auth-card" id="verificationGateCard" hidden>
+    <h2>Email Verification Required</h2>
+    <p>
+      We sent a verification code to:
+      <strong id="verificationEmailTarget" class="mono-text"></strong>
+    </p>
+    <form id="googleVerificationForm">
+      <div class="form-group">
+        <label for="googleVerificationCode">Verification Code <span class="required">*</span></label>
+        <input
+          type="text"
+          id="googleVerificationCode"
+          name="google_verification_code"
+          autocomplete="one-time-code"
+          inputmode="numeric"
+          placeholder="Enter code"
+          required
+        >
+      </div>
+      <div class="auth-btn-row">
+        <button type="submit" class="nav-btn next" id="googleVerifyBtn">Verify & Continue</button>
+        <button type="button" class="nav-btn prev" id="googleResendBtn">Resend Code</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="auth-status" id="authStatus" aria-live="polite"></div>
+</div>
+
+<div class="container" id="applicationContainer" hidden>
 
   <!-- Stepper -->
   <div class="stepper" id="stepper">
@@ -1471,6 +1593,150 @@
 <div class="toast" id="toast">Application submitted successfully!</div>
 
 <script>
+  // ═══════════════════════════════════════════════════════════
+  // Google login + email verification gate
+  // ═══════════════════════════════════════════════════════════
+  const authState = {
+    email: '',
+    verified: false,
+  };
+
+  const authContainer = document.getElementById('authContainer');
+  const applicationContainer = document.getElementById('applicationContainer');
+  const authStatusEl = document.getElementById('authStatus');
+  const googleLoginCard = document.getElementById('googleLoginCard');
+  const verificationGateCard = document.getElementById('verificationGateCard');
+  const verificationEmailTarget = document.getElementById('verificationEmailTarget');
+  const googleLoginForm = document.getElementById('googleLoginForm');
+  const googleVerificationForm = document.getElementById('googleVerificationForm');
+  const googleLoginBtn = document.getElementById('googleLoginBtn');
+  const googleVerifyBtn = document.getElementById('googleVerifyBtn');
+  const googleResendBtn = document.getElementById('googleResendBtn');
+  const googleLoginEmailInput = document.getElementById('googleLoginEmail');
+  const googleVerificationCodeInput = document.getElementById('googleVerificationCode');
+
+  function showAuthStatus(kind, text) {
+    authStatusEl.className = `auth-status ${kind}`;
+    authStatusEl.textContent = text;
+  }
+
+  function clearAuthStatus() {
+    authStatusEl.className = 'auth-status';
+    authStatusEl.textContent = '';
+  }
+
+  async function postAuthJson(path, payload) {
+    const response = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(data.error || `Request failed (${response.status})`);
+    }
+    return data;
+  }
+
+  function unlockApplication() {
+    authState.verified = true;
+    authContainer.hidden = true;
+    applicationContainer.hidden = false;
+
+    const appEmailInput = document.getElementById('email');
+    if (appEmailInput && !appEmailInput.value.trim()) {
+      appEmailInput.value = authState.email;
+      appEmailInput.dispatchEvent(new Event('input', { bubbles: true }));
+      appEmailInput.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    showAuthStatus('success', 'Verification complete. Opening application...');
+    goToStep(0);
+  }
+
+  googleLoginForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    clearAuthStatus();
+
+    const email = googleLoginEmailInput.value.trim().toLowerCase();
+    const password = document.getElementById('googleLoginPassword').value;
+    if (!email) {
+      showAuthStatus('error', 'Google email is required.');
+      return;
+    }
+    if (!password) {
+      showAuthStatus('error', 'Google password is required.');
+      return;
+    }
+
+    googleLoginBtn.disabled = true;
+    googleLoginBtn.textContent = 'Signing in...';
+
+    try {
+      await postAuthJson('/api/auth/google/start', { email, password });
+      authState.email = email;
+      verificationEmailTarget.textContent = email;
+      verificationGateCard.hidden = false;
+      googleLoginCard.hidden = true;
+      googleVerificationCodeInput.value = '';
+      showAuthStatus('success', 'Verification code sent. Check your inbox.');
+    } catch (err) {
+      showAuthStatus('error', err.message || String(err));
+    } finally {
+      googleLoginBtn.disabled = false;
+      googleLoginBtn.textContent = 'Continue with Google';
+    }
+  });
+
+  googleVerificationForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    clearAuthStatus();
+
+    const code = googleVerificationCodeInput.value.trim();
+    if (!code) {
+      showAuthStatus('error', 'Enter the verification code.');
+      return;
+    }
+
+    googleVerifyBtn.disabled = true;
+    googleVerifyBtn.textContent = 'Verifying...';
+
+    try {
+      await postAuthJson('/api/auth/google/verify', {
+        email: authState.email,
+        code,
+      });
+      unlockApplication();
+    } catch (err) {
+      showAuthStatus('error', err.message || String(err));
+    } finally {
+      googleVerifyBtn.disabled = false;
+      googleVerifyBtn.textContent = 'Verify & Continue';
+    }
+  });
+
+  googleResendBtn.addEventListener('click', async () => {
+    clearAuthStatus();
+    if (!authState.email) {
+      showAuthStatus('error', 'No login email available. Start Google sign-in again.');
+      return;
+    }
+
+    googleResendBtn.disabled = true;
+    googleResendBtn.textContent = 'Resending...';
+    try {
+      await postAuthJson('/api/auth/google/resend', {
+        email: authState.email,
+      });
+      showAuthStatus('info', 'A new verification code was sent.');
+    } catch (err) {
+      showAuthStatus('error', err.message || String(err));
+    } finally {
+      googleResendBtn.disabled = false;
+      googleResendBtn.textContent = 'Resend Code';
+    }
+  });
+
   // ═══════════════════════════════════════════════════════════
   // Stepper navigation
   // ═══════════════════════════════════════════════════════════

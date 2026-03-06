@@ -25,6 +25,14 @@ import { getLogger } from '../../../monitoring/logger.js';
 import type { WorkflowState } from '../types.js';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { HitlCapableAdapter } from '../../../adapters/types.js';
+import {
+  createEmptyHitlAttempts,
+  decideHitlAction,
+  getHitlAttemptsForType,
+  hasAnyHitlAttempts,
+  incrementHitlAttempt,
+  isRecoverableAuthBlocker,
+} from '../../../workers/hitl/decisionEngine.js';
 
 // ---------------------------------------------------------------------------
 // Private helpers
@@ -46,6 +54,38 @@ function mapBlockerCategory(category: string): BlockerType {
     return category as BlockerType;
   }
   return 'verification';
+}
+
+function canHandlerAutoRecoverAuth(handlerType: string): boolean {
+  return handlerType === 'smart_apply' || handlerType === 'workday_apply' || handlerType === 'agent_apply';
+}
+
+const VERIFICATION_INPUT_SELECTORS = [
+  'input[autocomplete="one-time-code"]',
+  'input[name*="code" i]',
+  'input[name*="otp" i]',
+  'input[name*="totp" i]',
+  'input[name*="verification" i]',
+  'input[name*="token" i]',
+  'input[name*="2fa" i]',
+  'input[name*="mfa" i]',
+  'input[type="tel"][maxlength="6"]',
+  'input[type="number"][maxlength="6"]',
+  'input[inputmode="numeric"]',
+];
+
+async function hasVisibleVerificationInput(adapter: HitlCapableAdapter): Promise<boolean> {
+  for (const selector of VERIFICATION_INPUT_SELECTORS) {
+    try {
+      const handle = await adapter.page.$(selector);
+      if (handle && await handle.isVisible()) {
+        return true;
+      }
+    } catch {
+      // ignore invalid selectors and detached elements
+    }
+  }
+  return false;
 }
 
 /**
@@ -255,10 +295,28 @@ export function buildSteps(rt: RuntimeContext) {
 
         // Verify the blocker is actually resolved (up to 3 attempts, 2s apart)
         let stillBlocked = false;
+        const allowAutoRecoverAuth = canHandlerAutoRecoverAuth(rt.handler.type);
         for (let attempt = 0; attempt < 3; attempt++) {
           await new Promise((r) => setTimeout(r, 2000));
           const recheck = await detector.detectWithAdapter(rt.adapter);
-          if (!recheck || recheck.confidence <= 0.6) {
+          if (!recheck) {
+            stillBlocked = false;
+            break;
+          }
+          const mappedType = mapBlockerCategory(recheck.type);
+          const hasCodeEntryPath = mappedType === '2fa'
+            ? await hasVisibleVerificationInput(rt.adapter)
+            : undefined;
+          const decision = decideHitlAction({
+            blockerType: mappedType,
+            confidence: recheck.confidence,
+            source: recheck.source,
+            selector: recheck.selector,
+            attemptsByType: state.hitl.attemptsByType,
+            hasCodeEntryPath,
+            allowAutoRecoverAuth,
+          });
+          if (decision.action !== 'IMMEDIATE_HITL') {
             stillBlocked = false;
             break;
           }
@@ -278,6 +336,8 @@ export function buildSteps(rt: RuntimeContext) {
           blockerType: null,
           resumeNonce: null,
           checkpoint: null,
+          attemptsByType: createEmptyHitlAttempts(),
+          lastDecision: 'NO_ACTION',
         };
         state.status = 'running';
 
@@ -312,11 +372,84 @@ export function buildSteps(rt: RuntimeContext) {
 
       // ── Fresh blocker check ──
       const blockerResult = await detector.detectWithAdapter(rt.adapter);
+      const existingAttempts = state.hitl.attemptsByType ?? createEmptyHitlAttempts();
 
-      if (blockerResult && blockerResult.confidence > 0.6) {
-        const blockerType = mapBlockerCategory(blockerResult.type);
-        const pageUrl = await rt.adapter.getCurrentUrl().catch(() => state.targetUrl);
+      if (!blockerResult) {
+        if (hasAnyHitlAttempts(existingAttempts) && state.hitl.lastDecision === 'AUTO_RECOVER') {
+          await rt.logEvent('blocker_recovery_succeeded', {
+            jobId: state.jobId,
+            attemptsByType: existingAttempts,
+          });
+          state.hitl = {
+            ...state.hitl,
+            attemptsByType: createEmptyHitlAttempts(),
+            lastDecision: 'NO_ACTION',
+          };
+        }
+        return state;
+      }
 
+      const blockerType = mapBlockerCategory(blockerResult.type);
+      const allowAutoRecoverAuth = canHandlerAutoRecoverAuth(rt.handler.type);
+      const hasCodeEntryPath = blockerType === '2fa'
+        ? await hasVisibleVerificationInput(rt.adapter)
+        : undefined;
+      const decision = decideHitlAction({
+        blockerType,
+        confidence: blockerResult.confidence,
+        source: blockerResult.source,
+        selector: blockerResult.selector,
+        attemptsByType: existingAttempts,
+        hasCodeEntryPath,
+        allowAutoRecoverAuth,
+      });
+
+      if (decision.action === 'NO_ACTION' || decision.action === 'RETRY_NO_HITL') {
+        return state;
+      }
+
+      if (decision.action === 'AUTO_RECOVER') {
+        if (isRecoverableAuthBlocker(blockerType)) {
+          const attemptsBefore = getHitlAttemptsForType(existingAttempts, blockerType);
+          const attemptsAfter = incrementHitlAttempt(existingAttempts, blockerType);
+          if (attemptsBefore === 0) {
+            await rt.logEvent('blocker_recovery_started', {
+              jobId: state.jobId,
+              blockerType,
+            });
+          }
+          await rt.logEvent('blocker_recovery_attempted', {
+            jobId: state.jobId,
+            blockerType,
+            confidence: blockerResult.confidence,
+            attempt: attemptsAfter[blockerType],
+            attemptsRemaining: decision.attemptsRemaining ?? 0,
+          });
+          state.hitl = {
+            ...state.hitl,
+            blocked: false,
+            blockerType,
+            checkpoint: 'check_blockers_checkpoint',
+            resumeNonce: null,
+            attemptsByType: attemptsAfter,
+            lastDecision: decision.action,
+          };
+        }
+        return state;
+      }
+
+      const pageUrl = await rt.adapter.getCurrentUrl().catch(() => state.targetUrl);
+
+      if (decision.reason === 'auth_recovery_exhausted') {
+        await rt.logEvent('blocker_recovery_exhausted', {
+          jobId: state.jobId,
+          blockerType,
+          confidence: blockerResult.confidence,
+          attemptsByType: existingAttempts,
+        });
+      }
+
+      if (decision.action === 'IMMEDIATE_HITL') {
         logger.warn('Blocker detected, suspending for HITL', {
           jobId: state.jobId,
           blockerType,
@@ -350,6 +483,8 @@ export function buildSteps(rt: RuntimeContext) {
           blockerType,
           resumeNonce,
           checkpoint: 'check_blockers_checkpoint',
+          attemptsByType: existingAttempts,
+          lastDecision: decision.action,
         };
         state.status = 'suspended';
 
@@ -357,7 +492,6 @@ export function buildSteps(rt: RuntimeContext) {
         return await suspend({ blockerType, pageUrl });
       }
 
-      // No blocker found — pass through unchanged
       return state;
     },
   });
