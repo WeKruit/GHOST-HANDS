@@ -135,7 +135,7 @@ jobs:
   deploy-staging:
     name: Deploy Staging
     runs-on: ubuntu-latest
-    needs: [docker, deploy-asg]
+    needs: [docker]
     if: github.event_name == 'push'
     environment: staging
     steps:
