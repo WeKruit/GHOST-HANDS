@@ -17,7 +17,8 @@
  *   POST /admin/refresh-secrets — Re-fetch secrets from AWS Secrets Manager (requires X-Deploy-Secret)
  *
  * Auth:
- *   POST endpoints require X-Deploy-Secret header matching GH_DEPLOY_SECRET env var.
+ *   POST endpoints require X-Deploy-Secret header matching ATM_DEPLOY_SECRET
+ *   or GH_DEPLOY_SECRET env var.
  *   GET endpoints are unauthenticated (monitoring/health checks).
  *
  * Secrets:
@@ -26,10 +27,11 @@
  *   take precedence. AWS SM is non-fatal — if unavailable, process.env is used as-is.
  *
  * Usage:
- *   GH_DEPLOY_SECRET=<secret> bun scripts/deploy-server.ts
+ *   ATM_DEPLOY_SECRET=<secret> bun scripts/deploy-server.ts
  *
  * Environment:
- *   GH_DEPLOY_SECRET     — Required. Shared secret for deploy auth.
+ *   ATM_DEPLOY_SECRET    — Preferred shared secret for deploy auth.
+ *   GH_DEPLOY_SECRET     — Legacy fallback for deploy auth.
  *   GH_DEPLOY_PORT       — Port to listen on (default: 8000)
  *   GH_API_PORT          — GH API health port (default: 3100)
  *   GH_WORKER_PORT       — GH worker status port (default: 3101)
@@ -96,7 +98,7 @@ async function loadSecretsFromAwsSm(): Promise<void> {
 await loadSecretsFromAwsSm();
 
 const DEPLOY_PORT = parseInt(process.env.GH_DEPLOY_PORT || '8000', 10);
-const DEPLOY_SECRET = process.env.GH_DEPLOY_SECRET;
+const DEPLOY_SECRET = process.env.ATM_DEPLOY_SECRET || process.env.GH_DEPLOY_SECRET;
 const API_HOST = process.env.GH_API_HOST || 'localhost';
 const API_PORT = parseInt(process.env.GH_API_PORT || '3100', 10);
 const WORKER_HOST = process.env.GH_WORKER_HOST || 'localhost';
@@ -126,8 +128,13 @@ interface DeployFailure {
   failedService?: string;
 }
 
+if (process.env.ATM_DEPLOY_SECRET && process.env.GH_DEPLOY_SECRET
+    && process.env.ATM_DEPLOY_SECRET !== process.env.GH_DEPLOY_SECRET) {
+  console.warn('[deploy-server] ATM_DEPLOY_SECRET and GH_DEPLOY_SECRET differ. Using ATM_DEPLOY_SECRET.');
+}
+
 if (!DEPLOY_SECRET) {
-  console.error('[deploy-server] FATAL: GH_DEPLOY_SECRET is required');
+  console.error('[deploy-server] FATAL: ATM_DEPLOY_SECRET or GH_DEPLOY_SECRET is required');
   process.exit(1);
 }
 
