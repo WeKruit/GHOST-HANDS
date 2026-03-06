@@ -576,6 +576,7 @@ export function buildSteps(rt: RuntimeContext) {
         resumeFilePath: rt.resumeFilePath,
         emailVerification: rt.emailVerification,
         logEvent: rt.logEvent,
+        pageContext: rt.pageContext,
         waitForManualAction: rt.waitForManualAction,
       };
 

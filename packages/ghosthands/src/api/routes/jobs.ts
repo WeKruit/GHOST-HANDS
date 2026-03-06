@@ -92,7 +92,7 @@ export function createJobRoutes(controller: JobController) {
   // ─── GET /jobs/:id - Get Job ───────────────────────────────────
 
   jobs.get('/:id', async (c) => {
-    const jobId = c.req.param('id');
+    const jobId = c.req.param('id')!;
     const auth = getAuth(c);
     const scopedUserId = auth.type === 'user' ? auth.userId : undefined;
 
@@ -107,7 +107,7 @@ export function createJobRoutes(controller: JobController) {
   // ─── GET /jobs/:id/status - Get Job Status (Lightweight) ──────
 
   jobs.get('/:id/status', async (c) => {
-    const jobId = c.req.param('id');
+    const jobId = c.req.param('id')!;
     const auth = getAuth(c);
     const scopedUserId = auth.type === 'user' ? auth.userId : undefined;
 
@@ -122,7 +122,7 @@ export function createJobRoutes(controller: JobController) {
   // ─── POST /jobs/:id/cancel - Cancel Job ───────────────────────
 
   jobs.post('/:id/cancel', async (c) => {
-    const jobId = c.req.param('id');
+    const jobId = c.req.param('id')!;
     const auth = getAuth(c);
     const scopedUserId = auth.type === 'user' ? auth.userId : undefined;
 
@@ -149,7 +149,7 @@ export function createJobRoutes(controller: JobController) {
   // ─── GET /jobs/:id/events - Get Job Events ────────────────────
 
   jobs.get('/:id/events', validateQuery(GetEventsQuerySchema), async (c) => {
-    const jobId = c.req.param('id');
+    const jobId = c.req.param('id')!;
     const auth = getAuth(c);
     const scopedUserId = auth.type === 'user' ? auth.userId : undefined;
     const query = c.get('validatedQuery') as GetEventsQuery;
@@ -165,7 +165,7 @@ export function createJobRoutes(controller: JobController) {
   // ─── POST /jobs/:id/retry - Retry Job ─────────────────────────
 
   jobs.post('/:id/retry', async (c) => {
-    const jobId = c.req.param('id');
+    const jobId = c.req.param('id')!;
     const auth = getAuth(c);
     const scopedUserId = auth.type === 'user' ? auth.userId : undefined;
 

@@ -3,6 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import type { TaskHandler, TaskContext, TaskResult, ValidationResult } from './types.js';
 import type { BrowserAutomationAdapter } from '../../adapters/types.js';
+import type { PageContextService } from '../../context/PageContextService.js';
 import type { PlatformConfig, PageState, PageType, ScannedField, ScanResult } from './platforms/types.js';
 import type { CostTracker } from '../costControl.js';
 import { detectPlatformFromUrl } from './platforms/index.js';
@@ -57,6 +58,7 @@ export class SmartApplyHandler implements TaskHandler {
   async execute(ctx: TaskContext): Promise<TaskResult> {
     const { job, adapter, progress, resumeFilePath: downloadedResumePath } = ctx;
     const userProfile = job.input_data.user_data as Record<string, any>;
+    const pageContext = ctx.pageContext;
 
     // TaskHandlerRegistry stores singleton handler instances, so reset
     // per-run state at the start of each execute() call.
@@ -177,6 +179,8 @@ export class SmartApplyHandler implements TaskHandler {
           samePageCount++;
           if (samePageCount >= MAX_SAME_PAGE) {
             console.warn(`[SmartApply] Stuck on same page for ${samePageCount} iterations (${ESCALATE_AFTER} DOM + ${samePageCount - ESCALATE_AFTER} Magnitude) — stopping.`);
+            await pageContext?.finalizeActivePage({ status: 'blocked' });
+            await pageContext?.markAwaitingReview();
             await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
             return {
               success: true,
@@ -206,6 +210,16 @@ export class SmartApplyHandler implements TaskHandler {
           pageState.page_type = 'questions' as any;
           pageState.page_title = 'Form Page (SPA)';
         }
+
+        await pageContext?.enterOrResumePage({
+          pageType: pageState.page_type,
+          pageTitle: pageState.page_title,
+          url: currentPageUrl,
+          fingerprint: contentFingerprint,
+          pageStepKey: this.buildPageStepKey(pageState),
+          pageSequence: pagesProcessed,
+          domSummary: this.buildPageDomSummary(pageState),
+        });
 
         // Handle based on page type
         switch (pageState.page_type) {
@@ -257,6 +271,7 @@ export class SmartApplyHandler implements TaskHandler {
 
           case 'review':
             // We've reached the review page — STOP HERE
+            await pageContext?.markAwaitingReview();
             await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
             console.log('\n' + '='.repeat(70));
             console.log('[SmartApply] APPLICATION FILLED SUCCESSFULLY');
@@ -279,6 +294,7 @@ export class SmartApplyHandler implements TaskHandler {
 
           case 'confirmation':
             console.warn('[SmartApply] Unexpected: landed on confirmation page');
+            await pageContext?.finalizeActivePage({ status: 'completed' });
             return {
               success: true,
               data: {
@@ -379,11 +395,21 @@ export class SmartApplyHandler implements TaskHandler {
               : ProgressStep.FILLING_FORM;
             await progress.setStep(step as any);
 
-            const result = await this.fillPage(adapter, config, resumePath, profileText, 0, stuckEscalate, ctx.costTracker);
+            const result = await this.fillPage(
+              adapter,
+              config,
+              resumePath,
+              profileText,
+              0,
+              stuckEscalate,
+              ctx.costTracker,
+              pageContext,
+            );
 
             if (result === 'review') {
               // fillPage detected this is actually the review page
               console.log(`[SmartApply] Review page reached via fillPage — stopping.`);
+              await pageContext?.markAwaitingReview();
               await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
               console.log('\n' + '='.repeat(70));
               console.log('[SmartApply] Stopped at REVIEW page — NOT submitting.');
@@ -411,6 +437,8 @@ export class SmartApplyHandler implements TaskHandler {
 
       // Safety: hit max pages without reaching review
       console.warn(`[SmartApply] Reached max page limit (${MAX_FORM_PAGES}) without finding review page`);
+      await pageContext?.finalizeActivePage({ status: 'blocked' });
+      await pageContext?.markAwaitingReview();
       await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
       console.log('\n' + '='.repeat(70));
       console.log('[SmartApply] Reached page limit. Browser is open for manual takeover.');
@@ -431,6 +459,7 @@ export class SmartApplyHandler implements TaskHandler {
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       console.error(`[SmartApply] Error on page ${pagesProcessed}: ${msg}`);
+      await pageContext?.markFailed();
 
       // If we fail mid-application, keep browser open so user can recover
       if (pagesProcessed > 2) {
@@ -1949,6 +1978,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
     _depth = 0,
     forceEscalate = false,
     costTracker?: CostTracker,
+    pageContext?: PageContextService,
   ): Promise<'navigated' | 'review' | 'complete'> {
     const MAX_DEPTH = 3;
 
@@ -1970,7 +2000,19 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
     if (profileText) {
       const escalate = _depth > 0 || forceEscalate;
       if (escalate) console.log(`[SmartApply] Escalating to MagnitudeHand (${forceEscalate ? 'stuck escalation' : `retry ${_depth}/${MAX_DEPTH}`})`);
-      const fillResult = await fillFormOnPage(adapter.page, adapter, profileText, resumePath, { forceMagnitude: escalate });
+      const fillResult = await fillFormOnPage(adapter.page, adapter, profileText, resumePath, {
+        forceMagnitude: escalate,
+        observers: pageContext
+          ? {
+              onQuestionsNormalized: async (questions, opts) => pageContext.syncQuestions(questions, opts),
+              onAnswerPlanned: async (decisions) => pageContext.recordAnswerPlan(decisions),
+              onFieldAttempt: async (questionKey, actor, notes) =>
+                pageContext.recordFieldAttempt(questionKey, actor, notes),
+              onFieldResult: async (outcome) => pageContext.recordFieldResult(outcome),
+              onVerification: async (outcome) => pageContext.recordFieldResult(outcome),
+            }
+          : undefined,
+      });
       console.log(`[SmartApply] formFiller: ${fillResult.domFilled} DOM + ${fillResult.magnitudeFilled} Magnitude filled (${fillResult.llmCalls} LLM calls)`);
 
       // Record formFiller LLM token usage in cost tracker.
@@ -1984,6 +2026,27 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
           outputCost: fillResult.outputTokens * (5.00 / 1_000_000),
         });
       }
+    }
+
+    const audit = await pageContext?.auditBeforeAdvance();
+    if (audit?.blockNavigation) {
+      console.log(`[SmartApply] Page audit blocked advance: ${audit.summary}`);
+      if (_depth + 1 < MAX_DEPTH) {
+        return this.fillPage(
+          adapter,
+          config,
+          null,
+          profileText,
+          _depth + 1,
+          true,
+          costTracker,
+          pageContext,
+        );
+      }
+
+      await pageContext?.finalizeActivePage({ status: 'blocked' });
+      console.warn('[SmartApply] Required questions remain unresolved after retry budget; leaving page for manual recovery.');
+      return 'complete';
     }
 
     // ── ADVANCE PHASE: Click Next or detect review page ──
@@ -2013,13 +2076,14 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
         // Pass null for resumePath on retries — resume was already uploaded on first attempt.
         // Workday replaces the file input after processing, creating a fresh one for "add another file",
         // so re-passing resumePath would cause a duplicate upload.
-        return this.fillPage(adapter, config, null, profileText, _depth + 1, false, costTracker);
+        return this.fillPage(adapter, config, null, profileText, _depth + 1, false, costTracker, pageContext);
       }
 
       // Verify page changed
       const urlAfterClick = await adapter.getCurrentUrl();
       const fingerprintAfterClick = await this.getPageFingerprint(adapter);
       if (urlAfterClick !== urlBeforeClick || fingerprintAfterClick !== fingerprintBeforeClick) {
+        await pageContext?.finalizeActivePage();
         await this.waitForPageLoad(adapter);
         return 'navigated';
       }
@@ -2029,6 +2093,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       const urlAfterWait = await adapter.getCurrentUrl();
       const fingerprintAfterWait = await this.getPageFingerprint(adapter);
       if (urlAfterWait !== urlBeforeClick || fingerprintAfterWait !== fingerprintBeforeClick) {
+        await pageContext?.finalizeActivePage();
         await this.waitForPageLoad(adapter);
         return 'navigated';
       }
@@ -2037,7 +2102,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       const scrollAfterClick = await adapter.page.evaluate(() => window.scrollY);
       if (Math.abs(scrollAfterClick - scrollBeforeClick) > 50) {
         console.log(`[SmartApply] Clicked Next — page auto-scrolled to unfilled fields. Re-filling.`);
-        return this.fillPage(adapter, config, null, profileText, _depth + 1, false, costTracker);
+        return this.fillPage(adapter, config, null, profileText, _depth + 1, false, costTracker, pageContext);
       }
 
       console.log(`[SmartApply] Clicked Next but page unchanged.`);
@@ -2045,6 +2110,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
 
     if (clickResult === 'review_detected') {
       console.log(`[SmartApply] Review page detected — not clicking Submit.`);
+      await pageContext?.markAwaitingReview();
       return 'review';
     }
 
@@ -2060,11 +2126,13 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       if (finalClick === 'clicked') {
         console.log(`[SmartApply] Clicked Next at content bottom.`);
         await adapter.page.waitForTimeout(2000);
+        await pageContext?.finalizeActivePage();
         await this.waitForPageLoad(adapter);
         return 'navigated';
       }
       if (finalClick === 'review_detected') {
         console.log(`[SmartApply] Review page detected at content bottom.`);
+        await pageContext?.markAwaitingReview();
         return 'review';
       }
     }
@@ -2074,12 +2142,18 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a.btn'));
       return btns.some(b => {
         const text = (b.textContent || (b as HTMLInputElement).value || '').trim().toLowerCase();
-        return text.includes('submit') || text === 'apply' || text === 'apply now' || text === 'send application';
+        return text.includes('submit') || text === 'send application';
       });
     });
     if (hasSubmitFallback) {
-      console.log(`[SmartApply] Submit button present — treating as review.`);
-      return 'review';
+      const domReview = await this.checkIfReviewPage(adapter);
+      const verifiedReview = domReview ? true : await this.verifyReviewPage(adapter);
+      if (verifiedReview) {
+        console.log(`[SmartApply] Submit button present and review verified — stopping before submit.`);
+        await pageContext?.markAwaitingReview();
+        return 'review';
+      }
+      console.log('[SmartApply] Submit-like button present, but page is not verified as final review.');
     }
 
     console.log(`[SmartApply] Page complete.`);
@@ -3012,6 +3086,24 @@ ${dataPrompt}`;
 
       return `${heading}|fields:${visibleFieldCount}|active:${activeText}`;
     });
+  }
+
+  private buildPageStepKey(pageState: PageState): string {
+    const normalizedTitle = (pageState.page_title || '')
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .trim();
+    return `${pageState.page_type}::${normalizedTitle || 'untitled'}`;
+  }
+
+  private buildPageDomSummary(pageState: PageState): string {
+    const flags = [
+      pageState.has_apply_button ? 'apply' : '',
+      pageState.has_next_button ? 'next' : '',
+      pageState.has_submit_button ? 'submit' : '',
+      pageState.has_sign_in_with_google ? 'google' : '',
+    ].filter(Boolean);
+    return `${pageState.page_type}:${flags.join(',')}`;
   }
 
   /**

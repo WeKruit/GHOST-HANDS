@@ -13,7 +13,7 @@ export function createUsageRoutes(): Hono {
   const usage = new Hono();
 
   usage.get('/users/:id/usage', async (c) => {
-    const targetUserId = c.req.param('id');
+    const targetUserId = c.req.param('id')!;
     const auth = getAuth(c);
 
     // User callers can only view their own usage

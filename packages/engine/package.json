@@ -3,6 +3,34 @@
   "version": "0.2.1-spencer-magnitude-hand.448327c",
   "main": "dist/packages/engine/src/index.js",
   "types": "dist/packages/engine/src/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/packages/engine/src/index.js",
+      "require": "./dist/packages/engine/src/index.js",
+      "types": "./dist/packages/engine/src/index.d.ts"
+    },
+    "./desktop": {
+      "import": "./dist/packages/engine/src/desktop.js",
+      "require": "./dist/packages/engine/src/desktop.js",
+      "types": "./dist/packages/engine/src/desktop.d.ts"
+    },
+    "./worker": {
+      "import": "./dist/packages/engine/src/worker.js",
+      "require": "./dist/packages/engine/src/worker.js",
+      "types": "./dist/packages/engine/src/worker.d.ts"
+    },
+    "./shared": {
+      "import": "./dist/packages/engine/src/shared.js",
+      "require": "./dist/packages/engine/src/shared.js",
+      "types": "./dist/packages/engine/src/shared.d.ts"
+    },
+    "./broker": {
+      "import": "./dist/packages/engine/src/broker.js",
+      "require": "./dist/packages/engine/src/broker.js",
+      "types": "./dist/packages/engine/src/broker.d.ts"
+    },
+    "./dist/*": "./dist/*"
+  },
   "files": ["dist", "MANIFEST.json"],
   "description": "Job application automation engine for GH-Desktop-App",
   "scripts": {
@@ -32,9 +60,14 @@
   },
   "peerDependenciesMeta": {
     "hono": { "optional": true },
+    "pg": { "optional": true },
+    "pg-boss": { "optional": true },
+    "ioredis": { "optional": true },
     "@supabase/supabase-js": { "optional": true },
     "@actionbookdev/sdk": { "optional": true },
-    "magnitude-extract": { "optional": true }
+    "magnitude-extract": { "optional": true },
+    "@mastra/core": { "optional": true },
+    "@mastra/pg": { "optional": true }
   },
   "devDependencies": {
     "typescript": "~5.7.2",

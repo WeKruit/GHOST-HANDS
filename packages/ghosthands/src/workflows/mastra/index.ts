@@ -1,5 +1,9 @@
 export { buildApplyWorkflow } from './applyWorkflow';
-export { getMastra, resetMastra } from './init';
+export {
+  createMastra,
+  getMastra,
+  resetMastra,
+} from './init';
 export {
   isMastraResume,
   claimResume,
@@ -18,4 +22,8 @@ export type {
   BlockerResumeData,
   RuntimeContext,
 } from './types';
+export type {
+  WorkflowStoreFactory,
+  CreateMastraOptions,
+} from './init';
 export { buildSteps } from './steps/factory';
