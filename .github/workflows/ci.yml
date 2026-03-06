@@ -67,7 +67,7 @@ jobs:
     name: Docker Build & Push
     runs-on: ubuntu-latest
     needs: [typecheck, test-unit]
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/staging' || github.ref == 'refs/heads/main'))
     outputs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
       environment: ${{ steps.meta.outputs.environment }}
