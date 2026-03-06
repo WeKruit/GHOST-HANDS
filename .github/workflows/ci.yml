@@ -135,8 +135,8 @@ jobs:
   deploy-staging:
     name: Deploy Staging
     runs-on: ubuntu-latest
-    needs: [docker, deploy-asg]
-    if: github.event_name == 'push'
+    needs: [docker]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/staging'
     environment: staging
     steps:
       - name: Notify VALET (staging)
