@@ -1425,10 +1425,18 @@ Click only ONE button, then report the task as done.`,
         },
       });
       if (autoResult.success) {
-        return;
+        await this.waitForPageLoad(adapter);
+        await adapter.page.waitForTimeout(1000);
+        const stillBlockedAfterAuto = await this.isVerificationChallengeVisible(adapter);
+        if (!stillBlockedAfterAuto) {
+          return;
+        }
+        autoVerifyReason = 'verification_still_visible_after_auto';
+        console.log('[SmartApply] Auto verification submitted, but verification challenge is still visible. Falling back to inbox-context agent/manual path.');
+      } else {
+        autoVerifyReason = autoResult.reason || null;
+        console.log(`[SmartApply] Auto verification attempt failed: ${autoResult.reason || 'unknown reason'}`);
       }
-      autoVerifyReason = autoResult.reason || null;
-      console.log(`[SmartApply] Auto verification attempt failed: ${autoResult.reason || 'unknown reason'}`);
     } else {
       autoVerifyReason = 'missing_connection';
     }

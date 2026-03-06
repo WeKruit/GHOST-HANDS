@@ -89,4 +89,72 @@ describe('GmailApiProvider integration', () => {
     expect(signal?.link).toContain('https://example.com/verify');
     expect(store.markUsedCount).toBe(1);
   });
+
+  test('extracts numeric OTP and ignores keyword-only tokens like "code"', async () => {
+    const store = new FakeConnectionStore({
+      userId: 'u1',
+      provider: 'google',
+      emailAddress: 'user@example.com',
+      refreshToken: 'refresh-token',
+      accessToken: 'access-token',
+      accessTokenExpiresAt: new Date(Date.now() + 180_000).toISOString(),
+    });
+
+    const base64Body = Buffer
+      .from(
+        [
+          'Google sign-in verification code',
+          'Enter verification code on the page to continue.',
+          'Your verification code is: 123456',
+        ].join('\n'),
+        'utf8',
+      )
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/g, '');
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const target = String(url);
+      if (target.includes('/gmail/v1/users/me/messages?')) {
+        return Response.json({
+          messages: [{ id: 'msg-otp-1' }],
+        });
+      }
+      if (target.includes('/gmail/v1/users/me/messages/msg-otp-1')) {
+        return Response.json({
+          id: 'msg-otp-1',
+          snippet: 'Google sign-in verification code',
+          internalDate: String(Date.now()),
+          payload: {
+            headers: [
+              { name: 'Subject', value: 'Google sign-in verification code' },
+              { name: 'From', value: 'accounts@example.com' },
+            ],
+            mimeType: 'text/plain',
+            body: { data: base64Body },
+          },
+        });
+      }
+      throw new Error(`Unexpected URL: ${target}`);
+    }) as typeof fetch;
+
+    const provider = new GmailApiProvider({
+      userId: 'u1',
+      tokenStore: store as unknown as GmailConnectionStore,
+      oauthConfig: {
+        clientId: 'cid',
+        clientSecret: 'secret',
+      },
+    });
+
+    const signal = await provider.findLatestVerificationSignal({
+      loginEmail: 'user@example.com',
+      lookbackMinutes: 15,
+    });
+
+    expect(signal).not.toBeNull();
+    expect(signal?.kind).toBe('otp');
+    expect(signal?.code).toBe('123456');
+  });
 });
