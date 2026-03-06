@@ -26,8 +26,24 @@ export interface EmailSearchOptions {
   lookbackMinutes: number;
 }
 
+export interface RecentInboxOptions {
+  limit?: number;
+  lookbackMinutes?: number;
+}
+
+export interface RecentInboxMessage {
+  messageId: string;
+  threadId?: string;
+  subject?: string;
+  from?: string;
+  receivedAt?: string;
+  snippet?: string;
+  bodyText?: string;
+}
+
 export interface EmailProvider {
   findLatestVerificationSignal(options: EmailSearchOptions): Promise<VerificationSignal | null>;
+  listRecentInboxMessages?(options: RecentInboxOptions): Promise<RecentInboxMessage[]>;
   close?(): Promise<void>;
 }
 
@@ -43,5 +59,6 @@ export interface AutoVerifyOptions {
 
 export interface EmailVerificationService {
   tryAutoVerify(options: AutoVerifyOptions): Promise<VerificationResult>;
+  getRecentInboxMessages?(options?: RecentInboxOptions): Promise<RecentInboxMessage[]>;
   close?(): Promise<void>;
 }

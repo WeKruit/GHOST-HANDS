@@ -10,6 +10,7 @@ import { findBestAnswer } from './platforms/genericConfig.js';
 import { ProgressStep } from '../progressTracker.js';
 import { fillFormOnPage, buildProfileText } from './formFiller.js';
 import type { WorkdayUserProfile } from './workday/workdayTypes.js';
+import type { RecentInboxMessage } from '../emailVerification/types.js';
 
 // --- Constants ---
 
@@ -22,6 +23,10 @@ const MAGNITUDE_HAND_BUDGET_CAP = 0.50;       // Max $ to spend in MagnitudeHand
 const MAGNITUDE_HAND_MAX_FIELDS = 15;          // Max fields to attempt per pass
 const MAGNITUDE_HAND_ACT_TIMEOUT_MS = 30_000;  // Timeout per individual act() call
 const MAGNITUDE_HAND_MIN_REMAINING_BUDGET = 0.02; // Skip if less than this remains
+const VERIFICATION_EMAIL_CONTEXT_LIMIT = 5;
+const VERIFICATION_EMAIL_CONTEXT_BODY_MAX_CHARS = 4_000;
+const VERIFICATION_AGENT_MAX_ATTEMPTS = 2;
+const VERIFICATION_AGENT_RETRY_DELAY_MS = 1_500;
 
 // --- Handler ---
 
@@ -52,6 +57,12 @@ export class SmartApplyHandler implements TaskHandler {
   async execute(ctx: TaskContext): Promise<TaskResult> {
     const { job, adapter, progress, resumeFilePath: downloadedResumePath } = ctx;
     const userProfile = job.input_data.user_data as Record<string, any>;
+
+    // TaskHandlerRegistry stores singleton handler instances, so reset
+    // per-run state at the start of each execute() call.
+    this.lastLlmCallTime = 0;
+    this.loginAttempted = false;
+    this.applyClicked = false;
 
     // Normalize address: API route stores flat (city, state, country, zip)
     // but platform configs expect nested address object
@@ -576,7 +587,19 @@ export class SmartApplyHandler implements TaskHandler {
     // Quick DOM check for login (password field) and confirmation (thank you text)
     const obvious = await adapter.page.evaluate(() => {
       const bodyText = document.body.innerText.toLowerCase();
-      const passwordFields = document.querySelectorAll('input[type="password"]:not([disabled])');
+      const isVisible = (el: Element | null): el is HTMLElement => {
+        if (!el) return false;
+        const node = el as HTMLElement;
+        if (node.closest('[hidden], [aria-hidden="true"]')) return false;
+        const style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
+      const passwordFields = Array.from(
+        document.querySelectorAll<HTMLInputElement>('input[type="password"]:not([disabled])')
+      ).filter((input) => isVisible(input));
       const hasPasswordField = passwordFields.length > 0;
       // 2+ password fields (password + confirm) = account creation, not login
       const hasConfirmPassword = passwordFields.length > 1;
@@ -590,14 +613,14 @@ export class SmartApplyHandler implements TaskHandler {
         || bodyText.includes('successfully submitted')
         || bodyText.includes('application has been submitted');
       // Count form fields — pages with many inputs are application forms, not login
-      const formFieldCount = document.querySelectorAll(
+      const formFieldCount = Array.from(document.querySelectorAll(
         'input[type="text"]:not([readonly]):not([disabled]), ' +
         'input[type="email"]:not([readonly]):not([disabled]), ' +
         'input[type="tel"]:not([readonly]):not([disabled]), ' +
         'textarea:not([readonly]):not([disabled]), ' +
         'select:not([disabled]), ' +
         '[role="combobox"]:not([aria-disabled="true"])'
-      ).length;
+      )).filter((el) => isVisible(el)).length;
       return { hasPasswordField, hasConfirmPassword, isCreateAccountHeading, hasConfirmation, formFieldCount };
     });
 
@@ -1050,26 +1073,6 @@ Click only ONE button, then report the task as done.`,
     // Non-Google login path: Google SSO → platform sign-in → account creation
     console.log('[SmartApply] On login page, looking for sign-in options...');
     const password = process.env.TEST_GMAIL_PASSWORD || profile.password || '';
-
-    // Step 1: Prefer Google SSO when available.
-    const clickedGoogle = await this.clickPreferredGoogleSignIn(adapter);
-    if (clickedGoogle) {
-      console.log('[SmartApply] Clicked Google SSO option.');
-      await this.waitForPageLoad(adapter);
-      return;
-    }
-
-    // Step 2: No Google SSO — try opening the platform-specific sign-in path.
-    const signInViewClicked = await this.clickPlatformSpecificSignIn(
-      adapter,
-      await adapter.getCurrentUrl(),
-    );
-    if (signInViewClicked) {
-      console.log('[SmartApply] Opened platform-specific sign-in view.');
-      await adapter.page.waitForTimeout(1200);
-    }
-
-    console.log('[SmartApply] No Google SSO available — checking sign-in/create-account state...');
     const readFormState = () => adapter.page.evaluate(() => {
       const passwordFields = document.querySelectorAll('input[type="password"]:not([disabled])');
       const headings = Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]'));
@@ -1085,6 +1088,42 @@ Click only ONE button, then report the task as done.`,
       const hasPassword = passwordFields.length > 0;
       return { hasEmail, hasPassword, isCreateAccountForm };
     });
+
+    // Step 1: Prefer Google SSO when available.
+    let googleClickDidNotNavigate = false;
+    const clickedGoogle = await this.clickPreferredGoogleSignIn(adapter);
+    if (clickedGoogle) {
+      console.log('[SmartApply] Clicked Google SSO option.');
+      await this.waitForPageLoad(adapter);
+
+      const postGoogleUrl = await adapter.getCurrentUrl().catch(() => currentUrl);
+      const movedToExternalGoogle = postGoogleUrl.includes('accounts.google.com') || postGoogleUrl !== currentUrl;
+      if (movedToExternalGoogle) {
+        return;
+      }
+
+      const postGoogleFormState = await readFormState();
+      if (postGoogleFormState.hasEmail || postGoogleFormState.hasPassword) {
+        console.log('[SmartApply] Google SSO click stayed on local page with visible credential fields — treating as local sign-in form.');
+        googleClickDidNotNavigate = true;
+      } else {
+        return;
+      }
+    }
+
+    // Step 2: No Google SSO — try opening the platform-specific sign-in path.
+    if (!googleClickDidNotNavigate) {
+      const signInViewClicked = await this.clickPlatformSpecificSignIn(
+        adapter,
+        await adapter.getCurrentUrl(),
+      );
+      if (signInViewClicked) {
+        console.log('[SmartApply] Opened platform-specific sign-in view.');
+        await adapter.page.waitForTimeout(1200);
+      }
+    }
+
+    console.log('[SmartApply] Checking sign-in/create-account state...');
     let formState = await readFormState();
 
     // If we're still on Create Account, one more explicit attempt to switch to Sign In.
@@ -1165,6 +1204,32 @@ Click only ONE button, then report the task as done.`,
 
         autoVerifyReason = autoResult.reason || null;
         console.log(`[SmartApply] Email verification automation failed: ${autoResult.reason || 'unknown reason'}`);
+      } else if (!ctx?.emailVerification) {
+        autoVerifyReason = 'missing_connection';
+      }
+
+      const solvedByAgent = await this.trySolveVerificationWithInboxContextRetries(
+        adapter,
+        ctx,
+        email,
+        profile,
+        VERIFICATION_AGENT_MAX_ATTEMPTS,
+      );
+      if (solvedByAgent) {
+        console.log('[SmartApply] Email verification solved by MagnitudeHand with inbox context. Retrying sign-in once...');
+        (profile as any)._postVerificationLoginRetryAttempted = true;
+
+        const switchedToSignIn = await this.clickPlatformSpecificSignIn(
+          adapter,
+          await adapter.getCurrentUrl(),
+        );
+        if (switchedToSignIn) {
+          await adapter.page.waitForTimeout(1200);
+        }
+
+        await this.waitForPageLoad(adapter);
+        await this.handleGenericLogin(adapter, profile, dataPrompt, ctx);
+        return;
       }
 
       if (ctx?.waitForManualAction) {
@@ -1173,11 +1238,12 @@ Click only ONE button, then report the task as done.`,
           ? 'connect_gmail_required'
           : 'email_verification';
         const pauseDescription = autoVerifyReason === 'missing_connection'
-          ? 'No Gmail connection found for this user. Connect Gmail, complete verification/sign-in, then click Resume.'
+          ? `No Gmail connection found for this user. Target login email: ${email || '(unknown)'}. Connect Gmail, complete verification/sign-in, then click Resume.`
           : 'Please verify your email and sign in manually, then click Resume.';
         await this.emitAuthEvent(ctx, 'email_verification_fallback_human', {
           reason: alreadyRetriedAfterAutoVerification ? 'post_auto_retry_still_blocked' : 'auto_verification_unavailable_or_failed',
           auto_verification_reason: autoVerifyReason,
+          login_email_attempted: email || null,
         });
         const hitlResult = await ctx.waitForManualAction({
           type: pauseType,
@@ -1188,6 +1254,8 @@ Click only ONE button, then report the task as done.`,
             auto_verification_attempted: Boolean(ctx.emailVerification),
             post_auto_retry_attempted: alreadyRetriedAfterAutoVerification,
             auto_verification_reason: autoVerifyReason,
+            login_email_attempted: email || null,
+            verification_agent_attempts: Number((profile as any)._verificationAgentAttempts || 0),
           },
         });
         if (!hitlResult.resumed) {
@@ -1254,6 +1322,13 @@ Click only ONE button, then report the task as done.`,
 
       await adapter.page.waitForTimeout(2000);
       await this.waitForPageLoad(adapter);
+
+      const verificationVisibleAfterSubmit = await this.isVerificationChallengeVisible(adapter);
+      if (verificationVisibleAfterSubmit) {
+        console.log('[SmartApply] Sign-in advanced to verification challenge — switching to verification handling.');
+        await this.handleVerificationCode(adapter, profile, ctx);
+        return;
+      }
 
       // Check for login errors
       const loginError = await adapter.page.evaluate(() => {
@@ -1354,24 +1429,319 @@ Click only ONE button, then report the task as done.`,
       }
       autoVerifyReason = autoResult.reason || null;
       console.log(`[SmartApply] Auto verification attempt failed: ${autoResult.reason || 'unknown reason'}`);
+    } else {
+      autoVerifyReason = 'missing_connection';
+    }
+
+    const solvedByAgent = await this.trySolveVerificationWithInboxContextRetries(
+      adapter,
+      ctx,
+      loginEmail,
+      profile,
+      VERIFICATION_AGENT_MAX_ATTEMPTS,
+    );
+    if (solvedByAgent) {
+      return;
     }
 
     const resumed = await this.pauseForManualAuth(
       ctx,
       autoVerifyReason === 'missing_connection' ? 'connect_gmail_required' : 'verification_code_required',
       autoVerifyReason === 'missing_connection'
-        ? 'No Gmail connection found for this user. Connect Gmail, enter the verification code manually, then click Resume.'
+        ? `No Gmail connection found for this user. Target login email: ${loginEmail || '(unknown)'}. Connect Gmail, enter the verification code manually, then click Resume.`
         : 'Verification code required. Enter the received code manually, then click Resume.',
       600,
       {
         source: 'smart_apply',
         auto_verification_attempted: Boolean(ctx?.emailVerification),
         auto_verification_reason: autoVerifyReason,
+        login_email_attempted: loginEmail || null,
+        verification_agent_attempts: Number((profile as any)._verificationAgentAttempts || 0),
       },
     );
     if (!resumed) {
       throw new Error('Verification code required and no manual resolution was provided.');
     }
+  }
+
+  private async trySolveVerificationWithInboxContextRetries(
+    adapter: BrowserAutomationAdapter,
+    ctx: TaskContext | undefined,
+    loginEmail: string,
+    profile: Record<string, any>,
+    maxAttempts = VERIFICATION_AGENT_MAX_ATTEMPTS,
+  ): Promise<boolean> {
+    const attemptsUsed = Math.max(0, Number((profile as any)._verificationAgentAttempts || 0));
+    if (attemptsUsed >= maxAttempts) {
+      return false;
+    }
+
+    if (!ctx?.emailVerification?.getRecentInboxMessages) {
+      await this.emitAuthEvent(ctx, 'email_verification_agent_context_failed', {
+        reason: 'email_service_unavailable',
+      });
+      (profile as any)._verificationAgentAttempts = maxAttempts;
+      return false;
+    }
+
+    for (let attempt = attemptsUsed + 1; attempt <= maxAttempts; attempt++) {
+      (profile as any)._verificationAgentAttempts = attempt;
+      await this.emitAuthEvent(ctx, 'email_verification_agent_attempted', {
+        attempt,
+        max_attempts: maxAttempts,
+      });
+
+      const solved = await this.trySolveVerificationWithInboxContext(adapter, ctx, loginEmail);
+      if (solved) {
+        (profile as any)._verificationAgentAttempts = 0;
+        return true;
+      }
+
+      if (attempt < maxAttempts) {
+        await adapter.page.waitForTimeout(VERIFICATION_AGENT_RETRY_DELAY_MS);
+      }
+    }
+
+    return false;
+  }
+
+  private async trySolveVerificationWithInboxContext(
+    adapter: BrowserAutomationAdapter,
+    ctx: TaskContext | undefined,
+    loginEmail: string,
+  ): Promise<boolean> {
+    if (!ctx?.emailVerification?.getRecentInboxMessages) {
+      return false;
+    }
+
+    let recentEmails: RecentInboxMessage[] = [];
+    try {
+      recentEmails = await ctx.emailVerification.getRecentInboxMessages({
+        limit: VERIFICATION_EMAIL_CONTEXT_LIMIT,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[SmartApply] Failed to fetch recent inbox context: ${message}`);
+      await this.emitAuthEvent(ctx, 'email_verification_agent_context_failed', {
+        reason: 'email_context_fetch_failed',
+        error: message,
+      });
+      return false;
+    }
+
+    if (recentEmails.length === 0) {
+      await this.emitAuthEvent(ctx, 'email_verification_agent_context_failed', {
+        reason: 'no_recent_emails',
+      });
+      return false;
+    }
+
+    const deterministicLink = this.findVerificationLinkInEmails(recentEmails);
+    if (deterministicLink) {
+      console.log('[SmartApply] Verification page: opening verification link from recent inbox context...');
+      try {
+        await this.openVerificationLinkFromInbox(adapter, deterministicLink);
+        await this.waitForPageLoad(adapter);
+        await adapter.page.waitForTimeout(1000);
+
+        const stillBlockedAfterLink = await this.isVerificationChallengeVisible(adapter);
+        if (!stillBlockedAfterLink) {
+          await this.emitAuthEvent(ctx, 'email_verification_agent_context_succeeded', {
+            method: 'link',
+            email_count: recentEmails.length,
+          });
+          return true;
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(`[SmartApply] Opening verification link from inbox context failed: ${message}`);
+        await this.emitAuthEvent(ctx, 'email_verification_agent_context_failed', {
+          reason: 'link_open_failed',
+          error: message,
+        });
+      }
+    }
+
+    const prompt = this.buildVerificationContextPrompt(loginEmail, recentEmails);
+    await this.emitAuthEvent(ctx, 'email_verification_agent_context_loaded', {
+      email_count: recentEmails.length,
+      newest_received_at: recentEmails[0]?.receivedAt || null,
+    });
+
+    console.log(`[SmartApply] Verification page: invoking MagnitudeHand with ${recentEmails.length} recent email(s) as context...`);
+    try {
+      await this.throttleLlm(adapter);
+      const result = await adapter.act(prompt, { timeoutMs: 60_000 });
+      if (!result.success) {
+        console.warn(`[SmartApply] Inbox-context verification attempt failed: ${result.message}`);
+        await this.emitAuthEvent(ctx, 'email_verification_agent_context_failed', {
+          reason: 'agent_action_failed',
+          message: result.message,
+        });
+        return false;
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[SmartApply] Inbox-context verification attempt errored: ${message}`);
+      await this.emitAuthEvent(ctx, 'email_verification_agent_context_failed', {
+        reason: 'agent_action_error',
+        error: message,
+      });
+      return false;
+    }
+
+    await this.waitForPageLoad(adapter);
+    await adapter.page.waitForTimeout(1000);
+
+    const stillBlocked = await this.isVerificationChallengeVisible(adapter);
+    if (stillBlocked) {
+      await this.emitAuthEvent(ctx, 'email_verification_agent_context_failed', {
+        reason: 'verification_still_visible',
+      });
+      return false;
+    }
+
+    await this.emitAuthEvent(ctx, 'email_verification_agent_context_succeeded', {
+      email_count: recentEmails.length,
+    });
+    return true;
+  }
+
+  private buildVerificationContextPrompt(
+    loginEmail: string,
+    recentEmails: RecentInboxMessage[],
+  ): string {
+    const ordered = this.sortRecentEmailsByReceivedAt(recentEmails).slice(0, VERIFICATION_EMAIL_CONTEXT_LIMIT);
+    const context = ordered.map((email, index) => {
+      const bodyText = (email.bodyText || email.snippet || '').trim();
+      const clipped = bodyText.length > VERIFICATION_EMAIL_CONTEXT_BODY_MAX_CHARS
+        ? `${bodyText.slice(0, VERIFICATION_EMAIL_CONTEXT_BODY_MAX_CHARS)}\n[truncated]`
+        : bodyText || '(no body text)';
+
+      return [
+        `EMAIL ${index + 1} (newest=${index === 0 ? 'yes' : 'no'})`,
+        `received_at: ${email.receivedAt || 'unknown'}`,
+        `from: ${email.from || 'unknown'}`,
+        `subject: ${email.subject || '(no subject)'}`,
+        `message_id: ${email.messageId || 'unknown'}`,
+        'body:',
+        clipped,
+      ].join('\n');
+    }).join('\n\n');
+
+    return [
+      'You are on an account/email verification step.',
+      'Goal: complete verification and continue the flow.',
+      'Use ONLY the inbox context below (newest email first).',
+      'If a recent email contains a verification code, enter the most likely code.',
+      'If a recent email contains a verification link, click/open that link.',
+      'If multiple candidates exist, prefer the most recent matching verification email.',
+      'After completing the best verification action, click Verify/Continue/Next once.',
+      'Do not edit account credentials. Do not perform unrelated navigation.',
+      `Target site login email: ${loginEmail || '(unknown)'}`,
+      '',
+      'RECENT INBOX CONTEXT (ordered by received time, newest first):',
+      context,
+      '',
+      'Stop when verification is completed or no reliable action can be taken.',
+    ].join('\n');
+  }
+
+  private sortRecentEmailsByReceivedAt(emails: RecentInboxMessage[]): RecentInboxMessage[] {
+    return [...emails]
+      .map((email, index) => ({ email, index }))
+      .sort((a, b) => {
+        const aTime = Date.parse(a.email.receivedAt || '');
+        const bTime = Date.parse(b.email.receivedAt || '');
+        const aValid = Number.isFinite(aTime);
+        const bValid = Number.isFinite(bTime);
+        if (aValid && bValid) return bTime - aTime;
+        if (aValid) return -1;
+        if (bValid) return 1;
+        return a.index - b.index;
+      })
+      .map((entry) => entry.email);
+  }
+
+  private findVerificationLinkInEmails(emails: RecentInboxMessage[]): string | null {
+    const ordered = this.sortRecentEmailsByReceivedAt(emails);
+    const preferredPattern = /verify|verification|confirm|activate|magic|token|signin|sign-in|account/i;
+
+    let fallback: string | null = null;
+    for (const email of ordered) {
+      const text = `${email.bodyText || ''}\n${email.snippet || ''}`;
+      const matches = text.match(/https?:\/\/[^\s<>")]+/gi) || [];
+      if (matches.length === 0) continue;
+
+      const preferred = matches.find((url) => preferredPattern.test(url));
+      if (preferred) return preferred;
+      if (!fallback) fallback = matches[0] || null;
+    }
+
+    return fallback;
+  }
+
+  private async openVerificationLinkFromInbox(
+    adapter: BrowserAutomationAdapter,
+    link: string,
+  ): Promise<void> {
+    const originalPage = adapter.page;
+    const verificationPage = await originalPage.context().newPage();
+    try {
+      await verificationPage.goto(link, { waitUntil: 'domcontentloaded' });
+      await verificationPage.waitForTimeout(3000);
+      await verificationPage.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+    } finally {
+      try {
+        await verificationPage.close();
+      } catch {
+        // Ignore close errors.
+      }
+      await originalPage.bringToFront().catch(() => {});
+    }
+
+    await originalPage.waitForTimeout(500);
+  }
+
+  private async isVerificationChallengeVisible(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    return adapter.page.evaluate(() => {
+      const isVisible = (el: Element | null): el is HTMLElement => {
+        if (!el) return false;
+        const node = el as HTMLElement;
+        if (node.closest('[hidden], [aria-hidden="true"]')) return false;
+        const style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
+      const text = document.body.innerText.toLowerCase();
+      const keywordMatch =
+        text.includes('enter verification code') ||
+        text.includes('enter the code') ||
+        text.includes('enter code') ||
+        text.includes('security code') ||
+        text.includes('one-time') ||
+        text.includes('otp') ||
+        text.includes('verify your email') ||
+        text.includes('check your email');
+
+      const hasVisiblePasswordInput = Array.from(document.querySelectorAll<HTMLInputElement>(
+        'input[type="password"]:not([disabled])',
+      )).some((input) => isVisible(input));
+
+      const hasLikelyCodeInput = Array.from(document.querySelectorAll<HTMLInputElement>(
+        'input[autocomplete="one-time-code"], ' +
+        'input[name*="code" i], input[id*="code" i], input[name*="otp" i], input[id*="otp" i], ' +
+        'input[name*="verification" i], input[id*="verification" i]',
+      )).some((input) => isVisible(input) && !input.disabled);
+
+      // Prefer concrete UI signals. Generic instructional text alone is not enough.
+      if (hasLikelyCodeInput) return true;
+      if (hasVisiblePasswordInput) return false;
+
+      return keywordMatch;
+    });
   }
 
   private async handlePhone2FA(adapter: BrowserAutomationAdapter): Promise<void> {

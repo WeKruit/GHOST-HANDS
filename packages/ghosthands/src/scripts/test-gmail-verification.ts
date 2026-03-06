@@ -6,6 +6,7 @@
  * 1) Checks Google OAuth connection status for the user.
  * 2) If disconnected, prints OAuth consent URL and polls until connected.
  * 3) Queries Gmail for the latest verification signal (link or OTP).
+ * 4) Prints the full decoded text of the matched message.
  *
  * Usage:
  *   bun src/scripts/test-gmail-verification.ts --user-id=<uuid>
@@ -105,7 +106,11 @@ async function main(): Promise<void> {
   if (signal.from) log(`From: ${signal.from}`);
   if (signal.receivedAt) log(`Received: ${signal.receivedAt}`);
   if (signal.link) log(`Link: ${redactSensitiveUrl(signal.link)}`);
-  if (signal.code) log(`Code: ${signal.code}`);
+  if (signal.rawText) {
+    console.log('----- MOST RECENT EMAIL (DECODED TEXT) START -----');
+    console.log(signal.rawText);
+    console.log('----- MOST RECENT EMAIL (DECODED TEXT) END -----');
+  }
 }
 
 async function ensureConnection(args: CliArgs, serviceSecret: string): Promise<GoogleAuthStatusResponse> {

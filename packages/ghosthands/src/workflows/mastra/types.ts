@@ -44,6 +44,13 @@ export const workflowState = z.object({
     blockerType: z.string().nullable().default(null),
     resumeNonce: z.string().nullable().default(null),
     checkpoint: z.string().nullable().default(null),
+    attemptsByType: z.record(z.number().int().nonnegative()).optional(),
+    lastDecision: z.enum([
+      'IMMEDIATE_HITL',
+      'AUTO_RECOVER',
+      'RETRY_NO_HITL',
+      'NO_ACTION',
+    ]).nullable().optional(),
   }),
 
   metrics: z.object({

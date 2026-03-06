@@ -293,12 +293,18 @@ describe('check_blockers_checkpoint', () => {
         const suspend = vi.fn().mockResolvedValue(undefined);
         const params = makeExecuteParams({ suspend });
 
-        await checkBlockers.execute(params);
+        const result = await checkBlockers.execute(params);
 
-        // The suspend call should include the mapped blocker type matching the input category
-        expect(suspend).toHaveBeenCalledWith(
-          expect.objectContaining({ blockerType: category }),
-        );
+        if (category === 'rate_limited') {
+          // Rate limits should retry without immediate HITL pause.
+          expect(suspend).not.toHaveBeenCalled();
+          expect(result).toEqual(params.inputData);
+        } else {
+          // The suspend call should include the mapped blocker type matching the input category
+          expect(suspend).toHaveBeenCalledWith(
+            expect.objectContaining({ blockerType: category }),
+          );
+        }
       });
     }
 
@@ -472,6 +478,95 @@ describe('check_blockers_checkpoint', () => {
           jobId: '550e8400-e29b-41d4-a716-446655440000',
           blockerType: '2fa',
           confidence: 0.95,
+        }),
+      );
+    });
+  });
+
+  describe('recovery-first auth behavior', () => {
+    test('auth-capable handlers auto-recover login blocker before HITL', async () => {
+      const rt = createMockRuntimeContext({
+        handler: {
+          ...createMockHandler(),
+          type: 'smart_apply',
+        } as any,
+      });
+      const { checkBlockers } = buildSteps(rt);
+
+      mockDetectWithAdapter.mockResolvedValue({
+        type: 'login',
+        confidence: 0.9,
+        details: 'Login wall',
+        source: 'dom',
+      });
+
+      const suspend = vi.fn().mockResolvedValue(undefined);
+      const params = makeExecuteParams({ suspend });
+      const result = await checkBlockers.execute(params);
+
+      expect(suspend).not.toHaveBeenCalled();
+      expect(result.hitl.lastDecision).toBe('AUTO_RECOVER');
+      expect(result.hitl.attemptsByType).toEqual({ login: 1 });
+      expect(rt.logEvent).toHaveBeenCalledWith(
+        'blocker_recovery_started',
+        expect.objectContaining({
+          blockerType: 'login',
+        }),
+      );
+      expect(rt.logEvent).toHaveBeenCalledWith(
+        'blocker_recovery_attempted',
+        expect.objectContaining({
+          blockerType: 'login',
+          attempt: 1,
+        }),
+      );
+    });
+
+    test('auth-capable handlers suspend only after auth recovery attempts are exhausted', async () => {
+      const rt = createMockRuntimeContext({
+        handler: {
+          ...createMockHandler(),
+          type: 'smart_apply',
+        } as any,
+      });
+      const { checkBlockers } = buildSteps(rt);
+
+      mockDetectWithAdapter.mockResolvedValue({
+        type: 'login',
+        confidence: 0.9,
+        details: 'Login wall',
+        source: 'dom',
+      });
+
+      const suspendSentinel = Symbol('suspend-sentinel');
+      const suspend = vi.fn().mockResolvedValue(suspendSentinel);
+      const params = makeExecuteParams({
+        suspend,
+        inputData: makeBaseState({
+          hitl: {
+            blocked: false,
+            blockerType: null,
+            resumeNonce: null,
+            checkpoint: null,
+            attemptsByType: { login: 2 },
+            lastDecision: 'AUTO_RECOVER',
+          },
+        }),
+      });
+      const result = await checkBlockers.execute(params);
+
+      expect(suspend).toHaveBeenCalledTimes(1);
+      expect(result).toBe(suspendSentinel);
+      expect(rt.logEvent).toHaveBeenCalledWith(
+        'blocker_recovery_exhausted',
+        expect.objectContaining({
+          blockerType: 'login',
+        }),
+      );
+      expect(rt.logEvent).toHaveBeenCalledWith(
+        'blocker_detected',
+        expect.objectContaining({
+          blockerType: 'login',
         }),
       );
     });

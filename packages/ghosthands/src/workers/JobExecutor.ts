@@ -33,6 +33,16 @@ import { workflowState, type RuntimeContext, type WorkflowState } from '../workf
 import { finalizeCookbookSuccess, finalizeHandlerResult, finalizeHandlerSideEffects } from './finalization.js';
 import { createEmailVerificationServiceFromEnv } from './emailVerification/service.js';
 import type { EmailVerificationService } from './emailVerification/types.js';
+import {
+  createEmptyHitlAttempts,
+  decideHitlAction,
+  getHitlAttemptsForType,
+  hasAnyHitlAttempts,
+  incrementHitlAttempt,
+  isRecoverableAuthBlocker,
+  type HitlDecisionAction,
+  type HitlAttemptsByType,
+} from './hitl/decisionEngine.js';
 
 const logger = getLogger({ service: 'job-executor' });
 
@@ -91,7 +101,6 @@ const HEARTBEAT_INTERVAL_MS = 10_000;
 const MAX_HEARTBEAT_FAILURES = 3;
 const DEFAULT_HITL_TIMEOUT_SECONDS = 300; // 5 minutes
 const MAX_CRASH_RECOVERIES = 2;
-const BLOCKER_CONFIDENCE_THRESHOLD = 0.6;
 const MAX_POST_RESUME_CHECKS = 3;
 const BLOCKER_CHECK_INTERVAL_MS = 15_000; // Minimum interval between action-triggered blocker checks
 const PERIODIC_BLOCKER_CHECK_MS = 30_000; // Periodic timer-based blocker check interval
@@ -111,6 +120,17 @@ export function classifyError(message: string): string {
     if (pattern.test(message)) return code;
   }
   return 'internal_error';
+}
+
+function isEmailAutomationDisabled(raw: string | undefined = process.env.GH_EMAIL_AUTOMATION_ENABLED): boolean {
+  const normalized = (raw || '').trim().toLowerCase();
+  if (!normalized) return false;
+  return ['0', 'false', 'off', 'no', 'disabled'].includes(normalized);
+}
+
+interface HitlRecoveryState {
+  attemptsByType: HitlAttemptsByType;
+  lastDecision: HitlDecisionAction | null;
 }
 
 // --- Platform detection ---
@@ -175,6 +195,101 @@ export class JobExecutor {
     this.redis = opts.redis ?? null;
     this.hitlTimeoutSeconds = opts.hitlTimeoutSeconds ?? DEFAULT_HITL_TIMEOUT_SECONDS;
     this.resumeDownloader = new ResumeDownloader(opts.supabase);
+  }
+
+  private canAutoRecoverAuth(job: AutomationJob): boolean {
+    const executionMode = (job.execution_mode || '').toLowerCase();
+    const jobType = (job.job_type || '').toLowerCase();
+    if (executionMode === 'smart_apply' || executionMode === 'agent_apply') {
+      return true;
+    }
+    return jobType === 'smart_apply' || jobType === 'workday_apply' || jobType === 'agent_apply';
+  }
+
+  private getHitlRecoveryState(job: AutomationJob): HitlRecoveryState {
+    const metadata = (job.metadata || {}) as Record<string, any>;
+    const raw = metadata.hitl_recovery;
+    const attemptsByType = raw?.attemptsByType && typeof raw.attemptsByType === 'object'
+      ? (raw.attemptsByType as HitlAttemptsByType)
+      : createEmptyHitlAttempts();
+    const lastDecision = typeof raw?.lastDecision === 'string'
+      ? raw.lastDecision as HitlDecisionAction
+      : null;
+    return {
+      attemptsByType,
+      lastDecision,
+    };
+  }
+
+  private async persistHitlRecoveryState(job: AutomationJob, state: HitlRecoveryState): Promise<void> {
+    const metadata = {
+      ...(job.metadata || {}),
+      hitl_recovery: {
+        attemptsByType: state.attemptsByType,
+        lastDecision: state.lastDecision,
+        updatedAt: new Date().toISOString(),
+      },
+    };
+    job.metadata = metadata;
+    try {
+      await this.supabase
+        .from('gh_automation_jobs')
+        .update({ metadata, updated_at: new Date().toISOString() })
+        .eq('id', job.id);
+    } catch (err) {
+      getLogger().warn('Failed to persist HITL recovery state', {
+        jobId: job.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private async clearHitlRecoveryState(job: AutomationJob): Promise<void> {
+    const current = this.getHitlRecoveryState(job);
+    if (!hasAnyHitlAttempts(current.attemptsByType) && !current.lastDecision) {
+      return;
+    }
+    await this.persistHitlRecoveryState(job, {
+      attemptsByType: createEmptyHitlAttempts(),
+      lastDecision: 'NO_ACTION',
+    });
+  }
+
+  private async hasVisibleVerificationInput(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    const selectors = [
+      'input[autocomplete="one-time-code"]',
+      'input[name*="code" i]',
+      'input[name*="otp" i]',
+      'input[name*="totp" i]',
+      'input[name*="verification" i]',
+      'input[name*="token" i]',
+      'input[name*="2fa" i]',
+      'input[name*="mfa" i]',
+      'input[type="tel"][maxlength="6"]',
+      'input[type="number"][maxlength="6"]',
+      'input[inputmode="numeric"]',
+    ];
+
+    for (const selector of selectors) {
+      try {
+        const el = await adapter.page.$(selector);
+        if (el && await el.isVisible()) {
+          return true;
+        }
+      } catch {
+        // ignore invalid selectors and detached DOM nodes
+      }
+    }
+
+    return false;
+  }
+
+  private mapErrorCodeToBlockerType(errorCode: string): BlockerType | null {
+    if (errorCode === 'captcha_blocked') return 'captcha';
+    if (errorCode === 'login_required') return 'login';
+    if (errorCode === '2fa_required') return '2fa';
+    if (errorCode === 'rate_limited') return 'rate_limited';
+    return null;
   }
 
   async execute(job: AutomationJob): Promise<void> {
@@ -391,8 +506,9 @@ export class JobExecutor {
       // 5. Build data prompt from input_data
       const dataPrompt = buildDataPrompt(job.input_data);
 
-      // 5a. Optional per-user Gmail verification automation (Mastra + SmartApply scope)
-      if (handler.type === 'smart_apply' && process.env.GH_EMAIL_AUTOMATION_ENABLED === 'true') {
+      // 5a. Per-user Gmail verification automation (SmartApply scope).
+      // Enabled by default; disable only via explicit false-like values.
+      if (handler.type === 'smart_apply' && !isEmailAutomationDisabled()) {
         try {
           emailVerification = createEmailVerificationServiceFromEnv({
             supabase: this.supabase,
@@ -1187,21 +1303,111 @@ export class JobExecutor {
           // Use checkForBlockers for proper detect → pause → verify flow
           const stillBlocked = await this.checkForBlockers(job, adapter, costTracker);
           if (!stillBlocked) {
-            // Blocker resolved (or detection didn't find one after error classification).
-            // Try direct HITL as fallback since the error was classified as captcha/login.
-            const resumed = await this.requestHumanIntervention(job, adapter, {
-              type: errorCode === 'captcha_blocked' ? 'captcha' : errorCode === '2fa_required' ? '2fa' : 'login',
-              confidence: 0.9,
-              details: errorMessage,
-              source: 'dom',
-            }, costTracker);
-            if (resumed) {
-              const hitlSnapshot = costTracker.getSnapshot();
-              await costService.recordJobCost(job.user_id, job.id, hitlSnapshot).catch((err) => {
-                getLogger().warn('Failed to record HITL partial cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+            const inferredBlockerType = this.mapErrorCodeToBlockerType(errorCode);
+            if (inferredBlockerType) {
+              const recoveryState = this.getHitlRecoveryState(job);
+              const allowAutoRecoverAuth = this.canAutoRecoverAuth(job);
+              const hasCodeEntryPath = inferredBlockerType === '2fa'
+                ? await this.hasVisibleVerificationInput(adapter)
+                : undefined;
+              const decision = decideHitlAction({
+                blockerType: inferredBlockerType,
+                confidence: 0.9,
+                attemptsByType: recoveryState.attemptsByType,
+                hasCodeEntryPath,
+                allowAutoRecoverAuth,
               });
-              getLogger().info('Job resumed after HITL intervention', { jobId: job.id });
-              return;
+
+              if (decision.action === 'AUTO_RECOVER' && isRecoverableAuthBlocker(inferredBlockerType)) {
+                const attemptsBefore = getHitlAttemptsForType(recoveryState.attemptsByType, inferredBlockerType);
+                const alreadyRecordedThisCycle =
+                  recoveryState.lastDecision === 'AUTO_RECOVER' && attemptsBefore > 0;
+                let effectiveAttempt = attemptsBefore;
+
+                if (!alreadyRecordedThisCycle && attemptsBefore === 0) {
+                  await this.logJobEvent(job.id, JOB_EVENT_TYPES.BLOCKER_RECOVERY_STARTED, {
+                    blocker_type: inferredBlockerType,
+                    source: 'error_fallback',
+                  });
+                }
+
+                if (!alreadyRecordedThisCycle) {
+                  const attemptsAfter = incrementHitlAttempt(
+                    recoveryState.attemptsByType,
+                    inferredBlockerType,
+                  );
+                  effectiveAttempt = attemptsAfter[inferredBlockerType] || 1;
+                  await this.logJobEvent(job.id, JOB_EVENT_TYPES.BLOCKER_RECOVERY_ATTEMPTED, {
+                    blocker_type: inferredBlockerType,
+                    attempt: effectiveAttempt,
+                    attempts_remaining: decision.attemptsRemaining ?? 0,
+                    source: 'error_fallback',
+                    reason: errorMessage,
+                  });
+                  await this.persistHitlRecoveryState(job, {
+                    attemptsByType: attemptsAfter,
+                    lastDecision: decision.action,
+                  });
+                }
+
+                const backoffSeconds = Math.min(20, 5 * Math.max(1, effectiveAttempt));
+                const scheduledAt = new Date(Date.now() + backoffSeconds * 1000).toISOString();
+                await this.supabase
+                  .from('gh_automation_jobs')
+                  .update({
+                    status: 'pending',
+                    worker_id: null,
+                    scheduled_at: scheduledAt,
+                    error_code: errorCode,
+                    error_details: {
+                      message: errorMessage,
+                      auth_recovery: true,
+                      blocker_type: inferredBlockerType,
+                      attempt: effectiveAttempt,
+                      backoff_seconds: backoffSeconds,
+                    },
+                  })
+                  .eq('id', job.id);
+
+                const hitlSnapshot = costTracker.getSnapshot();
+                await costService.recordJobCost(job.user_id, job.id, hitlSnapshot).catch((err) => {
+                  getLogger().warn('Failed to record auth-recovery partial cost', {
+                    jobId: job.id,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                });
+                getLogger().info('Re-queued job for auth auto-recovery', {
+                  jobId: job.id,
+                  blockerType: inferredBlockerType,
+                  scheduledAt,
+                });
+                return;
+              }
+
+              if (decision.reason === 'auth_recovery_exhausted') {
+                await this.logJobEvent(job.id, JOB_EVENT_TYPES.BLOCKER_RECOVERY_EXHAUSTED, {
+                  blocker_type: inferredBlockerType,
+                  source: 'error_fallback',
+                  attempts_by_type: recoveryState.attemptsByType,
+                });
+              }
+
+              if (decision.action === 'IMMEDIATE_HITL') {
+                const resumed = await this.requestHumanIntervention(job, adapter, {
+                  type: inferredBlockerType,
+                  confidence: 0.9,
+                  details: errorMessage,
+                  source: 'dom',
+                }, costTracker);
+                if (resumed) {
+                  const hitlSnapshot = costTracker.getSnapshot();
+                  await costService.recordJobCost(job.user_id, job.id, hitlSnapshot).catch((err) => {
+                    getLogger().warn('Failed to record HITL partial cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+                  });
+                  getLogger().info('Job resumed after HITL intervention', { jobId: job.id });
+                  return;
+                }
+              }
             }
           } else {
             // checkForBlockers handled the HITL flow but the blocker couldn't be resolved
@@ -1954,13 +2160,90 @@ export class JobExecutor {
       getLogger().warn('Blocker detection failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       return false;
     }
+    const recoveryState = this.getHitlRecoveryState(job);
 
-    if (!blockerResult || blockerResult.confidence < BLOCKER_CONFIDENCE_THRESHOLD) {
+    if (!blockerResult) {
+      if (hasAnyHitlAttempts(recoveryState.attemptsByType) && recoveryState.lastDecision === 'AUTO_RECOVER') {
+        await this.logJobEvent(job.id, JOB_EVENT_TYPES.BLOCKER_RECOVERY_SUCCEEDED, {
+          attempts_by_type: recoveryState.attemptsByType,
+        });
+        await this.clearHitlRecoveryState(job);
+      }
+
       await this.logJobEvent(job.id, JOB_EVENT_TYPES.OBSERVATION_COMPLETED, {
         result: 'clear',
         url: currentUrl,
       });
       return false;
+    }
+
+    const allowAutoRecoverAuth = this.canAutoRecoverAuth(job);
+    const hasCodeEntryPath = blockerResult.type === '2fa'
+      ? await this.hasVisibleVerificationInput(adapter)
+      : undefined;
+    const decision = decideHitlAction({
+      blockerType: blockerResult.type,
+      confidence: blockerResult.confidence,
+      source: blockerResult.source,
+      selector: blockerResult.selector,
+      attemptsByType: recoveryState.attemptsByType,
+      hasCodeEntryPath,
+      allowAutoRecoverAuth,
+    });
+
+    await this.logJobEvent(job.id, JOB_EVENT_TYPES.OBSERVATION_COMPLETED, {
+      result: 'blocker',
+      blocker_type: blockerResult.type,
+      confidence: blockerResult.confidence,
+      decision: decision.action,
+      url: currentUrl,
+    });
+
+    if (decision.action === 'NO_ACTION' || decision.action === 'RETRY_NO_HITL') {
+      if (decision.action === 'RETRY_NO_HITL') {
+        await this.logJobEvent(job.id, JOB_EVENT_TYPES.BLOCKER_RECOVERY_ATTEMPTED, {
+          blocker_type: blockerResult.type,
+          decision: decision.action,
+          reason: decision.reason,
+        });
+      }
+      if (recoveryState.lastDecision !== decision.action) {
+        await this.persistHitlRecoveryState(job, {
+          attemptsByType: recoveryState.attemptsByType,
+          lastDecision: decision.action,
+        });
+      }
+      return false;
+    }
+
+    if (decision.action === 'AUTO_RECOVER' && isRecoverableAuthBlocker(blockerResult.type)) {
+      const attemptsBefore = getHitlAttemptsForType(recoveryState.attemptsByType, blockerResult.type);
+      const attemptsAfter = incrementHitlAttempt(recoveryState.attemptsByType, blockerResult.type);
+      if (attemptsBefore === 0) {
+        await this.logJobEvent(job.id, JOB_EVENT_TYPES.BLOCKER_RECOVERY_STARTED, {
+          blocker_type: blockerResult.type,
+        });
+      }
+      await this.logJobEvent(job.id, JOB_EVENT_TYPES.BLOCKER_RECOVERY_ATTEMPTED, {
+        blocker_type: blockerResult.type,
+        confidence: blockerResult.confidence,
+        attempt: attemptsAfter[blockerResult.type],
+        attempts_remaining: decision.attemptsRemaining ?? 0,
+        reason: decision.reason,
+      });
+      await this.persistHitlRecoveryState(job, {
+        attemptsByType: attemptsAfter,
+        lastDecision: decision.action,
+      });
+      return false;
+    }
+
+    if (decision.reason === 'auth_recovery_exhausted') {
+      await this.logJobEvent(job.id, JOB_EVENT_TYPES.BLOCKER_RECOVERY_EXHAUSTED, {
+        blocker_type: blockerResult.type,
+        confidence: blockerResult.confidence,
+        attempts_by_type: recoveryState.attemptsByType,
+      });
     }
 
     // Blocker detected — emit event and trigger HITL
@@ -1970,6 +2253,11 @@ export class JobExecutor {
       source: blockerResult.source,
       selector: blockerResult.selector,
       details: blockerResult.details,
+    });
+
+    await this.persistHitlRecoveryState(job, {
+      attemptsByType: recoveryState.attemptsByType,
+      lastDecision: decision.action,
     });
 
     const resumed = await this.requestHumanIntervention(job, adapter, blockerResult, costTracker);
@@ -1985,8 +2273,26 @@ export class JobExecutor {
           break;
         }
 
-        if (!stillBlocked || stillBlocked.confidence < BLOCKER_CONFIDENCE_THRESHOLD) {
-          // Clear — continue execution
+        if (!stillBlocked) {
+          await this.clearHitlRecoveryState(job);
+          return false;
+        }
+
+        const postResumeHasCodeEntryPath = stillBlocked.type === '2fa'
+          ? await this.hasVisibleVerificationInput(adapter)
+          : undefined;
+        const postResumeDecision = decideHitlAction({
+          blockerType: stillBlocked.type,
+          confidence: stillBlocked.confidence,
+          source: stillBlocked.source,
+          selector: stillBlocked.selector,
+          attemptsByType: this.getHitlRecoveryState(job).attemptsByType,
+          hasCodeEntryPath: postResumeHasCodeEntryPath,
+          allowAutoRecoverAuth,
+        });
+
+        if (postResumeDecision.action !== 'IMMEDIATE_HITL') {
+          await this.clearHitlRecoveryState(job);
           return false;
         }
 

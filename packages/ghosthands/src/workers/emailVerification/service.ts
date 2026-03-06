@@ -4,7 +4,14 @@ import { MissingEmailConnectionError, TokenRefreshFailedError } from './errors.j
 import { GmailApiProvider } from './gmailApiProvider.js';
 import { getGoogleOAuthConfigFromEnv } from './googleOAuth.js';
 import { createEmailTokenEncryptionFromEnv, GmailConnectionStore } from './tokenStore.js';
-import type { AutoVerifyOptions, EmailProvider, EmailVerificationService, VerificationResult } from './types.js';
+import type {
+  AutoVerifyOptions,
+  EmailProvider,
+  EmailVerificationService,
+  RecentInboxMessage,
+  RecentInboxOptions,
+  VerificationResult,
+} from './types.js';
 
 export interface GmailEmailVerificationServiceOptions {
   provider: EmailProvider;
@@ -126,6 +133,16 @@ export class GmailEmailVerificationService implements EmailVerificationService {
     };
   }
 
+  async getRecentInboxMessages(options: RecentInboxOptions = {}): Promise<RecentInboxMessage[]> {
+    if (!this.provider.listRecentInboxMessages) {
+      return [];
+    }
+    return this.provider.listRecentInboxMessages({
+      limit: options.limit,
+      lookbackMinutes: options.lookbackMinutes,
+    });
+  }
+
   async close(): Promise<void> {
     await this.provider.close?.();
   }
@@ -220,7 +237,7 @@ export function createEmailVerificationServiceFromEnv(options: {
   supabase: SupabaseClient;
   userId: string;
 }): EmailVerificationService | null {
-  if (process.env.GH_EMAIL_AUTOMATION_ENABLED !== 'true') {
+  if (!isEmailAutomationEnabled()) {
     return null;
   }
 
@@ -254,6 +271,12 @@ export function createEmailVerificationServiceFromEnv(options: {
     pollSeconds,
     lookbackMinutes,
   });
+}
+
+function isEmailAutomationEnabled(): boolean {
+  const raw = (process.env.GH_EMAIL_AUTOMATION_ENABLED || '').trim().toLowerCase();
+  if (!raw) return true;
+  return !(['0', 'false', 'off', 'no', 'disabled'].includes(raw));
 }
 
 function parseNumberEnv(raw: string | undefined, fallback: number): number {
