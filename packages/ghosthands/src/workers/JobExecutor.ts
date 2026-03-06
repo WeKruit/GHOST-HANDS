@@ -51,6 +51,7 @@ import {
 import { LivePageContextService, type PageContextService } from '../context/PageContextService.js';
 import { RedisPageContextStore } from '../context/RedisPageContextStore.js';
 import { SupabasePageContextFlusher } from '../context/SupabasePageContextFlusher.js';
+import { VERIFICATION_INPUT_SELECTORS } from './verificationSelectors.js';
 
 const logger = getLogger({ service: 'job-executor' });
 
@@ -277,21 +278,7 @@ export class JobExecutor {
   }
 
   private async hasVisibleVerificationInput(adapter: BrowserAutomationAdapter): Promise<boolean> {
-    const selectors = [
-      'input[autocomplete="one-time-code"]',
-      'input[name*="code" i]',
-      'input[name*="otp" i]',
-      'input[name*="totp" i]',
-      'input[name*="verification" i]',
-      'input[name*="token" i]',
-      'input[name*="2fa" i]',
-      'input[name*="mfa" i]',
-      'input[type="tel"][maxlength="6"]',
-      'input[type="number"][maxlength="6"]',
-      'input[inputmode="numeric"]',
-    ];
-
-    for (const selector of selectors) {
+    for (const selector of VERIFICATION_INPUT_SELECTORS) {
       try {
         const el = await adapter.page.$(selector);
         if (el && await el.isVisible()) {
@@ -3023,21 +3010,7 @@ export class JobExecutor {
       injection_type: 'code_entry',
     });
 
-    const selectors = [
-      'input[autocomplete="one-time-code"]',
-      'input[name*="code" i]',
-      'input[name*="otp" i]',
-      'input[name*="totp" i]',
-      'input[name*="verification" i]',
-      'input[name*="token" i]',
-      'input[name*="2fa" i]',
-      'input[name*="mfa" i]',
-      'input[type="tel"][maxlength="6"]',
-      'input[type="number"][maxlength="6"]',
-      'input[inputmode="numeric"]',
-    ];
-
-    for (const selector of selectors) {
+    for (const selector of VERIFICATION_INPUT_SELECTORS) {
       try {
         const el = await page.$(selector);
         if (el && await el.isVisible()) {

@@ -12,6 +12,7 @@ import { ProgressStep } from '../progressTracker.js';
 import { fillFormOnPage, buildProfileText } from './formFiller.js';
 import type { WorkdayUserProfile } from './workday/workdayTypes.js';
 import type { RecentInboxMessage } from '../emailVerification/types.js';
+import { VERIFICATION_INPUT_SELECTOR_QUERY } from '../verificationSelectors.js';
 
 // --- Constants ---
 
@@ -1741,7 +1742,7 @@ Click only ONE button, then report the task as done.`,
   }
 
   private async isVerificationChallengeVisible(adapter: BrowserAutomationAdapter): Promise<boolean> {
-    return adapter.page.evaluate(() => {
+    return adapter.page.evaluate((verificationSelectorQuery: string) => {
       const isVisible = (el: Element | null): el is HTMLElement => {
         if (!el) return false;
         const node = el as HTMLElement;
@@ -1768,9 +1769,7 @@ Click only ONE button, then report the task as done.`,
       )).some((input) => isVisible(input));
 
       const hasLikelyCodeInput = Array.from(document.querySelectorAll<HTMLInputElement>(
-        'input[autocomplete="one-time-code"], ' +
-        'input[name*="code" i], input[id*="code" i], input[name*="otp" i], input[id*="otp" i], ' +
-        'input[name*="verification" i], input[id*="verification" i]',
+        verificationSelectorQuery,
       )).some((input) => isVisible(input) && !input.disabled);
 
       // Prefer concrete UI signals. Generic instructional text alone is not enough.
@@ -1778,7 +1777,7 @@ Click only ONE button, then report the task as done.`,
       if (hasVisiblePasswordInput) return false;
 
       return keywordMatch;
-    });
+    }, VERIFICATION_INPUT_SELECTOR_QUERY);
   }
 
   private async handlePhone2FA(adapter: BrowserAutomationAdapter): Promise<void> {

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { BrowserAutomationAdapter } from '../../../adapters/types.js';
 import type { PlatformConfig, PageState, PageType, ScannedField, ScanResult } from './types.js';
+import { VERIFICATION_INPUT_SELECTOR_QUERY } from '../../verificationSelectors.js';
 
 // ---------------------------------------------------------------------------
 // Base rules (generic — works for most ATS platforms)
@@ -172,7 +173,7 @@ export class GenericPlatformConfig implements PlatformConfig {
   }
 
   async detectPageByDOM(adapter: BrowserAutomationAdapter): Promise<PageState | null> {
-    const signals = await adapter.page.evaluate(() => {
+    const signals = await adapter.page.evaluate((verificationSelectorQuery: string) => {
       const isVisible = (el: Element | null): el is HTMLElement => {
         if (!el) return false;
         const node = el as HTMLElement;
@@ -230,11 +231,7 @@ export class GenericPlatformConfig implements PlatformConfig {
         || bodyText.includes('verify your email')
         || bodyText.includes('check your email');
       const hasVerificationInput = Array.from(document.querySelectorAll<HTMLInputElement>(
-        'input[autocomplete="one-time-code"], ' +
-        'input[name*="code" i], input[id*="code" i], ' +
-        'input[name*="otp" i], input[id*="otp" i], ' +
-        'input[name*="verification" i], input[id*="verification" i], ' +
-        'input[name*="token" i], input[id*="token" i]'
+        verificationSelectorQuery,
       )).some((input) => isVisible(input) && !input.disabled);
       const hasSignInWithGoogle = bodyText.includes('sign in with google') || bodyText.includes('continue with google');
       const hasSignInClickable = clickableTexts.some(t =>
@@ -274,7 +271,7 @@ export class GenericPlatformConfig implements PlatformConfig {
         hasFormInputs,
         hasConfirmation,
       };
-    });
+    }, VERIFICATION_INPUT_SELECTOR_QUERY);
 
     if (signals.hasConfirmation && !signals.hasFormInputs) {
       return { page_type: 'confirmation', page_title: 'Confirmation' };
@@ -335,7 +332,7 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
   }
 
   async classifyByDOMFallback(adapter: BrowserAutomationAdapter): Promise<PageType> {
-    return adapter.page.evaluate(() => {
+    return adapter.page.evaluate((verificationSelectorQuery: string) => {
       const isVisible = (el: Element | null): el is HTMLElement => {
         if (!el) return false;
         const node = el as HTMLElement;
@@ -382,11 +379,7 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
         || allText.includes('verify your email')
         || allText.includes('check your email');
       const hasVerificationInput = Array.from(document.querySelectorAll<HTMLInputElement>(
-        'input[autocomplete="one-time-code"], ' +
-        'input[name*="code" i], input[id*="code" i], ' +
-        'input[name*="otp" i], input[id*="otp" i], ' +
-        'input[name*="verification" i], input[id*="verification" i], ' +
-        'input[name*="token" i], input[id*="token" i]'
+        verificationSelectorQuery,
       )).some((input) => isVisible(input) && !input.disabled);
       const hasSignInClickable = clickableTexts.some(t =>
         t === 'sign in' || t === 'log in' || t === 'login' || t === 'sign in with google'
@@ -415,7 +408,7 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
       }
 
       return 'unknown' as PageType;
-    });
+    }, VERIFICATION_INPUT_SELECTOR_QUERY);
   }
 
   // --- Form Filling ---
