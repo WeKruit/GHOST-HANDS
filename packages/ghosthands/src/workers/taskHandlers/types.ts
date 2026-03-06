@@ -1,4 +1,5 @@
 import type { BrowserAutomationAdapter } from '../../adapters/types.js';
+import type { PageContextService } from '../../context/PageContextService.js';
 import type { CostTracker } from '../costControl.js';
 import type { ProgressTracker } from '../progressTracker.js';
 import type { EmailVerificationService } from '../emailVerification/types.js';
@@ -48,6 +49,8 @@ export interface TaskContext {
   emailVerification?: EmailVerificationService;
   /** Structured job-event logger injected by JobExecutor. */
   logEvent?: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
+  /** Per-run page context tracker used by the Mastra apply flow. */
+  pageContext?: PageContextService;
   /** Block handler execution until human completes a manual action (email verification, manual sign-in, etc.) */
   waitForManualAction?: (options: {
     type: string;

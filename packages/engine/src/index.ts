@@ -52,6 +52,7 @@ export * as v3 from '../../ghosthands/src/engine/v3';
 
 import type * as _api from '../../ghosthands/src/api';
 import type * as _client from '../../ghosthands/src/client';
+import type * as _context from '../../ghosthands/src/context';
 import type * as _db from '../../ghosthands/src/db';
 import type * as _security from '../../ghosthands/src/security';
 import type * as _sessions from '../../ghosthands/src/sessions';
@@ -67,6 +68,7 @@ import type * as _workflows from '../../ghosthands/src/workflows/mastra';
 
 export const api: typeof _api = undefined!;
 export const client: typeof _client = undefined!;
+export const context: typeof _context = undefined!;
 export const db: typeof _db = undefined!;
 export const security: typeof _security = undefined!;
 export const sessions: typeof _sessions = undefined!;
@@ -92,6 +94,7 @@ function _lazyNs(name: string, path: string) {
 }
 _lazyNs('api', '../../ghosthands/src/api');
 _lazyNs('client', '../../ghosthands/src/client');
+_lazyNs('context', '../../ghosthands/src/context');
 _lazyNs('db', '../../ghosthands/src/db');
 _lazyNs('security', '../../ghosthands/src/security');
 _lazyNs('sessions', '../../ghosthands/src/sessions');
