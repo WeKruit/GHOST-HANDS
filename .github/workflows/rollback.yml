@@ -56,6 +56,42 @@ jobs:
 
           echo "Image tag '${IMAGE_TAG}' verified in ECR."
 
+      - name: Update Kasm workspace image
+        if: env.KASM_API_URL != ''
+        env:
+          KASM_API_URL: ${{ secrets.KASM_API_URL }}
+          KASM_API_KEY: ${{ secrets.KASM_API_KEY }}
+          KASM_API_SECRET: ${{ secrets.KASM_API_SECRET }}
+          KASM_IMAGE_ID: ${{ secrets.KASM_IMAGE_ID }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+        run: |
+          echo "Rolling back Kasm workspace image to ${IMAGE_TAG}"
+
+          HTTP_STATUS=$(curl -s -o /tmp/kasm_response.txt -w "%{http_code}" \
+            -X POST "${KASM_API_URL}/api/public/update_image" \
+            -H "Content-Type: application/json" \
+            --max-time 30 \
+            -d "{
+              \"api_key\": \"${KASM_API_KEY}\",
+              \"api_key_secret\": \"${KASM_API_SECRET}\",
+              \"target_image\": {
+                \"image_id\": \"${KASM_IMAGE_ID}\",
+                \"docker_registry\": \"${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}\"
+              }
+            }")
+
+          echo "Kasm responded with HTTP ${HTTP_STATUS}"
+          cat /tmp/kasm_response.txt
+
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "Kasm workspace image rolled back to ${IMAGE_TAG}."
+          else
+            echo "::error::Kasm API returned HTTP ${HTTP_STATUS}. Rollback may have failed."
+            exit 1
+          fi
+
       - name: Notify VALET of rollback
         env:
           VALET_DEPLOY_WEBHOOK_URL: ${{ secrets.VALET_DEPLOY_WEBHOOK_URL }}
