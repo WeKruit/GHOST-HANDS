@@ -47,6 +47,10 @@ export const JOB_EVENT_TYPES = {
   HITL_PAUSED: 'hitl_paused',
   HITL_RESUMED: 'hitl_resumed',
   HITL_TIMEOUT: 'hitl_timeout',
+  BLOCKER_RECOVERY_STARTED: 'blocker_recovery_started',
+  BLOCKER_RECOVERY_ATTEMPTED: 'blocker_recovery_attempted',
+  BLOCKER_RECOVERY_SUCCEEDED: 'blocker_recovery_succeeded',
+  BLOCKER_RECOVERY_EXHAUSTED: 'blocker_recovery_exhausted',
 
   // Credential injection
   CREDENTIAL_INJECTION_ATTEMPTED: 'credential_injection_attempted',

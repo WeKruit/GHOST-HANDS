@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Email Verification Signup Test</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: linear-gradient(140deg, #e5ecf7 0%, #f4f6fa 55%, #fff7ef 100%);
+      color: #16233a;
+      min-height: 100vh;
+      padding: 2.25rem 1rem;
+    }
+    .wrap {
+      max-width: 760px;
+      margin: 0 auto;
+    }
+    .hero {
+      background: #fff;
+      border: 1px solid #d5e0ef;
+      border-radius: 16px;
+      padding: 1.25rem 1.3rem;
+      margin-bottom: 1rem;
+      box-shadow: 0 6px 24px rgba(28, 47, 82, 0.08);
+    }
+    .hero h1 {
+      font-size: 1.35rem;
+      color: #102341;
+      margin-bottom: 0.35rem;
+    }
+    .hero p {
+      color: #445b7d;
+      font-size: 0.95rem;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid #d5e0ef;
+      border-radius: 16px;
+      padding: 1.25rem 1.3rem;
+      box-shadow: 0 6px 24px rgba(28, 47, 82, 0.08);
+      margin-bottom: 1rem;
+    }
+    .card h2 {
+      font-size: 1.1rem;
+      color: #102341;
+      margin-bottom: 0.9rem;
+      padding-bottom: 0.7rem;
+      border-bottom: 1px solid #e4ebf4;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.9rem;
+    }
+    .field {
+      margin-bottom: 0.9rem;
+    }
+    .field.full {
+      grid-column: 1 / -1;
+    }
+    label {
+      display: block;
+      margin-bottom: 0.35rem;
+      font-size: 0.86rem;
+      font-weight: 600;
+      color: #1d365d;
+    }
+    input {
+      width: 100%;
+      border: 1.5px solid #cfdced;
+      border-radius: 10px;
+      padding: 0.62rem 0.72rem;
+      font-size: 0.94rem;
+      color: #12284a;
+      background: #f9fbff;
+      transition: border-color 0.2s, box-shadow 0.2s, background 0.2s;
+    }
+    input:focus {
+      outline: none;
+      border-color: #2f66d5;
+      box-shadow: 0 0 0 3px rgba(47, 102, 213, 0.17);
+      background: #fff;
+    }
+    .hint {
+      color: #577196;
+      font-size: 0.82rem;
+      margin-top: 0.2rem;
+    }
+    .btn-row {
+      display: flex;
+      gap: 0.6rem;
+      margin-top: 0.25rem;
+    }
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 0.64rem 0.95rem;
+      font-size: 0.92rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.06s, opacity 0.2s, filter 0.2s;
+    }
+    button:active { transform: translateY(1px); }
+    button.primary {
+      background: linear-gradient(120deg, #2d63d3 0%, #214fb0 100%);
+      color: #fff;
+      flex: 1;
+    }
+    button.secondary {
+      background: #f2f6fd;
+      color: #214fb0;
+      border: 1px solid #d3def0;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      filter: grayscale(0.1);
+    }
+    .status {
+      border-radius: 10px;
+      padding: 0.62rem 0.72rem;
+      font-size: 0.9rem;
+      margin-top: 0.7rem;
+      display: none;
+      white-space: pre-wrap;
+    }
+    .status.info {
+      display: block;
+      background: #edf3ff;
+      border: 1px solid #cfe0ff;
+      color: #1f4ea8;
+    }
+    .status.ok {
+      display: block;
+      background: #ebf9ef;
+      border: 1px solid #bfe8c8;
+      color: #1f7a36;
+    }
+    .status.error {
+      display: block;
+      background: #fff0f0;
+      border: 1px solid #f3c6c6;
+      color: #9f2f2f;
+    }
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.86rem;
+      color: #49648c;
+    }
+    @media (max-width: 720px) {
+      .grid { grid-template-columns: 1fr; }
+      .field.full { grid-column: auto; }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <h1>Signup + Email Verification Test Site</h1>
+      <p>Create an account, receive a verification code by email, then enter it to finish signup.</p>
+    </section>
+
+    <section class="card" id="signupCard">
+      <h2>1. Create Account</h2>
+      <form id="signupForm">
+        <div class="grid">
+          <div class="field">
+            <label for="fullName">Full Name</label>
+            <input id="fullName" name="full_name" type="text" autocomplete="name" placeholder="Alex Tester" required>
+          </div>
+          <div class="field">
+            <label for="signupEmail">Email</label>
+            <input id="signupEmail" name="email" type="email" autocomplete="email" value="__DEFAULT_EMAIL__" required>
+          </div>
+          <div class="field full">
+            <label for="signupPassword">Password</label>
+            <input id="signupPassword" name="password" type="password" autocomplete="new-password" minlength="8" placeholder="At least 8 characters" required>
+            <div class="hint">Any password works for this test app. It is never persisted beyond this local process.</div>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button type="submit" id="createAccountBtn" class="primary">Create Account</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card" id="verifyCard" hidden>
+      <h2>2. Verify Email</h2>
+      <p class="hint">
+        We emailed a one-time verification code to:
+        <strong id="verificationEmailLabel" class="mono"></strong>
+      </p>
+      <form id="verifyForm">
+        <div class="field">
+          <label for="verificationCode">Verification Code</label>
+          <input id="verificationCode" name="verification_code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="Enter code" required>
+        </div>
+        <div class="btn-row">
+          <button type="submit" id="verifyBtn" class="primary">Verify Email</button>
+          <button type="button" id="resendBtn" class="secondary">Resend Code</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card" id="successCard" hidden>
+      <h2>3. Account Created</h2>
+      <p id="successText">Your account is verified.</p>
+    </section>
+
+    <div id="status" class="status"></div>
+  </main>
+
+  <script>
+    const signupForm = document.getElementById('signupForm');
+    const verifyForm = document.getElementById('verifyForm');
+    const signupCard = document.getElementById('signupCard');
+    const verifyCard = document.getElementById('verifyCard');
+    const successCard = document.getElementById('successCard');
+    const verificationEmailLabel = document.getElementById('verificationEmailLabel');
+    const statusEl = document.getElementById('status');
+
+    const createAccountBtn = document.getElementById('createAccountBtn');
+    const verifyBtn = document.getElementById('verifyBtn');
+    const resendBtn = document.getElementById('resendBtn');
+
+    let pendingPayload = null;
+
+    function showStatus(kind, text) {
+      statusEl.className = 'status ' + kind;
+      statusEl.textContent = text;
+    }
+
+    function clearStatus() {
+      statusEl.className = 'status';
+      statusEl.textContent = '';
+    }
+
+    async function postJson(path, payload) {
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error || ('Request failed: ' + res.status));
+      }
+      return data;
+    }
+
+    signupForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      clearStatus();
+
+      const payload = {
+        fullName: document.getElementById('fullName').value.trim(),
+        email: document.getElementById('signupEmail').value.trim(),
+        password: document.getElementById('signupPassword').value,
+      };
+
+      if (!payload.email) {
+        showStatus('error', 'Email is required.');
+        return;
+      }
+
+      createAccountBtn.disabled = true;
+      createAccountBtn.textContent = 'Sending verification code...';
+
+      try {
+        await postJson('/api/signup', payload);
+        pendingPayload = payload;
+        verificationEmailLabel.textContent = payload.email;
+        verifyCard.hidden = false;
+        successCard.hidden = true;
+        document.getElementById('verificationCode').value = '';
+        showStatus('ok', 'Verification code sent. Check your inbox.');
+      } catch (err) {
+        showStatus('error', err.message || String(err));
+      } finally {
+        createAccountBtn.disabled = false;
+        createAccountBtn.textContent = 'Create Account';
+      }
+    });
+
+    verifyForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      clearStatus();
+
+      if (!pendingPayload) {
+        showStatus('error', 'No pending signup. Create an account first.');
+        return;
+      }
+
+      const payload = {
+        email: pendingPayload.email,
+        code: document.getElementById('verificationCode').value.trim(),
+      };
+
+      verifyBtn.disabled = true;
+      verifyBtn.textContent = 'Verifying...';
+
+      try {
+        const result = await postJson('/api/verify', payload);
+        successCard.hidden = false;
+        signupCard.hidden = true;
+        verifyCard.hidden = true;
+        document.getElementById('successText').textContent =
+          'Verified account for ' + result.account.email + ' at ' + result.account.verifiedAt;
+        showStatus('ok', 'Email verified. Account creation complete.');
+      } catch (err) {
+        showStatus('error', err.message || String(err));
+      } finally {
+        verifyBtn.disabled = false;
+        verifyBtn.textContent = 'Verify Email';
+      }
+    });
+
+    resendBtn.addEventListener('click', async () => {
+      clearStatus();
+      if (!pendingPayload) {
+        showStatus('error', 'No pending signup to resend for.');
+        return;
+      }
+
+      resendBtn.disabled = true;
+      resendBtn.textContent = 'Resending...';
+      try {
+        await postJson('/api/signup', pendingPayload);
+        showStatus('ok', 'Sent a new verification code.');
+      } catch (err) {
+        showStatus('error', err.message || String(err));
+      } finally {
+        resendBtn.disabled = false;
+        resendBtn.textContent = 'Resend Code';
+      }
+    });
+  </script>
+</body>
+</html>

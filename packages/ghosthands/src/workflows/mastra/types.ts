@@ -4,6 +4,7 @@ import type { BrowserAutomationAdapter, HitlCapableAdapter } from '../../adapter
 import type { PageContextService } from '../../context/PageContextService.js';
 import type { CostTracker } from '../../workers/costControl.js';
 import type { ProgressTracker } from '../../workers/progressTracker.js';
+import type { EmailVerificationService } from '../../workers/emailVerification/types.js';
 import type { TaskHandler, AutomationJob } from '../../workers/taskHandlers/types.js';
 
 // ---------------------------------------------------------------------------
@@ -44,6 +45,13 @@ export const workflowState = z.object({
     blockerType: z.string().nullable().default(null),
     resumeNonce: z.string().nullable().default(null),
     checkpoint: z.string().nullable().default(null),
+    attemptsByType: z.record(z.number().int().nonnegative()).optional(),
+    lastDecision: z.enum([
+      'IMMEDIATE_HITL',
+      'AUTO_RECOVER',
+      'RETRY_NO_HITL',
+      'NO_ACTION',
+    ]).nullable().optional(),
   }),
 
   metrics: z.object({
@@ -75,6 +83,7 @@ export interface RuntimeContext {
   credentials: Record<string, string> | null;
   dataPrompt: string;
   resumeFilePath: string | null;
+  emailVerification?: EmailVerificationService;
   pageContext: PageContextService;
   supabase: SupabaseClient;
   logEvent: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
@@ -85,6 +94,7 @@ export interface RuntimeContext {
     type: string;
     description: string;
     timeoutSeconds?: number;
+    metadata?: Record<string, unknown>;
   }) => Promise<{ resumed: boolean }>;
 }
 

@@ -9,6 +9,7 @@ import { strictCSP } from './middleware/csp.js';
 import { JobController } from './controllers/jobs.js';
 import { health } from './routes/health.js';
 import { models } from './routes/models.js';
+import { createGoogleAuthRoutes, createGoogleOAuthPublicRoutes } from './routes/googleAuth.js';
 import { createJobRoutes } from './routes/jobs.js';
 import { createValetRoutes } from './routes/valet.js';
 import { createUsageRoutes } from './routes/usage.js';
@@ -51,6 +52,10 @@ export function createApp() {
 
   app.route('/api/v1/gh/models', models);
 
+  // ─── Google OAuth callback (no auth required) ──────────────────
+
+  app.route('/api/v1/gh/oauth/google', createGoogleOAuthPublicRoutes());
+
   // ─── Monitoring Routes (no auth required) ──────────────────────
 
   const supabase = getSupabaseClient();
@@ -73,6 +78,7 @@ export function createApp() {
   const jobController = new JobController({ pool: pgPool });
 
   api.route('/jobs', createJobRoutes(jobController));
+  api.route('/auth/google', createGoogleAuthRoutes());
   api.route('/valet', createValetRoutes(pgPool));
   api.route('/', createUsageRoutes());
 
