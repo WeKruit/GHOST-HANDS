@@ -280,11 +280,27 @@ function extractVerificationLink(text: string): string | null {
 }
 
 function extractOtp(text: string): string | null {
-  const focused = text.match(/(?:verification|security|one[-\s]?time|otp|code)\D{0,24}([A-Z0-9]{4,10})/i);
-  if (focused?.[1]) return focused[1];
+  const focusedMatches = text.matchAll(
+    /(?:verification(?:\s+code)?|security(?:\s+code)?|one[-\s]?time(?:\s+pass(?:word|code))?|otp|passcode|pin)\D{0,16}\b([A-Z0-9]{4,10})\b/gi,
+  );
+  for (const match of focusedMatches) {
+    const candidate = match[1];
+    if (candidate && isLikelyOtpToken(candidate)) {
+      return candidate;
+    }
+  }
+
   const numeric = text.match(/\b(\d{4,8})\b/);
   if (numeric?.[1]) return numeric[1];
   return null;
+}
+
+function isLikelyOtpToken(value: string): boolean {
+  const token = value.trim();
+  if (token.length < 4 || token.length > 10) return false;
+  // Avoid matching plain words like "code" / "verification".
+  if (!/[0-9]/.test(token)) return false;
+  return true;
 }
 
 function extractMessageText(message: GmailMessageResponse): string {
