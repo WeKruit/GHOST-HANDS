@@ -33,6 +33,7 @@ import {
   incrementHitlAttempt,
   isRecoverableAuthBlocker,
 } from '../../../workers/hitl/decisionEngine.js';
+import { VERIFICATION_INPUT_SELECTORS } from '../../../workers/verificationSelectors.js';
 
 // ---------------------------------------------------------------------------
 // Private helpers
@@ -59,20 +60,6 @@ function mapBlockerCategory(category: string): BlockerType {
 function canHandlerAutoRecoverAuth(handlerType: string): boolean {
   return handlerType === 'smart_apply' || handlerType === 'workday_apply' || handlerType === 'agent_apply';
 }
-
-const VERIFICATION_INPUT_SELECTORS = [
-  'input[autocomplete="one-time-code"]',
-  'input[name*="code" i]',
-  'input[name*="otp" i]',
-  'input[name*="totp" i]',
-  'input[name*="verification" i]',
-  'input[name*="token" i]',
-  'input[name*="2fa" i]',
-  'input[name*="mfa" i]',
-  'input[type="tel"][maxlength="6"]',
-  'input[type="number"][maxlength="6"]',
-  'input[inputmode="numeric"]',
-];
 
 async function hasVisibleVerificationInput(adapter: HitlCapableAdapter): Promise<boolean> {
   for (const selector of VERIFICATION_INPUT_SELECTORS) {
