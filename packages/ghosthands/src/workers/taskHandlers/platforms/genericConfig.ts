@@ -251,12 +251,16 @@ export class GenericPlatformConfig implements PlatformConfig {
       const isLoginPage = (hasPasswordField && !isAccountCreation) || hasSignInWithGoogle ||
         (hasEmailField && hasSignInClickable && !isAccountCreation);
 
-      // Native inputs + ARIA-based form controls
+      // Native inputs + ARIA-based form controls (include password fields for account creation pages)
       const hasFormInputs = Array.from(document.querySelectorAll(
-        'input[type="text"], input[type="email"], input[type="tel"], textarea, select, [role="combobox"], [role="radiogroup"], [role="radio"]:not([aria-checked="true"]), [role="listbox"], [contenteditable="true"], input[type="file"]'
+        'input[type="text"], input[type="email"], input[type="tel"], input[type="password"], textarea, select, [role="combobox"], [role="radiogroup"], [role="radio"]:not([aria-checked="true"]), [role="listbox"], [contenteditable="true"], input[type="file"]'
       )).filter((el) => isVisible(el)).length > 2;
 
-      const hasConfirmation = bodyText.includes('thank you') || bodyText.includes('application received') || bodyText.includes('successfully submitted');
+      const hasConfirmation = bodyText.includes('thank you for applying')
+        || bodyText.includes('thank you for your application')
+        || bodyText.includes('application received')
+        || bodyText.includes('successfully submitted')
+        || bodyText.includes('application has been submitted');
 
       return {
         hasApplyButton,
@@ -273,7 +277,7 @@ export class GenericPlatformConfig implements PlatformConfig {
       };
     }, VERIFICATION_INPUT_SELECTOR_QUERY);
 
-    if (signals.hasConfirmation && !signals.hasFormInputs) {
+    if (signals.hasConfirmation && !signals.hasFormInputs && !signals.isAccountCreation) {
       return { page_type: 'confirmation', page_title: 'Confirmation' };
     }
 
