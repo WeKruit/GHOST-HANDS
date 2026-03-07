@@ -24,6 +24,7 @@ COPY package.json bun.lock turbo.json ./
 
 # Copy package.json for workspace resolution
 COPY packages/ghosthands/package.json packages/ghosthands/
+COPY packages/engine/package.json packages/engine/
 COPY scripts/package.json scripts/
 
 # Copy patches for patchedDependencies (e.g. stagehand)
