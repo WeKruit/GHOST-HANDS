@@ -45,9 +45,14 @@
       },
       "optionalPeers": [
         "@actionbookdev/sdk",
+        "@mastra/core",
+        "@mastra/pg",
         "@supabase/supabase-js",
         "hono",
+        "ioredis",
         "magnitude-extract",
+        "pg",
+        "pg-boss",
       ],
     },
     "packages/ghosthands": {
