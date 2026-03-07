@@ -314,10 +314,10 @@ export class JobPoller {
             for (const stuckJob of stuckResult.rows as Array<{ id: string; callback_url?: string | null; valet_task_id?: string | null }>) {
                 const jobId = stuckJob.id;
                 // EC3: Check if the job has any events indicating meaningful progress
-                // (form_submitted, or cookbook steps that indicate form-filling occurred)
+                // (form_submitted, or steps that indicate form-filling occurred)
                 const eventsResult = await this.pgDirect.query(
                     `SELECT COUNT(*) as cnt FROM gh_job_events
-                     WHERE job_id = $1::UUID AND event_type IN ('form_submitted', 'cookbook_step_completed', 'step_completed')`,
+                     WHERE job_id = $1::UUID AND event_type IN ('form_submitted', 'step_completed')`,
                     [jobId],
                 );
                 const hasFormSubmitted = parseInt(eventsResult.rows[0]?.cnt || '0', 10) > 0;

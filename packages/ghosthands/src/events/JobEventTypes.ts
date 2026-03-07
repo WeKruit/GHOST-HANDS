@@ -26,17 +26,8 @@ export const JOB_EVENT_TYPES = {
   OBSERVATION_STARTED: 'observation_started',
   OBSERVATION_COMPLETED: 'observation_completed',
 
-  // Cookbook
-  COOKBOOK_STEP_STARTED: 'cookbook_step_started',
-  COOKBOOK_STEP_COMPLETED: 'cookbook_step_completed',
-  COOKBOOK_STEP_FAILED: 'cookbook_step_failed',
-
   // Cost
   TOKENS_USED: 'tokens_used',
-
-  // Manual
-  MANUAL_FOUND: 'manual_found',
-  MANUAL_CREATED: 'manual_created',
 
   // Session
   SESSION_RESTORED: 'session_restored',
@@ -73,10 +64,6 @@ export const JOB_EVENT_TYPES = {
   // Resume
   RESUME_DOWNLOADED: 'resume_downloaded',
   RESUME_DOWNLOAD_FAILED: 'resume_download_failed',
-
-  // Trace
-  TRACE_RECORDING_STARTED: 'trace_recording_started',
-  TRACE_RECORDING_COMPLETED: 'trace_recording_completed',
 
   // Form submission (used by recovery to detect partial applications)
   FORM_SUBMITTED: 'form_submitted',
@@ -122,5 +109,5 @@ export class ThoughtThrottle {
   }
 }
 
-/** Type for logEvent callbacks passed to subsystems like CookbookExecutor/StagehandObserver. */
+/** Type for logEvent callbacks passed to subsystems like StagehandObserver. */
 export type LogEventCallback = (eventType: string, metadata: Record<string, any>) => Promise<void>;

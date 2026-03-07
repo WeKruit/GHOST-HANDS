@@ -7,7 +7,6 @@ import { describe, expect, test, vi, beforeEach, afterAll } from 'vitest';
 const mockCommittedWorkflow = { id: 'gh_apply' };
 const mockWorkflowBuilder = {
   then: vi.fn().mockReturnThis(),
-  branch: vi.fn().mockReturnThis(),
   commit: vi.fn().mockReturnValue(mockCommittedWorkflow),
 };
 
@@ -31,7 +30,6 @@ import * as factoryModule from '../../../../src/workflows/mastra/steps/factory.j
 
 const mockBuildStepsReturn = {
   checkBlockers: { id: 'check_blockers_checkpoint', execute: vi.fn() },
-  cookbookAttempt: { id: 'cookbook_attempt', execute: vi.fn() },
   executeHandler: { id: 'execute_handler', execute: vi.fn() },
 };
 
@@ -59,7 +57,6 @@ describe('buildApplyWorkflow', () => {
     );
     // Clear accumulated call counts between tests
     mockWorkflowBuilder.then.mockClear();
-    mockWorkflowBuilder.branch.mockClear();
     mockWorkflowBuilder.commit.mockClear();
     (createWorkflow as unknown as ReturnType<typeof vi.fn>).mockClear();
   });
@@ -101,7 +98,7 @@ describe('buildApplyWorkflow', () => {
 
   // ─── Test 5 ──────────────────────────────────────────────────────────
 
-  test('chains .then() for checkBlockers and cookbookAttempt, then .branch(), then .commit()', () => {
+  test('chains .then() for checkBlockers and executeHandler, then .commit()', () => {
     buildApplyWorkflow(fakeRt);
 
     // checkBlockers -> .then()
@@ -109,15 +106,10 @@ describe('buildApplyWorkflow', () => {
       expect.objectContaining({ id: 'check_blockers_checkpoint' }),
     );
 
-    // cookbookAttempt -> .then()
+    // executeHandler -> .then()
     expect(mockWorkflowBuilder.then).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 'cookbook_attempt' }),
+      expect.objectContaining({ id: 'execute_handler' }),
     );
-
-    // .branch() called with two branch conditions
-    expect(mockWorkflowBuilder.branch).toHaveBeenCalledTimes(1);
-    const branchArgs = mockWorkflowBuilder.branch.mock.calls[0][0];
-    expect(branchArgs).toHaveLength(2);
 
     // .commit() finalizes the workflow
     expect(mockWorkflowBuilder.commit).toHaveBeenCalledOnce();

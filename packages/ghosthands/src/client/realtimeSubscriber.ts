@@ -210,9 +210,8 @@ export class RealtimeSubscriber {
    * Listens for INSERT events on gh_job_events, delivering each new event as
    * it is written. This powers live UI features like:
    *  - Mode switching indicators (mode_selected, mode_switched)
-   *  - Action timeline (step_started, step_completed, cookbook_step_completed)
+   *  - Action timeline (step_started, step_completed)
    *  - Thinking/reasoning feed (current_action in progress_update events)
-   *  - Manual discovery (manual_found, manual_created)
    *
    * Requires migration 012_gh_job_events_realtime.sql (adds gh_job_events
    * to supabase_realtime publication).
@@ -220,7 +219,7 @@ export class RealtimeSubscriber {
    * Optionally filter by event types to reduce noise:
    *   subscribeToJobEvents(jobId, {
    *     onEvent: (e) => console.log(e),
-   *     eventTypes: ['mode_selected', 'mode_switched', 'manual_found'],
+   *     eventTypes: ['mode_selected', 'mode_switched'],
    *   })
    */
   subscribeToJobEvents(
