@@ -192,7 +192,7 @@ describe('formFiller observation pipeline integration', () => {
   it('applyNeverEmptyFallback with all-placeholder options leaves select unresolved', () => {
     const fields = [
       { id: 'f1', type: 'select', options: ['Select...', '-- Select --', 'Please select'], required: true },
-      { id: 'f2', type: 'text', options: ['Choose one', 'Choose...'], required: true },
+      { id: 'f2', type: 'text', options: ['Choose one', 'Choose...'], required: false },
     ];
 
     const resolved = applyNeverEmptyFallback(fields, {});

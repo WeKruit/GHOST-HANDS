@@ -3063,7 +3063,6 @@ export interface FallbackField {
   options?: string[];
   name?: string;
   demographicHint?: boolean;
-  required?: boolean;
 }
 
 /**
