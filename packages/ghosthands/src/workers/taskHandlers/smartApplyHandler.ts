@@ -694,9 +694,11 @@ export class SmartApplyHandler implements TaskHandler {
     await this.throttleLlm(adapter);
     const result = await adapter.act(
       'Click the "Apply" or "Apply Now" button to start the job application. ' +
-      'If a modal or dialog appears with options like "Apply Manually", "Autofill with Resume", ' +
-      '"Use My Last Application", etc., click "Apply Manually" to proceed. ' +
-      'Once you have clicked Apply AND handled any modal (e.g. clicked "Apply Manually"), STOP and report done. ' +
+      'After clicking, one of these will happen: ' +
+      '(1) The page scrolls to show a form — this means Apply worked, STOP immediately. ' +
+      '(2) A new page loads with a form — this means Apply worked, STOP immediately. ' +
+      '(3) A modal/dialog appears with options like "Apply Manually", "Autofill with Resume", etc. — ' +
+      'click "Apply Manually" (or the plain apply option without autofill), then STOP. ' +
       'Do NOT fill in any form fields, do NOT click Next, and do NOT click any sign-in/auth buttons.',
     );
 
@@ -713,8 +715,9 @@ export class SmartApplyHandler implements TaskHandler {
         try {
           await this.throttleLlm(adapter);
           const modalResult = await adapter.act(
-            'A dialog or modal is open. Click "Apply Manually" or the option to proceed ' +
-            'with the application without autofill. If no modal is visible, report done.',
+            'If a dialog or modal is visible, click "Apply Manually" or the option to proceed ' +
+            'with the application without autofill. If no modal is visible and a form is already ' +
+            'showing on the page, report done — the Apply action already succeeded.',
           );
           if (modalResult.success) {
             console.log('[SmartApply] Clicked through Apply modal. Continuing...');
@@ -2187,7 +2190,13 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
         await pageContext?.markAwaitingReview();
         return 'review';
       }
-      console.log('[SmartApply] Submit-like button present, but page is not verified as final review.');
+      // Single-page forms (e.g. Greenhouse) have Submit on the same page as the
+      // form fields — LLM verification will say "not a review page" because fields
+      // are still interactive. If we already filled everything, stop and let the
+      // user review rather than looping infinitely.
+      console.log('[SmartApply] Submit button present on form page — stopping for user review.');
+      await pageContext?.markAwaitingReview();
+      return 'review';
     }
 
     console.log(`[SmartApply] Page complete.`);
