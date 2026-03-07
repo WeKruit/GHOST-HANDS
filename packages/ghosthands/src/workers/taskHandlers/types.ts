@@ -44,12 +44,7 @@ export interface TaskContext {
   credentials: Record<string, string> | null;
   dataPrompt: string;
   llmClientConfig?: {
-    anthropic?: {
-      apiKey?: string;
-      authToken?: string;
-      baseURL?: string;
-      defaultHeaders?: Record<string, string>;
-    };
+    anthropic?: AnthropicClientConfig;
   };
   /** Local file path to the downloaded resume, if a resume_ref was provided */
   resumeFilePath?: string | null;
@@ -66,6 +61,13 @@ export interface TaskContext {
     timeoutSeconds?: number;
     metadata?: Record<string, unknown>;
   }) => Promise<{ resumed: boolean }>;
+}
+
+export interface AnthropicClientConfig {
+  apiKey?: string;
+  authToken?: string;
+  baseURL?: string;
+  defaultHeaders?: Record<string, string>;
 }
 
 export interface TaskResult {

@@ -27,6 +27,7 @@ import { buildAnswerDecisionsFromFieldAnswers, normalizeExtractedQuestions, reco
 import type { NormalizedQuestionDraft } from '../../context/QuestionNormalizer.js';
 import type { AnswerDecision, AnswerMode, QuestionOutcome, QuestionSnapshot } from '../../context/types.js';
 import type { WorkdayUserProfile } from './workday/workdayTypes.js';
+import type { AnthropicClientConfig } from './types.js';
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -92,13 +93,6 @@ export interface FillFormOptions {
   forceMagnitude?: boolean;
   observers?: FillObservers;
   anthropicClientConfig?: AnthropicClientConfig;
-}
-
-export interface AnthropicClientConfig {
-  apiKey?: string;
-  authToken?: string;
-  baseURL?: string;
-  defaultHeaders?: Record<string, string>;
 }
 
 interface GenerateResult {
@@ -1382,23 +1376,59 @@ function trimOptionalString(value: string | undefined): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+const DISALLOWED_ANTHROPIC_DEFAULT_HEADERS = new Set([
+  'authorization',
+  'content-length',
+  'host',
+]);
+
+function normalizeAnthropicBaseURL(value: string | undefined): string | undefined {
+  const trimmed = trimOptionalString(value);
+  if (!trimmed) return undefined;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error('Anthropic client baseURL must be an absolute http(s) URL');
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Anthropic client baseURL must use http or https');
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('Anthropic client baseURL must not include embedded credentials');
+  }
+
+  parsed.hash = '';
+  return parsed.toString().replace(/\/+$/, '');
+}
+
 export function buildAnthropicClientOptions(
   clientConfig?: AnthropicClientConfig,
 ): ConstructorParameters<typeof Anthropic>[0] | undefined {
   if (!clientConfig) return undefined;
 
+  const apiKey = trimOptionalString(clientConfig.apiKey);
+  const authToken = trimOptionalString(clientConfig.authToken);
+  const baseURL = normalizeAnthropicBaseURL(clientConfig.baseURL);
+
   const defaultHeaders = clientConfig.defaultHeaders
     ? Object.fromEntries(
         Object.entries(clientConfig.defaultHeaders).filter(
-          ([key, value]) => key.trim().length > 0 && typeof value === 'string' && value.trim().length > 0,
+          ([key, value]) =>
+            key.trim().length > 0 &&
+            !DISALLOWED_ANTHROPIC_DEFAULT_HEADERS.has(key.trim().toLowerCase()) &&
+            typeof value === 'string' &&
+            value.trim().length > 0,
         ),
       )
     : undefined;
 
   const options = {
-    ...(trimOptionalString(clientConfig.apiKey) ? { apiKey: trimOptionalString(clientConfig.apiKey) } : {}),
-    ...(trimOptionalString(clientConfig.authToken) ? { authToken: trimOptionalString(clientConfig.authToken) } : {}),
-    ...(trimOptionalString(clientConfig.baseURL) ? { baseURL: trimOptionalString(clientConfig.baseURL) } : {}),
+    ...(apiKey ? { apiKey } : {}),
+    ...(authToken ? { authToken } : {}),
+    ...(baseURL ? { baseURL } : {}),
     ...(defaultHeaders && Object.keys(defaultHeaders).length > 0 ? { defaultHeaders } : {}),
   };
 
