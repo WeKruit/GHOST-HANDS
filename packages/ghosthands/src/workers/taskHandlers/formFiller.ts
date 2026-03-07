@@ -91,6 +91,14 @@ export interface FillObservers {
 export interface FillFormOptions {
   forceMagnitude?: boolean;
   observers?: FillObservers;
+  anthropicClientConfig?: AnthropicClientConfig;
+}
+
+export interface AnthropicClientConfig {
+  apiKey?: string;
+  authToken?: string;
+  baseURL?: string;
+  defaultHeaders?: Record<string, string>;
 }
 
 interface GenerateResult {
@@ -1368,8 +1376,41 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
 
 // ── LLM answer generation ────────────────────────────────────
 
-async function generateAnswers(fields: FormField[], profileText: string): Promise<GenerateResult> {
-  const client = new Anthropic();
+function trimOptionalString(value: string | undefined): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+export function buildAnthropicClientOptions(
+  clientConfig?: AnthropicClientConfig,
+): ConstructorParameters<typeof Anthropic>[0] | undefined {
+  if (!clientConfig) return undefined;
+
+  const defaultHeaders = clientConfig.defaultHeaders
+    ? Object.fromEntries(
+        Object.entries(clientConfig.defaultHeaders).filter(
+          ([key, value]) => key.trim().length > 0 && typeof value === 'string' && value.trim().length > 0,
+        ),
+      )
+    : undefined;
+
+  const options = {
+    ...(trimOptionalString(clientConfig.apiKey) ? { apiKey: trimOptionalString(clientConfig.apiKey) } : {}),
+    ...(trimOptionalString(clientConfig.authToken) ? { authToken: trimOptionalString(clientConfig.authToken) } : {}),
+    ...(trimOptionalString(clientConfig.baseURL) ? { baseURL: trimOptionalString(clientConfig.baseURL) } : {}),
+    ...(defaultHeaders && Object.keys(defaultHeaders).length > 0 ? { defaultHeaders } : {}),
+  };
+
+  return Object.keys(options).length > 0 ? options : undefined;
+}
+
+async function generateAnswers(
+  fields: FormField[],
+  profileText: string,
+  clientConfig?: AnthropicClientConfig,
+): Promise<GenerateResult> {
+  const client = new Anthropic(buildAnthropicClientOptions(clientConfig));
   const profileEvidence = parseProfileEvidence(profileText);
 
   // Disambiguate duplicate field names by appending "#2", "#3", etc.
@@ -3355,7 +3396,7 @@ export async function fillFormOnPage(
     if (usedNewPipeline) {
       // 6c-i. Generate actual fill answers via proven legacy path
       console.log('[formFiller] Asking LLM for answers…');
-      const genResult = await generateAnswers(llmFields, profileText);
+      const genResult = await generateAnswers(llmFields, profileText, opts?.anthropicClientConfig);
       answers = { ...genResult.answers };
       Object.assign(fieldIdMap, genResult.fieldIdToKey);
       result.llmCalls++;

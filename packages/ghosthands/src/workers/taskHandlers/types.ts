@@ -43,6 +43,14 @@ export interface TaskContext {
   progress: ProgressTracker;
   credentials: Record<string, string> | null;
   dataPrompt: string;
+  llmClientConfig?: {
+    anthropic?: {
+      apiKey?: string;
+      authToken?: string;
+      baseURL?: string;
+      defaultHeaders?: Record<string, string>;
+    };
+  };
   /** Local file path to the downloaded resume, if a resume_ref was provided */
   resumeFilePath?: string | null;
   /** Optional email verification automation service (per-user Gmail API). */

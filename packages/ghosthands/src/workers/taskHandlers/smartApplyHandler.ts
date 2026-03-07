@@ -405,6 +405,7 @@ export class SmartApplyHandler implements TaskHandler {
               stuckEscalate,
               ctx.costTracker,
               pageContext,
+              ctx.llmClientConfig,
             );
 
             if (result === 'review') {
@@ -1978,6 +1979,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
     forceEscalate = false,
     costTracker?: CostTracker,
     pageContext?: PageContextService,
+    llmClientConfig?: TaskContext['llmClientConfig'],
   ): Promise<'navigated' | 'review' | 'complete'> {
     const MAX_DEPTH = 3;
 
@@ -2001,6 +2003,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       if (escalate) console.log(`[SmartApply] Escalating to MagnitudeHand (${forceEscalate ? 'stuck escalation' : `retry ${_depth}/${MAX_DEPTH}`})`);
       const fillResult = await fillFormOnPage(adapter.page, adapter, profileText, resumePath, {
         forceMagnitude: escalate,
+        anthropicClientConfig: llmClientConfig?.anthropic,
         observers: pageContext
           ? {
               onQuestionsNormalized: async (questions, opts) => pageContext.syncQuestions(questions, opts),
@@ -2086,7 +2089,17 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
         // Pass null for resumePath on retries — resume was already uploaded on first attempt.
         // Workday replaces the file input after processing, creating a fresh one for "add another file",
         // so re-passing resumePath would cause a duplicate upload.
-        return this.fillPage(adapter, config, null, profileText, _depth + 1, false, costTracker, pageContext);
+        return this.fillPage(
+          adapter,
+          config,
+          null,
+          profileText,
+          _depth + 1,
+          false,
+          costTracker,
+          pageContext,
+          llmClientConfig,
+        );
       }
 
       // Verify page changed
@@ -2112,7 +2125,17 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       const scrollAfterClick = await adapter.page.evaluate(() => window.scrollY);
       if (Math.abs(scrollAfterClick - scrollBeforeClick) > 50) {
         console.log(`[SmartApply] Clicked Next — page auto-scrolled to unfilled fields. Re-filling.`);
-        return this.fillPage(adapter, config, null, profileText, _depth + 1, false, costTracker, pageContext);
+        return this.fillPage(
+          adapter,
+          config,
+          null,
+          profileText,
+          _depth + 1,
+          false,
+          costTracker,
+          pageContext,
+          llmClientConfig,
+        );
       }
 
       console.log(`[SmartApply] Clicked Next but page unchanged.`);
