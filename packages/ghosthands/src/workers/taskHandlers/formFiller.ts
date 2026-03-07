@@ -3479,7 +3479,11 @@ export async function fillFormOnPage(
     } else {
       // Heuristic-only path — use legacy generateAnswers
       console.log('[formFiller] Using legacy generateAnswers (heuristic path)…');
-      const genResult = await generateAnswers(llmFields, profileText);
+      const genResult = await generateAnswers(
+        llmFields,
+        profileText,
+        opts?.anthropicClientConfig,
+      );
       answers = { ...genResult.answers };
       Object.assign(fieldIdMap, genResult.fieldIdToKey);
       result.llmCalls++;
@@ -3668,7 +3672,11 @@ export async function fillFormOnPage(
       }
 
       // Generate actual fill answers for unseen fields via proven legacy path
-      const extraResult = await generateAnswers(unseen, profileText);
+      const extraResult = await generateAnswers(
+        unseen,
+        profileText,
+        opts?.anthropicClientConfig,
+      );
       Object.assign(answers, extraResult.answers);
       Object.assign(fieldIdMap, extraResult.fieldIdToKey);
       result.llmCalls++;

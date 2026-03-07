@@ -2043,6 +2043,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
           true,
           costTracker,
           pageContext,
+          llmClientConfig,
         );
       }
 
