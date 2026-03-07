@@ -19,14 +19,6 @@ export const workflowState = z.object({
   qualityPreset: z.enum(['speed', 'balanced', 'quality']),
   budgetUsd: z.number(),
 
-  cookbook: z.object({
-    attempted: z.boolean().default(false),
-    success: z.boolean().default(false),
-    manualId: z.string().nullable().default(null),
-    steps: z.number().default(0),
-    error: z.string().nullable().default(null),
-  }),
-
   handler: z.object({
     attempted: z.boolean().default(false),
     success: z.boolean().default(false),

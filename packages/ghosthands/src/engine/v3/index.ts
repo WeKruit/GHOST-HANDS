@@ -24,12 +24,6 @@ export { MagnitudeHand } from './layers/MagnitudeHand';
 export { SectionOrchestrator, type OrchestratorResult } from './SectionOrchestrator';
 export { SectionGrouper } from './SectionGrouper';
 
-// Cookbook
-export { CookbookExecutorV3, type CookbookV3Result } from './CookbookExecutorV3';
-
-// Engine
-export { V3ExecutionEngine, type V3ExecutionResult, type V3ExecutionParams } from './V3ExecutionEngine';
-
 // Platform framework
 export type { PlatformConfig, PageType, PageState, ScannedField, ScanResult, FieldKind, FillStrategy } from './platformTypes';
 export { GenericPlatformConfig, findBestAnswer } from './GenericPlatformConfig';

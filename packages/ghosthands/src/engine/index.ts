@@ -1,13 +1,9 @@
 /**
- * Engine module — cookbook foundation types and runtime components.
+ * Engine module — observation types and runtime components.
  */
 
 export {
-  // Schemas
-  LocatorDescriptorSchema,
-  ManualStepSchema,
-  ManualSourceSchema,
-  ActionManualSchema,
+  // Observation schemas
   FieldObservationSchema,
   FormObservationSchema,
   ButtonObservationSchema,
@@ -17,11 +13,7 @@ export {
   BlockerDetectionSchema,
   ObservedElementSchema,
 
-  // Types
-  type LocatorDescriptor,
-  type ManualStep,
-  type ManualSource,
-  type ActionManual,
+  // Observation types
   type FieldObservation,
   type FormObservation,
   type ButtonObservation,
@@ -32,10 +24,5 @@ export {
   type ObservedElement,
 } from './types';
 
-export { LocatorResolver, type ResolveResult, type LocatorResolverOptions } from './LocatorResolver';
-export { CookbookExecutor, type ExecuteAllResult, type ExecuteStepResult, type CookbookExecutorOptions } from './CookbookExecutor';
 export { resolveTemplate, resolveOptionalTemplate } from './templateResolver';
-export { ManualStore, type SaveFromTraceMetadata, type SaveFromActionBookMetadata } from './ManualStore';
 export { PageObserver, detectPlatform, generateUrlPattern, detectPageType } from './PageObserver';
-export { seedFromActionBook, type SeedOptions } from './actionBookSeeder';
-export { ExecutionEngine, type ExecutionEngineOptions, type ExecutionResult, type ExecutionParams } from './ExecutionEngine';
