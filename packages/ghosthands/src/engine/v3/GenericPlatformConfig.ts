@@ -219,12 +219,16 @@ export class GenericPlatformConfig implements PlatformConfig {
       const isLoginPage = hasPasswordField || hasSignInWithGoogle ||
         (hasEmailField && hasSignInClickable);
 
-      // Native inputs + ARIA-based form controls
+      // Native inputs + ARIA-based form controls (include password fields for account creation pages)
       const hasFormInputs = document.querySelectorAll(
-        'input[type="text"], input[type="email"], input[type="tel"], textarea, select, [role="combobox"], [role="radiogroup"], [role="radio"]:not([aria-checked="true"]), [role="listbox"], [contenteditable="true"], input[type="file"]'
+        'input[type="text"], input[type="email"], input[type="tel"], input[type="password"], textarea, select, [role="combobox"], [role="radiogroup"], [role="radio"]:not([aria-checked="true"]), [role="listbox"], [contenteditable="true"], input[type="file"]'
       ).length > 2;
 
-      const hasConfirmation = bodyText.includes('thank you') || bodyText.includes('application received') || bodyText.includes('successfully submitted');
+      const hasConfirmation = bodyText.includes('thank you for applying')
+        || bodyText.includes('thank you for your application')
+        || bodyText.includes('application received')
+        || bodyText.includes('successfully submitted')
+        || bodyText.includes('application has been submitted');
 
       return { hasApplyButton, hasSubmitButton, hasReviewSignals, hasJobDescription, isLoginPage, hasSignInClickable, hasSignInWithGoogle, hasFormInputs, hasConfirmation };
     });
@@ -314,7 +318,7 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
       // Review: submit button, no editable inputs, no next button
       if (hasSubmitButton && !hasAnyEditableInputs && !hasNextButton) return 'review' as PageType;
 
-      if (allText.includes('thank you') || allText.includes('application received') || allText.includes('successfully submitted')) return 'confirmation' as PageType;
+      if (allText.includes('thank you for applying') || allText.includes('thank you for your application') || allText.includes('application received') || allText.includes('successfully submitted') || allText.includes('application has been submitted')) return 'confirmation' as PageType;
 
       // Job listing: has an Apply button
       if (hasApplyButton) return 'job_listing' as PageType;
