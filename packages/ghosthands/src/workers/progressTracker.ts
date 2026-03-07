@@ -80,6 +80,8 @@ export interface ProgressEventData {
   step_cost_cents?: number;
   /** Kasm session URL for live browser view (WEK-162) */
   kasm_url?: string;
+  /** Whether a browser liveview session is available for takeover */
+  browser_session_available?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +168,7 @@ export class ProgressTracker {
   private executionMode?: 'cookbook' | 'magnitude';
   private manualId?: string;
   private kasmUrl?: string;
+  private browserSessionAvailable = false;
 
   constructor(opts: ProgressTrackerOptions) {
     this.jobId = opts.jobId;
@@ -196,6 +199,11 @@ export class ProgressTracker {
   /** Set the Kasm session URL for live view (WEK-162). */
   setKasmUrl(url: string): void {
     this.kasmUrl = url;
+  }
+
+  /** Mark whether a browser liveview session is available. */
+  setBrowserSessionAvailable(available: boolean): void {
+    this.browserSessionAvailable = available;
   }
 
   /** Called when an action starts. Infers the step and emits progress. */
@@ -239,6 +247,7 @@ export class ProgressTracker {
       ...(this.executionMode && { execution_mode: this.executionMode }),
       ...(this.manualId && { manual_id: this.manualId }),
       ...(this.kasmUrl && { kasm_url: this.kasmUrl }),
+      browser_session_available: this.browserSessionAvailable,
     };
   }
 

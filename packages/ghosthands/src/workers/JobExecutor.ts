@@ -26,6 +26,7 @@ import { ResumeDownloader, type ResumeRef } from './resumeDownloader.js';
 import { ResumeProfileLoader } from '../db/resumeProfileLoader.js';
 import { getLogger } from '../monitoring/logger.js';
 import { AgentApplyHandler } from './taskHandlers/agentApplyHandler.js';
+import { browserSessionRegistry } from './browserSessionRegistry.js';
 
 const logger = getLogger({ service: 'job-executor' });
 
@@ -308,11 +309,15 @@ export class JobExecutor {
         progress.setKasmUrl(kasmUrl);
       }
       if (job.callback_url) {
+        const sessionSnap = browserSessionRegistry.getPublicSnapshot();
         callbackNotifier.notifyRunning(
           job.id,
           job.callback_url,
           job.valet_task_id,
-          kasmUrl ? { kasm_url: kasmUrl } : undefined,
+          {
+            ...(kasmUrl ? { kasm_url: kasmUrl } : {}),
+            browser_session_available: sessionSnap.available === true,
+          },
           this.workerId,
         ).catch((err) => {
           getLogger().warn('Running callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
@@ -486,6 +491,30 @@ export class JobExecutor {
           // Observer is optional — don't fail the job if it can't attach
           getLogger().warn('StagehandObserver init failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
           observer = undefined;
+        }
+      }
+
+      // 7d. Register browser session in the in-memory registry for CDP proxy
+      {
+        const cdpWsUrl = (adapter.page?.context()?.browser() as any)?.wsEndpoint?.() as string | undefined;
+        if (cdpWsUrl) {
+          // Extract the debug port from the CDP WebSocket URL (ws://127.0.0.1:{port}/...)
+          let debugPort = 0;
+          try {
+            const parsed = new URL(cdpWsUrl);
+            debugPort = parseInt(parsed.port, 10) || 0;
+          } catch { /* best-effort */ }
+
+          browserSessionRegistry.register({
+            jobId: job.id,
+            workerId: this.workerId,
+            engine: 'chromium',
+            cdpWsUrl,
+            debugPort,
+            pausedForHuman: false,
+            updatedAt: Date.now(),
+          });
+          progress.setBrowserSessionAvailable(true);
         }
       }
 
@@ -983,6 +1012,14 @@ export class JobExecutor {
       // 13. Handle awaiting_user_review vs completed
       if (taskResult.awaitingUserReview) {
         // Job paused at review page — keep browser open
+        browserSessionRegistry.setPausedForHuman(job.id, true, 'awaiting_user_review');
+        // Update page metadata for the session snapshot
+        try {
+          const pageUrl = adapter ? await adapter.getCurrentUrl() : undefined;
+          const pageTitle = adapter ? await adapter.page.title() : undefined;
+          browserSessionRegistry.updatePageMeta(job.id, pageUrl, pageTitle);
+        } catch { /* best-effort */ }
+
         await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
         await progress.flush();
 
@@ -1190,6 +1227,9 @@ export class JobExecutor {
         });
       }
     } finally {
+      // Clear browser session from registry on any exit path
+      browserSessionRegistry.clear(job.id);
+
       clearInterval(heartbeat);
       this._activeAdapter = null;
       this._executionAttemptId = null;
@@ -1529,6 +1569,10 @@ export class JobExecutor {
       await adapter.pause();
     }
 
+    // Mark session as paused for human in the browser session registry
+    browserSessionRegistry.setPausedForHuman(job.id, true, 'waiting_human');
+    browserSessionRegistry.updatePageMeta(job.id, pageUrl);
+
     await this.logJobEvent(job.id, JOB_EVENT_TYPES.HITL_PAUSED, {
       blocker_type: blockerResult.type,
       confidence: blockerResult.confidence,
@@ -1540,6 +1584,7 @@ export class JobExecutor {
     // 4. Notify VALET via callback
     if (job.callback_url) {
       const costSnapshot = costTracker?.getSnapshot();
+      const hitlSessionSnap = browserSessionRegistry.getPublicSnapshot();
       callbackNotifier.notifyHumanNeeded(
         job.id,
         job.callback_url,
@@ -1564,6 +1609,8 @@ export class JobExecutor {
           action_count: costSnapshot.actionCount,
           total_tokens: costSnapshot.inputTokens + costSnapshot.outputTokens,
         } : undefined,
+        undefined, // kasmUrl — resolved inside notifyHumanNeeded
+        hitlSessionSnap.available === true,
       ).catch((err) => {
         getLogger().warn('HITL callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
       });
@@ -1598,13 +1645,17 @@ export class JobExecutor {
         })
         .eq('id', job.id);
 
+      // Un-pause browser session in registry
+      browserSessionRegistry.setPausedForHuman(job.id, false);
+
       await this.logJobEvent(job.id, JOB_EVENT_TYPES.HITL_RESUMED, {
         resolution_type: result.resolutionType || 'manual',
         // SECURITY: Never log resolutionData — it may contain passwords/codes
       });
 
       if (job.callback_url) {
-        callbackNotifier.notifyResumed(job.id, job.callback_url, job.valet_task_id, this.workerId).catch((err) => {
+        const resumeSessionSnap = browserSessionRegistry.getPublicSnapshot();
+        callbackNotifier.notifyResumed(job.id, job.callback_url, job.valet_task_id, this.workerId, undefined, resumeSessionSnap.available === true).catch((err) => {
           getLogger().warn('Resume callback failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });
       }
