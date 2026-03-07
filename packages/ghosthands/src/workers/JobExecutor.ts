@@ -898,7 +898,10 @@ export class JobExecutor {
       }
 
       // Update final_mode and cost metadata
-      const finalMode = job.execution_mode || handler.type || 'magnitude';
+      // Map execution_mode to a valid final_mode value for the DB constraint.
+      // Valid final_mode values: 'magnitude', 'hybrid', 'smart_apply', 'agent_apply', 'mastra'
+      const VALID_FINAL_MODES = new Set(['magnitude', 'hybrid', 'smart_apply', 'agent_apply', 'mastra']);
+      const finalMode = (job.execution_mode && VALID_FINAL_MODES.has(job.execution_mode)) ? job.execution_mode : 'magnitude';
       await this.supabase
         .from('gh_automation_jobs')
         .update({
@@ -1735,10 +1738,13 @@ export class JobExecutor {
 
     if (finalState.handler?.attempted && finalState.handler.taskResult) {
       const taskResult = finalState.handler.taskResult as any;
-      const finalMode = job.execution_mode || handler.type || 'magnitude';
+      // Map execution_mode to a valid final_mode value for the DB constraint.
+      // Valid final_mode values: 'magnitude', 'hybrid', 'smart_apply', 'agent_apply', 'mastra'
+      const VALID_FINAL_MODES = new Set(['magnitude', 'hybrid', 'smart_apply', 'agent_apply', 'mastra']);
+      const finalMode = (job.execution_mode && VALID_FINAL_MODES.has(job.execution_mode)) ? job.execution_mode : 'magnitude';
       const engineResult = {
         success: false,
-        mode: finalMode as any,
+        mode: 'magnitude' as const,
         magnitudeSteps: costTracker.getSnapshot().actionCount,
       };
 

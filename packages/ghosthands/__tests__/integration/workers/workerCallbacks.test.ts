@@ -186,8 +186,8 @@ describe('worker_id propagation through callback chain', () => {
       llm_cost_cents: 250,
       action_count: 12,
       total_tokens: 5000,
-      execution_mode: 'cookbook',
-      final_mode: 'cookbook',
+      execution_mode: 'magnitude',
+      final_mode: 'magnitude',
     });
 
     const payload = capture.payloads[0];
@@ -197,8 +197,8 @@ describe('worker_id propagation through callback chain', () => {
       action_count: 12,
       total_tokens: 5000,
     });
-    expect(payload.execution_mode).toBe('cookbook');
-    expect(payload.final_mode).toBe('cookbook');
+    expect(payload.execution_mode).toBe('magnitude');
+    expect(payload.final_mode).toBe('magnitude');
   });
 
   test('worker_id is consistent across all callback types from same worker', async () => {
@@ -547,14 +547,13 @@ describe('VALET status endpoint — worker_id', () => {
       created_at: '2026-02-18T05:59:00Z',
       metadata: JSON.stringify({
         source: 'valet',
-        engine: { manual_id: 'manual-1', manual_status: 'cookbook_success', health_score: 95 },
-        cost_breakdown: { cookbook_steps: 5, magnitude_steps: 0, cookbook_cost_usd: 0.05, magnitude_cost_usd: 0 },
+        cost_breakdown: { magnitude_steps: 5, magnitude_cost_usd: 0.05 },
       }),
       callback_url: 'https://valet.example.com/callback',
       valet_task_id: 'valet-task-003',
-      execution_mode: 'cookbook',
+      execution_mode: 'magnitude',
       browser_mode: 'server',
-      final_mode: 'cookbook',
+      final_mode: 'magnitude',
       worker_id: 'worker-eu-west-2-xyz',
     });
 
