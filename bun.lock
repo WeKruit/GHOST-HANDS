@@ -27,11 +27,13 @@
         "playwright": "npm:patchright@^1.52.0",
       },
       "devDependencies": {
+        "@types/bun": "^1.2.0",
         "@types/node": "^20.0.0",
         "typescript": "~5.7.2",
       },
       "peerDependencies": {
         "@actionbookdev/sdk": "^0.3.0",
+        "@anthropic-ai/sdk": ">=0.30.0",
         "@mastra/core": "^1.7.0",
         "@mastra/pg": "^1.7.0",
         "@supabase/supabase-js": "^2.95.3",
@@ -45,6 +47,7 @@
       },
       "optionalPeers": [
         "@actionbookdev/sdk",
+        "@anthropic-ai/sdk",
         "@mastra/core",
         "@mastra/pg",
         "@supabase/supabase-js",
