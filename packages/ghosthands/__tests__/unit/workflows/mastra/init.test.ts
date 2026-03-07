@@ -5,16 +5,12 @@ import { describe, expect, test, vi, beforeEach, afterEach } from 'vitest';
 // ---------------------------------------------------------------------------
 
 vi.mock('@mastra/core', () => {
-  const Mastra = vi.fn().mockImplementation(function (this: any) {
-    this._isMastra = true;
-  });
+  const Mastra = vi.fn().mockImplementation(() => ({ _isMastra: true }));
   return { Mastra };
 });
 
 vi.mock('@mastra/pg', () => {
-  const PostgresStore = vi.fn().mockImplementation(function (this: any) {
-    this._isStore = true;
-  });
+  const PostgresStore = vi.fn().mockImplementation(() => ({ _isStore: true }));
   return { PostgresStore };
 });
 
@@ -50,8 +46,8 @@ describe('getMastra / resetMastra', () => {
     delete process.env.NODE_ENV;
 
     // Reset mock call counts
-    vi.mocked(Mastra).mockClear();
-    vi.mocked(PostgresStore).mockClear();
+    (Mastra as unknown as ReturnType<typeof vi.fn>).mockClear();
+    (PostgresStore as unknown as ReturnType<typeof vi.fn>).mockClear();
   });
 
   afterEach(() => {

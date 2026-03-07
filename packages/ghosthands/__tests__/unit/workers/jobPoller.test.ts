@@ -9,9 +9,7 @@ vi.mock('../../../src/monitoring/logger.js', () => ({
   }),
 }));
 
-const { notifyHumanNeededMock } = vi.hoisted(() => ({
-  notifyHumanNeededMock: vi.fn().mockResolvedValue(true),
-}));
+const notifyHumanNeededMock = vi.fn().mockResolvedValue(true);
 vi.mock('../../../src/workers/callbackNotifier.js', () => ({
   callbackNotifier: {
     notifyHumanNeeded: notifyHumanNeededMock,

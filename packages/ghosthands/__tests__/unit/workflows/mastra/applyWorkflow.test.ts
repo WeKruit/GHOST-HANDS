@@ -1,30 +1,19 @@
-import { describe, expect, test, vi, beforeEach } from 'vitest';
+import { describe, expect, test, vi, beforeEach, afterAll } from 'vitest';
 
 // ---------------------------------------------------------------------------
-// Mocks — vi.hoisted() ensures variables are available when vi.mock hoists
+// Mocks
 // ---------------------------------------------------------------------------
 
-const { mockCommittedWorkflow, mockWorkflowBuilder } = vi.hoisted(() => {
-  const mockCommittedWorkflow = { id: 'gh_apply' };
-  const mockWorkflowBuilder = {
-    then: vi.fn().mockReturnThis(),
-    branch: vi.fn().mockReturnThis(),
-    commit: vi.fn().mockReturnValue(mockCommittedWorkflow),
-  };
-  return { mockCommittedWorkflow, mockWorkflowBuilder };
-});
+const mockCommittedWorkflow = { id: 'gh_apply' };
+const mockWorkflowBuilder = {
+  then: vi.fn().mockReturnThis(),
+  branch: vi.fn().mockReturnThis(),
+  commit: vi.fn().mockReturnValue(mockCommittedWorkflow),
+};
 
 vi.mock('@mastra/core/workflows', () => ({
   createWorkflow: vi.fn().mockReturnValue(mockWorkflowBuilder),
   createStep: vi.fn().mockImplementation((config: any) => config),
-}));
-
-vi.mock('../../../../src/workflows/mastra/steps/factory.js', () => ({
-  buildSteps: vi.fn().mockReturnValue({
-    checkBlockers: { id: 'check_blockers_checkpoint', execute: vi.fn() },
-    cookbookAttempt: { id: 'cookbook_attempt', execute: vi.fn() },
-    executeHandler: { id: 'execute_handler', execute: vi.fn() },
-  }),
 }));
 
 vi.mock('../../../../src/monitoring/logger.js', () => ({
@@ -36,9 +25,23 @@ vi.mock('../../../../src/monitoring/logger.js', () => ({
   }),
 }));
 
+// Import factory module then spy on buildSteps, instead of vi.mock which
+// would contaminate bun's shared module cache and break factory.test.ts.
+import * as factoryModule from '../../../../src/workflows/mastra/steps/factory.js';
+
+const mockBuildStepsReturn = {
+  checkBlockers: { id: 'check_blockers_checkpoint', execute: vi.fn() },
+  cookbookAttempt: { id: 'cookbook_attempt', execute: vi.fn() },
+  executeHandler: { id: 'execute_handler', execute: vi.fn() },
+};
+
+let buildStepsSpy: ReturnType<typeof vi.spyOn>;
+afterAll(() => {
+  buildStepsSpy?.mockRestore();
+});
+
 import { buildApplyWorkflow } from '../../../../src/workflows/mastra/applyWorkflow.js';
 import { createWorkflow } from '@mastra/core/workflows';
-import { buildSteps } from '../../../../src/workflows/mastra/steps/factory.js';
 import type { RuntimeContext } from '../../../../src/workflows/mastra/types.js';
 
 // ---------------------------------------------------------------------------
@@ -50,12 +53,15 @@ describe('buildApplyWorkflow', () => {
   const fakeRt = {} as RuntimeContext;
 
   beforeEach(() => {
+    // Set up spy on each test, will be restored in afterAll
+    buildStepsSpy = vi.spyOn(factoryModule, 'buildSteps').mockReturnValue(
+      mockBuildStepsReturn as any,
+    );
     // Clear accumulated call counts between tests
     mockWorkflowBuilder.then.mockClear();
     mockWorkflowBuilder.branch.mockClear();
     mockWorkflowBuilder.commit.mockClear();
-    vi.mocked(createWorkflow).mockClear();
-    vi.mocked(buildSteps).mockClear();
+    (createWorkflow as unknown as ReturnType<typeof vi.fn>).mockClear();
   });
 
   // ─── Test 1 ──────────────────────────────────────────────────────────
@@ -80,7 +86,7 @@ describe('buildApplyWorkflow', () => {
   test('calls buildSteps with the provided RuntimeContext', () => {
     buildApplyWorkflow(fakeRt);
 
-    expect(buildSteps).toHaveBeenCalledWith(fakeRt);
+    expect(factoryModule.buildSteps).toHaveBeenCalledWith(fakeRt);
   });
 
   // ─── Test 4 ──────────────────────────────────────────────────────────

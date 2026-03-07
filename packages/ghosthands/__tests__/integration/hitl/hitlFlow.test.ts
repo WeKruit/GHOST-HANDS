@@ -39,8 +39,12 @@ describe('CallbackNotifier', () => {
     fetchCalls = [];
     originalFetch = globalThis.fetch;
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-      fetchCalls.push({ url: url as string, options: init });
-      return new Response('ok', { status: 200 });
+      const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url;
+      // Only capture callback POSTs, not Supabase dedupe check requests
+      if (init?.body && !urlStr.includes('/rest/v1/')) {
+        fetchCalls.push({ url: urlStr, options: init });
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }) as typeof fetch;
   });
 
@@ -288,8 +292,12 @@ describe('HITL flow simulation', () => {
     const originalFetch = globalThis.fetch;
     const fetchCalls: any[] = [];
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-      fetchCalls.push({ url, options: init });
-      return new Response('ok', { status: 200 });
+      const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url;
+      // Only capture callback POSTs, not Supabase dedupe check requests
+      if (init?.body && !urlStr.includes('/rest/v1/')) {
+        fetchCalls.push({ url: urlStr, options: init });
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }) as typeof fetch;
 
     try {

@@ -7,17 +7,16 @@
  * Mocks discoverImdsInstanceId (from asg-lifecycle) and process.argv/env.
  */
 
-import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, test, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 
 // ── Mocks (must be declared before imports) ──────────────────────────
 
 const mockDiscoverImds = vi.fn<() => Promise<string | null>>();
 
-vi.mock('../../../src/workers/asg-lifecycle.js', () => ({
-  fetchEc2InstanceId: vi.fn().mockResolvedValue('i-mock'),
-  fetchEc2Ip: vi.fn().mockResolvedValue('1.2.3.4'),
-  completeLifecycleAction: vi.fn(),
-  discoverImdsInstanceId: (...args: unknown[]) => mockDiscoverImds(...(args as [])),
+// Mock AWS SDK to prevent real API calls from asg-lifecycle.js
+vi.mock('@aws-sdk/client-auto-scaling', () => ({
+  AutoScalingClient: vi.fn().mockImplementation(() => ({ send: vi.fn() })),
+  CompleteLifecycleActionCommand: vi.fn(),
 }));
 
 vi.mock('../../../src/monitoring/logger.js', () => ({
@@ -29,7 +28,19 @@ vi.mock('../../../src/monitoring/logger.js', () => ({
   }),
 }));
 
+// Import the real asg-lifecycle module (with AWS SDK mocked above) then
+// spy on discoverImdsInstanceId in beforeEach/afterEach. This avoids replacing
+// the entire module in bun's shared mock cache which would contaminate other test files.
+import * as asgLifecycle from '../../../src/workers/asg-lifecycle.js';
+
 import { resolveWorkerId } from '../../../src/workers/resolveWorkerId.js';
+
+// Restore the spy on the shared module after all tests in this file complete,
+// so other test files importing asg-lifecycle get the real implementation.
+let discoverSpy: ReturnType<typeof vi.spyOn>;
+afterAll(() => {
+  discoverSpy?.mockRestore();
+});
 
 // ── Test suite ───────────────────────────────────────────────────────
 
@@ -39,6 +50,10 @@ describe('resolveWorkerId', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // Set up spy on each test, will be restored in afterAll
+    discoverSpy = vi.spyOn(asgLifecycle, 'discoverImdsInstanceId').mockImplementation(
+      (...args: unknown[]) => mockDiscoverImds(...(args as [])),
+    );
     // Deep-copy env and argv so each test is isolated
     process.argv = [...originalArgv];
     process.env = { ...originalEnv };
