@@ -343,7 +343,10 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
   }
 
   get page(): Page {
-    return this.requireAgent().page;
+    // Type assertion: magnitude-core's patchright-core may resolve to a slightly
+    // different patch version than the workspace's patchright. The Page types are
+    // structurally identical, so the cast is safe.
+    return this.requireAgent().page as unknown as Page;
   }
 
   async getBrowserSession(): Promise<string | null> {

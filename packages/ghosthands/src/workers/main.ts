@@ -565,7 +565,7 @@ async function main(): Promise<void> {
   if (typeof Bun !== 'undefined') {
     Bun.serve({
       port: workerPort,
-      fetch(req) {
+      fetch(req: Request) {
         const url = new URL(req.url);
 
         if (url.pathname === '/worker/status') {

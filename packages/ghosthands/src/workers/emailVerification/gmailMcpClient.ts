@@ -60,7 +60,7 @@ export class GmailMcpClient {
   private readonly pending = new Map<number, {
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
-    timeout: Timer;
+    timeout: ReturnType<typeof setTimeout>;
   }>();
 
   constructor(options: GmailMcpClientOptions) {
