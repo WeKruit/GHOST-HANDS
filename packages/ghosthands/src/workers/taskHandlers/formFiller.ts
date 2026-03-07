@@ -1380,6 +1380,7 @@ const DISALLOWED_ANTHROPIC_DEFAULT_HEADERS = new Set([
   'authorization',
   'content-length',
   'host',
+  'x-api-key',
 ]);
 
 function normalizeAnthropicBaseURL(value: string | undefined): string | undefined {
