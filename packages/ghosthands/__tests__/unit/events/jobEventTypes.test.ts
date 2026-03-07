@@ -49,19 +49,8 @@ describe('JOB_EVENT_TYPES', () => {
     expect(JOB_EVENT_TYPES.OBSERVATION_COMPLETED).toBe('observation_completed');
   });
 
-  test('contains cookbook events', () => {
-    expect(JOB_EVENT_TYPES.COOKBOOK_STEP_STARTED).toBe('cookbook_step_started');
-    expect(JOB_EVENT_TYPES.COOKBOOK_STEP_COMPLETED).toBe('cookbook_step_completed');
-    expect(JOB_EVENT_TYPES.COOKBOOK_STEP_FAILED).toBe('cookbook_step_failed');
-  });
-
   test('contains cost event', () => {
     expect(JOB_EVENT_TYPES.TOKENS_USED).toBe('tokens_used');
-  });
-
-  test('contains manual events', () => {
-    expect(JOB_EVENT_TYPES.MANUAL_FOUND).toBe('manual_found');
-    expect(JOB_EVENT_TYPES.MANUAL_CREATED).toBe('manual_created');
   });
 
   test('contains session events', () => {
@@ -78,11 +67,6 @@ describe('JOB_EVENT_TYPES', () => {
   test('contains browser crash events', () => {
     expect(JOB_EVENT_TYPES.BROWSER_CRASH_DETECTED).toBe('browser_crash_detected');
     expect(JOB_EVENT_TYPES.BROWSER_CRASH_RECOVERED).toBe('browser_crash_recovered');
-  });
-
-  test('contains trace recording events', () => {
-    expect(JOB_EVENT_TYPES.TRACE_RECORDING_STARTED).toBe('trace_recording_started');
-    expect(JOB_EVENT_TYPES.TRACE_RECORDING_COMPLETED).toBe('trace_recording_completed');
   });
 
   test('contains progress and budget events', () => {

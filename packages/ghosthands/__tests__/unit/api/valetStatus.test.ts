@@ -28,16 +28,16 @@ describe('VALET Status API — mode/cost fields', () => {
         callback_url: 'https://example.com/callback',
         status: 'completed',
         result_data: { applied: true },
-        execution_mode: 'cookbook',
+        execution_mode: 'magnitude',
         browser_mode: 'local',
-        final_mode: 'cookbook',
+        final_mode: 'magnitude',
       });
 
       expect(result).toBe(true);
       expect(capturedPayload).not.toBeNull();
-      expect(capturedPayload.execution_mode).toBe('cookbook');
+      expect(capturedPayload.execution_mode).toBe('magnitude');
       expect(capturedPayload.browser_mode).toBe('local');
-      expect(capturedPayload.final_mode).toBe('cookbook');
+      expect(capturedPayload.final_mode).toBe('magnitude');
     });
 
     test('omits mode fields when not present (backward compatibility)', async () => {
@@ -54,68 +54,6 @@ describe('VALET Status API — mode/cost fields', () => {
       expect(capturedPayload.browser_mode).toBeUndefined();
       expect(capturedPayload.final_mode).toBeUndefined();
       expect(capturedPayload.manual).toBeUndefined();
-    });
-
-    test('includes manual info when engine metadata has manual_id', async () => {
-      const result = await notifier.notifyFromJob({
-        id: 'job-789',
-        callback_url: 'https://example.com/callback',
-        status: 'completed',
-        result_data: { applied: true },
-        execution_mode: 'hybrid',
-        metadata: {
-          engine: {
-            manual_id: 'manual-abc',
-            manual_status: 'cookbook_success',
-            health_score: 95,
-          },
-        },
-      });
-
-      expect(result).toBe(true);
-      expect(capturedPayload.manual).toEqual({
-        id: 'manual-abc',
-        status: 'cookbook_success',
-        health_score: 95,
-        fallback_reason: null,
-      });
-    });
-
-    test('omits manual when engine metadata has no manual_id', async () => {
-      const result = await notifier.notifyFromJob({
-        id: 'job-no-manual',
-        callback_url: 'https://example.com/callback',
-        status: 'completed',
-        result_data: { applied: true },
-        metadata: { engine: {} },
-      });
-
-      expect(result).toBe(true);
-      expect(capturedPayload.manual).toBeUndefined();
-    });
-
-    test('includes manual with fallback_reason when present', async () => {
-      await notifier.notifyFromJob({
-        id: 'job-fallback',
-        callback_url: 'https://example.com/callback',
-        status: 'completed',
-        result_data: { applied: true },
-        metadata: {
-          engine: {
-            manual_id: 'manual-def',
-            manual_status: 'fallback_to_ai',
-            health_score: 30,
-            fallback_reason: 'health_score_below_threshold',
-          },
-        },
-      });
-
-      expect(capturedPayload.manual).toEqual({
-        id: 'manual-def',
-        status: 'fallback_to_ai',
-        health_score: 30,
-        fallback_reason: 'health_score_below_threshold',
-      });
     });
 
     test('preserves existing cost field alongside new mode fields', async () => {
@@ -352,13 +290,13 @@ describe('VALET Schema — model + execution_mode fields', () => {
         ...baseTaskBody,
         model: 'claude-sonnet',
         image_model: 'qwen-72b',
-        execution_mode: 'cookbook_only',
+        execution_mode: 'ai_only',
       });
       expect(result.success).toBe(true);
       if (result.success) {
         expect(result.data.model).toBe('claude-sonnet');
         expect(result.data.image_model).toBe('qwen-72b');
-        expect(result.data.execution_mode).toBe('cookbook_only');
+        expect(result.data.execution_mode).toBe('ai_only');
       }
     });
 

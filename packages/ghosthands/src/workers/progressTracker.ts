@@ -75,8 +75,7 @@ export interface ProgressEventData {
   elapsed_ms: number;
   eta_ms: number | null;
   // Mode tracking (Sprint 3)
-  execution_mode?: 'cookbook' | 'magnitude';
-  manual_id?: string;
+  execution_mode?: 'magnitude';
   step_cost_cents?: number;
   /** Kasm session URL for live browser view (WEK-162) */
   kasm_url?: string;
@@ -163,8 +162,7 @@ export class ProgressTracker {
   private lastEmitTime = 0;
   private latestThought: string | undefined;
   private pendingEmit: ProgressEventData | null = null;
-  private executionMode?: 'cookbook' | 'magnitude';
-  private manualId?: string;
+  private executionMode?: 'magnitude';
   private kasmUrl?: string;
 
   constructor(opts: ProgressTrackerOptions) {
@@ -188,9 +186,8 @@ export class ProgressTracker {
   }
 
   /** Set the current execution mode for progress events. */
-  setExecutionMode(mode: 'cookbook' | 'magnitude', manualId?: string): void {
+  setExecutionMode(mode: 'magnitude'): void {
     this.executionMode = mode;
-    this.manualId = manualId;
   }
 
   /** Set the Kasm session URL for live view (WEK-162). */
@@ -237,7 +234,6 @@ export class ProgressTracker {
       elapsed_ms: elapsedMs,
       eta_ms: this.estimateEta(elapsedMs),
       ...(this.executionMode && { execution_mode: this.executionMode }),
-      ...(this.manualId && { manual_id: this.manualId }),
       ...(this.kasmUrl && { kasm_url: this.kasmUrl }),
     };
   }

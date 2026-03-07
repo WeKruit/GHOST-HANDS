@@ -26,7 +26,6 @@ export interface StreamEventFields {
   elapsed_ms: number;
   eta_ms: number | null;
   execution_mode?: string;
-  manual_id?: string;
   step_cost_cents?: number;
   timestamp: string;
 }
