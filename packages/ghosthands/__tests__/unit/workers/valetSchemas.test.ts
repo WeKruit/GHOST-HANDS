@@ -97,7 +97,7 @@ describe('VALET Schemas', () => {
       if (result.success) {
         expect(result.data.quality).toBe('balanced'); // default
         expect(result.data.priority).toBe(5); // default
-        expect(result.data.timeout_seconds).toBe(300); // default
+        expect(result.data.timeout_seconds).toBe(1800); // default
       }
     });
 

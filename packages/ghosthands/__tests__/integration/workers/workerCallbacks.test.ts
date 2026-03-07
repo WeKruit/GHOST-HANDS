@@ -5,14 +5,22 @@ import { createValetRoutes } from '../../../src/api/routes/valet.js';
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-/** Capture all payloads sent by CallbackNotifier via fetch. */
+/** Capture only callback payloads sent by CallbackNotifier via fetch.
+ *  Filters out Supabase dedupe check requests (which also go through fetch). */
 function createFetchCapture() {
   const payloads: CallbackPayload[] = [];
   const originalFetch = globalThis.fetch;
 
-  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
-    payloads.push(JSON.parse(init!.body as string));
-    return new Response('OK', { status: 200 });
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url;
+    // Only capture callback POSTs (not Supabase REST API calls for dedupe)
+    if (init?.body && !urlStr.includes('/rest/v1/')) {
+      try {
+        const parsed = JSON.parse(init.body as string);
+        if (parsed.job_id) payloads.push(parsed);
+      } catch { /* ignore non-JSON bodies */ }
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }) as typeof fetch;
 
   return {

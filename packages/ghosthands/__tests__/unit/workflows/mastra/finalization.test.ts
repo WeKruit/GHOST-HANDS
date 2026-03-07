@@ -30,15 +30,20 @@ vi.mock('../../../../src/workers/callbackNotifier.js', () => ({
   },
 }));
 
-vi.mock('../../../../src/workers/costControl.js', async (importOriginal) => {
-  const actual = await importOriginal() as Record<string, unknown>;
-  return {
-    ...actual,
-    CostControlService: class MockCostControlService {
-      recordJobCost = vi.fn().mockResolvedValue(undefined);
-    },
-  };
-});
+vi.mock('../../../../src/workers/costControl.js', () => ({
+  CostControlService: class MockCostControlService {
+    recordJobCost = vi.fn().mockResolvedValue(undefined);
+  },
+  CostTracker: vi.fn(),
+  BudgetExceededError: class extends Error {},
+  ActionLimitExceededError: class extends Error {},
+  TASK_BUDGET: { speed: 0.05, balanced: 0.15, quality: 0.50 },
+  JOB_TYPE_BUDGET_OVERRIDES: {},
+  MONTHLY_BUDGET: {},
+  DEFAULT_MAX_ACTIONS: 50,
+  JOB_TYPE_ACTION_LIMITS: {},
+  resolveQualityPreset: vi.fn(),
+}));
 
 // Import after mocking so the mocked modules are used
 import { callbackNotifier } from '../../../../src/workers/callbackNotifier.js';
