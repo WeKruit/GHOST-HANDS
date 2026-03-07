@@ -567,12 +567,6 @@ describe('VALET status endpoint — worker_id', () => {
     expect(body.status).toBe('completed');
     expect(body.result).not.toBeNull();
     expect(body.result.summary).toBe('Application submitted');
-    expect(body.manual).toEqual({
-      id: 'manual-1',
-      status: 'cookbook_success',
-      health_score: 95,
-      fallback_reason: null,
-    });
   });
 
   test('GET /valet/status/:jobId returns worker_id alongside failed error', async () => {

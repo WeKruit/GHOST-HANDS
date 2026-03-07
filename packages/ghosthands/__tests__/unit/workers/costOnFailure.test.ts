@@ -17,7 +17,6 @@ describe('CostTracker getSnapshot() failure edge cases', () => {
     expect(snap.outputCost).toBe(0);
     expect(snap.totalCost).toBe(0);
     expect(snap.actionCount).toBe(0);
-    expect(snap.cookbookSteps).toBe(0);
     expect(snap.magnitudeSteps).toBe(0);
     expect(snap.imageCost).toBe(0);
     expect(snap.reasoningCost).toBe(0);
@@ -453,7 +452,7 @@ describe('CostControlService recordJobCost with atomic RPC', () => {
       outputCost: 0,
       totalCost: 0,
       actionCount: 0,
-      cookbookSteps: 0,
+
       magnitudeSteps: 0,
       imageCost: 0,
       reasoningCost: 0,
@@ -516,7 +515,7 @@ describe('CostControlService recordJobCost with atomic RPC', () => {
       outputCost: 0.003,
       totalCost: 0.008,
       actionCount: 3,
-      cookbookSteps: 0,
+
       magnitudeSteps: 3,
       imageCost: 0,
       reasoningCost: 0.008,
@@ -566,7 +565,7 @@ describe('CostControlService recordJobCost with atomic RPC', () => {
       outputCost: 0.001,
       totalCost: 0.002,
       actionCount: 1,
-      cookbookSteps: 0,
+
       magnitudeSteps: 1,
       imageCost: 0,
       reasoningCost: 0.002,

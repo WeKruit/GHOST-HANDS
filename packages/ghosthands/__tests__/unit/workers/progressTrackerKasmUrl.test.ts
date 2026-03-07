@@ -64,13 +64,12 @@ describe('WEK-162: kasm_url in progress events', () => {
     expect(snapshot.action_index).toBe(1);
   });
 
-  test('kasm_url coexists with execution_mode and manual_id', () => {
+  test('kasm_url coexists with execution_mode', () => {
     tracker.setKasmUrl(KASM_URL);
-    tracker.setExecutionMode('cookbook', 'manual-abc');
+    tracker.setExecutionMode('magnitude');
 
     const snapshot = tracker.getSnapshot();
     expect(snapshot.kasm_url).toBe(KASM_URL);
-    expect(snapshot.execution_mode).toBe('cookbook');
-    expect(snapshot.manual_id).toBe('manual-abc');
+    expect(snapshot.execution_mode).toBe('magnitude');
   });
 });

@@ -898,7 +898,7 @@ export class JobExecutor {
       }
 
       // Update final_mode and cost metadata
-      const finalMode = 'magnitude';
+      const finalMode = job.execution_mode || handler.type || 'magnitude';
       await this.supabase
         .from('gh_automation_jobs')
         .update({
@@ -1735,10 +1735,10 @@ export class JobExecutor {
 
     if (finalState.handler?.attempted && finalState.handler.taskResult) {
       const taskResult = finalState.handler.taskResult as any;
-      const finalMode = 'magnitude';
+      const finalMode = job.execution_mode || handler.type || 'magnitude';
       const engineResult = {
         success: false,
-        mode: 'magnitude' as const,
+        mode: finalMode as any,
         magnitudeSteps: costTracker.getSnapshot().actionCount,
       };
 
