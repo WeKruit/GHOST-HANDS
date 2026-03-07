@@ -3,7 +3,7 @@
  *
  * Detects platform (workday, greenhouse, lever, etc.), page type (form, login, etc.),
  * enumerates forms/buttons/navigation, and produces a deterministic structure fingerprint
- * for cookbook matching.
+ * for page analysis.
  *
  * Zero LLM calls: all detection is URL-pattern and DOM-based.
  */

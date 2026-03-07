@@ -18,9 +18,7 @@ export interface CostSnapshot {
   outputCost: number;
   totalCost: number;
   actionCount: number;
-  // Mode tracking (Sprint 3)
-  mode?: 'cookbook' | 'magnitude' | 'hybrid';
-  cookbookSteps: number;
+  mode?: 'magnitude';
   magnitudeSteps: number;
   // Dual-model cost breakdown (Sprint 4)
   imageCost: number;
@@ -117,9 +115,7 @@ export class CostTracker {
   private inputCost = 0;
   private outputCost = 0;
   private actionCount = 0;
-  private cookbookSteps = 0;
   private magnitudeSteps = 0;
-  private currentMode: CostSnapshot['mode'] = undefined;
   private _imageCost = 0;
   private _reasoningCost = 0;
 
@@ -198,26 +194,16 @@ export class CostTracker {
       outputCost: this.outputCost,
       totalCost: this.inputCost + this.outputCost,
       actionCount: this.actionCount,
-      mode: this.currentMode,
-      cookbookSteps: this.cookbookSteps,
+      mode: 'magnitude',
       magnitudeSteps: this.magnitudeSteps,
       imageCost: this._imageCost,
       reasoningCost: this._reasoningCost,
     };
   }
 
-  /** Record a step in the given mode. */
-  recordModeStep(mode: 'cookbook' | 'magnitude'): void {
-    if (mode === 'cookbook') {
-      this.cookbookSteps++;
-    } else {
-      this.magnitudeSteps++;
-    }
-  }
-
-  /** Set the current execution mode. */
-  setMode(mode: 'cookbook' | 'magnitude' | 'hybrid'): void {
-    this.currentMode = mode;
+  /** Record a magnitude step. */
+  recordModeStep(): void {
+    this.magnitudeSteps++;
   }
 
   /** The dollar budget for this task. */

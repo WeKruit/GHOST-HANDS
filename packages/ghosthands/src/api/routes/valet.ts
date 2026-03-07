@@ -459,17 +459,6 @@ export function createValetRoutes(pool: pg.Pool) {
 
   // ─── Helpers for status endpoint ──────────────────────────────
 
-  function buildManualInfo(meta: Record<string, any>) {
-    const engine = meta?.engine || {};
-    if (!engine.manual_id) return null;
-    return {
-      id: engine.manual_id,
-      status: engine.manual_status || 'ai_only',
-      health_score: engine.health_score ?? null,
-      fallback_reason: engine.fallback_reason ?? null,
-    };
-  }
-
   function buildCostBreakdown(job: Record<string, any>) {
     const resultCost = job.result_data?.cost;
     if (!resultCost) return null;
@@ -481,9 +470,7 @@ export function createValetRoutes(pool: pg.Pool) {
       total_cost_usd: resultCost.total_cost_usd ?? 0,
       action_count: resultCost.action_count ?? 0,
       total_tokens: (resultCost.input_tokens ?? 0) + (resultCost.output_tokens ?? 0),
-      cookbook_steps: modeCosts.cookbook_steps ?? 0,
       magnitude_steps: modeCosts.magnitude_steps ?? 0,
-      cookbook_cost_usd: modeCosts.cookbook_cost_usd ?? 0,
       magnitude_cost_usd: modeCosts.magnitude_cost_usd ?? 0,
     };
   }
@@ -538,7 +525,6 @@ export function createValetRoutes(pool: pg.Pool) {
       execution_mode: job.execution_mode || 'auto',
       browser_mode: job.browser_mode || 'server',
       final_mode: job.final_mode || null,
-      manual: buildManualInfo(meta),
       cost_breakdown: buildCostBreakdown(job),
       timestamps: {
         created_at: job.created_at,
