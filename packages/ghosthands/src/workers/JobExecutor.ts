@@ -15,10 +15,6 @@ import { callbackNotifier } from './callbackNotifier.js';
 import type { TaskHandler, TaskContext, TaskResult } from './taskHandlers/types.js';
 import { SessionManager } from '../sessions/SessionManager.js';
 import { BlockerDetector, type BlockerResult, type BlockerType } from '../detection/BlockerDetector.js';
-import { ExecutionEngine } from '../engine/ExecutionEngine.js';
-import { ManualStore } from '../engine/ManualStore.js';
-import { CookbookExecutor } from '../engine/CookbookExecutor.js';
-import { TraceRecorder } from '../engine/TraceRecorder.js';
 import { StagehandObserver } from '../engine/StagehandObserver.js';
 import type { MagnitudeAdapter } from '../adapters/magnitude.js';
 import { ThoughtThrottle, JOB_EVENT_TYPES } from '../events/JobEventTypes.js';
@@ -31,7 +27,6 @@ import { buildApplyWorkflow } from '../workflows/mastra/applyWorkflow.js';
 import { isMastraResume, claimResume, persistMastraRunId } from '../workflows/mastra/resumeCoordinator.js';
 import { workflowState, type RuntimeContext, type WorkflowState } from '../workflows/mastra/types.js';
 import {
-  finalizeCookbookSuccess,
   finalizeHandlerResult,
   finalizeHandlerSideEffects,
   serializeContextReport,
@@ -695,7 +690,7 @@ export class JobExecutor {
       logger.debug('[exec] Step 8.5: Session injection done', { jobId: job.id });
 
       // 8a. Auto-attach resume to file inputs via Playwright filechooser event.
-      // This covers ALL execution paths (handlers, cookbook, crash recovery).
+      // This covers ALL execution paths (handlers, crash recovery).
       if (resumeFilePath) {
         fileChooserHandler = async (chooser: any) => {
           try {
@@ -754,156 +749,13 @@ export class JobExecutor {
         logger.debug('[exec] Step 8.6: Blocker check passed', { jobId: job.id });
       }
 
-      // 9. Try ExecutionEngine (cookbook replay) before Magnitude handler
-      logger.debug('[exec] Step 9: Trying cookbook engine', { jobId: job.id });
+      // 9. Set up handler execution
       await progress.setStep(ProgressStep.NAVIGATING);
 
       const logEventFn = (eventType: string, metadata: Record<string, any>) =>
         this.logJobEvent(job.id, eventType, metadata);
 
-      const executionEngine = new ExecutionEngine({
-        manualStore: new ManualStore(this.supabase),
-        cookbookExecutor: new CookbookExecutor({
-          logEvent: logEventFn,
-        }),
-      });
-
-      const engineResult = await executionEngine.execute({
-        job,
-        adapter,
-        costTracker,
-        progress,
-        logEvent: logEventFn,
-        resumeFilePath,
-      });
-
-      logger.debug('[exec] Step 9: Engine result', { jobId: job.id, success: engineResult.success, mode: engineResult.mode });
-
-      // Track TraceRecorder for Magnitude path (manual training)
-      let traceRecorder: TraceRecorder | null = null;
-
-      if (engineResult.success) {
-        // Cookbook succeeded — update mode and skip to success handling
-        await this.supabase
-          .from('gh_automation_jobs')
-          .update({
-            final_mode: engineResult.mode,
-            metadata: {
-              ...(job.metadata || {}),
-              engine: {
-                manual_id: engineResult.manualId,
-                manual_status: 'cookbook_success',
-                health_score: engineResult.cookbookSteps > 0 ? 95 : null,
-              },
-              cost_breakdown: {
-                cookbook_steps: engineResult.cookbookSteps,
-                magnitude_steps: 0,
-                cookbook_cost_usd: costTracker.getSnapshot().totalCost,
-                magnitude_cost_usd: 0,
-                image_cost_usd: costTracker.getSnapshot().imageCost,
-                reasoning_cost_usd: costTracker.getSnapshot().reasoningCost,
-              },
-            },
-          })
-          .eq('id', job.id);
-
-        // Take final screenshot and upload
-        const screenshotUrls: string[] = [];
-        try {
-          const screenshotBuffer = await adapter.screenshot();
-          const screenshotUrl = await this.uploadScreenshot(job.id, 'final', screenshotBuffer);
-          screenshotUrls.push(screenshotUrl);
-        } catch (err) {
-          getLogger().warn('Screenshot failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
-        }
-
-        // Save browser session
-        if (this.sessionManager && adapter.getBrowserSession) {
-          try {
-            const sessionJson = await adapter.getBrowserSession();
-            if (sessionJson) {
-              const sessionState = JSON.parse(sessionJson);
-              await this.sessionManager.saveSession(job.user_id, job.target_url, sessionState);
-            }
-          } catch (err) {
-            getLogger().warn('Session save failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
-          }
-        }
-
-        // Get final cost and mark complete
-        const finalCost = costTracker.getSnapshot();
-        await progress.setStep(ProgressStep.COMPLETED);
-        await progress.flush();
-
-        const resultData = {
-          success_message: 'Task completed via cookbook replay',
-          cost: {
-            input_tokens: finalCost.inputTokens,
-            output_tokens: finalCost.outputTokens,
-            total_cost_usd: finalCost.totalCost,
-            action_count: finalCost.actionCount,
-          },
-        };
-
-        await this.supabase
-          .from('gh_automation_jobs')
-          .update({
-            status: 'completed',
-            completed_at: new Date().toISOString(),
-            result_data: resultData,
-            result_summary: 'Task completed via cookbook replay',
-            screenshot_urls: screenshotUrls,
-            llm_cost_cents: Math.round(finalCost.totalCost * 100),
-            action_count: finalCost.actionCount,
-            total_tokens: finalCost.inputTokens + finalCost.outputTokens,
-          })
-          .eq('id', job.id);
-
-        await this.logJobEvent(job.id, 'job_completed', {
-          handler: 'cookbook',
-          result_summary: 'Task completed via cookbook replay',
-          action_count: finalCost.actionCount,
-          cost_cents: Math.round(finalCost.totalCost * 100),
-          final_mode: 'cookbook',
-          cookbook_steps: engineResult.cookbookSteps,
-        });
-
-        await costService.recordJobCost(job.user_id, job.id, finalCost).catch((err) => {
-          getLogger().warn('Failed to record cost', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
-        });
-
-        if (job.callback_url) {
-          callbackNotifier.notifyFromJob({
-            id: job.id,
-            valet_task_id: job.valet_task_id,
-            callback_url: job.callback_url,
-            status: 'completed',
-            worker_id: this.workerId,
-            result_data: resultData,
-            result_summary: 'Task completed via cookbook replay',
-            screenshot_urls: screenshotUrls,
-            llm_cost_cents: Math.round(finalCost.totalCost * 100),
-            action_count: finalCost.actionCount,
-            total_tokens: finalCost.inputTokens + finalCost.outputTokens,
-          }).catch((err) => {
-            getLogger().warn('Callback notification failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
-          });
-        }
-
-        getLogger().info('Job completed via cookbook', { jobId: job.id, cookbookSteps: engineResult.cookbookSteps, costUsd: finalCost.totalCost });
-        return;
-      }
-
-      // Engine returned failure — fall back to Magnitude handler
-      // Start trace recording so we can create a manual from this run
-      traceRecorder = new TraceRecorder({
-        adapter,
-        userData: (job.input_data?.user_data as Record<string, string>) || {},
-      });
-      traceRecorder.start();
-      await this.logJobEvent(job.id, JOB_EVENT_TYPES.TRACE_RECORDING_STARTED, {});
-
-      // 9a. Wire up event tracking with cost control + progress for Magnitude path
+      // 9a. Wire up event tracking with cost control + progress
       const thoughtThrottle = new ThoughtThrottle(2000);
       const targetDomain = new URL(job.target_url).hostname;
       const blockerState = {
@@ -1045,51 +897,19 @@ export class JobExecutor {
         throw new Error(taskResult.error || `Task handler '${handler.type}' returned failure`);
       }
 
-      // 10a. Save trace as manual for future cookbook replay
-      if (traceRecorder && traceRecorder.isRecording()) {
-        traceRecorder.stopRecording();
-        await this.logJobEvent(job.id, JOB_EVENT_TYPES.TRACE_RECORDING_COMPLETED, {
-          steps: traceRecorder.getTrace().length,
-        });
-        const trace = traceRecorder.getTrace();
-        if (trace.length > 0) {
-          try {
-            const manualStore = new ManualStore(this.supabase);
-            const platform = detectPlatform(job.target_url);
-            await manualStore.saveFromTrace(trace, {
-              url: job.target_url,
-              taskType: job.job_type,
-              platform,
-            });
-            await this.logJobEvent(job.id, 'manual_created', {
-              steps: trace.length,
-              url_pattern: ManualStore.urlToPattern(job.target_url),
-            });
-          } catch (err) {
-            getLogger().warn('Manual save failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
-          }
-        }
-      }
-
-      // Determine final mode based on engine result
-      const finalMode = engineResult.cookbookSteps > 0 ? 'hybrid' : 'magnitude';
-
-      // Update final_mode and engine metadata
+      // Update final_mode and cost metadata
+      // Map execution_mode to a valid final_mode value for the DB constraint.
+      // Valid final_mode values: 'magnitude', 'hybrid', 'smart_apply', 'agent_apply', 'mastra'
+      const VALID_FINAL_MODES = new Set(['magnitude', 'hybrid', 'smart_apply', 'agent_apply', 'mastra']);
+      const finalMode = (job.execution_mode && VALID_FINAL_MODES.has(job.execution_mode)) ? job.execution_mode : 'magnitude';
       await this.supabase
         .from('gh_automation_jobs')
         .update({
           final_mode: finalMode,
           metadata: {
             ...(job.metadata || {}),
-            engine: {
-              manual_id: engineResult.manualId || null,
-              manual_status: engineResult.manualId ? 'cookbook_failed_fallback' : 'no_manual_available',
-              fallback_reason: engineResult.error || null,
-            },
             cost_breakdown: {
-              cookbook_steps: engineResult.cookbookSteps,
               magnitude_steps: costTracker.getSnapshot().actionCount,
-              cookbook_cost_usd: 0,
               magnitude_cost_usd: costTracker.getSnapshot().totalCost,
               image_cost_usd: costTracker.getSnapshot().imageCost,
               reasoning_cost_usd: costTracker.getSnapshot().reasoningCost,
@@ -1249,7 +1069,6 @@ export class JobExecutor {
         total_tokens: finalCost.inputTokens + finalCost.outputTokens,
         cost_cents: Math.round(finalCost.totalCost * 100),
         final_mode: finalMode,
-        cookbook_steps: engineResult.cookbookSteps,
         magnitude_steps: finalCost.actionCount,
       });
 
@@ -1504,7 +1323,7 @@ export class JobExecutor {
 
   /**
    * Execute a job using the Mastra workflow engine.
-   * Implements PRD V5.2 Phase 1: wraps cookbook + handler in a durable workflow
+   * Implements PRD V5.2 Phase 1: wraps handler in a durable workflow
    * with suspend/resume for HITL blockers.
    */
   private async executeMastraWorkflow(opts: {
@@ -1799,7 +1618,6 @@ export class JobExecutor {
         platform: job.metadata?.platform || 'other',
         qualityPreset: resolveQualityPreset(job.input_data, job.metadata),
         budgetUsd: costTracker.getRemainingBudget(),
-        cookbook: {},
         handler: {},
         hitl: {},
         metrics: {},
@@ -1889,18 +1707,18 @@ export class JobExecutor {
     let finalState: WorkflowState | undefined;
     const raw = result?.result;
 
-    if (raw && typeof raw === 'object' && 'cookbook' in raw && 'handler' in raw) {
+    if (raw && typeof raw === 'object' && 'handler' in raw) {
       // Direct: result.result IS the WorkflowState
       finalState = raw as WorkflowState;
-    } else if (raw && typeof raw === 'object' && 'output' in raw && typeof raw.output === 'object' && raw.output && 'cookbook' in raw.output) {
+    } else if (raw && typeof raw === 'object' && 'output' in raw && typeof raw.output === 'object' && raw.output && 'handler' in raw.output) {
       // Wrapped in StepResult: result.result.output is the WorkflowState
       finalState = raw.output as WorkflowState;
     } else if (result?.steps) {
       // Fallback: extract from individual step results
-      const stepKeys = ['execute_handler', 'cookbook_done'];
+      const stepKeys = ['execute_handler'];
       for (const key of stepKeys) {
         const stepResult = (result.steps as Record<string, any>)[key];
-        if (stepResult?.output && typeof stepResult.output === 'object' && 'cookbook' in stepResult.output) {
+        if (stepResult?.output && typeof stepResult.output === 'object' && 'handler' in stepResult.output) {
           finalState = stepResult.output as WorkflowState;
           break;
         }
@@ -1918,37 +1736,15 @@ export class JobExecutor {
       throw new Error('Mastra workflow returned no extractable state');
     }
 
-    if (finalState.cookbook?.success) {
-      // Cookbook path finalization
-      await finalizeCookbookSuccess({
-        job,
-        adapter,
-        costTracker,
-        progress,
-        sessionManager: this.sessionManager,
-        workerId: this.workerId,
-        supabase: this.supabase,
-        logEvent: logEventFn,
-        uploadScreenshot: (jid, name, buf) => this.uploadScreenshot(jid, name, buf),
-        pageContext,
-        engineResult: {
-          success: true,
-          mode: 'cookbook',
-          manualId: finalState.cookbook.manualId || undefined,
-          cookbookSteps: finalState.cookbook.steps,
-          magnitudeSteps: 0,
-        },
-      });
-      return;
-    }
-
     if (finalState.handler?.attempted && finalState.handler.taskResult) {
       const taskResult = finalState.handler.taskResult as any;
-      const finalMode = (finalState.cookbook?.steps ?? 0) > 0 ? 'hybrid' : 'magnitude';
+      // Map execution_mode to a valid final_mode value for the DB constraint.
+      // Valid final_mode values: 'magnitude', 'hybrid', 'smart_apply', 'agent_apply', 'mastra'
+      const VALID_FINAL_MODES = new Set(['magnitude', 'hybrid', 'smart_apply', 'agent_apply', 'mastra']);
+      const finalMode = (job.execution_mode && VALID_FINAL_MODES.has(job.execution_mode)) ? job.execution_mode : 'magnitude';
       const engineResult = {
         success: false,
         mode: 'magnitude' as const,
-        cookbookSteps: finalState.cookbook?.steps ?? 0,
         magnitudeSteps: costTracker.getSnapshot().actionCount,
       };
 
@@ -2039,7 +1835,7 @@ export class JobExecutor {
       return;
     }
 
-    // Workflow completed but neither cookbook nor handler succeeded — fail
+    // Workflow completed but handler did not succeed — fail
     throw new Error(`Mastra workflow completed with unexpected state: ${finalState.status}`);
   }
 
@@ -2172,7 +1968,7 @@ export class JobExecutor {
       logger.debug('[magnitude] actionStarted', { variant: action.variant, jobId: job.id });
       blockerState.consecutiveFailures++;
       costTracker.recordAction(); // throws ActionLimitExceededError if over limit
-      costTracker.recordModeStep('magnitude');
+      costTracker.recordModeStep();
       progress.onActionStarted(action.variant);
       this.logJobEvent(job.id, JOB_EVENT_TYPES.STEP_STARTED, {
         action: action.variant,

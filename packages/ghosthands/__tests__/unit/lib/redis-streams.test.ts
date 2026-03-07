@@ -114,7 +114,7 @@ describe('xaddEvent', () => {
       eta_ms: null, // null
       timestamp: '2026-02-20T10:00:00Z',
       // execution_mode is undefined (optional)
-      // manual_id is undefined (optional)
+      // step_cost_cents is undefined (optional)
     };
 
     await xaddEvent(redis as any, 'job-123', eventWithOptionals);
@@ -122,7 +122,7 @@ describe('xaddEvent', () => {
     const args = redis.xadd.mock.calls[0];
     const fields = args.slice(5);
 
-    // Should NOT contain current_action, execution_mode, manual_id, or eta_ms
+    // Should NOT contain current_action, execution_mode, step_cost_cents, or eta_ms
     const fieldKeys: string[] = [];
     for (let i = 0; i < fields.length; i += 2) {
       fieldKeys.push(fields[i]);
@@ -130,7 +130,7 @@ describe('xaddEvent', () => {
 
     expect(fieldKeys).not.toContain('current_action');
     expect(fieldKeys).not.toContain('execution_mode');
-    expect(fieldKeys).not.toContain('manual_id');
+    expect(fieldKeys).not.toContain('step_cost_cents');
     expect(fieldKeys).not.toContain('eta_ms');
   });
 

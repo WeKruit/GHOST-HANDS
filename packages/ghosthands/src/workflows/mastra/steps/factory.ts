@@ -1,11 +1,10 @@
 /**
  * Step Factory — Builds Mastra workflow steps with RuntimeContext captured via closure.
  *
- * PRD V5.2 Section 5.4: Three steps that compose the gh_apply workflow.
+ * Two steps compose the gh_apply workflow:
  *
  * 1. check_blockers_checkpoint — Detect CAPTCHAs/login walls, suspend for HITL
- * 2. cookbook_attempt — Try deterministic cookbook replay via ExecutionEngine
- * 3. execute_handler — Fall back to LLM-driven task handler execution
+ * 2. execute_handler — LLM-driven task handler execution
  *
  * IMPORTANT: RuntimeContext is closure-injected. Non-serializable objects
  * (adapter, supabase, costTracker, etc.) are NEVER placed into workflow state.
@@ -15,9 +14,6 @@ import { createStep } from '@mastra/core/workflows';
 import { z } from 'zod';
 
 import { workflowState, blockerResumeSchema, type RuntimeContext } from '../types.js';
-import { ExecutionEngine } from '../../../engine/ExecutionEngine.js';
-import { ManualStore } from '../../../engine/ManualStore.js';
-import { CookbookExecutor } from '../../../engine/CookbookExecutor.js';
 import type { TaskContext } from '../../../workers/taskHandlers/types.js';
 import { BlockerDetector, type BlockerType } from '../../../detection/BlockerDetector.js';
 import { callbackNotifier } from '../../../workers/callbackNotifier.js';
@@ -483,67 +479,7 @@ export function buildSteps(rt: RuntimeContext) {
     },
   });
 
-  // ─── Step 2: cookbook_attempt ────────────────────────────────────────
-
-  const cookbookAttempt = createStep({
-    id: 'cookbook_attempt',
-    inputSchema: workflowState,
-    outputSchema: workflowState,
-    execute: async ({ inputData }) => {
-      const state: WorkflowState = { ...inputData };
-
-      const manualStore = new ManualStore(rt.supabase);
-      const cookbookExecutor = new CookbookExecutor({ logEvent: rt.logEvent });
-      const engine = new ExecutionEngine({
-        manualStore,
-        cookbookExecutor,
-      });
-
-      const result = await engine.execute({
-        job: rt.job,
-        adapter: rt.adapter,
-        costTracker: rt.costTracker,
-        progress: rt.progress,
-        logEvent: rt.logEvent,
-        resumeFilePath: rt.resumeFilePath,
-      });
-
-      // Map ExecutionResult to cookbook state fields
-      state.cookbook = {
-        attempted: true,
-        success: result.success,
-        manualId: result.manualId ?? null,
-        steps: result.cookbookSteps,
-        error: result.error ?? null,
-      };
-
-      // Read current cost from tracker
-      const costSnapshot = rt.costTracker.getSnapshot();
-      state.metrics = {
-        ...state.metrics,
-        costUsd: costSnapshot.totalCost,
-      };
-
-      if (result.success) {
-        state.status = 'completed';
-        logger.info('Cookbook execution succeeded', {
-          jobId: state.jobId,
-          manualId: result.manualId,
-          steps: result.cookbookSteps,
-        });
-      } else {
-        logger.info('Cookbook execution did not succeed, falling through to handler', {
-          jobId: state.jobId,
-          mode: result.mode,
-          error: result.error,
-        });
-      }
-
-      return state;
-    },
-  });
-
-  // ─── Step 3: execute_handler ────────────────────────────────────────
+  // ─── Step 2: execute_handler ────────────────────────────────────────
 
   const executeHandler = createStep({
     id: 'execute_handler',
@@ -624,5 +560,5 @@ export function buildSteps(rt: RuntimeContext) {
     },
   });
 
-  return { checkBlockers, cookbookAttempt, executeHandler };
+  return { checkBlockers, executeHandler };
 }

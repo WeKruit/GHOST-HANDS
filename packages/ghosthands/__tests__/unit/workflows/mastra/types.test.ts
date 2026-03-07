@@ -15,13 +15,6 @@ describe('workflowState schema', () => {
       platform: 'greenhouse',
       qualityPreset: 'balanced' as const,
       budgetUsd: 0.5,
-      cookbook: {
-        attempted: true,
-        success: false,
-        manualId: null,
-        steps: 0,
-        error: 'cookbook_miss',
-      },
       handler: {
         attempted: true,
         success: true,
@@ -59,7 +52,6 @@ describe('workflowState schema', () => {
       targetUrl: 'https://jobs.example.com/apply',
       qualityPreset: 'balanced',
       budgetUsd: 0.5,
-      cookbook: {},
       handler: {},
       hitl: {},
       metrics: {},
@@ -68,7 +60,6 @@ describe('workflowState schema', () => {
     const parsed = workflowState.parse(minimal);
     expect(parsed.platform).toBe('other');
     expect(parsed.status).toBe('running');
-    expect(parsed.cookbook.attempted).toBe(false);
     expect(parsed.handler.taskResult).toBeNull();
     expect(parsed.hitl.blocked).toBe(false);
     expect(parsed.metrics.costUsd).toBe(0);
@@ -83,7 +74,6 @@ describe('workflowState schema', () => {
         targetUrl: 'https://jobs.example.com/apply',
         qualityPreset: 'balanced',
         budgetUsd: 0.5,
-        cookbook: {},
         handler: {},
         hitl: {},
         metrics: {},
@@ -100,7 +90,6 @@ describe('workflowState schema', () => {
       targetUrl: 'https://jobs.example.com/apply',
       qualityPreset: 'balanced',
       budgetUsd: 0.5,
-      cookbook: {},
       handler: {},
       hitl: {},
       metrics: {},
@@ -146,7 +135,7 @@ describe('secret safety: no forbidden keys in workflow schemas', () => {
 });
 
 describe('execution mode enum: AD-1 backward compatibility', () => {
-  const existingModes = ['auto', 'ai_only', 'cookbook_only', 'hybrid', 'smart_apply', 'agent_apply'];
+  const existingModes = ['auto', 'ai_only', 'hybrid', 'smart_apply', 'agent_apply', 'mastra'];
 
   test('mastra is accepted in ValetApplySchema', () => {
     const input = {

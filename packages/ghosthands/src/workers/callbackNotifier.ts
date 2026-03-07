@@ -48,19 +48,11 @@ export interface CallbackPayload {
   execution_mode?: string;
   browser_mode?: string;
   final_mode?: string;
-  manual?: {
-    id: string | null;
-    status: string;
-    health_score: number | null;
-    fallback_reason: string | null;
-  } | null;
   cost_breakdown?: {
     total_cost_usd: number;
     action_count: number;
     total_tokens: number;
-    cookbook_steps: number;
     magnitude_steps: number;
-    cookbook_cost_usd: number;
     magnitude_cost_usd: number;
     image_cost_usd: number;
     reasoning_cost_usd: number;
@@ -150,16 +142,6 @@ export class CallbackNotifier {
       payload.final_mode = job.final_mode;
     }
 
-    const engineMeta = jobMeta?.engine || {};
-    if (engineMeta.manual_id) {
-      payload.manual = {
-        id: engineMeta.manual_id,
-        status: engineMeta.manual_status || 'ai_only',
-        health_score: engineMeta.health_score ?? null,
-        fallback_reason: engineMeta.fallback_reason ?? null,
-      };
-    }
-
     return this.sendWithRetry(job.callback_url, payload);
   }
 
@@ -170,7 +152,7 @@ export class CallbackNotifier {
     jobId: string,
     callbackUrl: string,
     valetTaskId?: string | null,
-    metadata?: { execution_mode?: string; manual_id?: string | null; kasm_url?: string },
+    metadata?: { execution_mode?: string; kasm_url?: string },
     workerId?: string,
   ): Promise<boolean> {
     const kasmUrl = metadata?.kasm_url || process.env.KASM_SESSION_URL;

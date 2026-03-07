@@ -3,7 +3,6 @@
  *
  * Tests the shared finalization logic that both the legacy JobExecutor path
  * and the Mastra workflow path use for post-execution lifecycle:
- * - finalizeCookbookSuccess: cookbook replay completion
  * - finalizeHandlerResult: handler execution completion + awaiting review
  *
  * All external services are mocked (Supabase, adapters, cost trackers, etc).
@@ -12,12 +11,11 @@
 import { describe, expect, test, vi, beforeEach } from 'vitest';
 
 import {
-  finalizeCookbookSuccess,
   finalizeHandlerResult,
 } from '../../../../src/workers/finalization.js';
 
 import type { AutomationJob, TaskResult } from '../../../../src/workers/taskHandlers/types.js';
-import type { ExecutionResult } from '../../../../src/engine/ExecutionEngine.js';
+import type { ExecutionResult } from '../../../../src/workers/finalization.js';
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -90,7 +88,6 @@ function createMockCostTracker() {
       outputCost: 0.005,
       totalCost: 0.015,
       actionCount: 5,
-      cookbookSteps: 0,
       magnitudeSteps: 5,
       imageCost: 0,
       reasoningCost: 0,
@@ -126,10 +123,8 @@ function makeJob(overrides: Partial<AutomationJob> = {}): AutomationJob {
 function makeEngineResult(overrides: Partial<ExecutionResult> = {}): ExecutionResult {
   return {
     success: true,
-    mode: 'cookbook',
-    cookbookSteps: 10,
-    magnitudeSteps: 0,
-    manualId: 'manual-abc',
+    mode: 'magnitude',
+    magnitudeSteps: 5,
     ...overrides,
   };
 }
@@ -148,128 +143,6 @@ function makeTaskResult(overrides: Partial<TaskResult> = {}): TaskResult {
 
 beforeEach(() => {
   vi.clearAllMocks();
-});
-
-// ---------------------------------------------------------------------------
-// finalizeCookbookSuccess
-// ---------------------------------------------------------------------------
-
-describe('finalizeCookbookSuccess', () => {
-  test('updates job status to "completed" via Supabase', async () => {
-    const supabase = createMockSupabase();
-    const adapter = createMockAdapter();
-    const costTracker = createMockCostTracker();
-    const progress = createMockProgress();
-    const uploadScreenshot = vi.fn().mockResolvedValue('https://cdn.example.com/screenshot.png');
-    const logEvent = vi.fn().mockResolvedValue(undefined);
-
-    await finalizeCookbookSuccess({
-      job: makeJob(),
-      adapter: adapter as any,
-      costTracker: costTracker as any,
-      progress: progress as any,
-      sessionManager: null,
-      workerId: 'worker-1',
-      supabase: supabase as any,
-      logEvent,
-      uploadScreenshot,
-      engineResult: makeEngineResult(),
-    });
-
-    // supabase.from should be called at least twice (metadata update + status update)
-    expect(supabase.from).toHaveBeenCalledWith('gh_automation_jobs');
-
-    // The second .update() call should contain status: 'completed'
-    const updateCalls = supabase._updateFn.mock.calls;
-    const statusUpdate = updateCalls.find(
-      (call: any[]) => call[0]?.status === 'completed',
-    );
-    expect(statusUpdate).toBeDefined();
-    expect(statusUpdate[0].status).toBe('completed');
-  });
-
-  test('calls uploadScreenshot', async () => {
-    const supabase = createMockSupabase();
-    const adapter = createMockAdapter();
-    const costTracker = createMockCostTracker();
-    const progress = createMockProgress();
-    const uploadScreenshot = vi.fn().mockResolvedValue('https://cdn.example.com/final.png');
-    const logEvent = vi.fn().mockResolvedValue(undefined);
-
-    await finalizeCookbookSuccess({
-      job: makeJob(),
-      adapter: adapter as any,
-      costTracker: costTracker as any,
-      progress: progress as any,
-      sessionManager: null,
-      workerId: 'worker-1',
-      supabase: supabase as any,
-      logEvent,
-      uploadScreenshot,
-      engineResult: makeEngineResult(),
-    });
-
-    // adapter.screenshot is called by captureAndUpload
-    expect(adapter.screenshot).toHaveBeenCalled();
-    // uploadScreenshot receives the job ID, name, and buffer
-    expect(uploadScreenshot).toHaveBeenCalledWith(
-      '550e8400-e29b-41d4-a716-446655440000',
-      'final',
-      expect.any(Buffer),
-    );
-  });
-
-  test('fires callback via callbackNotifier when callback_url exists', async () => {
-    const supabase = createMockSupabase();
-    const adapter = createMockAdapter();
-    const costTracker = createMockCostTracker();
-    const progress = createMockProgress();
-    const uploadScreenshot = vi.fn().mockResolvedValue('https://cdn.example.com/screenshot.png');
-    const logEvent = vi.fn().mockResolvedValue(undefined);
-
-    await finalizeCookbookSuccess({
-      job: makeJob({ callback_url: 'https://valet.example.com/callback' }),
-      adapter: adapter as any,
-      costTracker: costTracker as any,
-      progress: progress as any,
-      sessionManager: null,
-      workerId: 'worker-1',
-      supabase: supabase as any,
-      logEvent,
-      uploadScreenshot,
-      engineResult: makeEngineResult(),
-    });
-
-    expect(callbackNotifier.notifyFromJob).toHaveBeenCalled();
-    const callArg = (callbackNotifier.notifyFromJob as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    expect(callArg.id).toBe('550e8400-e29b-41d4-a716-446655440000');
-    expect(callArg.callback_url).toBe('https://valet.example.com/callback');
-    expect(callArg.status).toBe('completed');
-  });
-
-  test('does NOT fire callback when callback_url is null', async () => {
-    const supabase = createMockSupabase();
-    const adapter = createMockAdapter();
-    const costTracker = createMockCostTracker();
-    const progress = createMockProgress();
-    const uploadScreenshot = vi.fn().mockResolvedValue('https://cdn.example.com/screenshot.png');
-    const logEvent = vi.fn().mockResolvedValue(undefined);
-
-    await finalizeCookbookSuccess({
-      job: makeJob({ callback_url: null }),
-      adapter: adapter as any,
-      costTracker: costTracker as any,
-      progress: progress as any,
-      sessionManager: null,
-      workerId: 'worker-1',
-      supabase: supabase as any,
-      logEvent,
-      uploadScreenshot,
-      engineResult: makeEngineResult(),
-    });
-
-    expect(callbackNotifier.notifyFromJob).not.toHaveBeenCalled();
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -297,7 +170,7 @@ describe('finalizeHandlerResult', () => {
       uploadScreenshot,
       taskResult: makeTaskResult({ awaitingUserReview: true }),
       finalMode: 'magnitude',
-      engineResult: makeEngineResult({ mode: 'magnitude', cookbookSteps: 0, magnitudeSteps: 5 }),
+      engineResult: makeEngineResult({ mode: 'magnitude', magnitudeSteps: 5 }),
     });
 
     expect(result).toEqual({ awaitingReview: true });
@@ -323,7 +196,7 @@ describe('finalizeHandlerResult', () => {
       uploadScreenshot,
       taskResult: makeTaskResult({ awaitingUserReview: false }),
       finalMode: 'magnitude',
-      engineResult: makeEngineResult({ mode: 'magnitude', cookbookSteps: 0, magnitudeSteps: 5 }),
+      engineResult: makeEngineResult({ mode: 'magnitude', magnitudeSteps: 5 }),
     });
 
     expect(result).toEqual({ awaitingReview: false });
@@ -349,7 +222,7 @@ describe('finalizeHandlerResult', () => {
       uploadScreenshot,
       taskResult: makeTaskResult({ awaitingUserReview: true }),
       finalMode: 'magnitude',
-      engineResult: makeEngineResult({ mode: 'magnitude', cookbookSteps: 0, magnitudeSteps: 5 }),
+      engineResult: makeEngineResult({ mode: 'magnitude', magnitudeSteps: 5 }),
     });
 
     // Find the update call that sets status to 'awaiting_review'
@@ -381,7 +254,7 @@ describe('finalizeHandlerResult', () => {
       uploadScreenshot,
       taskResult: makeTaskResult({ awaitingUserReview: false }),
       finalMode: 'magnitude',
-      engineResult: makeEngineResult({ mode: 'magnitude', cookbookSteps: 0, magnitudeSteps: 5 }),
+      engineResult: makeEngineResult({ mode: 'magnitude', magnitudeSteps: 5 }),
     });
 
     // Find the update call that sets status to 'completed'
@@ -417,7 +290,7 @@ describe('finalizeHandlerResult', () => {
       uploadScreenshot,
       taskResult: makeTaskResult({ awaitingUserReview: true }),
       finalMode: 'magnitude',
-      engineResult: makeEngineResult({ mode: 'magnitude', cookbookSteps: 0, magnitudeSteps: 5 }),
+      engineResult: makeEngineResult({ mode: 'magnitude', magnitudeSteps: 5 }),
     });
 
     // Race the function against a timeout

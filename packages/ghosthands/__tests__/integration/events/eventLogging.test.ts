@@ -276,56 +276,6 @@ describe('Event logging integration', () => {
   });
 });
 
-// ── CookbookExecutor step events ────────────────────────────────────────
-
-describe('CookbookExecutor event logging', () => {
-  test('logEvent callback receives cookbook step events', async () => {
-    const { CookbookExecutor } = await import('../../../src/engine/CookbookExecutor');
-
-    const events: Array<{ type: string; meta: any }> = [];
-    const logEvent = mock(async (eventType: string, metadata: Record<string, any>) => {
-      events.push({ type: eventType, meta: metadata });
-    });
-
-    const executor = new CookbookExecutor({ logEvent });
-
-    // Create a mock page that will fail on locator resolution
-    // (we just want to verify events are emitted, not full Playwright execution)
-    const mockPage = {
-      goto: mock(() => Promise.resolve()),
-    } as any;
-
-    const manual = {
-      id: 'manual-1',
-      steps: [
-        { order: 0, action: 'navigate', value: 'https://example.com', locator: { css: 'body' }, healthScore: 1.0 },
-      ],
-      url_pattern: '*.example.com',
-      task_pattern: 'test',
-      platform: 'other',
-      health_score: 0.9,
-      source: 'recorded' as const,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-
-    const result = await executor.executeAll(mockPage, manual, {});
-
-    expect(result.success).toBe(true);
-
-    // Should have cookbook_step_started and cookbook_step_completed
-    const stepStarted = events.filter((e) => e.type === 'cookbook_step_started');
-    const stepCompleted = events.filter((e) => e.type === 'cookbook_step_completed');
-
-    expect(stepStarted).toHaveLength(1);
-    expect(stepCompleted).toHaveLength(1);
-
-    expect(stepStarted[0].meta.step_index).toBe(0);
-    expect(stepStarted[0].meta.action).toBe('navigate');
-    expect(stepCompleted[0].meta.step_index).toBe(0);
-  });
-});
-
 // ── StagehandObserver event logging ─────────────────────────────────────
 
 describe('StagehandObserver logEvent config', () => {

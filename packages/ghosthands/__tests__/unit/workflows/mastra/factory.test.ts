@@ -1,10 +1,9 @@
 /**
  * PRD V5.2 Section 5.4 — Step Factory Unit Tests
  *
- * Tests the three Mastra workflow steps created by buildSteps():
+ * Tests the two Mastra workflow steps created by buildSteps():
  * 1. check_blockers_checkpoint — Blocker detection + HITL suspend/resume
- * 2. cookbook_attempt — Deterministic cookbook replay via ExecutionEngine
- * 3. execute_handler — LLM-driven task handler fallback
+ * 2. execute_handler — LLM-driven task handler execution
  *
  * Also indirectly tests the private mapBlockerCategory helper through
  * the check_blockers_checkpoint step behavior.
@@ -13,7 +12,7 @@
  * without `return`, which means if suspend does NOT throw, execution
  * falls through to `return state`. The test tagged [BUG-3] exposes this.
  *
- * All external services are mocked (Supabase, adapters, detectors, engines).
+ * All external services are mocked (Supabase, adapters, detectors).
  */
 
 import { describe, expect, test, vi, beforeEach } from 'vitest';
@@ -27,27 +26,6 @@ const mockDetectWithAdapter = vi.fn();
 vi.mock('../../../../src/detection/BlockerDetector.js', () => ({
   BlockerDetector: class MockBlockerDetector {
     detectWithAdapter = mockDetectWithAdapter;
-  },
-}));
-
-const mockEngineExecute = vi.fn();
-
-vi.mock('../../../../src/engine/ExecutionEngine.js', () => ({
-  ExecutionEngine: class MockExecutionEngine {
-    constructor(_opts: any) {}
-    execute = mockEngineExecute;
-  },
-}));
-
-vi.mock('../../../../src/engine/ManualStore.js', () => ({
-  ManualStore: class MockManualStore {
-    constructor(_supabase: any) {}
-  },
-}));
-
-vi.mock('../../../../src/engine/CookbookExecutor.js', () => ({
-  CookbookExecutor: class MockCookbookExecutor {
-    constructor(_opts: any) {}
   },
 }));
 
@@ -139,7 +117,6 @@ function createMockCostTracker() {
       outputCost: 0.005,
       totalCost: 0.015,
       actionCount: 5,
-      cookbookSteps: 0,
       magnitudeSteps: 5,
       imageCost: 0,
       reasoningCost: 0,
@@ -187,13 +164,6 @@ function makeBaseState(overrides: Partial<WorkflowState> = {}): WorkflowState {
     platform: 'greenhouse',
     qualityPreset: 'balanced',
     budgetUsd: 0.5,
-    cookbook: {
-      attempted: false,
-      success: false,
-      manualId: null,
-      steps: 0,
-      error: null,
-    },
     handler: {
       attempted: false,
       success: false,
@@ -251,14 +221,6 @@ beforeEach(() => {
   vi.clearAllMocks();
   // Default: no blocker detected
   mockDetectWithAdapter.mockResolvedValue(null);
-  // Default: engine returns failure (cookbook miss)
-  mockEngineExecute.mockResolvedValue({
-    success: false,
-    mode: 'magnitude',
-    cookbookSteps: 0,
-    magnitudeSteps: 0,
-    error: 'cookbook_miss',
-  });
 });
 
 // ===========================================================================
@@ -833,154 +795,7 @@ describe('check_blockers_checkpoint', () => {
 });
 
 // ===========================================================================
-// 2. cookbook_attempt
-// ===========================================================================
-
-describe('cookbook_attempt', () => {
-  test('sets cookbook.attempted = true', async () => {
-    const rt = createMockRuntimeContext();
-    const { cookbookAttempt } = buildSteps(rt);
-
-    mockEngineExecute.mockResolvedValue({
-      success: false,
-      mode: 'magnitude',
-      cookbookSteps: 0,
-      magnitudeSteps: 0,
-      error: 'cookbook_miss',
-    });
-
-    const params = makeExecuteParams();
-    const result = (await cookbookAttempt.execute(params)) as WorkflowState;
-
-    expect(result.cookbook.attempted).toBe(true);
-  });
-
-  test('sets cookbook.success = true when engine succeeds', async () => {
-    const rt = createMockRuntimeContext();
-    const { cookbookAttempt } = buildSteps(rt);
-
-    mockEngineExecute.mockResolvedValue({
-      success: true,
-      mode: 'cookbook',
-      cookbookSteps: 12,
-      magnitudeSteps: 0,
-      manualId: 'manual-abc-123',
-    });
-
-    const params = makeExecuteParams();
-    const result = (await cookbookAttempt.execute(params)) as WorkflowState;
-
-    expect(result.cookbook.success).toBe(true);
-    expect(result.cookbook.manualId).toBe('manual-abc-123');
-    expect(result.cookbook.steps).toBe(12);
-    expect(result.cookbook.error).toBeNull();
-    expect(result.status).toBe('completed');
-  });
-
-  test('sets cookbook.success = false on engine failure', async () => {
-    const rt = createMockRuntimeContext();
-    const { cookbookAttempt } = buildSteps(rt);
-
-    mockEngineExecute.mockResolvedValue({
-      success: false,
-      mode: 'magnitude',
-      cookbookSteps: 0,
-      magnitudeSteps: 0,
-      error: 'cookbook_miss',
-    });
-
-    const params = makeExecuteParams();
-    const result = (await cookbookAttempt.execute(params)) as WorkflowState;
-
-    expect(result.cookbook.success).toBe(false);
-    expect(result.cookbook.error).toBe('cookbook_miss');
-    // Status should NOT be set to 'completed' on failure — it stays as input
-    expect(result.status).toBe('running');
-  });
-
-  test('updates metrics.costUsd from cost tracker', async () => {
-    const costTracker = createMockCostTracker();
-    costTracker.getSnapshot.mockReturnValue({
-      inputTokens: 200,
-      outputTokens: 100,
-      inputCost: 0.02,
-      outputCost: 0.01,
-      totalCost: 0.035,
-      actionCount: 10,
-      cookbookSteps: 5,
-      magnitudeSteps: 5,
-      imageCost: 0.005,
-      reasoningCost: 0,
-    });
-
-    const rt = createMockRuntimeContext({ costTracker: costTracker as any });
-    const { cookbookAttempt } = buildSteps(rt);
-
-    mockEngineExecute.mockResolvedValue({
-      success: true,
-      mode: 'cookbook',
-      cookbookSteps: 5,
-      magnitudeSteps: 0,
-      manualId: 'manual-xyz',
-    });
-
-    const params = makeExecuteParams();
-    const result = (await cookbookAttempt.execute(params)) as WorkflowState;
-
-    expect(result.metrics.costUsd).toBe(0.035);
-  });
-
-  test('passes correct params to engine.execute', async () => {
-    const rt = createMockRuntimeContext();
-    const { cookbookAttempt } = buildSteps(rt);
-
-    mockEngineExecute.mockResolvedValue({
-      success: false,
-      mode: 'magnitude',
-      cookbookSteps: 0,
-      magnitudeSteps: 0,
-    });
-
-    const params = makeExecuteParams();
-    await cookbookAttempt.execute(params);
-
-    expect(mockEngineExecute).toHaveBeenCalledWith(
-      expect.objectContaining({
-        job: rt.job,
-        adapter: rt.adapter,
-        costTracker: rt.costTracker,
-        progress: rt.progress,
-        logEvent: rt.logEvent,
-        resumeFilePath: rt.resumeFilePath,
-      }),
-    );
-  });
-
-  test('preserves pagesProcessed from input state metrics', async () => {
-    const rt = createMockRuntimeContext();
-    const { cookbookAttempt } = buildSteps(rt);
-
-    mockEngineExecute.mockResolvedValue({
-      success: false,
-      mode: 'magnitude',
-      cookbookSteps: 0,
-      magnitudeSteps: 0,
-      error: 'miss',
-    });
-
-    const inputState = makeBaseState({
-      metrics: { costUsd: 0, pagesProcessed: 7 },
-    });
-    const params = makeExecuteParams({ inputData: inputState });
-    const result = (await cookbookAttempt.execute(params)) as WorkflowState;
-
-    // pagesProcessed should be preserved from input via spread
-    expect(result.metrics.pagesProcessed).toBe(7);
-  });
-});
-
-// ===========================================================================
-// 3. execute_handler
+// 2. execute_handler
 // ===========================================================================
 
 describe('execute_handler', () => {
@@ -1115,7 +930,6 @@ describe('execute_handler', () => {
       outputCost: 0.02,
       totalCost: 0.08,
       actionCount: 15,
-      cookbookSteps: 0,
       magnitudeSteps: 15,
       imageCost: 0.01,
       reasoningCost: 0,
