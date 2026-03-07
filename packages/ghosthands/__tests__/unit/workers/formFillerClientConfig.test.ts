@@ -39,6 +39,7 @@ describe('formFiller Anthropic client config', () => {
       baseURL: 'https://valet.example.com/api/v1/local-workers/inference',
       defaultHeaders: {
         Authorization: 'Bearer should-be-ignored',
+        'x-api-key': 'should-be-ignored',
         'x-local-worker-session': 'session-token',
       },
     });
