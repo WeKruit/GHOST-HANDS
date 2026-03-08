@@ -969,6 +969,9 @@ All GhostHands tables use the `gh_` prefix (shared Supabase with VALET).
 | `execution_mode` | TEXT | Migration 011 | Requested mode: auto, ai_only, cookbook_only |
 | `browser_mode` | TEXT | Migration 011 | Browser context: server, operator |
 | `final_mode` | TEXT | Migration 011 | Actual mode used: cookbook, magnitude, hybrid |
+| `llm_cost_cents` | INTEGER | Migration 025 | Total LLM cost in cents |
+| `action_count` | INTEGER | Migration 025 | Number of browser actions executed |
+| `total_tokens` | INTEGER | Migration 025 | Sum of input + output LLM tokens |
 
 ### 8.3 Migrations (apply in order)
 
@@ -980,6 +983,7 @@ All GhostHands tables use the `gh_` prefix (shared Supabase with VALET).
 | 010 | `010_gh_action_manuals.sql` | Cookbook manuals table |
 | 011 | `011_execution_mode_tracking.sql` | Execution mode columns |
 | 012 | `012_gh_job_events_realtime.sql` | Enable Realtime on gh_job_events |
+| 025 | `025_add_cost_columns.sql` | Cost-tracking columns on gh_automation_jobs |
 
 ---
 
