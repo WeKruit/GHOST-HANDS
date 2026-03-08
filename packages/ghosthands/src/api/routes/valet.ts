@@ -554,8 +554,8 @@ export function createValetRoutes(pool: pg.Pool) {
 
   valet.get('/reports/user/:userId', async (c) => {
     const userId = c.req.param('userId');
-    const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 100);
-    const offset = Math.max(parseInt(c.req.query('offset') || '0', 10), 0);
+    const limit = Math.min(parseInt(c.req.query('limit') || '50', 10) || 50, 100);
+    const offset = Math.max(parseInt(c.req.query('offset') || '0', 10) || 0, 0);
 
     const { rows } = await pool.query(`
       SELECT * FROM gh_application_reports

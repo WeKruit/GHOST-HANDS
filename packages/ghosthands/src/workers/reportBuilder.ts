@@ -58,6 +58,7 @@ export interface ApplicationReportData {
   screenshot_urls?: string[];
   started_at?: string | null;
   completed_at?: string | null;
+  updated_at?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +224,7 @@ export function buildApplicationReport(
     platform: inputData.platform || taskResult.data?.platform || null,
     resume_ref: typeof job.resume_ref === 'string'
       ? job.resume_ref
-      : (job.resume_ref as Record<string, any>)?.path || (job.resume_ref as Record<string, any>)?.url || null,
+      : (job.resume_ref as Record<string, any>)?.storage_path || (job.resume_ref as Record<string, any>)?.download_url || (job.resume_ref as Record<string, any>)?.s3_key || null,
     fields_submitted: fields,
     total_fields: counts.total,
     fields_filled: counts.filled,
@@ -238,6 +239,7 @@ export function buildApplicationReport(
     screenshot_urls: screenshotUrls,
     started_at: job.metadata?.started_at || null,
     completed_at: status === 'completed' || status === 'failed' ? new Date().toISOString() : null,
+    updated_at: new Date().toISOString(),
   };
 }
 
