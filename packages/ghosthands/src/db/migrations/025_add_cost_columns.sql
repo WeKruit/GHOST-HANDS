@@ -1,0 +1,56 @@
+-- Migration 025: Add cost-tracking columns to gh_automation_jobs
+-- These columns have been referenced in finalization.ts and JobExecutor.ts
+-- but were never added to the schema — writes were silently dropped by
+-- PostgREST (unknown columns stripped from PATCH requests).
+--
+-- Columns:
+--   llm_cost_cents  — Total LLM cost in cents (Math.round(totalCost * 100))
+--   action_count    — Number of browser actions executed
+--   total_tokens    — Sum of input + output LLM tokens
+
+-- UP
+
+ALTER TABLE gh_automation_jobs
+  ADD COLUMN IF NOT EXISTS llm_cost_cents INTEGER DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS action_count   INTEGER DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS total_tokens   INTEGER DEFAULT 0;
+
+-- Index for cost analytics queries (per-user cost views, monthly reports)
+CREATE INDEX IF NOT EXISTS idx_gh_jobs_cost
+  ON gh_automation_jobs (user_id, llm_cost_cents)
+  WHERE llm_cost_cents > 0;
+
+-- Backfill historical jobs from gh_job_events (most reliable source)
+UPDATE gh_automation_jobs j
+SET
+  llm_cost_cents = COALESCE(ROUND((e.metadata->>'total_cost')::NUMERIC * 100)::INTEGER, 0),
+  action_count   = COALESCE((e.metadata->>'action_count')::INTEGER, 0),
+  total_tokens   = COALESCE(
+    (e.metadata->>'input_tokens')::INTEGER + (e.metadata->>'output_tokens')::INTEGER,
+    0
+  )
+FROM gh_job_events e
+WHERE e.job_id = j.id
+  AND e.event_type = 'cost_recorded'
+  AND j.llm_cost_cents = 0
+  AND j.status IN ('completed', 'failed', 'awaiting_review');
+
+-- Fallback backfill from result_data.cost for jobs without a cost_recorded event
+UPDATE gh_automation_jobs
+SET
+  llm_cost_cents = COALESCE(ROUND((result_data->'cost'->>'total_cost_usd')::NUMERIC * 100)::INTEGER, llm_cost_cents),
+  action_count   = COALESCE((result_data->'cost'->>'action_count')::INTEGER, action_count),
+  total_tokens   = COALESCE(
+    (result_data->'cost'->>'input_tokens')::INTEGER + (result_data->'cost'->>'output_tokens')::INTEGER,
+    total_tokens
+  )
+WHERE llm_cost_cents = 0
+  AND result_data->'cost' IS NOT NULL
+  AND status IN ('completed', 'failed', 'awaiting_review');
+
+-- DOWN (rollback)
+-- DROP INDEX IF EXISTS idx_gh_jobs_cost;
+-- ALTER TABLE gh_automation_jobs
+--   DROP COLUMN IF EXISTS llm_cost_cents,
+--   DROP COLUMN IF EXISTS action_count,
+--   DROP COLUMN IF EXISTS total_tokens;
