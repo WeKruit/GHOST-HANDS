@@ -555,6 +555,80 @@ Returns all registered workers with status, heartbeat, and job counts.
 }
 ```
 
+### 4.11 Get Application Report — `GET /valet/reports/:jobId`
+
+Returns the structured application report for a single job, containing every field the worker filled.
+
+**Response (200):**
+
+```json
+{
+  "report": {
+    "id": "uuid",
+    "job_id": "uuid",
+    "user_id": "uuid",
+    "valet_task_id": "vt-789",
+    "job_url": "https://mycompany.wd5.myworkdayjobs.com/en-US/External/job/apply",
+    "company_name": "mycompany",
+    "job_title": null,
+    "platform": "workday",
+    "resume_ref": "resumes/resume-abc.pdf",
+    "fields_submitted": [
+      {
+        "prompt_text": "First Name",
+        "value": "John",
+        "question_type": "text",
+        "source": "dom",
+        "answer_mode": "profile_backed",
+        "confidence": 0.95,
+        "required": true,
+        "section_label": "Personal Information",
+        "state": "verified"
+      }
+    ],
+    "total_fields": 15,
+    "fields_filled": 13,
+    "fields_failed": 1,
+    "fields_unresolved": 1,
+    "status": "completed",
+    "submitted": true,
+    "result_summary": "Application submitted successfully",
+    "llm_cost_cents": 5,
+    "action_count": 10,
+    "total_tokens": 1500,
+    "screenshot_urls": ["https://s3.amazonaws.com/..."],
+    "started_at": "2026-03-08T10:00:00Z",
+    "completed_at": "2026-03-08T10:02:30Z",
+    "created_at": "2026-03-08T10:02:30Z",
+    "updated_at": "2026-03-08T10:02:30Z"
+  }
+}
+```
+
+**Response (404):** Report not found for the given `jobId`.
+
+### 4.12 List Application Reports — `GET /valet/reports/user/:userId`
+
+Returns paginated application reports for a user, ordered by most recent first.
+
+**Query params:**
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `limit` | number | 50 | Max results per page (1–100) |
+| `offset` | number | 0 | Pagination offset |
+
+**Response (200):**
+
+```json
+{
+  "reports": [ /* array of report objects, same shape as 4.11 */ ],
+  "count": 12
+}
+```
+
+> **Note:** Reports are written best-effort during job finalization. A small percentage of jobs may not have reports if the DB write fails. The `resume_ref` field contains a storage path — VALET should resolve this to a display name via its own `resumes` table. Sensitive fields (passwords, SSNs) are automatically redacted to `[REDACTED]`.
+
 ---
 
 ## 5. Callback System (Push Notifications)
@@ -956,6 +1030,7 @@ All GhostHands tables use the `gh_` prefix (shared Supabase with VALET).
 | `gh_action_manuals` | Saved step-by-step playbooks per platform+task |
 | `gh_user_usage` | Monthly cost tracking per user |
 | `gh_user_credentials` | Encrypted platform credentials |
+| `gh_application_reports` | Structured per-job application reports (fields filled, cost, screenshots) |
 
 ### 8.2 Key Columns on `gh_automation_jobs`
 
@@ -984,6 +1059,7 @@ All GhostHands tables use the `gh_` prefix (shared Supabase with VALET).
 | 011 | `011_execution_mode_tracking.sql` | Execution mode columns |
 | 012 | `012_gh_job_events_realtime.sql` | Enable Realtime on gh_job_events |
 | 025 | `025_add_cost_columns.sql` | Cost-tracking columns on gh_automation_jobs |
+| 026 | `026_gh_application_reports.sql` | Application reports table with RLS |
 
 ---
 
