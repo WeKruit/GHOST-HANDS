@@ -173,10 +173,11 @@ export function extractCompanyFromUrl(url: string): string | null {
     // Generic: use first subdomain or second-level domain
     const parts = hostname.split('.');
     if (parts.length >= 2) {
-      // Skip common prefixes
+      // Skip common prefixes and TLDs
       const skip = ['www', 'careers', 'jobs', 'apply', 'boards'];
+      const tlds = ['com', 'org', 'net', 'io', 'co', 'gov', 'edu', 'info', 'biz'];
       for (const part of parts) {
-        if (!skip.includes(part) && part.length > 2) {
+        if (!skip.includes(part) && !tlds.includes(part) && part.length > 2) {
           return part;
         }
       }

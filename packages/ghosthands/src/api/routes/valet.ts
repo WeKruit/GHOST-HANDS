@@ -536,7 +536,7 @@ export function createValetRoutes(pool: pg.Pool) {
 
   // ─── GET /valet/reports/:jobId — Application report for a job ──
 
-  valet.get('/reports/:jobId', async (c) => {
+  valet.get('/reports/:jobId', rateLimitMiddleware(), async (c) => {
     const jobId = c.req.param('jobId');
 
     const { rows } = await pool.query(`
@@ -552,9 +552,9 @@ export function createValetRoutes(pool: pg.Pool) {
 
   // ─── GET /valet/reports/user/:userId — List reports for a user ──
 
-  valet.get('/reports/user/:userId', async (c) => {
+  valet.get('/reports/user/:userId', rateLimitMiddleware(), async (c) => {
     const userId = c.req.param('userId');
-    const limit = Math.min(parseInt(c.req.query('limit') || '50', 10) || 50, 100);
+    const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '50', 10) || 50, 1), 100);
     const offset = Math.max(parseInt(c.req.query('offset') || '0', 10) || 0, 0);
 
     const { rows } = await pool.query(`
