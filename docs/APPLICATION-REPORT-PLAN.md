@@ -405,7 +405,7 @@ VALET can then call `GET /valet/reports/:jobId` to fetch the full report.
 | `src/events/JobEventTypes.ts` | **MODIFY** | Add `REPORT_GENERATED: 'report_generated'` event type |
 | `__tests__/unit/reportBuilder.test.ts` | **CREATE** | Unit tests for report builder |
 | `__tests__/integration/applicationReport.test.ts` | **CREATE** | Integration test for the full flow |
-| `docs/VALET-INTEGRATION-CONTRACT.md` | **MODIFY** | Document new endpoints and report schema |
+| `docs/VALET-APPLICATION-REPORTS-TODO.md` | **CREATE** | Handoff document for VALET frontend integration |
 
 ---
 
