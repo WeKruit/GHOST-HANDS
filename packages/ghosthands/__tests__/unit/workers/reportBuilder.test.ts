@@ -290,7 +290,7 @@ describe('buildApplicationReport', () => {
   });
 
   test('extracts resume_ref from object', () => {
-    const job = makeJob({ resume_ref: { path: 'resumes/my-resume.pdf', url: 'https://storage/...' } });
+    const job = makeJob({ resume_ref: { storage_path: 'resumes/my-resume.pdf', download_url: 'https://storage/...' } });
     const report = buildApplicationReport(job, null, makeCostSnapshot(), { success: true }, [], 'completed');
     expect(report.resume_ref).toBe('resumes/my-resume.pdf');
   });
