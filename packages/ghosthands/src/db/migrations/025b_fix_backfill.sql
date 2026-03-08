@@ -31,4 +31,5 @@ FROM (
 ) e
 WHERE e.job_id = j.id
   AND j.llm_cost_cents = 0
+  AND j.result_data->'cost' IS NULL
   AND j.status IN ('completed', 'failed', 'awaiting_review');
