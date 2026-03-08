@@ -21,17 +21,21 @@ CREATE INDEX IF NOT EXISTS idx_gh_jobs_cost
   WHERE llm_cost_cents > 0;
 
 -- Backfill historical jobs from gh_job_events (most reliable source)
+-- Uses DISTINCT ON to pick the latest cost_recorded event per job,
+-- avoiding non-deterministic row selection when multiple events exist.
 UPDATE gh_automation_jobs j
 SET
   llm_cost_cents = COALESCE(ROUND((e.metadata->>'total_cost')::NUMERIC * 100)::INTEGER, 0),
   action_count   = COALESCE((e.metadata->>'action_count')::INTEGER, 0),
-  total_tokens   = COALESCE(
-    (e.metadata->>'input_tokens')::INTEGER + (e.metadata->>'output_tokens')::INTEGER,
-    0
-  )
-FROM gh_job_events e
+  total_tokens   = COALESCE((e.metadata->>'input_tokens')::INTEGER, 0)
+               + COALESCE((e.metadata->>'output_tokens')::INTEGER, 0)
+FROM (
+  SELECT DISTINCT ON (job_id) *
+  FROM gh_job_events
+  WHERE event_type = 'cost_recorded'
+  ORDER BY job_id, created_at DESC
+) e
 WHERE e.job_id = j.id
-  AND e.event_type = 'cost_recorded'
   AND j.llm_cost_cents = 0
   AND j.status IN ('completed', 'failed', 'awaiting_review');
 
@@ -40,10 +44,8 @@ UPDATE gh_automation_jobs
 SET
   llm_cost_cents = COALESCE(ROUND((result_data->'cost'->>'total_cost_usd')::NUMERIC * 100)::INTEGER, llm_cost_cents),
   action_count   = COALESCE((result_data->'cost'->>'action_count')::INTEGER, action_count),
-  total_tokens   = COALESCE(
-    (result_data->'cost'->>'input_tokens')::INTEGER + (result_data->'cost'->>'output_tokens')::INTEGER,
-    total_tokens
-  )
+  total_tokens   = COALESCE((result_data->'cost'->>'input_tokens')::INTEGER, 0)
+               + COALESCE((result_data->'cost'->>'output_tokens')::INTEGER, 0)
 WHERE llm_cost_cents = 0
   AND result_data->'cost' IS NOT NULL
   AND status IN ('completed', 'failed', 'awaiting_review');
