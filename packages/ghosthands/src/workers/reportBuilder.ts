@@ -97,7 +97,7 @@ export function extractFieldsFromSession(session: PageContextSession): Submitted
         continue;
       }
 
-      const rawValue = question.lastAnswer || question.currentValue || '';
+      const rawValue = question.lastAnswer ?? question.currentValue ?? '';
 
       fields.push({
         prompt_text: question.promptText,
