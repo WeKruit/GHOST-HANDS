@@ -32,6 +32,7 @@ import type { SessionManager } from '../sessions/SessionManager.js';
 import { getLogger } from '../monitoring/logger.js';
 import type { PageContextService } from '../context/PageContextService.js';
 import type { ContextReport } from '../context/types.js';
+import { buildApplicationReport, writeApplicationReport } from './reportBuilder.js';
 
 // ---------------------------------------------------------------------------
 // Shared input interface
@@ -253,6 +254,42 @@ function fireCallbackBestEffort(
     });
 }
 
+/**
+ * Build and persist an application report. Best-effort — never throws.
+ */
+async function writeReportBestEffort(
+  supabase: SupabaseClient,
+  job: AutomationJob,
+  pageContext: PageContextService | undefined,
+  costSnapshot: CostSnapshot,
+  taskResult: TaskResult,
+  screenshotUrls: string[],
+  status: 'completed' | 'failed' | 'awaiting_review',
+  logEvent: CommonFinalizationInput['logEvent'],
+): Promise<void> {
+  try {
+    const session = pageContext ? await pageContext.getSession() : null;
+    const reportData = buildApplicationReport(
+      job,
+      session,
+      costSnapshot,
+      taskResult,
+      screenshotUrls,
+      status,
+    );
+    await writeApplicationReport(supabase, reportData);
+    await logEvent('report_generated', {
+      fields_filled: reportData.fields_filled,
+      total_fields: reportData.total_fields,
+    }).catch(() => {});
+  } catch (err) {
+    logger.warn('Application report generation failed', {
+      jobId: job.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -380,6 +417,9 @@ export async function finalizeHandlerResult(
     // Best-effort cost recording
     recordCostBestEffort(supabase, job.user_id, job.id, finalCost);
 
+    // Best-effort application report
+    await writeReportBestEffort(supabase, job, pageContext, finalCost, taskResult, screenshotUrls, 'awaiting_review', logEvent);
+
     logger.info('Job awaiting user review', {
       jobId: job.id,
       actionCount: finalCost.actionCount,
@@ -446,6 +486,9 @@ export async function finalizeHandlerResult(
 
     recordCostBestEffort(supabase, job.user_id, job.id, finalCost);
 
+    // Best-effort application report
+    await writeReportBestEffort(supabase, job, pageContext, finalCost, taskResult, screenshotUrls, 'failed', logEvent);
+
     fireCallbackBestEffort(
       job,
       workerId,
@@ -500,6 +543,9 @@ export async function finalizeHandlerResult(
 
   // Best-effort cost recording
   recordCostBestEffort(supabase, job.user_id, job.id, finalCost);
+
+  // Best-effort application report
+  await writeReportBestEffort(supabase, job, pageContext, finalCost, taskResult, screenshotUrls, 'completed', logEvent);
 
   // Fire VALET callback
   fireCallbackBestEffort(

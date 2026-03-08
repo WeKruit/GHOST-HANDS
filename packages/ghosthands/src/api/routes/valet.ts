@@ -534,5 +534,38 @@ export function createValetRoutes(pool: pg.Pool) {
     });
   });
 
+  // ─── GET /valet/reports/:jobId — Application report for a job ──
+
+  valet.get('/reports/:jobId', async (c) => {
+    const jobId = c.req.param('jobId');
+
+    const { rows } = await pool.query(`
+      SELECT * FROM gh_application_reports WHERE job_id = $1::UUID
+    `, [jobId]);
+
+    if (rows.length === 0) {
+      return c.json({ error: 'not_found', message: 'Report not found' }, 404);
+    }
+
+    return c.json({ report: rows[0] });
+  });
+
+  // ─── GET /valet/reports/user/:userId — List reports for a user ──
+
+  valet.get('/reports/user/:userId', async (c) => {
+    const userId = c.req.param('userId');
+    const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 100);
+    const offset = Math.max(parseInt(c.req.query('offset') || '0', 10), 0);
+
+    const { rows } = await pool.query(`
+      SELECT * FROM gh_application_reports
+      WHERE user_id = $1::UUID
+      ORDER BY created_at DESC
+      LIMIT $2 OFFSET $3
+    `, [userId, limit, offset]);
+
+    return c.json({ reports: rows, count: rows.length });
+  });
+
   return valet;
 }

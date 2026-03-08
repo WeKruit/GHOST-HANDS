@@ -2,6 +2,7 @@ import type {
   AnswerDecision,
   ContextReport,
   PageAuditResult,
+  PageContextSession,
   PageEntryInput,
   PageFinalizeInput,
   QuestionOutcome,
@@ -42,5 +43,8 @@ export class NoopPageContextService implements PageContextService {
   }
   async flushToSupabase(): Promise<ContextReport> {
     return this.getContextReport('pending');
+  }
+  async getSession(): Promise<PageContextSession | null> {
+    return null;
   }
 }
