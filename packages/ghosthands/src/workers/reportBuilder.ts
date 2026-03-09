@@ -213,7 +213,7 @@ export function buildApplicationReport(
     taskResult.data?.success_message ||
     taskResult.data?.summary ||
     taskResult.data?.message ||
-    null;
+    (taskResult.data?.submitted ? 'Application submitted successfully' : null);
 
   return {
     job_id: job.id,
