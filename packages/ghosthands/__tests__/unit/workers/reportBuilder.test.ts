@@ -107,7 +107,7 @@ function makeJob(overrides: Record<string, any> = {}): AutomationJob {
     priority: 0,
     tags: [],
     valet_task_id: 'vt-789',
-    resume_ref: 'resumes/resume-abc.pdf',
+    resume_ref: { storage_path: 'resumes/resume-abc.pdf' },
     ...overrides,
   } as AutomationJob;
 }
