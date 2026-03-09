@@ -71,10 +71,16 @@ CREATE INDEX IF NOT EXISTS idx_gh_app_reports_valet_task
 -- RLS
 ALTER TABLE gh_application_reports ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "Service role full access on gh_application_reports"
-  ON gh_application_reports FOR ALL
-  TO service_role
-  USING (true) WITH CHECK (true);
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies WHERE policyname = 'Service role full access on gh_application_reports'
+  ) THEN
+    CREATE POLICY "Service role full access on gh_application_reports"
+      ON gh_application_reports FOR ALL
+      TO service_role
+      USING (true) WITH CHECK (true);
+  END IF;
+END $$;
 
 -- DOWN (rollback — commented)
 -- DROP TABLE IF EXISTS gh_application_reports;
