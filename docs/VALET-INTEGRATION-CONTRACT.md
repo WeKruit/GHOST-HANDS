@@ -555,79 +555,11 @@ Returns all registered workers with status, heartbeat, and job counts.
 }
 ```
 
-### 4.11 Get Application Report — `GET /valet/reports/:jobId`
+### 4.11 Application Reports (Direct DB Access)
 
-Returns the structured application report for a single job, containing every field the worker filled.
+GhostHands writes structured application reports to `gh_application_reports` during job finalization. VALET reads this table directly via Supabase (shared DB) — there are no GH API endpoints for report reads. See Section 8 for the table schema.
 
-**Response (200):**
-
-```json
-{
-  "report": {
-    "id": "uuid",
-    "job_id": "uuid",
-    "user_id": "uuid",
-    "valet_task_id": "vt-789",
-    "job_url": "https://mycompany.wd5.myworkdayjobs.com/en-US/External/job/apply",
-    "company_name": "mycompany",
-    "job_title": null,
-    "platform": "workday",
-    "resume_ref": "resumes/resume-abc.pdf",
-    "fields_submitted": [
-      {
-        "prompt_text": "First Name",
-        "value": "John",
-        "question_type": "text",
-        "source": "dom",
-        "answer_mode": "profile_backed",
-        "confidence": 0.95,
-        "required": true,
-        "section_label": "Personal Information",
-        "state": "verified"
-      }
-    ],
-    "total_fields": 15,
-    "fields_filled": 13,
-    "fields_failed": 1,
-    "fields_unresolved": 1,
-    "status": "completed",
-    "submitted": true,
-    "result_summary": "Application submitted successfully",
-    "llm_cost_cents": 5,
-    "action_count": 10,
-    "total_tokens": 1500,
-    "screenshot_urls": ["https://s3.amazonaws.com/..."],
-    "started_at": "2026-03-08T10:00:00Z",
-    "completed_at": "2026-03-08T10:02:30Z",
-    "created_at": "2026-03-08T10:02:30Z",
-    "updated_at": "2026-03-08T10:02:30Z"
-  }
-}
-```
-
-**Response (404):** Report not found for the given `jobId`.
-
-### 4.12 List Application Reports — `GET /valet/reports/user/:userId`
-
-Returns paginated application reports for a user, ordered by most recent first.
-
-**Query params:**
-
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| `limit` | number | 50 | Max results per page (1–100) |
-| `offset` | number | 0 | Pagination offset |
-
-**Response (200):**
-
-```json
-{
-  "reports": [ /* array of report objects, same shape as 4.11 */ ],
-  "count": 12  // total reports for user (not page count)
-}
-```
-
-> **Note:** Reports are written best-effort during job finalization. A small percentage of jobs may not have reports if the DB write fails. The `resume_ref` field contains a storage path — VALET should resolve this to a display name via its own `resumes` table. Sensitive fields (passwords, SSNs) are automatically redacted to `[REDACTED]`.
+> **Note:** Reports are written best-effort. A small percentage of jobs may not have reports if the DB write fails. The `resume_ref` field contains a storage path — VALET should resolve this to a display name via its own `resumes` table. Sensitive fields (passwords, SSNs) are automatically redacted to `[REDACTED]`.
 
 ---
 

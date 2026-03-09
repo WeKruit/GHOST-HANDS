@@ -3,7 +3,7 @@
 **For:** VALET repo Claude agent
 **Date:** 2026-03-08
 **GH Branch:** `feature/application-reports` (merged into staging)
-**Context:** GhostHands now stores a structured report of every field the worker filled during a job application. This document describes the new API endpoints, data schema, and exactly where/how to integrate in VALET.
+**Context:** GhostHands now writes a structured report of every field the worker filled during a job application into the shared Supabase database. VALET should query this table directly (no GH API calls needed for reads). This document describes the table schema and how to integrate the Application Tracker UI.
 
 ---
 
@@ -18,124 +18,97 @@ After every job completes (or fails / goes to awaiting_review), GhostHands write
 
 ---
 
-## Where to Add Code in VALET
+## How to Read Reports (Direct Supabase Query)
 
-The GhostHands integration layer lives in:
+VALET and GhostHands share the same Supabase database. **VALET should query `gh_application_reports` directly** — there are no GH API endpoints for report reads. GhostHands only writes to this table.
 
-```
-apps/api/src/modules/ghosthands/
-├── ghosthands.client.ts    ← Add new methods here (getApplicationReport, listUserReports)
-├── ghosthands.types.ts     ← Add new types here (GHApplicationReport, GHSubmittedField, etc.)
-└── ghosthands.webhook.ts   ← No changes needed (callbacks unchanged)
-```
+### Get Report for a Single Job
 
-### Auth & Request Pattern
-
-All requests use the existing pattern in `ghosthands.client.ts`:
-- **Base URL:** `GHOSTHANDS_API_URL` env var (already configured, default `http://localhost:3100`)
-- **Auth header:** `X-GH-Service-Key: {GH_SERVICE_SECRET}` (already used by all other methods)
-- **Full path prefix:** `{GHOSTHANDS_API_URL}/api/v1/gh/valet/reports/...`
-
-Follow the exact same `fetch()` pattern used by existing methods like `getJobStatus(jobId)`.
-
----
-
-## New API Endpoints
-
-Base URL: `{GHOSTHANDS_API_URL}/api/v1/gh/valet`
-
-### 1. Get Report for a Single Job
-
-```
-GET /valet/reports/:jobId
+```typescript
+const { data: report } = await supabase
+  .from('gh_application_reports')
+  .select('*')
+  .eq('job_id', jobId)
+  .single();
 ```
 
-**Response (200):**
+### List All Reports for a User (Paginated)
+
+```typescript
+const { data: reports, count } = await supabase
+  .from('gh_application_reports')
+  .select('*', { count: 'exact' })
+  .eq('user_id', userId)
+  .order('created_at', { ascending: false })
+  .range(offset, offset + limit - 1);
+```
+
+### Example Row Shape
+
 ```json
 {
-  "report": {
-    "id": "uuid",
-    "job_id": "uuid",
-    "user_id": "uuid",
-    "valet_task_id": "vt-789",
-    "job_url": "https://mycompany.wd5.myworkdayjobs.com/en-US/External/job/apply",
-    "company_name": "mycompany",
-    "job_title": null,
-    "platform": "workday",
-    "resume_ref": "resumes/resume-abc.pdf",
-    "fields_submitted": [
-      {
-        "prompt_text": "First Name",
-        "value": "John",
-        "question_type": "text",
-        "source": "dom",
-        "answer_mode": "profile_backed",
-        "confidence": 0.95,
-        "required": true,
-        "section_label": "Personal Information",
-        "state": "verified"
-      },
-      {
-        "prompt_text": "Years of Experience",
-        "value": "5",
-        "question_type": "select",
-        "source": "llm",
-        "answer_mode": "best_effort_guess",
-        "confidence": 0.7,
-        "required": true,
-        "section_label": null,
-        "state": "filled"
-      }
-    ],
-    "total_fields": 15,
-    "fields_filled": 13,
-    "fields_failed": 1,
-    "fields_unresolved": 1,
-    "status": "completed",
-    "submitted": true,
-    "result_summary": "Application submitted successfully",
-    "llm_cost_cents": 5,
-    "action_count": 10,
-    "total_tokens": 1500,
-    "screenshot_urls": ["https://s3.amazonaws.com/..."],
-    "started_at": "2026-03-08T10:00:00Z",
-    "completed_at": "2026-03-08T10:02:30Z",
-    "created_at": "2026-03-08T10:02:30Z",
-    "updated_at": "2026-03-08T10:02:30Z"
-  }
+  "id": "uuid",
+  "job_id": "uuid",
+  "user_id": "uuid",
+  "valet_task_id": "vt-789",
+  "job_url": "https://mycompany.wd5.myworkdayjobs.com/en-US/External/job/apply",
+  "company_name": "mycompany",
+  "job_title": null,
+  "platform": "workday",
+  "resume_ref": "resumes/resume-abc.pdf",
+  "fields_submitted": [
+    {
+      "prompt_text": "First Name",
+      "value": "John",
+      "question_type": "text",
+      "source": "dom",
+      "answer_mode": "profile_backed",
+      "confidence": 0.95,
+      "required": true,
+      "section_label": "Personal Information",
+      "state": "verified"
+    },
+    {
+      "prompt_text": "Years of Experience",
+      "value": "5",
+      "question_type": "select",
+      "source": "llm",
+      "answer_mode": "best_effort_guess",
+      "confidence": 0.7,
+      "required": true,
+      "section_label": null,
+      "state": "filled"
+    }
+  ],
+  "total_fields": 15,
+  "fields_filled": 13,
+  "fields_failed": 1,
+  "fields_unresolved": 1,
+  "status": "completed",
+  "submitted": true,
+  "result_summary": "Application submitted successfully",
+  "llm_cost_cents": 5,
+  "action_count": 10,
+  "total_tokens": 1500,
+  "screenshot_urls": ["https://s3.amazonaws.com/..."],
+  "started_at": "2026-03-08T10:00:00Z",
+  "completed_at": "2026-03-08T10:02:30Z",
+  "created_at": "2026-03-08T10:02:30Z",
+  "updated_at": "2026-03-08T10:02:30Z"
 }
 ```
 
-**Response (404):**
-```json
-{ "error": "not_found", "message": "Report not found" }
-```
+---
 
-### 2. List All Reports for a User
+## RLS Note
 
-```
-GET /valet/reports/user/:userId?limit=50&offset=0
-```
-
-**Query params:**
-- `limit` — 1–100, default 50
-- `offset` — default 0
-
-**Response (200):**
-```json
-{
-  "reports": [ /* array of report objects, same shape as above */ ],
-  "count": 42
-}
-```
-
-> **Note:** `count` is the **total** number of reports for the user (not the page size). Use it with `limit`/`offset` to build pagination controls (e.g., "Page 1 of 3").
+The table currently only has a `service_role` RLS policy. For VALET to query via the Supabase client with an authenticated user, you need to add an RLS policy. Either:
+- Use the `service_role` client (bypasses RLS) for server-side queries, OR
+- Add an authenticated user read policy: `CREATE POLICY "Users can read own reports" ON gh_application_reports FOR SELECT TO authenticated USING (user_id = auth.uid());`
 
 ---
 
-## TypeScript Types to Add
-
-Add these to `ghosthands.types.ts`:
+## TypeScript Types
 
 ```typescript
 export interface GHSubmittedField {
@@ -177,32 +150,6 @@ export interface GHApplicationReport {
   created_at: string;
   updated_at: string;
 }
-
-export interface GHGetReportResponse {
-  report: GHApplicationReport;
-}
-
-export interface GHListReportsResponse {
-  reports: GHApplicationReport[];
-  count: number; // total count for the user (not page size)
-}
-```
-
----
-
-## Client Methods to Add
-
-Add these to `ghosthands.client.ts`, following the same pattern as `getJobStatus()`:
-
-```typescript
-async getApplicationReport(jobId: string): Promise<GHGetReportResponse | null> {
-  // GET /api/v1/gh/valet/reports/:jobId
-  // Returns null on 404 (report not found)
-}
-
-async listUserReports(userId: string, limit = 50, offset = 0): Promise<GHListReportsResponse> {
-  // GET /api/v1/gh/valet/reports/user/:userId?limit=X&offset=Y
-}
 ```
 
 ---
@@ -236,10 +183,10 @@ The `resume_ref` field contains the storage path (e.g., `resumes/resume-abc.pdf`
 
 ## VALET Implementation Checklist
 
-### Backend (`apps/api/src/modules/ghosthands/`)
-- [ ] Add `GHSubmittedField`, `GHApplicationReport`, `GHGetReportResponse`, `GHListReportsResponse` types to `ghosthands.types.ts`
-- [ ] Add `getApplicationReport(jobId)` method to `ghosthands.client.ts`
-- [ ] Add `listUserReports(userId, limit?, offset?)` method to `ghosthands.client.ts`
+### Backend
+- [ ] Add `GHSubmittedField` and `GHApplicationReport` types (see TypeScript Types section above)
+- [ ] Create a service/helper that queries `gh_application_reports` via Supabase (see query examples above)
+- [ ] Handle RLS: either use service_role client or add an authenticated user read policy
 - [ ] Resolve `resume_ref` to user-facing resume name via VALET's `resumes` table
 - [ ] Cache report data if needed (reports are immutable once status is `completed` — but may update from `awaiting_review` → `completed`)
 
@@ -258,7 +205,7 @@ The `resume_ref` field contains the storage path (e.g., `resumes/resume-abc.pdf`
 - [ ] Show screenshots (clickable thumbnails)
 - [ ] Show resume used (resolved display name)
 - [ ] Filter/sort applications by: date, company, platform, status
-- [ ] Pagination controls using `count` (total) with `limit`/`offset`
+- [ ] Pagination controls using Supabase `count: 'exact'` for total
 
 ### Visual Indicators
 - **State badges:**
@@ -284,4 +231,3 @@ The `resume_ref` field contains the storage path (e.g., `resumes/resume-abc.pdf`
 - When a job transitions from `awaiting_review` → `completed`, the report is updated via upsert (same `job_id`).
 - Sensitive fields (passwords, SSNs, tokens) are automatically redacted to `[REDACTED]`. User PII like phone numbers and addresses are NOT redacted since the user needs to verify them.
 - The `company_name` is best-effort extracted from the URL (works well for Workday, Greenhouse, Lever — may be null for unknown ATS platforms).
-- Both endpoints are rate-limited (same middleware as other valet routes).
