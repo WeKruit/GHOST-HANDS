@@ -255,7 +255,7 @@ export function buildApplicationReport(
 export async function writeApplicationReport(
   supabase: SupabaseClient,
   reportData: ApplicationReportData,
-): Promise<void> {
+): Promise<boolean> {
   try {
     const { error } = await supabase
       .from('gh_application_reports')
@@ -266,17 +266,20 @@ export async function writeApplicationReport(
         jobId: reportData.job_id,
         error: error.message,
       });
-    } else {
-      logger.info('Application report written', {
-        jobId: reportData.job_id,
-        fieldsFilled: reportData.fields_filled,
-        totalFields: reportData.total_fields,
-      });
+      return false;
     }
+
+    logger.info('Application report written', {
+      jobId: reportData.job_id,
+      fieldsFilled: reportData.fields_filled,
+      totalFields: reportData.total_fields,
+    });
+    return true;
   } catch (err) {
     logger.warn('Application report write threw', {
       jobId: reportData.job_id,
       error: err instanceof Error ? err.message : String(err),
     });
+    return false;
   }
 }
