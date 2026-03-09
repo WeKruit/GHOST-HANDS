@@ -67,6 +67,9 @@ export const JOB_EVENT_TYPES = {
 
   // Form submission (used by recovery to detect partial applications)
   FORM_SUBMITTED: 'form_submitted',
+
+  // Application report
+  REPORT_GENERATED: 'report_generated',
 } as const;
 
 export type JobEventType = (typeof JOB_EVENT_TYPES)[keyof typeof JOB_EVENT_TYPES];
