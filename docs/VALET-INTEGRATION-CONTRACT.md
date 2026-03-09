@@ -623,7 +623,7 @@ Returns paginated application reports for a user, ordered by most recent first.
 ```json
 {
   "reports": [ /* array of report objects, same shape as 4.11 */ ],
-  "count": 12
+  "count": 12  // total reports for user (not page count)
 }
 ```
 

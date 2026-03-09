@@ -557,14 +557,20 @@ export function createValetRoutes(pool: pg.Pool) {
     const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '50', 10) || 50, 1), 100);
     const offset = Math.max(parseInt(c.req.query('offset') || '0', 10) || 0, 0);
 
-    const { rows } = await pool.query(`
-      SELECT * FROM gh_application_reports
-      WHERE user_id = $1::UUID
-      ORDER BY created_at DESC
-      LIMIT $2 OFFSET $3
-    `, [userId, limit, offset]);
+    const [{ rows }, countResult] = await Promise.all([
+      pool.query(`
+        SELECT * FROM gh_application_reports
+        WHERE user_id = $1::UUID
+        ORDER BY created_at DESC
+        LIMIT $2 OFFSET $3
+      `, [userId, limit, offset]),
+      pool.query(`
+        SELECT COUNT(*)::int AS total FROM gh_application_reports
+        WHERE user_id = $1::UUID
+      `, [userId]),
+    ]);
 
-    return c.json({ reports: rows, count: rows.length });
+    return c.json({ reports: rows, count: countResult.rows[0].total });
   });
 
   return valet;
