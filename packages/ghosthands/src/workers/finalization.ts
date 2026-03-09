@@ -277,11 +277,13 @@ async function writeReportBestEffort(
       screenshotUrls,
       status,
     );
-    await writeApplicationReport(supabase, reportData);
-    await logEvent('report_generated', {
-      fields_filled: reportData.fields_filled,
-      total_fields: reportData.total_fields,
-    }).catch(() => {});
+    const written = await writeApplicationReport(supabase, reportData);
+    if (written) {
+      await logEvent('report_generated', {
+        fields_filled: reportData.fields_filled,
+        total_fields: reportData.total_fields,
+      }).catch(() => {});
+    }
   } catch (err) {
     logger.warn('Application report generation failed', {
       jobId: job.id,
