@@ -3,7 +3,7 @@
 **For:** VALET repo Claude agent
 **Date:** 2026-03-08
 **GH Branch:** `feature/application-reports` (merged into staging)
-**Context:** GhostHands now stores a structured report of every field the worker filled during a job application. This document describes the new API endpoints and data schema so VALET can integrate the Application Tracker UI.
+**Context:** GhostHands now stores a structured report of every field the worker filled during a job application. This document describes the new API endpoints, data schema, and exactly where/how to integrate in VALET.
 
 ---
 
@@ -18,9 +18,31 @@ After every job completes (or fails / goes to awaiting_review), GhostHands write
 
 ---
 
+## Where to Add Code in VALET
+
+The GhostHands integration layer lives in:
+
+```
+apps/api/src/modules/ghosthands/
+├── ghosthands.client.ts    ← Add new methods here (getApplicationReport, listUserReports)
+├── ghosthands.types.ts     ← Add new types here (GHApplicationReport, GHSubmittedField, etc.)
+└── ghosthands.webhook.ts   ← No changes needed (callbacks unchanged)
+```
+
+### Auth & Request Pattern
+
+All requests use the existing pattern in `ghosthands.client.ts`:
+- **Base URL:** `GHOSTHANDS_API_URL` env var (already configured, default `http://localhost:3100`)
+- **Auth header:** `X-GH-Service-Key: {GH_SERVICE_SECRET}` (already used by all other methods)
+- **Full path prefix:** `{GHOSTHANDS_API_URL}/api/v1/gh/valet/reports/...`
+
+Follow the exact same `fetch()` pattern used by existing methods like `getJobStatus(jobId)`.
+
+---
+
 ## New API Endpoints
 
-Base URL: `{GH_API_URL}/api/v1/gh/valet`
+Base URL: `{GHOSTHANDS_API_URL}/api/v1/gh/valet`
 
 ### 1. Get Report for a Single Job
 
@@ -96,20 +118,96 @@ GET /valet/reports/user/:userId?limit=50&offset=0
 ```
 
 **Query params:**
-- `limit` — max 100, default 50
+- `limit` — 1–100, default 50
 - `offset` — default 0
 
 **Response (200):**
 ```json
 {
   "reports": [ /* array of report objects, same shape as above */ ],
-  "count": 12
+  "count": 42
+}
+```
+
+> **Note:** `count` is the **total** number of reports for the user (not the page size). Use it with `limit`/`offset` to build pagination controls (e.g., "Page 1 of 3").
+
+---
+
+## TypeScript Types to Add
+
+Add these to `ghosthands.types.ts`:
+
+```typescript
+export interface GHSubmittedField {
+  prompt_text: string;
+  value: string;
+  question_type: 'text' | 'textarea' | 'email' | 'tel' | 'url' | 'number' | 'date' | 'file' | 'select' | 'radio' | 'checkbox' | 'unknown';
+  source: 'dom' | 'llm' | 'magnitude' | 'manual';
+  answer_mode?: 'profile_backed' | 'best_effort_guess' | 'default_decline' | 'system_attachment' | null;
+  confidence: number;
+  required: boolean;
+  section_label?: string | null;
+  state: 'verified' | 'filled' | 'failed' | 'uncertain' | 'planned' | 'attempted';
+}
+
+export interface GHApplicationReport {
+  id: string;
+  job_id: string;
+  user_id: string;
+  valet_task_id: string | null;
+  job_url: string;
+  company_name: string | null;
+  job_title: string | null;
+  platform: string | null;
+  resume_ref: string | null;
+  fields_submitted: GHSubmittedField[];
+  total_fields: number;
+  fields_filled: number;
+  fields_failed: number;
+  fields_unresolved: number;
+  status: 'completed' | 'failed' | 'awaiting_review';
+  submitted: boolean;
+  result_summary: string | null;
+  llm_cost_cents: number | null;
+  action_count: number | null;
+  total_tokens: number | null;
+  screenshot_urls: string[];
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GHGetReportResponse {
+  report: GHApplicationReport;
+}
+
+export interface GHListReportsResponse {
+  reports: GHApplicationReport[];
+  count: number; // total count for the user (not page size)
 }
 ```
 
 ---
 
-## `fields_submitted` Schema
+## Client Methods to Add
+
+Add these to `ghosthands.client.ts`, following the same pattern as `getJobStatus()`:
+
+```typescript
+async getApplicationReport(jobId: string): Promise<GHGetReportResponse | null> {
+  // GET /api/v1/gh/valet/reports/:jobId
+  // Returns null on 404 (report not found)
+}
+
+async listUserReports(userId: string, limit = 50, offset = 0): Promise<GHListReportsResponse> {
+  // GET /api/v1/gh/valet/reports/user/:userId?limit=X&offset=Y
+}
+```
+
+---
+
+## `fields_submitted` Schema Reference
 
 Each element in the `fields_submitted` JSONB array:
 
@@ -130,7 +228,7 @@ Each element in the `fields_submitted` JSONB array:
 ## Resume Reference Resolution
 
 The `resume_ref` field contains the storage path (e.g., `resumes/resume-abc.pdf`). This is NOT the user-facing filename. VALET should:
-1. Parse the resume ID from the path
+1. Parse the resume ID from the path (the UUID portion after `resumes/`)
 2. Look up the resume record in the VALET `resumes` table to get the display name
 3. Show the display name in the UI (e.g., "Software Engineer Resume.pdf")
 
@@ -138,26 +236,29 @@ The `resume_ref` field contains the storage path (e.g., `resumes/resume-abc.pdf`
 
 ## VALET Implementation Checklist
 
-### Backend
-- [ ] Add a service/helper to call `GET /valet/reports/:jobId` from GH API
-- [ ] Add a service/helper to call `GET /valet/reports/user/:userId` from GH API
-- [ ] Cache report data if needed (reports are immutable after creation)
-- [ ] Resolve `resume_ref` to user-facing resume name
+### Backend (`apps/api/src/modules/ghosthands/`)
+- [ ] Add `GHSubmittedField`, `GHApplicationReport`, `GHGetReportResponse`, `GHListReportsResponse` types to `ghosthands.types.ts`
+- [ ] Add `getApplicationReport(jobId)` method to `ghosthands.client.ts`
+- [ ] Add `listUserReports(userId, limit?, offset?)` method to `ghosthands.client.ts`
+- [ ] Resolve `resume_ref` to user-facing resume name via VALET's `resumes` table
+- [ ] Cache report data if needed (reports are immutable once status is `completed` — but may update from `awaiting_review` → `completed`)
 
 ### Frontend (Application Tracker UI)
-- [ ] Create Application Tracker page/component (similar to Tsenta screenshot)
-- [ ] Display list of applications with: company, status, date, field count
-- [ ] Detail view: show all `fields_submitted` as a table with columns:
+- [ ] Create Application Tracker page/component
+- [ ] **List view:** display applications with: company, status, date, field count, pagination
+- [ ] **Detail view:** show all `fields_submitted` as a table with columns:
   - Field Name (`prompt_text`)
   - Value Submitted (`value`)
   - Type (`question_type`)
   - Confidence badge (green >=0.9, yellow 0.7-0.9, red <0.7)
   - Required indicator
+  - State badge
 - [ ] Show summary stats: total fields, filled, failed, unresolved
 - [ ] Show cost info: `llm_cost_cents`, `action_count`
 - [ ] Show screenshots (clickable thumbnails)
 - [ ] Show resume used (resolved display name)
 - [ ] Filter/sort applications by: date, company, platform, status
+- [ ] Pagination controls using `count` (total) with `limit`/`offset`
 
 ### Visual Indicators
 - **State badges:**
@@ -183,3 +284,4 @@ The `resume_ref` field contains the storage path (e.g., `resumes/resume-abc.pdf`
 - When a job transitions from `awaiting_review` → `completed`, the report is updated via upsert (same `job_id`).
 - Sensitive fields (passwords, SSNs, tokens) are automatically redacted to `[REDACTED]`. User PII like phone numbers and addresses are NOT redacted since the user needs to verify them.
 - The `company_name` is best-effort extracted from the URL (works well for Workday, Greenhouse, Lever — may be null for unknown ATS platforms).
+- Both endpoints are rate-limited (same middleware as other valet routes).
