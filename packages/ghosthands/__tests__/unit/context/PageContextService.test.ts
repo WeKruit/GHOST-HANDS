@@ -18,13 +18,13 @@ function createService() {
 }
 
 describe('LivePageContextService', () => {
-  it('exposes the current session synchronously via getSession()', async () => {
+  it('exposes the current session synchronously via getSessionSync()', async () => {
     const { service } = createService();
-    expect(service.getSession()).toBeNull();
+    expect(service.getSessionSync()).toBeNull();
 
     await service.initializeRun('run-service-0');
 
-    const initialized = service.getSession();
+    const initialized = service.getSessionSync();
     expect(initialized).not.toBeNull();
     expect(initialized?.jobId).toBe('job-service');
 
@@ -37,7 +37,7 @@ describe('LivePageContextService', () => {
       pageSequence: 1,
     });
 
-    const session = service.getSession();
+    const session = service.getSessionSync();
     expect(session?.pages).toHaveLength(1);
     expect(session?.activePageId).toBe(session?.pages[0]?.pageId);
   });
