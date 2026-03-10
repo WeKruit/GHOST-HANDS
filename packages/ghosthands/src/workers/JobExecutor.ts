@@ -991,7 +991,7 @@ export class JobExecutor {
       // 12.7. Flush page context report if wired
       if (pageContext) {
         try {
-          await pageContext.getContextReport('completed');
+          await pageContext.getContextReport('flushed');
         } catch (err) {
           getLogger().warn('Page context flush failed (non-fatal)', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         }
