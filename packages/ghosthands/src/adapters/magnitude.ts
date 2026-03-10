@@ -23,7 +23,7 @@ import type { Page } from 'playwright';
 import type { ZodSchema } from 'zod';
 import EventEmitter from 'eventemitter3';
 import { loadModelConfig, type ResolvedModel } from '../config/models';
-import { createActMutex, acquireActMutex, releaseActMutex, poisonActMutex, refreshActMutex, type ActMutexState } from './actMutex';
+import { createActMutex, acquireActMutex, releaseActMutex, poisonActMutex, refreshActMutex, waitForActSettle as waitForActSettleMutex, type ActMutexState } from './actMutex';
 
 export class MagnitudeAdapter implements HitlCapableAdapter {
   readonly type = 'magnitude' as const;
@@ -123,8 +123,7 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
     );
 
     // Wire Magnitude events to adapter events
-    // Forward the full action payload (variant, x, y, content, etc.)
-    // so TraceRecorder can use coordinates for elementFromPoint lookups.
+    // Forward the full action payload (variant, x, y, content, etc.).
     this.agent.events.on('actionStarted', (action) => {
       this.emitter.emit('actionStarted', { ...action });
     });
@@ -227,6 +226,10 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
 
     releaseActMutex(this._actMutex);
     throw new Error('act() failed after schema retry');
+  }
+
+  async waitForActSettle(timeoutMs: number = 10_000): Promise<boolean> {
+    return waitForActSettleMutex(this._actMutex, timeoutMs);
   }
 
   async extract<T>(instruction: string, schema: ZodSchema<T>): Promise<T> {

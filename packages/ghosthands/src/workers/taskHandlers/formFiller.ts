@@ -27,6 +27,7 @@ import { buildAnswerDecisionsFromFieldAnswers, normalizeExtractedQuestions, reco
 import type { NormalizedQuestionDraft } from '../../context/QuestionNormalizer.js';
 import type { AnswerDecision, AnswerMode, QuestionOutcome, QuestionSnapshot } from '../../context/types.js';
 import type { WorkdayUserProfile } from './workday/workdayTypes.js';
+import type { AnthropicClientConfig } from './types.js';
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -91,6 +92,7 @@ export interface FillObservers {
 export interface FillFormOptions {
   forceMagnitude?: boolean;
   observers?: FillObservers;
+  anthropicClientConfig?: AnthropicClientConfig;
 }
 
 interface GenerateResult {
@@ -1368,8 +1370,78 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
 
 // ── LLM answer generation ────────────────────────────────────
 
-async function generateAnswers(fields: FormField[], profileText: string): Promise<GenerateResult> {
-  const client = new Anthropic();
+function trimOptionalString(value: string | undefined): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+const DISALLOWED_ANTHROPIC_DEFAULT_HEADERS = new Set([
+  'authorization',
+  'content-length',
+  'host',
+  'x-api-key',
+]);
+
+function normalizeAnthropicBaseURL(value: string | undefined): string | undefined {
+  const trimmed = trimOptionalString(value);
+  if (!trimmed) return undefined;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error('Anthropic client baseURL must be an absolute http(s) URL');
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Anthropic client baseURL must use http or https');
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('Anthropic client baseURL must not include embedded credentials');
+  }
+
+  parsed.hash = '';
+  return parsed.toString().replace(/\/+$/, '');
+}
+
+export function buildAnthropicClientOptions(
+  clientConfig?: AnthropicClientConfig,
+): ConstructorParameters<typeof Anthropic>[0] | undefined {
+  if (!clientConfig) return undefined;
+
+  const apiKey = trimOptionalString(clientConfig.apiKey);
+  const authToken = trimOptionalString(clientConfig.authToken);
+  const baseURL = normalizeAnthropicBaseURL(clientConfig.baseURL);
+
+  const defaultHeaders = clientConfig.defaultHeaders
+    ? Object.fromEntries(
+        Object.entries(clientConfig.defaultHeaders).filter(
+          ([key, value]) =>
+            key.trim().length > 0 &&
+            !DISALLOWED_ANTHROPIC_DEFAULT_HEADERS.has(key.trim().toLowerCase()) &&
+            typeof value === 'string' &&
+            value.trim().length > 0,
+        ),
+      )
+    : undefined;
+
+  const options = {
+    ...(apiKey ? { apiKey } : {}),
+    ...(authToken ? { authToken } : {}),
+    ...(baseURL ? { baseURL } : {}),
+    ...(defaultHeaders && Object.keys(defaultHeaders).length > 0 ? { defaultHeaders } : {}),
+  };
+
+  return Object.keys(options).length > 0 ? options : undefined;
+}
+
+async function generateAnswers(
+  fields: FormField[],
+  profileText: string,
+  clientConfig?: AnthropicClientConfig,
+): Promise<GenerateResult> {
+  const client = new Anthropic(buildAnthropicClientOptions(clientConfig));
   const profileEvidence = parseProfileEvidence(profileText);
 
   // Disambiguate duplicate field names by appending "#2", "#3", etc.
@@ -2991,8 +3063,8 @@ Questions to answer:
 ${questionDescriptions}
 
 Rules:
-- For REQUIRED questions, provide a non-empty answer.
-- For optional questions, you may return an empty answer only when the profile truly lacks the requested info.
+- Fields marked (REQUIRED) MUST have a non-empty, meaningful answer. NEVER return an empty answer for a required field.
+- For optional fields (NOT marked REQUIRED), return an empty string "" if the profile does not contain the information. Do NOT guess or fabricate data for optional fields like address, postal code, or phone extension. Leave them empty.
 - Use answerMode "profile_backed" when the answer comes directly from the profile.
 - Use answerMode "best_effort_guess" when you infer a plausible answer not explicitly in the profile.
 - Use answerMode "default_decline" for demographic/EEO fields where the profile lacks info — choose a neutral decline option like "Prefer not to say", "Decline to self-identify".
@@ -3001,7 +3073,7 @@ Rules:
 - For textarea fields, write 2-4 thoughtful sentences. Never a single letter or placeholder.
 - NEVER fabricate identity/contact handles or IDs (Twitter/X handle, GitHub username, social username, passport/license/ID numbers). If missing: optional -> empty answer, required -> "N/A".
 - NEVER select placeholder options like "Select One", "Choose one", "Please select".
-- Fields marked (REQUIRED) MUST have a meaningful answer.`;
+- NEVER use "N/A" as an answer for structured fields like postal code, city, phone number, or address. Either provide a real value or leave empty.`;
 
   try {
     const result = await adapter.extract(instruction, AnswerPlanSchema);
@@ -3079,7 +3151,8 @@ export function applyNeverEmptyFallback(
     const existing = result[field.id];
     if (existing && existing.trim()) continue;
     if (isLikelyNavigationField(field as any)) continue;
-    if (!field.required && FREE_TEXT_TYPES.has(field.type)) continue;
+    // Skip optional fields — leave them empty rather than filling with "N/A"
+    if (!field.required) continue;
     if (field.choices?.length) {
       result[field.id] = field.choices[0];
       continue;
@@ -3354,7 +3427,7 @@ export async function fillFormOnPage(
     if (usedNewPipeline) {
       // 6c-i. Generate actual fill answers via proven legacy path
       console.log('[formFiller] Asking LLM for answers…');
-      const genResult = await generateAnswers(llmFields, profileText);
+      const genResult = await generateAnswers(llmFields, profileText, opts?.anthropicClientConfig);
       answers = { ...genResult.answers };
       Object.assign(fieldIdMap, genResult.fieldIdToKey);
       result.llmCalls++;
@@ -3437,7 +3510,11 @@ export async function fillFormOnPage(
     } else {
       // Heuristic-only path — use legacy generateAnswers
       console.log('[formFiller] Using legacy generateAnswers (heuristic path)…');
-      const genResult = await generateAnswers(llmFields, profileText);
+      const genResult = await generateAnswers(
+        llmFields,
+        profileText,
+        opts?.anthropicClientConfig,
+      );
       answers = { ...genResult.answers };
       Object.assign(fieldIdMap, genResult.fieldIdToKey);
       result.llmCalls++;
@@ -3626,7 +3703,11 @@ export async function fillFormOnPage(
       }
 
       // Generate actual fill answers for unseen fields via proven legacy path
-      const extraResult = await generateAnswers(unseen, profileText);
+      const extraResult = await generateAnswers(
+        unseen,
+        profileText,
+        opts?.anthropicClientConfig,
+      );
       Object.assign(answers, extraResult.answers);
       Object.assign(fieldIdMap, extraResult.fieldIdToKey);
       result.llmCalls++;
@@ -3757,8 +3838,16 @@ export async function fillFormOnPage(
     if (f.type === 'file') continue;
 
     if (forceMagnitude) {
-      // Escalation mode: send ALL visible fields to MagnitudeHand — DOM values
-      // may be present but wrong (e.g. bad date format, validation failures).
+      // Escalation mode: still check DOM values — only send fields that are
+      // genuinely empty. Previously this sent ALL fields, but that wastes
+      // Magnitude calls on already-correct fields and causes issues with
+      // complex widgets (e.g. Workday date pickers) that MagnitudeHand
+      // can't handle well.
+      const filled = await isFieldFilled(page, f.id);
+      if (filled) {
+        filledIds.add(f.id);
+        continue;
+      }
       unfilledFields.push(f);
       continue;
     }

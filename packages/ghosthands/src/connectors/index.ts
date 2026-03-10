@@ -1,6 +1,4 @@
 /**
- * Connectors — AgentConnector implementations for GhostHands.
+ * Connectors — placeholder module (cookbook connectors removed).
  */
-
-export { ActionBookConnector } from './actionbookConnector';
-export type { AgentConnector } from './actionbookConnector';
+export {};

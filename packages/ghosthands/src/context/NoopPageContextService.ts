@@ -44,7 +44,10 @@ export class NoopPageContextService implements PageContextService {
   async flushToSupabase(): Promise<ContextReport> {
     return this.getContextReport('pending');
   }
-  getSession(): PageContextSession | null {
+  async getSession(): Promise<PageContextSession | null> {
+    return null;
+  }
+  getSessionSync(): PageContextSession | null {
     return null;
   }
 }

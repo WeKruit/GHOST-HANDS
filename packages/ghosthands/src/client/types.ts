@@ -140,7 +140,6 @@ export interface AutomationJob {
   completed_at: string | null;
   last_heartbeat: string | null;
   worker_id: string | null;
-  manual_id: string | null;
   target_worker_id: string | null;
   engine_type: string | null;
   result_data: Record<string, unknown> | null;

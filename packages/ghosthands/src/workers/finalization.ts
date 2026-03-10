@@ -19,12 +19,20 @@ import { CostControlService } from './costControl.js';
 import type { ProgressTracker } from './progressTracker.js';
 import { ProgressStep } from './progressTracker.js';
 import type { TaskResult, AutomationJob } from './taskHandlers/types.js';
-import type { ExecutionResult } from '../engine/ExecutionEngine.js';
 import { callbackNotifier } from './callbackNotifier.js';
+
+/** Minimal execution result shape used by finalization functions. */
+export interface ExecutionResult {
+  success: boolean;
+  mode: 'magnitude';
+  error?: string;
+  magnitudeSteps: number;
+}
 import type { SessionManager } from '../sessions/SessionManager.js';
 import { getLogger } from '../monitoring/logger.js';
 import type { PageContextService } from '../context/PageContextService.js';
 import type { ContextReport } from '../context/types.js';
+import { buildApplicationReport, writeApplicationReport } from './reportBuilder.js';
 
 // ---------------------------------------------------------------------------
 // Shared input interface
@@ -246,153 +254,47 @@ function fireCallbackBestEffort(
     });
 }
 
+/**
+ * Build and persist an application report. Best-effort — never throws.
+ */
+async function writeReportBestEffort(
+  supabase: SupabaseClient,
+  job: AutomationJob,
+  pageContext: PageContextService | undefined,
+  costSnapshot: CostSnapshot,
+  taskResult: TaskResult,
+  screenshotUrls: string[],
+  status: 'completed' | 'failed' | 'awaiting_review',
+  logEvent: CommonFinalizationInput['logEvent'],
+): Promise<void> {
+  try {
+    const session = pageContext ? await pageContext.getSession() : null;
+    const reportData = buildApplicationReport(
+      job,
+      session,
+      costSnapshot,
+      taskResult,
+      screenshotUrls,
+      status,
+    );
+    const written = await writeApplicationReport(supabase, reportData);
+    if (written) {
+      await logEvent('report_generated', {
+        fields_filled: reportData.fields_filled,
+        total_fields: reportData.total_fields,
+      }).catch(() => {});
+    }
+  } catch (err) {
+    logger.warn('Application report generation failed', {
+      jobId: job.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
-
-/**
- * Finalize a job that completed via cookbook replay.
- *
- * Steps:
- * 1. Update job metadata with engine result (final_mode, manual_id, health_score, cost_breakdown)
- * 2. Take final screenshot and upload
- * 3. Save browser session if sessionManager available
- * 4. Get final cost snapshot
- * 5. Set progress to COMPLETED and flush
- * 6. Build result_data with cost info
- * 7. Update job status to 'completed' with result_data, screenshot_urls, cost fields
- * 8. Log 'job_completed' event
- * 9. Record cost via CostControlService.recordJobCost (best-effort)
- * 10. Fire VALET callback if callback_url exists
- */
-export async function finalizeCookbookSuccess(
-  input: CommonFinalizationInput & {
-    engineResult: ExecutionResult;
-  },
-): Promise<void> {
-  const {
-    job,
-    adapter,
-    costTracker,
-    progress,
-    sessionManager,
-    workerId,
-    supabase,
-    logEvent,
-    uploadScreenshot,
-    pageContext,
-    engineResult,
-  } = input;
-
-  // Track metadata locally to avoid stale-base clobber across sequential writes
-  let currentMetadata: Record<string, unknown> = { ...(job.metadata || {}) };
-
-  // 1. Update job metadata with engine result
-  currentMetadata = {
-    ...currentMetadata,
-    engine: {
-      manual_id: engineResult.manualId,
-      manual_status: 'cookbook_success',
-      health_score: engineResult.cookbookSteps > 0 ? 95 : null,
-    },
-    cost_breakdown: {
-      cookbook_steps: engineResult.cookbookSteps,
-      magnitude_steps: 0,
-      cookbook_cost_usd: costTracker.getSnapshot().totalCost,
-      magnitude_cost_usd: 0,
-      image_cost_usd: costTracker.getSnapshot().imageCost,
-      reasoning_cost_usd: costTracker.getSnapshot().reasoningCost,
-    },
-  };
-  await supabase
-    .from('gh_automation_jobs')
-    .update({ final_mode: engineResult.mode, metadata: currentMetadata })
-    .eq('id', job.id);
-
-  // 2. Take final screenshot and upload
-  const screenshotUrls: string[] = [];
-  const screenshotUrl = await captureAndUpload(adapter, job.id, 'final', uploadScreenshot);
-  if (screenshotUrl) {
-    screenshotUrls.push(screenshotUrl);
-  }
-
-  // 3. Save browser session
-  await saveBrowserSession(adapter, sessionManager, job.user_id, job.target_url, job.id);
-
-  // 4. Get final cost snapshot
-  const finalCost = costTracker.getSnapshot();
-
-  // 5. Set progress to COMPLETED and flush
-  await progress.setStep(ProgressStep.COMPLETED);
-  await progress.flush();
-
-  // 6. Build result_data with cost info
-  const { report: contextReport, flushFailed } = await flushPageContext(pageContext, logEvent);
-  const resultData = {
-    success_message: 'Task completed via cookbook replay',
-    cost: {
-      input_tokens: finalCost.inputTokens,
-      output_tokens: finalCost.outputTokens,
-      total_cost_usd: finalCost.totalCost,
-      action_count: finalCost.actionCount,
-    },
-    ...(contextReport && { context_report: serializeContextReport(contextReport) }),
-  };
-
-  // 6.5. Propagate flush-failure flag into job metadata
-  if (flushFailed) {
-    currentMetadata = { ...currentMetadata, page_context_flush_pending: true };
-    await supabase
-      .from('gh_automation_jobs')
-      .update({ metadata: currentMetadata })
-      .eq('id', job.id);
-  }
-
-  // 7. Update job status to 'completed'
-  await supabase
-    .from('gh_automation_jobs')
-    .update({
-      status: 'completed',
-      completed_at: new Date().toISOString(),
-      result_data: resultData,
-      result_summary: 'Task completed via cookbook replay',
-      screenshot_urls: screenshotUrls,
-      llm_cost_cents: Math.round(finalCost.totalCost * 100),
-      action_count: finalCost.actionCount,
-      total_tokens: finalCost.inputTokens + finalCost.outputTokens,
-    })
-    .eq('id', job.id);
-
-  // 8. Log 'job_completed' event
-  await logEvent('job_completed', {
-    handler: 'cookbook',
-    result_summary: 'Task completed via cookbook replay',
-    action_count: finalCost.actionCount,
-    cost_cents: Math.round(finalCost.totalCost * 100),
-    final_mode: 'cookbook',
-    cookbook_steps: engineResult.cookbookSteps,
-  });
-
-  // 9. Record cost (best-effort)
-  recordCostBestEffort(supabase, job.user_id, job.id, finalCost);
-
-  // 10. Fire VALET callback if callback_url exists
-  fireCallbackBestEffort(
-    job,
-    workerId,
-    'completed',
-    resultData,
-    'Task completed via cookbook replay',
-    screenshotUrls,
-    finalCost,
-  );
-
-  logger.info('Job completed via cookbook', {
-    jobId: job.id,
-    cookbookSteps: engineResult.cookbookSteps,
-    costUsd: finalCost.totalCost,
-  });
-}
 
 /**
  * Finalize a job that completed via handler execution.
@@ -463,15 +365,8 @@ export async function finalizeHandlerResult(
   // 4.5. Persist final_mode and engine/cost metadata (parity with legacy path)
   currentMetadata = {
     ...currentMetadata,
-    engine: {
-      manual_id: engineResult.manualId || null,
-      manual_status: engineResult.manualId ? 'cookbook_failed_fallback' : 'no_manual_available',
-      fallback_reason: engineResult.error || null,
-    },
     cost_breakdown: {
-      cookbook_steps: engineResult.cookbookSteps,
       magnitude_steps: finalCost.actionCount,
-      cookbook_cost_usd: 0,
       magnitude_cost_usd: finalCost.totalCost,
       image_cost_usd: finalCost.imageCost,
       reasoning_cost_usd: finalCost.reasoningCost,
@@ -523,6 +418,9 @@ export async function finalizeHandlerResult(
 
     // Best-effort cost recording
     recordCostBestEffort(supabase, job.user_id, job.id, finalCost);
+
+    // Best-effort application report
+    await writeReportBestEffort(supabase, job, pageContext, finalCost, taskResult, screenshotUrls, 'awaiting_review', logEvent);
 
     logger.info('Job awaiting user review', {
       jobId: job.id,
@@ -590,6 +488,9 @@ export async function finalizeHandlerResult(
 
     recordCostBestEffort(supabase, job.user_id, job.id, finalCost);
 
+    // Best-effort application report
+    await writeReportBestEffort(supabase, job, pageContext, finalCost, taskResult, screenshotUrls, 'failed', logEvent);
+
     fireCallbackBestEffort(
       job,
       workerId,
@@ -639,12 +540,14 @@ export async function finalizeHandlerResult(
     total_tokens: finalCost.inputTokens + finalCost.outputTokens,
     cost_cents: Math.round(finalCost.totalCost * 100),
     final_mode: finalMode,
-    cookbook_steps: engineResult.cookbookSteps,
     magnitude_steps: finalCost.actionCount,
   });
 
   // Best-effort cost recording
   recordCostBestEffort(supabase, job.user_id, job.id, finalCost);
+
+  // Best-effort application report
+  await writeReportBestEffort(supabase, job, pageContext, finalCost, taskResult, screenshotUrls, 'completed', logEvent);
 
   // Fire VALET callback
   fireCallbackBestEffort(
@@ -736,15 +639,8 @@ export async function finalizeHandlerSideEffects(
   // 5. Persist final_mode and engine/cost metadata
   currentMetadata = {
     ...currentMetadata,
-    engine: {
-      manual_id: engineResult.manualId || null,
-      manual_status: engineResult.manualId ? 'cookbook_failed_fallback' : 'no_manual_available',
-      fallback_reason: engineResult.error || null,
-    },
     cost_breakdown: {
-      cookbook_steps: engineResult.cookbookSteps,
       magnitude_steps: finalCost.actionCount,
-      cookbook_cost_usd: 0,
       magnitude_cost_usd: finalCost.totalCost,
       image_cost_usd: finalCost.imageCost,
       reasoning_cost_usd: finalCost.reasoningCost,

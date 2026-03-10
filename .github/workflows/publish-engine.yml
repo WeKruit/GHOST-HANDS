@@ -1,6 +1,6 @@
 # Publish @wekruit/ghosthands-engine to GitHub Packages.
 # Staging: prerelease with commit SHA suffix (strict one-version-per-commit).
-# spencer-magnitude-hand: prerelease with commit SHA suffix (same strategy).
+# Feature channels: prerelease with branch label + commit SHA suffix.
 name: Publish Engine
 
 on:
@@ -39,7 +39,8 @@ jobs:
         id: meta
         working-directory: packages/engine
         run: |
-          BASE_VERSION=$(node -p "require('./package.json').version")
+          RAW_VERSION=$(node -p "require('./package.json').version")
+          BASE_VERSION="${RAW_VERSION%%-*}"
           SHORT_SHA=$(git rev-parse --short=8 HEAD)
           BRANCH="${{ github.ref_name }}"
           if [ "$BRANCH" = "staging" ]; then
@@ -53,6 +54,8 @@ jobs:
             echo "desktop-target=spencer-magnitude-hand" >> "$GITHUB_OUTPUT"
             echo "channel=spencer-magnitude-hand" >> "$GITHUB_OUTPUT"
           fi
+          echo "raw_version=${RAW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "base_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Check if version already published

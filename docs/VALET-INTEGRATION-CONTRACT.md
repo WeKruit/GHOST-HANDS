@@ -555,6 +555,12 @@ Returns all registered workers with status, heartbeat, and job counts.
 }
 ```
 
+### 4.11 Application Reports (Direct DB Access)
+
+GhostHands writes structured application reports to `gh_application_reports` during job finalization. VALET reads this table directly via Supabase (shared DB) — there are no GH API endpoints for report reads. See Section 8 for the table schema.
+
+> **Note:** Reports are written best-effort. A small percentage of jobs may not have reports if the DB write fails. The `resume_ref` field contains a storage path — VALET should resolve this to a display name via its own `resumes` table. Sensitive fields (passwords, SSNs) are automatically redacted to `[REDACTED]`.
+
 ---
 
 ## 5. Callback System (Push Notifications)
@@ -956,6 +962,7 @@ All GhostHands tables use the `gh_` prefix (shared Supabase with VALET).
 | `gh_action_manuals` | Saved step-by-step playbooks per platform+task |
 | `gh_user_usage` | Monthly cost tracking per user |
 | `gh_user_credentials` | Encrypted platform credentials |
+| `gh_application_reports` | Structured per-job application reports (fields filled, cost, screenshots) |
 
 ### 8.2 Key Columns on `gh_automation_jobs`
 
@@ -969,6 +976,9 @@ All GhostHands tables use the `gh_` prefix (shared Supabase with VALET).
 | `execution_mode` | TEXT | Migration 011 | Requested mode: auto, ai_only, cookbook_only |
 | `browser_mode` | TEXT | Migration 011 | Browser context: server, operator |
 | `final_mode` | TEXT | Migration 011 | Actual mode used: cookbook, magnitude, hybrid |
+| `llm_cost_cents` | INTEGER | Migration 025 | Total LLM cost in cents |
+| `action_count` | INTEGER | Migration 025 | Number of browser actions executed |
+| `total_tokens` | INTEGER | Migration 025 | Sum of input + output LLM tokens |
 
 ### 8.3 Migrations (apply in order)
 
@@ -980,6 +990,8 @@ All GhostHands tables use the `gh_` prefix (shared Supabase with VALET).
 | 010 | `010_gh_action_manuals.sql` | Cookbook manuals table |
 | 011 | `011_execution_mode_tracking.sql` | Execution mode columns |
 | 012 | `012_gh_job_events_realtime.sql` | Enable Realtime on gh_job_events |
+| 025 | `025_add_cost_columns.sql` | Cost-tracking columns on gh_automation_jobs |
+| 026 | `026_gh_application_reports.sql` | Application reports table with RLS |
 
 ---
 

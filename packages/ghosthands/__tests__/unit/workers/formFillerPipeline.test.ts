@@ -60,7 +60,7 @@ describe('formFiller observation pipeline integration', () => {
     expect(resolved2).toBe('Legacy fallback');
   });
 
-  it('applyNeverEmptyFallback produces type-valid defaults for all field types', () => {
+  it('applyNeverEmptyFallback produces type-valid defaults for required field types', () => {
     const fields = [
       { id: 'f1', type: 'text', required: true },
       { id: 'f2', type: 'textarea', required: true },
@@ -86,6 +86,20 @@ describe('formFiller observation pipeline integration', () => {
     for (const field of fields) {
       expect(resolved[field.id]).toBeTruthy();
     }
+  });
+
+  it('applyNeverEmptyFallback skips optional fields', () => {
+    const fields = [
+      { id: 'f1', type: 'text', required: false },
+      { id: 'f2', type: 'text' },  // required defaults to undefined (falsy)
+      { id: 'f3', type: 'tel', required: false },
+    ];
+
+    const resolved = applyNeverEmptyFallback(fields, {});
+
+    expect(resolved['f1']).toBeUndefined();
+    expect(resolved['f2']).toBeUndefined();
+    expect(resolved['f3']).toBeUndefined();
   });
 
   it('applyNeverEmptyFallback does not overwrite existing answers', () => {
@@ -177,8 +191,8 @@ describe('formFiller observation pipeline integration', () => {
 
   it('applyNeverEmptyFallback with all-placeholder options leaves select unresolved', () => {
     const fields = [
-      { id: 'f1', type: 'select', options: ['Select...', '-- Select --', 'Please select'] },
-      { id: 'f2', type: 'text', options: ['Choose one', 'Choose...'] },
+      { id: 'f1', type: 'select', options: ['Select...', '-- Select --', 'Please select'], required: true },
+      { id: 'f2', type: 'text', options: ['Choose one', 'Choose...'], required: false },
     ];
 
     const resolved = applyNeverEmptyFallback(fields, {});
@@ -192,7 +206,7 @@ describe('formFiller observation pipeline integration', () => {
 
   it('applyNeverEmptyFallback filters "Please select" as a placeholder', () => {
     const fields = [
-      { id: 'f1', type: 'select', options: ['Please select', 'United States', 'Canada'] },
+      { id: 'f1', type: 'select', options: ['Please select', 'United States', 'Canada'], required: true },
     ];
 
     const resolved = applyNeverEmptyFallback(fields, {});
@@ -328,7 +342,7 @@ describe('formFiller observation pipeline integration', () => {
 
   it('applyNeverEmptyFallback leaves placeholder-only select unresolved instead of using options[0]', () => {
     const fields = [
-      { id: 'f1', type: 'select', options: ['Select...', '-- Select --', 'Choose...'] },
+      { id: 'f1', type: 'select', options: ['Select...', '-- Select --', 'Choose...'], required: true },
     ];
 
     const resolved = applyNeverEmptyFallback(fields, {});

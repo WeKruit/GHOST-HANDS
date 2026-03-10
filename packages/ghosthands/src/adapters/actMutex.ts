@@ -90,3 +90,24 @@ export function poisonActMutex(state: ActMutexState, pending: Promise<unknown>):
   state.poisoned = true;
   state.pendingAct = pending;
 }
+
+/**
+ * Wait for a poisoned act() to settle (complete or fail).
+ * Used before page navigation to prevent zombie act() calls from
+ * interfering with the new page state.
+ * Returns true if settled, false if still running after timeout.
+ */
+export async function waitForActSettle(state: ActMutexState, timeoutMs: number = 10_000): Promise<boolean> {
+  if (!state.poisoned || !state.pendingAct) return true;
+
+  const settled = await Promise.race([
+    state.pendingAct.then(() => true, () => true),
+    new Promise<false>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
+  ]);
+  if (settled) {
+    state.poisoned = false;
+    state.actInFlight = false;
+    state.pendingAct = null;
+  }
+  return settled;
+}
