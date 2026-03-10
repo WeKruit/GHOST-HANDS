@@ -991,7 +991,7 @@ export class JobExecutor {
       // 12.7. Flush page context report if wired
       if (pageContext) {
         try {
-          await pageContext.getContextReport('flushed');
+          await pageContext.flushToSupabase();
         } catch (err) {
           getLogger().warn('Page context flush failed (non-fatal)', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         }
@@ -1277,6 +1277,7 @@ export class JobExecutor {
         actionCount: snapshot.actionCount,
         totalTokens: snapshot.inputTokens + snapshot.outputTokens,
         totalCost: snapshot.totalCost,
+        ...(pageContext && { pageContext }),
       });
 
       // Always record cost on failure (even zero cost for consistent accounting)
