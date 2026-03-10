@@ -327,6 +327,10 @@ export class JobExecutor {
       ...(this.redis && { redis: this.redis }),
     });
 
+    // Declared outside try so error handler can flush on failure
+    let pageContext: PageContextService | null = null;
+    let contextAlreadyFlushed = false;
+
     try {
       // 0a. Stamp execution_attempt_id to prevent duplicate execution (EC3)
       if (this.pgPool) {
@@ -755,6 +759,26 @@ export class JobExecutor {
       const logEventFn = (eventType: string, metadata: Record<string, any>) =>
         this.logJobEvent(job.id, eventType, metadata);
 
+      // 9.1. Wire page context for real-time context snapshots (non-Mastra path)
+      // Best-effort: Redis unavailability should not block job execution
+      if (this.redis) {
+        try {
+          pageContext = new LivePageContextService(
+            job.id,
+            new RedisPageContextStore(this.redis, job.id),
+            new SupabasePageContextFlusher(this.supabase),
+          );
+          await pageContext.initializeRun(`run-${job.id}-${this._executionAttemptId ?? '0'}`);
+          progress.setPageContext(pageContext);
+        } catch (err) {
+          getLogger().warn('Page context init failed (non-fatal, continuing without context snapshots)', {
+            jobId: job.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          pageContext = null;
+        }
+      }
+
       // 9a. Wire up event tracking with cost control + progress
       const thoughtThrottle = new ThoughtThrottle(2000);
       const targetDomain = new URL(job.target_url).hostname;
@@ -806,6 +830,7 @@ export class JobExecutor {
           resumeFilePath,
           emailVerification: emailVerification || undefined,
           logEvent: logEventFn,
+          ...(pageContext && { pageContext }),
         };
 
         try {
@@ -973,6 +998,18 @@ export class JobExecutor {
         getLogger().info('Saved fresh session cookies', { userId: job.user_id });
       } catch (err) {
         getLogger().warn('Session save failed (non-fatal)', { error: err instanceof Error ? err.message : String(err) });
+      }
+
+      // 12.7. Flush page context report if wired
+      if (pageContext) {
+        try {
+          await pageContext.flushToSupabase();
+          contextAlreadyFlushed = true;
+        } catch (err) {
+          getLogger().warn('Page context flush failed (non-fatal)', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+          // Mark as pending so a future backfill can pick it up
+          await pageContext.markFlushPending(err instanceof Error ? err.message : String(err)).catch(() => {});
+        }
       }
 
       // 13. Handle awaiting_review vs completed
@@ -1255,6 +1292,7 @@ export class JobExecutor {
         actionCount: snapshot.actionCount,
         totalTokens: snapshot.inputTokens + snapshot.outputTokens,
         totalCost: snapshot.totalCost,
+        ...(pageContext && { pageContext, contextFlushed: contextAlreadyFlushed }),
       });
 
       // Always record cost on failure (even zero cost for consistent accounting)
