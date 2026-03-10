@@ -1356,6 +1356,7 @@ export class JobExecutor {
       new RedisPageContextStore(this.redis, job.id),
       new SupabasePageContextFlusher(this.supabase),
     );
+    progress.setPageContext(pageContext);
 
     // Build RuntimeContext (closure-injected, never serialized)
     const rt: RuntimeContext = {

@@ -18,6 +18,30 @@ function createService() {
 }
 
 describe('LivePageContextService', () => {
+  it('exposes the current session synchronously via getSessionSync()', async () => {
+    const { service } = createService();
+    expect(service.getSessionSync()).toBeNull();
+
+    await service.initializeRun('run-service-0');
+
+    const initialized = service.getSessionSync();
+    expect(initialized).not.toBeNull();
+    expect(initialized?.jobId).toBe('job-service');
+
+    await service.enterOrResumePage({
+      pageType: 'questions',
+      pageTitle: 'Eligibility',
+      url: 'https://example.com/apply',
+      fingerprint: 'eligibility sponsorship visa',
+      pageStepKey: 'questions::eligibility',
+      pageSequence: 1,
+    });
+
+    const session = service.getSessionSync();
+    expect(session?.pages).toHaveLength(1);
+    expect(session?.activePageId).toBe(session?.pages[0]?.pageId);
+  });
+
   it('resumes the active page when the step key and fingerprint are similar', async () => {
     const { service, store } = createService();
     await service.initializeRun('run-service-1');

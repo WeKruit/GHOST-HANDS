@@ -211,6 +211,23 @@ export interface ContextReport {
   flushError?: string;
 }
 
+/** Lightweight counts-only snapshot for real-time streaming. */
+export interface ContextReportSnapshot {
+  pagesVisited: number;
+  requiredUnresolvedCount: number;
+  riskyOptionalCount: number;
+  lowConfidenceCount: number;
+  ambiguousGroupCount: number;
+  bestEffortGuessCount: number;
+  partialPages: Array<{
+    pageId: string;
+    pageSequence: number;
+    status: LogicalPageStatus;
+    requiredUnresolved: number;
+  }>;
+  flushStatus: 'pending';
+}
+
 export interface PageContextSession {
   jobId: string;
   mastraRunId: string;

@@ -47,4 +47,7 @@ export class NoopPageContextService implements PageContextService {
   async getSession(): Promise<PageContextSession | null> {
     return null;
   }
+  getSessionSync(): PageContextSession | null {
+    return null;
+  }
 }
