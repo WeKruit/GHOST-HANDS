@@ -105,7 +105,7 @@ describe('ProgressTracker context snapshots', () => {
       supabase: createMockSupabase() as any,
       workerId: 'worker-1',
       pageContext: {
-        getSession: () => session,
+        getSessionSync: () => session,
       },
     });
 
@@ -127,7 +127,7 @@ describe('ProgressTracker context snapshots', () => {
       workerId: 'worker-1',
       redis: redis as any,
       pageContext: {
-        getSession: () => session,
+        getSessionSync: () => session,
       },
     });
 
@@ -150,7 +150,7 @@ describe('ProgressTracker context snapshots', () => {
       supabase: createMockSupabase() as any,
       workerId: 'worker-1',
       pageContext: {
-        getSession: () => session,
+        getSessionSync: () => session,
       },
     });
 
