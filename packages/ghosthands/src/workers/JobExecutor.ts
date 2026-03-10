@@ -327,6 +327,9 @@ export class JobExecutor {
       ...(this.redis && { redis: this.redis }),
     });
 
+    // Declared outside try so error handler can flush on failure
+    let pageContext: PageContextService | null = null;
+
     try {
       // 0a. Stamp execution_attempt_id to prevent duplicate execution (EC3)
       if (this.pgPool) {
@@ -756,7 +759,6 @@ export class JobExecutor {
         this.logJobEvent(job.id, eventType, metadata);
 
       // 9.1. Wire page context for real-time context snapshots (non-Mastra path)
-      let pageContext: PageContextService | null = null;
       if (this.redis) {
         pageContext = new LivePageContextService(
           job.id,
