@@ -28,6 +28,7 @@ export interface StreamEventFields {
   execution_mode?: string;
   manual_id?: string;
   step_cost_cents?: number;
+  context_report_snapshot?: string;
   timestamp: string;
 }
 

@@ -7,6 +7,7 @@ export type {
   ContextEvent,
   PageAuditResult,
   ContextReport,
+  ContextReportSnapshot,
   QuestionSnapshot,
   QuestionOutcome,
   AnswerDecision,

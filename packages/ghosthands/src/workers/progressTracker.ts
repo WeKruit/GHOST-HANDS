@@ -1,5 +1,7 @@
 import { SupabaseClient } from '@supabase/supabase-js';
 import type Redis from 'ioredis';
+import { computeSnapshotCounts } from '../context/PageContextReducer.js';
+import type { ContextReportSnapshot, PageContextSession } from '../context/types.js';
 import { xaddEvent, setStreamTTL } from '../lib/redis-streams.js';
 import { getLogger } from '../monitoring/logger.js';
 
@@ -80,6 +82,11 @@ export interface ProgressEventData {
   step_cost_cents?: number;
   /** Kasm session URL for live browser view (WEK-162) */
   kasm_url?: string;
+  context_report_snapshot?: ContextReportSnapshot;
+}
+
+interface PageContextReader {
+  getSession(): PageContextSession | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +154,8 @@ export interface ProgressTrackerOptions {
   throttleMs?: number;
   /** Optional Redis client for real-time streaming via Redis Streams. */
   redis?: Redis;
+  /** Optional synchronous page-context reader for counts-only snapshots. */
+  pageContext?: PageContextReader;
 }
 
 export class ProgressTracker {
@@ -166,6 +175,7 @@ export class ProgressTracker {
   private executionMode?: 'cookbook' | 'magnitude';
   private manualId?: string;
   private kasmUrl?: string;
+  private pageContextReader: PageContextReader | null = null;
 
   constructor(opts: ProgressTrackerOptions) {
     this.jobId = opts.jobId;
@@ -174,6 +184,7 @@ export class ProgressTracker {
     this.estimatedTotalActions = opts.estimatedTotalActions ?? 30;
     this.throttleMs = opts.throttleMs ?? 2000;
     this.redis = opts.redis ?? null;
+    this.pageContextReader = opts.pageContext ?? null;
   }
 
   /** Set the current step explicitly (for lifecycle transitions). */
@@ -196,6 +207,10 @@ export class ProgressTracker {
   /** Set the Kasm session URL for live view (WEK-162). */
   setKasmUrl(url: string): void {
     this.kasmUrl = url;
+  }
+
+  setPageContext(reader: PageContextReader | null): void {
+    this.pageContextReader = reader;
   }
 
   /** Called when an action starts. Infers the step and emits progress. */
@@ -225,6 +240,8 @@ export class ProgressTracker {
   getSnapshot(): ProgressEventData {
     const now = Date.now();
     const elapsedMs = now - this.startedAt;
+    const session = this.pageContextReader?.getSession() ?? null;
+    const contextReportSnapshot = session ? computeSnapshotCounts(session) : undefined;
 
     return {
       step: this.currentStep,
@@ -239,6 +256,7 @@ export class ProgressTracker {
       ...(this.executionMode && { execution_mode: this.executionMode }),
       ...(this.manualId && { manual_id: this.manualId }),
       ...(this.kasmUrl && { kasm_url: this.kasmUrl }),
+      ...(contextReportSnapshot && { context_report_snapshot: contextReportSnapshot }),
     };
   }
 
@@ -272,8 +290,12 @@ export class ProgressTracker {
     // 1. Publish to Redis Streams for real-time SSE consumption (fast path)
     if (this.redis) {
       try {
+        const { context_report_snapshot, ...streamSnapshot } = snapshot;
         await xaddEvent(this.redis, this.jobId, {
-          ...snapshot,
+          ...streamSnapshot,
+          ...(context_report_snapshot && {
+            context_report_snapshot: JSON.stringify(context_report_snapshot),
+          }),
           timestamp: new Date().toISOString(),
         });
       } catch (err) {
@@ -318,6 +340,8 @@ export class ProgressTracker {
     if (this.pendingEmit) {
       await this.emit();
     }
+
+    this.pageContextReader = null;
 
     // Set a 24-hour TTL on the Redis stream so it auto-cleans after retention period
     if (this.redis) {

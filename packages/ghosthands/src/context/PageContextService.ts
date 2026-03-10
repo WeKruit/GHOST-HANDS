@@ -111,6 +111,7 @@ export interface PageContextService {
   markFlushPending(error: string): Promise<void>;
   getContextReport(flushStatus?: ContextReport['flushStatus']): Promise<ContextReport>;
   flushToSupabase(): Promise<ContextReport>;
+  getSession(): PageContextSession | null;
 }
 
 export class LivePageContextService implements PageContextService {
@@ -280,6 +281,10 @@ export class LivePageContextService implements PageContextService {
     await this.persistCurrent(baseVersion);
     await this.store.retain(this.session, this.keepDebugRetention);
     return report;
+  }
+
+  getSession(): PageContextSession | null {
+    return this.session ?? null;
   }
 
   private async ensureSession(): Promise<PageContextSession> {
