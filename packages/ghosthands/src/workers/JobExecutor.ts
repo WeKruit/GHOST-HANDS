@@ -755,6 +755,18 @@ export class JobExecutor {
       const logEventFn = (eventType: string, metadata: Record<string, any>) =>
         this.logJobEvent(job.id, eventType, metadata);
 
+      // 9.1. Wire page context for real-time context snapshots (non-Mastra path)
+      let pageContext: PageContextService | null = null;
+      if (this.redis) {
+        pageContext = new LivePageContextService(
+          job.id,
+          new RedisPageContextStore(this.redis, job.id),
+          new SupabasePageContextFlusher(this.supabase),
+        );
+        await pageContext.initializeRun(`run-${job.id}`);
+        progress.setPageContext(pageContext);
+      }
+
       // 9a. Wire up event tracking with cost control + progress
       const thoughtThrottle = new ThoughtThrottle(2000);
       const targetDomain = new URL(job.target_url).hostname;
@@ -806,6 +818,7 @@ export class JobExecutor {
           resumeFilePath,
           emailVerification: emailVerification || undefined,
           logEvent: logEventFn,
+          ...(pageContext && { pageContext }),
         };
 
         try {
@@ -973,6 +986,15 @@ export class JobExecutor {
         getLogger().info('Saved fresh session cookies', { userId: job.user_id });
       } catch (err) {
         getLogger().warn('Session save failed (non-fatal)', { error: err instanceof Error ? err.message : String(err) });
+      }
+
+      // 12.7. Flush page context report if wired
+      if (pageContext) {
+        try {
+          await pageContext.getContextReport('completed');
+        } catch (err) {
+          getLogger().warn('Page context flush failed (non-fatal)', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+        }
       }
 
       // 13. Handle awaiting_review vs completed

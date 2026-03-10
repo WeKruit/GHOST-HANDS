@@ -238,7 +238,9 @@ export class ProgressTracker {
     const now = Date.now();
     const elapsedMs = now - this.startedAt;
     const session = this.pageContextReader?.getSessionSync() ?? null;
-    const contextReportSnapshot = session ? computeSnapshotCounts(session) : undefined;
+    const rawSnapshot = session ? computeSnapshotCounts(session) : undefined;
+    // Only include snapshot when pages have been visited — avoids misleading all-zero cards
+    const contextReportSnapshot = rawSnapshot && rawSnapshot.pagesVisited > 0 ? rawSnapshot : undefined;
 
     return {
       step: this.currentStep,
