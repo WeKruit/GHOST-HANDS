@@ -329,6 +329,7 @@ export class JobExecutor {
 
     // Declared outside try so error handler can flush on failure
     let pageContext: PageContextService | null = null;
+    let contextAlreadyFlushed = false;
 
     try {
       // 0a. Stamp execution_attempt_id to prevent duplicate execution (EC3)
@@ -994,6 +995,7 @@ export class JobExecutor {
       if (pageContext) {
         try {
           await pageContext.flushToSupabase();
+          contextAlreadyFlushed = true;
         } catch (err) {
           getLogger().warn('Page context flush failed (non-fatal)', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         }
@@ -1279,7 +1281,7 @@ export class JobExecutor {
         actionCount: snapshot.actionCount,
         totalTokens: snapshot.inputTokens + snapshot.outputTokens,
         totalCost: snapshot.totalCost,
-        ...(pageContext && { pageContext }),
+        ...(pageContext && { pageContext, contextFlushed: contextAlreadyFlushed }),
       });
 
       // Always record cost on failure (even zero cost for consistent accounting)
