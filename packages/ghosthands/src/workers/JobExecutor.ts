@@ -760,14 +760,23 @@ export class JobExecutor {
         this.logJobEvent(job.id, eventType, metadata);
 
       // 9.1. Wire page context for real-time context snapshots (non-Mastra path)
+      // Best-effort: Redis unavailability should not block job execution
       if (this.redis) {
-        pageContext = new LivePageContextService(
-          job.id,
-          new RedisPageContextStore(this.redis, job.id),
-          new SupabasePageContextFlusher(this.supabase),
-        );
-        await pageContext.initializeRun(`run-${job.id}`);
-        progress.setPageContext(pageContext);
+        try {
+          pageContext = new LivePageContextService(
+            job.id,
+            new RedisPageContextStore(this.redis, job.id),
+            new SupabasePageContextFlusher(this.supabase),
+          );
+          await pageContext.initializeRun(`run-${job.id}-${this._executionAttemptId ?? '0'}`);
+          progress.setPageContext(pageContext);
+        } catch (err) {
+          getLogger().warn('Page context init failed (non-fatal, continuing without context snapshots)', {
+            jobId: job.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          pageContext = null;
+        }
       }
 
       // 9a. Wire up event tracking with cost control + progress
@@ -998,6 +1007,8 @@ export class JobExecutor {
           contextAlreadyFlushed = true;
         } catch (err) {
           getLogger().warn('Page context flush failed (non-fatal)', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
+          // Mark as pending so a future backfill can pick it up
+          await pageContext.markFlushPending(err instanceof Error ? err.message : String(err)).catch(() => {});
         }
       }
 
