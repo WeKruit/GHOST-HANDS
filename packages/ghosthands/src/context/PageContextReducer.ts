@@ -3,6 +3,7 @@ import type {
   AnswerDecision,
   ContextEvent,
   ContextReport,
+  ContextReportSnapshot,
   LogicalPageRecord,
   PageAuditResult,
   PageContextSession,
@@ -696,6 +697,62 @@ export function buildContextReport(
   }
 
   return report;
+}
+
+/**
+ * Lightweight counts-only snapshot for real-time streaming.
+ *
+ * Uses per-page coverage for aggregate counts and inspects question metadata only
+ * for best-effort guesses, which are not tracked in coverage.
+ */
+export function computeSnapshotCounts(session: PageContextSession): ContextReportSnapshot {
+  let requiredUnresolvedCount = 0;
+  let riskyOptionalCount = 0;
+  let lowConfidenceCount = 0;
+  let ambiguousGroupCount = 0;
+  let bestEffortGuessCount = 0;
+  const partialPages: ContextReportSnapshot['partialPages'] = [];
+
+  for (const page of session.pages) {
+    const coverage = page.coverage;
+    requiredUnresolvedCount += coverage.requiredUnresolved;
+    riskyOptionalCount += coverage.optionalRisky;
+    lowConfidenceCount += coverage.lowConfidenceResolved;
+    ambiguousGroupCount += coverage.ambiguousGrouped;
+
+    if (page.status !== 'completed' || coverage.requiredUnresolved > 0) {
+      partialPages.push({
+        pageId: page.pageId,
+        pageSequence: page.sequence,
+        status: page.status,
+        requiredUnresolved: coverage.requiredUnresolved,
+      });
+    }
+
+    for (const question of page.questions) {
+      if (
+        question.state === 'skipped' &&
+        question.warnings.includes('retired_missing_from_dom')
+      ) {
+        continue;
+      }
+
+      if (question.answerMode === 'best_effort_guess' || question.answerMode === 'default_decline') {
+        bestEffortGuessCount++;
+      }
+    }
+  }
+
+  return {
+    pagesVisited: session.pages.length,
+    requiredUnresolvedCount,
+    riskyOptionalCount,
+    lowConfidenceCount,
+    ambiguousGroupCount,
+    bestEffortGuessCount,
+    partialPages,
+    flushStatus: 'pending',
+  };
 }
 
 export function attachReport(

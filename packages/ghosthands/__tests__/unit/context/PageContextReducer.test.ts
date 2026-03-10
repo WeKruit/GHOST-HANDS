@@ -4,9 +4,11 @@ import {
   applyPageEntry,
   auditPage,
   buildContextReport,
+  computeSnapshotCounts,
   createEmptySession,
   createPageRecord,
   finalizeActivePage,
+  recordOutcome,
   syncQuestions,
 } from '../../../src/context/PageContextReducer';
 import type { QuestionSnapshot } from '../../../src/context/types';
@@ -414,6 +416,93 @@ describe('PageContextReducer', () => {
     expect(report.bestEffortGuesses).toHaveLength(1);
     expect(report.bestEffortGuesses[0].questionKey).toBe('demo::gender::select::male|female');
     expect(report.bestEffortGuesses[0].answerMode).toBe('best_effort_guess');
+  });
+
+  it('computeSnapshotCounts returns counts-only progress snapshots with real page fields', () => {
+    const base = createEmptySession('job-snapshot', 'run-snapshot');
+    const firstPage = createPageRecord({
+      pageType: 'questions',
+      pageTitle: 'Eligibility',
+      url: 'https://example.com/apply',
+      fingerprint: 'fp-snapshot-1',
+      pageStepKey: 'questions::eligibility',
+      pageSequence: 1,
+    });
+
+    let session = applyPageEntry(base, firstPage);
+    session = syncQuestions(session, [
+      makeSnapshot({
+        questionKey: 'q::required::text::ff-1',
+        fieldIds: ['ff-1'],
+        promptText: 'First name',
+        questionType: 'text',
+        required: true,
+      }),
+      makeSnapshot({
+        questionKey: 'q::optional::radio::ff-2',
+        fieldIds: ['ff-2'],
+        promptText: 'Are you willing to relocate?',
+        questionType: 'radio',
+        required: false,
+        riskLevel: 'optional_risky',
+      }),
+      makeSnapshot({
+        questionKey: 'q::guess::select::ff-3',
+        fieldIds: ['ff-3'],
+        promptText: 'Gender',
+        questionType: 'select',
+        required: false,
+        groupingConfidence: 0.4,
+        warnings: ['ambiguous_prompt_anchor'],
+      }),
+    ], { isFullSync: true });
+    session = applyAnswerDecisions(session, [
+      {
+        questionKey: 'q::guess::select::ff-3',
+        answer: 'Prefer not to say',
+        confidence: 0.4,
+        source: 'llm',
+        answerMode: 'best_effort_guess',
+      },
+    ]);
+    session = recordOutcome(session, {
+      questionKey: 'q::guess::select::ff-3',
+      state: 'verified',
+      currentValue: 'Prefer not to say',
+      confidence: 0.4,
+      source: 'llm',
+    });
+    session = finalizeActivePage(session);
+
+    const secondPage = createPageRecord({
+      pageType: 'review',
+      pageTitle: 'Review',
+      url: 'https://example.com/apply/review',
+      fingerprint: 'fp-snapshot-2',
+      pageStepKey: 'review::final',
+      pageSequence: 2,
+    });
+    session = applyPageEntry(session, secondPage);
+    session = finalizeActivePage(session);
+
+    const snapshot = computeSnapshotCounts(session);
+
+    expect(snapshot.pagesVisited).toBe(2);
+    expect(snapshot.requiredUnresolvedCount).toBe(1);
+    expect(snapshot.riskyOptionalCount).toBe(1);
+    expect(snapshot.lowConfidenceCount).toBe(1);
+    expect(snapshot.ambiguousGroupCount).toBe(1);
+    expect(snapshot.bestEffortGuessCount).toBe(1);
+    expect(snapshot.partialPages).toEqual([
+      {
+        pageId: session.pages[0].pageId,
+        pageSequence: 1,
+        status: 'partial',
+        requiredUnresolved: 1,
+      },
+    ]);
+    expect('pageType' in snapshot.partialPages[0]!).toBe(false);
+    expect(snapshot.flushStatus).toBe('pending');
   });
 
   it('overlap consolidation: rerun regrouping with shared fieldIds does not leave duplicate live records', () => {
