@@ -318,9 +318,16 @@ export class SmartApplyHandler implements TaskHandler {
             break;
 
           case 'account_creation':
-            // If we haven't tried login yet, try it first — many sites (e.g. Workday)
-            // show the Create Account page by default with an "Already have an account? Sign In" link.
-            // The login handler already knows how to click "Sign In" and try credentials.
+            // Workday account creation should proceed directly. Many Workday flows
+            // present a combined auth screen, but for our desktop apply flow we want
+            // a new account created unless we explicitly entered the login branch.
+            if (config.platformId === 'workday') {
+              await this.handleAccountCreation(adapter, dataPrompt, userProfile);
+              break;
+            }
+
+            // If we haven't tried login yet, try it first — many sites show the
+            // Create Account page by default with an "Already have an account? Sign In" link.
             if (!this.loginAttempted) {
               console.log('[SmartApply] Account creation page detected but login not yet attempted — trying login first.');
               if (config.handleLogin) {
@@ -1909,12 +1916,11 @@ Click only ONE button, then report the task as done.`,
   ): Promise<void> {
     console.log('[SmartApply] Account creation page detected, filling in details...');
 
-    // Use TEST_GMAIL credentials for account creation (not the applicant's resume email).
-    // The applicant's actual email goes in the application form later via formFiller.
+    // Use the shared application password for ATS account creation.
+    // Keep the legacy fallback chain temporarily so older profiles keep working
+    // until VALET finishes collecting this secret for every user.
     const email = process.env.TEST_GMAIL_EMAIL || profile.email || '';
-    // TEST_GMAIL_PASSWORD must already satisfy all site password requirements
-    // (uppercase, lowercase, digit, special char, 8+ chars).
-    const password = process.env.TEST_GMAIL_PASSWORD || profile.password || '';
+    const password = this.resolveAccountCreationPassword(profile);
 
     // ── DOM-first: fill everything without LLM (cost: $0) ──
 
@@ -2064,6 +2070,16 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
     }
 
     await this.waitForPageLoad(adapter);
+  }
+
+  private resolveAccountCreationPassword(profile: Record<string, any>): string {
+    const fromProfile =
+      (typeof profile.applicationPassword === 'string' && profile.applicationPassword.trim()) ||
+      (typeof profile.application_password === 'string' && profile.application_password.trim()) ||
+      (typeof profile.password === 'string' && profile.password.trim()) ||
+      '';
+
+    return fromProfile || process.env.TEST_GMAIL_PASSWORD || 'defaultPassword123';
   }
 
   // =========================================================================
