@@ -1522,6 +1522,7 @@ export class JobExecutor {
               profile: (rt.job.metadata as Record<string, any>)?.profile ?? {},
               platform: options.platform,
               budgetUsd: options.budgetUsd,
+              costTracker: options.costTracker,
               anthropicConfig: rt.llmClientConfig?.anthropic,
               model: (rt.job.metadata as Record<string, any>)?.decision_model,
               previousActionHistory: options.previousActionHistory,

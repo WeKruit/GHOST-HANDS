@@ -91,38 +91,20 @@ async function detectBlockerSafe(
 }
 
 // ---------------------------------------------------------------------------
-// Types for the decision engine classes (implemented in engine/decision/)
+// Types for the decision engine classes (imported from engine/decision/)
 // ---------------------------------------------------------------------------
 
-interface DecisionLoopResult {
-  terminalState: 'confirmation' | 'review_page' | 'submitted' | 'blocked' | 'stuck' | 'budget_exceeded' | 'error' | 'max_iterations';
-  terminationReason: string;
-  iteration: number;
-  pagesProcessed: number;
-  currentPageFingerprint: string | null;
-  previousPageFingerprint: string | null;
-  samePageCount: number;
-  actionHistory: Array<{
-    iteration: number;
-    action: string;
-    target: string;
-    result: 'success' | 'partial' | 'failed' | 'skipped';
-    layer: 'dom' | 'stagehand' | 'magnitude' | null;
-    costUsd: number;
-    durationMs: number;
-    fieldsAttempted?: number;
-    fieldsFilled?: number;
-    pageFingerprint: string;
-    timestamp: number;
-  }>;
-  loopCostUsd: number;
-  /** Set when the loop encountered a blocker and needs HITL */
+import type { DecisionLoopState, ActionHistoryEntry } from '../../../engine/decision/types.js';
+import type { CostTracker } from '../../../workers/costControl.js';
+
+/** Result returned by DecisionLoopRunner.run() */
+type DecisionLoopResult = DecisionLoopState & {
   blockerDetected?: {
     type: string;
     confidence: number;
     pageUrl: string;
   };
-}
+};
 
 interface DecisionLoopRunnerInterface {
   run(): Promise<DecisionLoopResult>;
@@ -132,16 +114,11 @@ interface DecisionLoopRunnerFactory {
   create(options: {
     page: import('playwright').Page;
     adapter: import('../../../adapters/types.js').HitlCapableAdapter;
-    costTracker: import('../../../workers/costControl.js').CostTracker;
+    costTracker: CostTracker;
     platform: string;
-    targetUrl: string;
     budgetUsd: number;
-    qualityPreset: 'speed' | 'balanced' | 'quality';
-    dataPrompt: string;
-    credentials: Record<string, string> | null;
     logEvent: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
-    /** Previous action history from a resumed workflow */
-    previousActionHistory?: DecisionLoopResult['actionHistory'];
+    previousActionHistory?: ActionHistoryEntry[];
     previousIteration?: number;
   }): DecisionLoopRunnerInterface;
 }
@@ -292,11 +269,7 @@ export function buildPageDecisionLoopStep(
           adapter: rt.adapter,
           costTracker: rt.costTracker,
           platform: state.platform,
-          targetUrl: state.targetUrl,
           budgetUsd: state.budgetUsd,
-          qualityPreset: state.qualityPreset,
-          dataPrompt: rt.dataPrompt,
-          credentials: rt.credentials,
           logEvent: rt.logEvent,
           previousActionHistory: state.decisionLoop.actionHistory,
           previousIteration: state.decisionLoop.iteration,
@@ -460,7 +433,7 @@ export function buildPageDecisionLoopStep(
             success: false,
             taskResult: {
               success: false,
-              error: result.terminationReason,
+              error: result.terminationReason ?? undefined,
               data: {
                 decision_engine: true,
                 iterations: result.iteration,
@@ -481,7 +454,7 @@ export function buildPageDecisionLoopStep(
             success: false,
             taskResult: {
               success: false,
-              error: result.terminationReason,
+              error: result.terminationReason ?? undefined,
               data: {
                 decision_engine: true,
                 iterations: result.iteration,
