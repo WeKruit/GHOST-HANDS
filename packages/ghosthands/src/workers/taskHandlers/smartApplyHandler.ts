@@ -7,6 +7,11 @@ import type { PageContextService } from '../../context/PageContextService.js';
 import type { PlatformConfig, PageState, PageType, ScannedField, ScanResult } from './platforms/types.js';
 import type { CostTracker } from '../costControl.js';
 import { detectPlatformFromUrl } from './platforms/index.js';
+import {
+  inferCredentialPlatformFromUrl,
+  resolvePlatformAccountEmail,
+  resolvePlatformAccountPassword,
+} from './platforms/accountCredentials.js';
 import { findBestAnswer } from './platforms/genericConfig.js';
 import { ProgressStep } from '../progressTracker.js';
 import { fillFormOnPage, buildProfileText } from './formFiller.js';
@@ -1916,124 +1921,51 @@ Click only ONE button, then report the task as done.`,
   ): Promise<void> {
     console.log('[SmartApply] Account creation page detected, filling in details...');
 
-    // Use the shared application password for ATS account creation.
-    // Keep the legacy fallback chain temporarily so older profiles keep working
-    // until VALET finishes collecting this secret for every user.
-    const email = process.env.TEST_GMAIL_EMAIL || profile.email || '';
-    const password = this.resolveAccountCreationPassword(profile);
+    const currentUrl = adapter.page.url();
+    const platform = inferCredentialPlatformFromUrl(currentUrl);
+    const email = resolvePlatformAccountEmail(profile, platform);
+    let passwordResolution = resolvePlatformAccountPassword(profile, platform);
+    let password = passwordResolution.password;
+    console.log(
+      `[SmartApply] Account credentials resolved for ${platform ?? 'generic'}: ` +
+      `email=${email ? 'present' : 'missing'}, passwordSource=${passwordResolution.source}`,
+    );
 
     // ── DOM-first: fill everything without LLM (cost: $0) ──
 
-    // 1. DOM-fill email
-    await adapter.page.evaluate((e: string) => {
-      const sels = [
-        'input[type="email"]', 'input[autocomplete="email"]',
-        'input[data-automation-id*="email" i]',
-        'input[name*="email" i]', 'input[id*="email" i]',
-      ];
-      for (const sel of sels) {
-        const input = document.querySelector<HTMLInputElement>(sel + ':not([disabled])');
-        if (input && input.getBoundingClientRect().width > 0 && !input.value?.trim()) {
-          input.focus();
-          input.value = e;
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-          break;
-        }
-      }
-    }, email);
-
-    // 2. DOM-fill ALL visible password inputs (password + confirm password)
-    await adapter.page.evaluate((pw: string) => {
-      const inputs = document.querySelectorAll<HTMLInputElement>('input[type="password"]:not([disabled])');
-      for (const input of inputs) {
-        if (input.getBoundingClientRect().width > 0) {
-          input.focus();
-          input.value = pw;
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      }
-    }, password);
-
-    await adapter.page.waitForTimeout(300);
-
-    // 3. DOM-scroll the form/modal to bottom so checkboxes become visible
-    await adapter.page.evaluate(() => {
-      // Try scrollable containers: modal dialogs, form containers, etc.
-      const containers = document.querySelectorAll(
-        '[role="dialog"], [class*="modal"], [class*="Modal"], [class*="dialog"], ' +
-        '[class*="Dialog"], [data-automation-id*="dialog"], [data-automation-id*="panel"], ' +
-        'form, [class*="scroll"], [class*="Scroll"]'
-      );
-      for (const container of containers) {
-        const el = container as HTMLElement;
-        if (el.scrollHeight > el.clientHeight) {
-          el.scrollTop = el.scrollHeight;
-        }
-      }
-      // Also scroll the page itself
-      window.scrollTo(0, document.documentElement.scrollHeight);
-    });
-
-    await adapter.page.waitForTimeout(500);
-
-    // 4. DOM-check ALL unchecked checkboxes (privacy policy, terms, consent, etc.)
-    const checkedCount = await adapter.page.evaluate(() => {
-      let count = 0;
-
-      // Standard HTML checkboxes
-      const htmlCheckboxes = document.querySelectorAll<HTMLInputElement>(
-        'input[type="checkbox"]:not(:checked):not([disabled])'
-      );
-      for (const cb of htmlCheckboxes) {
-        cb.click();
-        count++;
-      }
-
-      // ARIA checkboxes (Workday, custom UI frameworks)
-      const ariaCheckboxes = document.querySelectorAll<HTMLElement>(
-        '[role="checkbox"][aria-checked="false"]:not([aria-disabled="true"])'
-      );
-      for (const cb of ariaCheckboxes) {
-        cb.click();
-        count++;
-      }
-
-      return count;
-    });
-    console.log(`[SmartApply] DOM checked ${checkedCount} checkbox(es)`);
-
-    await adapter.page.waitForTimeout(300);
-
-    // 5. DOM-click the Create Account / Register / Submit button
-    const submitted = await adapter.page.evaluate(() => {
-      const TEXTS = ['create account', 'register', 'sign up', 'continue', 'next', 'submit'];
-      const btns = document.querySelectorAll<HTMLElement>(
-        'button, input[type="submit"], [role="button"]'
-      );
-      for (const btn of btns) {
-        const text = (btn.textContent || (btn as HTMLInputElement).value || '').trim().toLowerCase();
-        if (TEXTS.some(t => text === t || (text.length < 30 && text.includes(t)))) {
-          btn.click();
-          return true;
-        }
-      }
-      // Try submitting the form directly
-      const form = document.querySelector('form');
-      if (form) { form.requestSubmit(); return true; }
-      return false;
-    });
+    await this.fillAccountCreationCredentials(adapter, email, password);
+    const submitted = await this.submitAccountCreationDom(adapter);
 
     if (submitted) {
       console.log('[SmartApply] DOM submitted account creation form.');
       await adapter.page.waitForTimeout(3000);
       await this.waitForPageLoad(adapter);
 
-      // Check if we're still on the account creation page (validation errors, missed checkbox, etc.)
-      const stillOnCreateAccount = await adapter.page.evaluate(() => {
-        return document.querySelectorAll('input[type="password"]:not([disabled])').length > 1;
-      });
+      let stillOnCreateAccount = await this.isStillOnAccountCreationPage(adapter);
+
+      if (stillOnCreateAccount && passwordResolution.source !== 'platform_override') {
+        const validationText = await this.readAccountCreationValidationText(adapter);
+        if (validationText) {
+          const strengthened = resolvePlatformAccountPassword(profile, platform, {
+            validationText,
+          });
+          if (strengthened.password !== password) {
+            passwordResolution = strengthened;
+            password = strengthened.password;
+            console.log(
+              `[SmartApply] Retrying account creation with strengthened password ` +
+              `(source=${strengthened.source}) after validation hint: ${validationText.slice(0, 180)}`,
+            );
+            await this.fillAccountCreationCredentials(adapter, email, password);
+            const retried = await this.submitAccountCreationDom(adapter);
+            if (retried) {
+              await adapter.page.waitForTimeout(3000);
+              await this.waitForPageLoad(adapter);
+              stillOnCreateAccount = await this.isStillOnAccountCreationPage(adapter);
+            }
+          }
+        }
+      }
 
       if (!stillOnCreateAccount) {
         console.log('[SmartApply] Account creation succeeded (DOM-only).');
@@ -2072,14 +2004,137 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
     await this.waitForPageLoad(adapter);
   }
 
-  private resolveAccountCreationPassword(profile: Record<string, any>): string {
-    const fromProfile =
-      (typeof profile.applicationPassword === 'string' && profile.applicationPassword.trim()) ||
-      (typeof profile.application_password === 'string' && profile.application_password.trim()) ||
-      (typeof profile.password === 'string' && profile.password.trim()) ||
-      '';
+  private async fillAccountCreationCredentials(
+    adapter: BrowserAutomationAdapter,
+    email: string,
+    password: string,
+  ): Promise<void> {
+    await adapter.page.evaluate((e: string) => {
+      const sels = [
+        'input[type="email"]', 'input[autocomplete="email"]',
+        'input[data-automation-id*="email" i]',
+        'input[name*="email" i]', 'input[id*="email" i]',
+      ];
+      for (const sel of sels) {
+        const input = document.querySelector<HTMLInputElement>(sel + ':not([disabled])');
+        if (input && input.getBoundingClientRect().width > 0 && !input.value?.trim()) {
+          input.focus();
+          input.value = e;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          break;
+        }
+      }
+    }, email);
 
-    return fromProfile || process.env.TEST_GMAIL_PASSWORD || 'defaultPassword123';
+    await adapter.page.evaluate((pw: string) => {
+      const inputs = document.querySelectorAll<HTMLInputElement>('input[type="password"]:not([disabled])');
+      for (const input of inputs) {
+        if (input.getBoundingClientRect().width > 0) {
+          input.focus();
+          input.value = pw;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
+    }, password);
+
+    await adapter.page.waitForTimeout(300);
+  }
+
+  private async submitAccountCreationDom(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    await adapter.page.evaluate(() => {
+      const containers = document.querySelectorAll(
+        '[role="dialog"], [class*="modal"], [class*="Modal"], [class*="dialog"], ' +
+        '[class*="Dialog"], [data-automation-id*="dialog"], [data-automation-id*="panel"], ' +
+        'form, [class*="scroll"], [class*="Scroll"]',
+      );
+      for (const container of containers) {
+        const el = container as HTMLElement;
+        if (el.scrollHeight > el.clientHeight) {
+          el.scrollTop = el.scrollHeight;
+        }
+      }
+      window.scrollTo(0, document.documentElement.scrollHeight);
+    });
+
+    await adapter.page.waitForTimeout(500);
+
+    const checkedCount = await adapter.page.evaluate(() => {
+      let count = 0;
+      const htmlCheckboxes = document.querySelectorAll<HTMLInputElement>(
+        'input[type="checkbox"]:not(:checked):not([disabled])',
+      );
+      for (const cb of htmlCheckboxes) {
+        cb.click();
+        count++;
+      }
+
+      const ariaCheckboxes = document.querySelectorAll<HTMLElement>(
+        '[role="checkbox"][aria-checked="false"]:not([aria-disabled="true"])',
+      );
+      for (const cb of ariaCheckboxes) {
+        cb.click();
+        count++;
+      }
+
+      return count;
+    });
+    console.log(`[SmartApply] DOM checked ${checkedCount} checkbox(es)`);
+
+    await adapter.page.waitForTimeout(300);
+
+    return adapter.page.evaluate(() => {
+      const TEXTS = ['create account', 'register', 'sign up', 'continue', 'next', 'submit'];
+      const btns = document.querySelectorAll<HTMLElement>(
+        'button, input[type="submit"], [role="button"]',
+      );
+      for (const btn of btns) {
+        const text = (btn.textContent || (btn as HTMLInputElement).value || '').trim().toLowerCase();
+        if (TEXTS.some((t) => text === t || (text.length < 30 && text.includes(t)))) {
+          btn.click();
+          return true;
+        }
+      }
+
+      const form = document.querySelector('form');
+      if (form) {
+        form.requestSubmit();
+        return true;
+      }
+      return false;
+    });
+  }
+
+  private async isStillOnAccountCreationPage(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    return adapter.page.evaluate(() =>
+      document.querySelectorAll('input[type="password"]:not([disabled])').length > 1,
+    );
+  }
+
+  private async readAccountCreationValidationText(adapter: BrowserAutomationAdapter): Promise<string> {
+    return adapter.page.evaluate(() => {
+      const selectors = [
+        '[role="alert"]',
+        '[aria-live="assertive"]',
+        '[aria-live="polite"]',
+        '[data-automation-id*="error" i]',
+        '[class*="error"]',
+        '[class*="Error"]',
+        '[class*="validation"]',
+      ];
+      const messages = new Set<string>();
+      for (const selector of selectors) {
+        const elements = document.querySelectorAll<HTMLElement>(selector);
+        for (const element of elements) {
+          const rect = element.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          const text = (element.textContent || '').replace(/\s+/g, ' ').trim();
+          if (text) messages.add(text);
+        }
+      }
+      return [...messages].join(' | ').slice(0, 500);
+    });
   }
 
   // =========================================================================

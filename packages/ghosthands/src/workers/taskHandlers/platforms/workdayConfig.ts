@@ -5,6 +5,10 @@ import type { BrowserAutomationAdapter } from '../../../adapters/types.js';
 import type { PlatformConfig, PageState, PageType, ScannedField, ScanResult } from './types.js';
 import type { WorkdayUserProfile } from '../workdayTypes.js';
 import {
+  resolvePlatformAccountEmail,
+  resolvePlatformAccountPassword,
+} from './accountCredentials.js';
+import {
   WORKDAY_BASE_RULES,
   buildPersonalInfoPrompt,
   buildFormPagePrompt,
@@ -1787,16 +1791,18 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
   ): Promise<void> {
     const currentUrl = await adapter.getCurrentUrl();
     const userProfile = profile as WorkdayUserProfile;
-    const email = userProfile.email;
-    const password = process.env.TEST_GMAIL_PASSWORD || '';
+    const googleEmail = userProfile.email;
+    const googlePassword = process.env.TEST_GMAIL_PASSWORD || '';
+    const workdayEmail = resolvePlatformAccountEmail(profile, 'workday');
+    const workdayPassword = resolvePlatformAccountPassword(profile, 'workday');
 
     // Google sign-in page — handle each sub-page with DOM clicks
     if (currentUrl.includes('accounts.google.com')) {
-      console.log(`[Workday] On Google sign-in page for ${email}...`);
+      console.log(`[Workday] On Google sign-in page for ${googleEmail}...`);
 
       const googlePageType = await adapter.page.evaluate(`
         (() => {
-          const targetEmail = ${JSON.stringify(email)}.toLowerCase();
+          const targetEmail = ${JSON.stringify(googleEmail)}.toLowerCase();
           const bodyText = document.body.innerText.toLowerCase();
 
           let hasVisiblePassword = false;
@@ -1888,11 +1894,11 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
               }
             }
             return false;
-          }, email);
+          }, googleEmail);
 
           if (!clicked) {
             console.warn('[Workday] Could not click account in chooser, falling back to LLM');
-            await adapter.act(`Click on the account "${email}" to sign in with it.`);
+            await adapter.act(`Click on the account "${googleEmail}" to sign in with it.`);
           }
 
           await adapter.page.waitForTimeout(2000);
@@ -1902,7 +1908,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
         case 'email_entry': {
           console.log('[Workday] Email entry page — typing email via DOM...');
           const emailInput = adapter.page.locator('input[type="email"]:visible').first();
-          await emailInput.fill(email);
+          await emailInput.fill(googleEmail);
           await adapter.page.waitForTimeout(300);
           const nextClicked = await adapter.page.evaluate(() => {
             const buttons = document.querySelectorAll('button, div[role="button"]');
@@ -1924,7 +1930,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
         case 'password_entry': {
           console.log('[Workday] Password entry page — typing password via DOM...');
           const passwordInput = adapter.page.locator('input[type="password"]:visible').first();
-          await passwordInput.fill(password);
+          await passwordInput.fill(googlePassword);
           await adapter.page.waitForTimeout(300);
           const nextClicked = await adapter.page.evaluate(() => {
             const buttons = document.querySelectorAll('button, div[role="button"]');
@@ -1945,7 +1951,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
 
         default: {
           console.log('[Workday] Unknown Google page — using LLM fallback...');
-          await adapter.act(buildGoogleSignInFallbackPrompt(email));
+          await adapter.act(buildGoogleSignInFallbackPrompt(googleEmail));
           await adapter.page.waitForTimeout(2000);
           return;
         }
@@ -1954,6 +1960,10 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
 
     // Workday login page — try Google SSO first, then native email/password
     console.log('[Workday] On login page...');
+    console.log(
+      `[Workday] Native credential source: email=${workdayEmail ? 'present' : 'missing'}, ` +
+      `passwordSource=${workdayPassword.source}`,
+    );
 
     // Step 1: Try Google SSO via Playwright selectors
     let googleClicked = false;
@@ -2124,10 +2134,10 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
         const form = (pwInput || emailInput)?.closest('form');
         if (form) { form.requestSubmit(); return { filled: true, submitted: true }; }
         return { filled: true, submitted: false };
-      }, { email, password: pw });
+      }, { email: workdayEmail, password: pw });
 
       if (fillResult.filled) {
-        console.log(`[Workday] Filled login form with email="${email}", pw=***. submitted=${fillResult.submitted}`);
+        console.log(`[Workday] Filled login form with email="${workdayEmail}", pw=***. submitted=${fillResult.submitted}`);
       } else {
         console.log('[Workday] Could not find login form fields to fill.');
         return null;
@@ -2160,10 +2170,10 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
 
     // Step 3: Try login with base password
     const PASSWORD_SUFFIX = 'aA1!';
-    let loginError = await tryLogin(password);
+    let loginError = await tryLogin(workdayPassword.password);
 
     // Step 3b: If base password failed, try with suffix appended
-    if (loginError && password) {
+    if (loginError && workdayPassword.password) {
       console.log(`[Workday] Login failed with base password: "${loginError}" — retrying with strengthened password...`);
       // Dismiss error / re-open sign-in form
       await adapter.page.keyboard.press('Escape');
@@ -2185,7 +2195,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
         });
         await adapter.page.waitForTimeout(1500);
       }
-      loginError = await tryLogin(password + PASSWORD_SUFFIX);
+      loginError = await tryLogin(workdayPassword.password + PASSWORD_SUFFIX);
     }
 
     // Mark that we attempted login
