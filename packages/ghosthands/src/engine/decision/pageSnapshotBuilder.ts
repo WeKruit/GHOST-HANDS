@@ -11,7 +11,7 @@ import { PageDecisionContextSchema } from './types';
 
 export type ObservationScope = 'current_view' | 'full_page_audit';
 
-const MAX_AX_EXTRACTION_MS = 200;
+const MAX_AX_EXTRACTION_MS = 500;
 
 type ExtractorResult<T> = {
   ok: boolean;

@@ -37,6 +37,17 @@ type PageWithAccessibility = Page & {
   };
 };
 
+/** CDP Accessibility.AXNode shape (subset we use) */
+interface CDPAXNode {
+  nodeId: string;
+  role: { type: string; value?: string };
+  name?: { type: string; value?: string };
+  description?: { type: string; value?: string };
+  value?: { type: string; value?: string | number };
+  properties?: Array<{ name: string; value: { type: string; value?: string | boolean | number } }>;
+  childIds?: string[];
+}
+
 const INTERACTIVE_AX_ROLES = new Set([
   'textbox',
   'combobox',
@@ -162,24 +173,131 @@ export function flattenAXTree(
   }
 }
 
-export async function extractAXFields(page: Page): Promise<AXFieldNode[]> {
-  const castPage = page as PageWithAccessibility;
-  if (!castPage.accessibility?.snapshot) {
-    console.log('[axTreeExtractor] page.accessibility not available — skipping AX extraction');
+// ── CDP-based AX extraction ─────────────────────────────────
+
+function cdpPropertyValue(
+  props: CDPAXNode['properties'],
+  name: string,
+): string | boolean | number | undefined {
+  const prop = props?.find((p) => p.name === name);
+  return prop?.value?.value;
+}
+
+function cdpNodeToPlaywright(
+  node: CDPAXNode,
+  nodeMap: Map<string, CDPAXNode>,
+): PlaywrightAXNode {
+  const role = node.role?.value ?? '';
+  const name = node.name?.value ?? '';
+  const description = node.description?.value ?? '';
+  const value = node.value?.value;
+
+  const props = node.properties;
+  const disabled = cdpPropertyValue(props, 'disabled');
+  const expanded = cdpPropertyValue(props, 'expanded');
+  const focused = cdpPropertyValue(props, 'focused');
+  const required = cdpPropertyValue(props, 'required');
+  const checked = cdpPropertyValue(props, 'checked');
+  const readonly = cdpPropertyValue(props, 'readonly');
+  const multiselectable = cdpPropertyValue(props, 'multiselectable');
+
+  const children: PlaywrightAXNode[] = [];
+  for (const childId of node.childIds ?? []) {
+    const child = nodeMap.get(childId);
+    if (child) {
+      children.push(cdpNodeToPlaywright(child, nodeMap));
+    }
+  }
+
+  const result: PlaywrightAXNode = {
+    role: typeof role === 'string' ? role : String(role),
+    name: typeof name === 'string' ? name : String(name),
+    description: typeof description === 'string' ? description : undefined,
+    value: value != null ? String(value) : undefined,
+    disabled: disabled === true ? true : undefined,
+    expanded: expanded === true ? true : expanded === false ? false : undefined,
+    focused: focused === true ? true : undefined,
+    required: required === true ? true : undefined,
+    readonly: readonly === true ? true : undefined,
+    multiselectable: multiselectable === true ? true : undefined,
+    checked:
+      checked === 'mixed' ? 'mixed' :
+      checked === true ? 'true' :
+      checked === false ? 'false' :
+      undefined,
+    children: children.length > 0 ? children : undefined,
+  };
+
+  return result;
+}
+
+async function extractAXFieldsViaCDP(page: Page): Promise<AXFieldNode[]> {
+  // Get CDP session from the page's browser context
+  const context = page.context();
+  if (typeof (context as any).newCDPSession !== 'function') {
     return [];
   }
 
+  const cdp = await (context as any).newCDPSession(page);
   try {
-    const snapshot = await castPage.accessibility.snapshot({
-      interestingOnly: false,
-    });
-    if (!snapshot) return [];
+    const result = await cdp.send('Accessibility.getFullAXTree');
+    const nodes: CDPAXNode[] = result.nodes ?? [];
 
+    if (nodes.length === 0) return [];
+
+    // Build node map for parent→child resolution
+    const nodeMap = new Map<string, CDPAXNode>();
+    for (const node of nodes) {
+      nodeMap.set(node.nodeId, node);
+    }
+
+    // Find the root node and convert to PlaywrightAXNode tree
+    const root = nodes[0];
+    if (!root) return [];
+
+    const pwRoot = cdpNodeToPlaywright(root, nodeMap);
+
+    // Flatten into AXFieldNode[] using the same logic
     const results: AXFieldNode[] = [];
-    flattenAXTree(snapshot, 0, null, results);
+    flattenAXTree(pwRoot, 0, null, results);
     return results;
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
+}
+
+// ── Public API ───────────────────────────────────────────────
+
+export async function extractAXFields(page: Page): Promise<AXFieldNode[]> {
+  // Strategy 1: Playwright's native accessibility API
+  const castPage = page as PageWithAccessibility;
+  if (castPage.accessibility?.snapshot) {
+    try {
+      const snapshot = await castPage.accessibility.snapshot({
+        interestingOnly: false,
+      });
+      if (snapshot) {
+        const results: AXFieldNode[] = [];
+        flattenAXTree(snapshot, 0, null, results);
+        console.log(`[axTreeExtractor] Playwright AX: ${results.length} interactive fields`);
+        return results;
+      }
+    } catch {
+      // Fall through to CDP
+    }
+  }
+
+  // Strategy 2: CDP-based extraction (works with patchright/magnitude)
+  try {
+    const results = await extractAXFieldsViaCDP(page);
+    if (results.length > 0) {
+      console.log(`[axTreeExtractor] CDP AX: ${results.length} interactive fields`);
+      return results;
+    }
+    console.log('[axTreeExtractor] CDP AX returned 0 fields');
+    return [];
   } catch (err) {
-    console.log(`[axTreeExtractor] AX extraction failed: ${err instanceof Error ? err.message : String(err)}`);
+    console.log(`[axTreeExtractor] CDP AX failed: ${err instanceof Error ? err.message : String(err)}`);
     return [];
   }
 }
