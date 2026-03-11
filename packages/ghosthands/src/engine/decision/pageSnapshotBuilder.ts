@@ -231,7 +231,7 @@ export class PageSnapshotBuilder {
   ): Promise<MergedPageObservation> {
     const domSnapshot = domSnapshotOverride ?? await this.buildSnapshot(page, actionHistory);
     const axFields = await Promise.race<AXFieldNode[]>([
-      extractAXFields(page),
+      extractAXFields(page).catch(() => []),
       new Promise<AXFieldNode[]>((resolve) => {
         setTimeout(() => resolve([]), MAX_AX_EXTRACTION_MS);
       }),

@@ -163,12 +163,21 @@ export function flattenAXTree(
 }
 
 export async function extractAXFields(page: Page): Promise<AXFieldNode[]> {
-  const snapshot = await (page as PageWithAccessibility).accessibility.snapshot({
-    interestingOnly: false,
-  });
-  if (!snapshot) return [];
+  const castPage = page as PageWithAccessibility;
+  if (!castPage.accessibility?.snapshot) {
+    return [];
+  }
 
-  const results: AXFieldNode[] = [];
-  flattenAXTree(snapshot, 0, null, results);
-  return results;
+  try {
+    const snapshot = await castPage.accessibility.snapshot({
+      interestingOnly: false,
+    });
+    if (!snapshot) return [];
+
+    const results: AXFieldNode[] = [];
+    flattenAXTree(snapshot, 0, null, results);
+    return results;
+  } catch {
+    return [];
+  }
 }
