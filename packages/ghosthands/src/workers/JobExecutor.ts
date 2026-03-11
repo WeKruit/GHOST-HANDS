@@ -23,7 +23,7 @@ import { ResumeProfileLoader } from '../db/resumeProfileLoader.js';
 import { getLogger } from '../monitoring/logger.js';
 import { AgentApplyHandler } from './taskHandlers/agentApplyHandler.js';
 import { getMastra } from '../workflows/mastra/init.js';
-import { buildApplyWorkflow } from '../workflows/mastra/applyWorkflow.js';
+import { buildApplyWorkflow, buildDecisionApplyWorkflow } from '../workflows/mastra/applyWorkflow.js';
 import { isMastraResume, claimResume, persistMastraRunId } from '../workflows/mastra/resumeCoordinator.js';
 import { workflowState, type RuntimeContext, type WorkflowState } from '../workflows/mastra/types.js';
 import {
@@ -217,7 +217,7 @@ export class JobExecutor {
   private canAutoRecoverAuth(job: AutomationJob): boolean {
     const executionMode = (job.execution_mode || '').toLowerCase();
     const jobType = (job.job_type || '').toLowerCase();
-    if (executionMode === 'smart_apply' || executionMode === 'agent_apply') {
+    if (executionMode === 'smart_apply' || executionMode === 'agent_apply' || executionMode === 'mastra_decision') {
       return true;
     }
     return jobType === 'smart_apply' || jobType === 'workday_apply' || jobType === 'agent_apply';
@@ -708,7 +708,7 @@ export class JobExecutor {
       }
 
       // --- MASTRA WORKFLOW PATH ---
-      if (job.execution_mode === 'mastra') {
+      if (job.execution_mode === 'mastra' || job.execution_mode === 'mastra_decision') {
         const logEventFn = (eventType: string, metadata: Record<string, any>) =>
           this.logJobEvent(job.id, eventType, metadata);
         await this.executeMastraWorkflow({
@@ -1509,7 +1509,23 @@ export class JobExecutor {
     };
 
     // Build the workflow (per-job, captures rt via closure)
-    const workflow = buildApplyWorkflow(rt);
+    // For mastra_decision mode, we pass a stub DecisionLoopRunnerFactory.
+    // The actual DecisionLoopRunner is implemented in engine/decision/ and will
+    // be wired here once built. The stub throws a clear error at runtime.
+    const workflow = job.execution_mode === 'mastra_decision'
+      ? buildDecisionApplyWorkflow(rt, {
+          create() {
+            return {
+              async run() {
+                throw new Error(
+                  'DecisionLoopRunner is not yet implemented. ' +
+                  'Wire engine/decision/DecisionLoopRunner into buildDecisionApplyWorkflow().',
+                );
+              },
+            };
+          },
+        })
+      : buildApplyWorkflow(rt);
     const mastra = getMastra();
 
     if (!mastra) {
@@ -1596,8 +1612,17 @@ export class JobExecutor {
 
       run = await registeredWf.createRun({ runId: job.metadata.mastra_run_id });
       await pageContext.initializeRun(run.runId);
+
+      // Determine which step to resume. For mastra_decision mode, the
+      // page_decision_loop step can also suspend for HITL.
+      // When only one step is suspended, Mastra auto-detects it, but we
+      // still resolve the step ID for explicit logging and correctness.
+      const externalResumeStep = job.execution_mode === 'mastra_decision'
+        ? undefined  // Let Mastra auto-detect from persisted snapshot
+        : 'check_blockers_checkpoint';
+
       result = await run.resume({
-        step: 'check_blockers_checkpoint',
+        step: externalResumeStep,
         resumeData: {
           resolutionType,
           resumeNonce: job.metadata.resume_nonce || crypto.randomUUID(),
@@ -1703,14 +1728,22 @@ export class JobExecutor {
         return;
       }
 
-      // Human resolved — resume the Mastra workflow in-process
+      // Human resolved — resume the Mastra workflow in-process.
+      // Determine which step suspended (check_blockers_checkpoint or page_decision_loop).
+      // When only one step is suspended, Mastra auto-detects it, but we explicitly
+      // identify it for logging and correctness when the decision loop also suspends.
+      const suspendedStepId = Array.isArray(result?.suspended) && result.suspended.length > 0
+        ? (typeof result.suspended[0] === 'string' ? result.suspended[0] : result.suspended[0]?.id ?? 'check_blockers_checkpoint')
+        : 'check_blockers_checkpoint';
+
       logger.info('HITL resolved, resuming workflow in-process', {
         jobId: job.id,
         resolutionType: resumeResult.resolutionType,
+        resumeStep: suspendedStepId,
       });
 
       result = await run.resume({
-        step: 'check_blockers_checkpoint',
+        step: suspendedStepId,
         resumeData: {
           resolutionType: resumeResult.resolutionType || 'manual',
           resumeNonce: crypto.randomUUID(),
@@ -1754,7 +1787,7 @@ export class JobExecutor {
       finalState = raw.output as WorkflowState;
     } else if (result?.steps) {
       // Fallback: extract from individual step results
-      const stepKeys = ['execute_handler'];
+      const stepKeys = ['execute_handler', 'page_decision_loop'];
       for (const key of stepKeys) {
         const stepResult = (result.steps as Record<string, any>)[key];
         if (stepResult?.output && typeof stepResult.output === 'object' && 'handler' in stepResult.output) {
@@ -1775,11 +1808,49 @@ export class JobExecutor {
       throw new Error('Mastra workflow returned no extractable state');
     }
 
+    // Persist decision engine metrics if the decision loop was used
+    if (finalState.decisionLoop) {
+      const dl = finalState.decisionLoop as Record<string, any>;
+      const decisionEngineMetrics = {
+        iterations: dl.iteration ?? 0,
+        pages_processed: dl.pagesProcessed ?? 0,
+        terminal_state: dl.terminalState ?? 'unknown',
+        termination_reason: dl.terminationReason ?? null,
+        total_actions: Array.isArray(dl.actionHistory) ? dl.actionHistory.length : 0,
+        loop_cost_usd: dl.loopCostUsd ?? 0,
+        cost_breakdown: Array.isArray(dl.actionHistory) ? {
+          dom_actions: dl.actionHistory.filter((a: any) => a.layer === 'dom').length,
+          stagehand_actions: dl.actionHistory.filter((a: any) => a.layer === 'stagehand').length,
+          magnitude_actions: dl.actionHistory.filter((a: any) => a.layer === 'magnitude').length,
+        } : {},
+      };
+
+      try {
+        await this.supabase
+          .from('gh_automation_jobs')
+          .update({
+            metadata: {
+              ...job.metadata,
+              decision_engine: decisionEngineMetrics,
+            },
+          })
+          .eq('id', job.id);
+
+        // Keep job.metadata in sync for downstream finalization
+        job.metadata = { ...job.metadata, decision_engine: decisionEngineMetrics };
+      } catch (err) {
+        logger.warn('Failed to persist decision engine metrics', {
+          jobId: job.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     if (finalState.handler?.attempted && finalState.handler.taskResult) {
       const taskResult = finalState.handler.taskResult as any;
       // Map execution_mode to a valid final_mode value for the DB constraint.
-      // Valid final_mode values: 'magnitude', 'hybrid', 'smart_apply', 'agent_apply', 'mastra'
-      const VALID_FINAL_MODES = new Set(['magnitude', 'hybrid', 'smart_apply', 'agent_apply', 'mastra']);
+      // Valid final_mode values: 'magnitude', 'hybrid', 'smart_apply', 'agent_apply', 'mastra', 'mastra_decision'
+      const VALID_FINAL_MODES = new Set(['magnitude', 'hybrid', 'smart_apply', 'agent_apply', 'mastra', 'mastra_decision']);
       const finalMode = (job.execution_mode && VALID_FINAL_MODES.has(job.execution_mode)) ? job.execution_mode : 'magnitude';
       const engineResult = {
         success: false,
