@@ -559,4 +559,97 @@ describe('Cost Controls', () => {
       }).toThrow(BudgetExceededError);
     });
   });
+
+  // ─── CostTracker: maxBudgetOverride (VALET credit budget cap) ──
+
+  describe('CostTracker - maxBudgetOverride (VALET credit budget)', () => {
+    it('should use override when lower than internal budget', () => {
+      const tracker = new CostTracker({
+        jobId: 'override-lower',
+        qualityPreset: 'balanced', // internal = $0.50
+        maxBudgetOverride: 0.10,   // override is stricter
+      });
+
+      expect(tracker.getTaskBudget()).toBe(0.10);
+    });
+
+    it('should use internal budget when override is higher', () => {
+      const tracker = new CostTracker({
+        jobId: 'override-higher',
+        qualityPreset: 'speed', // internal = $0.05
+        maxBudgetOverride: 1.00, // override is more generous
+      });
+
+      expect(tracker.getTaskBudget()).toBe(TASK_BUDGET.speed);
+    });
+
+    it('should use internal budget when no override provided (backward compat)', () => {
+      const tracker = new CostTracker({
+        jobId: 'no-override',
+        qualityPreset: 'quality',
+      });
+
+      expect(tracker.getTaskBudget()).toBe(TASK_BUDGET.quality);
+    });
+
+    it('should throw BudgetExceededError when override budget is exceeded', () => {
+      const tracker = new CostTracker({
+        jobId: 'override-exceeded',
+        qualityPreset: 'balanced', // internal = $0.50
+        maxBudgetOverride: 0.02,   // much tighter cap
+      });
+
+      // First call within budget
+      tracker.recordTokenUsage({
+        inputTokens: 500,
+        outputTokens: 200,
+        inputCost: 0.01,
+        outputCost: 0.005,
+      });
+
+      // Second call exceeds the $0.02 override cap
+      expect(() => {
+        tracker.recordTokenUsage({
+          inputTokens: 500,
+          outputTokens: 200,
+          inputCost: 0.01,
+          outputCost: 0.005,
+        });
+      }).toThrow(BudgetExceededError);
+    });
+
+    it('should include correct snapshot when override budget is exceeded', () => {
+      const tracker = new CostTracker({
+        jobId: 'override-snapshot',
+        qualityPreset: 'balanced',
+        maxBudgetOverride: 0.01,
+      });
+
+      try {
+        tracker.recordTokenUsage({
+          inputTokens: 1000,
+          outputTokens: 500,
+          inputCost: 0.008,
+          outputCost: 0.005,
+        });
+        expect.unreachable('Should have thrown');
+      } catch (err) {
+        expect(err).toBeInstanceOf(BudgetExceededError);
+        const budgetErr = err as BudgetExceededError;
+        expect(budgetErr.jobId).toBe('override-snapshot');
+        expect(budgetErr.costSnapshot.totalCost).toBeGreaterThan(0.01);
+      }
+    });
+
+    it('should apply override with job-type budget overrides', () => {
+      // smart_apply has JOB_TYPE_BUDGET_OVERRIDES = $2.00
+      const tracker = new CostTracker({
+        jobId: 'override-jobtype',
+        jobType: 'smart_apply',   // internal = $2.00
+        maxBudgetOverride: 0.50,  // credit cap is tighter
+      });
+
+      expect(tracker.getTaskBudget()).toBe(0.50);
+    });
+  });
 });
