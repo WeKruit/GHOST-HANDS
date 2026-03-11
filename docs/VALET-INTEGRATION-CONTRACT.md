@@ -198,6 +198,7 @@ Rich application request with full profile data.
 | `target_worker_id` | string | No | null | Route to specific worker (null = any available) |
 | `worker_affinity` | enum | No | preferred | strict (must use target worker), preferred (try target, fallback to any), any |
 | `metadata` | object | No | {} | Arbitrary key-value pairs |
+| `credit_budget_usd` | number | No | - | VALET credit-derived USD budget cap. Effective budget = min(internal_budget, credit_budget_usd) |
 
 ### 4.1.1 Model Reference (30 models)
 
@@ -312,11 +313,12 @@ For non-apply tasks (scraping, form filling, custom).
   "callback_url": "https://valet.example.com/webhook/gh",
   "quality": "speed",
   "priority": 3,
-  "timeout_seconds": 120
+  "timeout_seconds": 120,
+  "credit_budget_usd": 0.50
 }
 ```
 
-Same response format as `/apply`.
+Accepts the same optional fields as `/valet/apply` including `credit_budget_usd`. Same response format as `/apply`.
 
 ### 4.3 Get Job Status — `GET /valet/status/:jobId`
 
