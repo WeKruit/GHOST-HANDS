@@ -605,6 +605,10 @@ export class StagehandPageCompat {
     return this._stagehandPage.close();
   }
 
+  async bringToFront(): Promise<void> {
+    return this._stagehandPage.bringToFront();
+  }
+
   async title(): Promise<string> {
     return this._stagehandPage.title();
   }
