@@ -320,6 +320,68 @@ describe('WorkdayPlatformConfig', () => {
       page_title: 'Workday Create Account',
     });
   });
+
+  test('handleLogin uses native tenant credential after account creation and never prompts for Google', async () => {
+    const actPrompts: string[] = [];
+    const evaluateCalls: Array<{ email: string; password: string }> = [];
+    const adapter = {
+      getCurrentUrl: async () =>
+        'https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers/login?redirect=apply',
+      act: async (prompt: string) => {
+        actPrompts.push(prompt);
+        return { success: true };
+      },
+      page: {
+        evaluate: async (fn: unknown, arg?: unknown) => {
+          const text = String(fn);
+          if (text.includes('const passwordFields')) {
+            return {
+              isCreateAccountView: false,
+              hasSignInTab: false,
+              hasConfirmPassword: false,
+              hasPasswordField: true,
+            };
+          }
+          if (text.includes('const ctx = document.querySelector') || text.includes('const modal')) {
+            evaluateCalls.push(arg as { email: string; password: string });
+            return { filled: true, submitted: true };
+          }
+          if (text.includes('const patterns = [')) {
+            return null;
+          }
+          throw new Error(`Unexpected evaluate call: ${text.slice(0, 80)}`);
+        },
+        waitForTimeout: async () => {},
+        keyboard: {
+          press: async () => {},
+        },
+      },
+    } as any;
+
+    await config.handleLogin(adapter, {
+      email: 'profile@example.com',
+      _accountCreationCompleted: true,
+      _forceNativeLoginAfterAccountCreation: true,
+      platform_credentials: {
+        workday: {
+          byDomain: {
+            'cadence.wd1.myworkdayjobs.com': {
+              email: 'tenant@example.com',
+              password: 'TenantWorkday!234',
+            },
+          },
+        },
+      },
+      application_password: 'SharedPassword!234',
+    });
+
+    expect(evaluateCalls).toHaveLength(1);
+    expect(evaluateCalls[0]).toEqual({
+      email: 'tenant@example.com',
+      password: 'TenantWorkday!234',
+    });
+    expect(actPrompts.some((prompt) => prompt.includes('Google'))).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -52,9 +52,23 @@ function firstNonEmptyString(...values: unknown[]): string | undefined {
   return undefined;
 }
 
+function normalizeRequestedDomain(options?: {
+  sourceUrl?: string | null;
+  domain?: string | null;
+}): string | null {
+  if (!options) return null;
+  const fromUrl = inferCredentialDomainFromUrl(options.sourceUrl);
+  if (fromUrl) return fromUrl;
+  if (typeof options.domain !== 'string') return null;
+  const trimmed = options.domain.trim();
+  if (!trimmed) return null;
+  return inferCredentialDomainFromUrl(trimmed) ?? trimmed.toLowerCase();
+}
+
 function getPlatformOverride(
   profile: Record<string, unknown>,
   platform: string | null,
+  options?: { sourceUrl?: string | null; domain?: string | null },
 ): Record<string, unknown> | null {
   if (!platform) return null;
   const snakeCaseKey = `${platform}_credentials`;
@@ -65,7 +79,17 @@ function getPlatformOverride(
     asRecord(profile[snakeCaseKey]) ??
     asRecord(profile[camelCaseKey]);
   if (!platformsRecord) return null;
-  return asRecord(platformsRecord[platform]) ?? platformsRecord;
+  const platformRecord = asRecord(platformsRecord[platform]) ?? platformsRecord;
+  const normalizedDomain = normalizeRequestedDomain(options);
+  if (!normalizedDomain) return platformRecord;
+  const scopedByDomain = asRecord(platformRecord?.byDomain);
+  const scopedOverride = scopedByDomain ? asRecord(scopedByDomain[normalizedDomain]) : null;
+  if (!scopedOverride) return platformRecord;
+  return {
+    ...platformRecord,
+    ...scopedOverride,
+    domain: normalizedDomain,
+  };
 }
 
 function inferDefaultRequirements(platform: string | null): PasswordRequirements {
@@ -134,8 +158,9 @@ export function hasPlatformPasswordOverride(
 export function resolvePlatformAccountEmail(
   profile: Record<string, unknown>,
   platform: string | null,
+  options?: { sourceUrl?: string | null; domain?: string | null },
 ): string {
-  const override = getPlatformOverride(profile, platform);
+  const override = getPlatformOverride(profile, platform, options);
   return firstNonEmptyString(
     override?.email,
     override?.login_identifier,
@@ -249,10 +274,11 @@ export function generatePlatformCredential(
   const secret = generatePasswordForRequirements(requirements);
   const describedRequirements = describePasswordRequirements(requirements);
   const domain = inferCredentialDomainFromUrl(options?.sourceUrl);
+  const sourceContext = options?.sourceUrl ? ` while applying to ${options.sourceUrl}` : '';
   const scopeLabel = domain ? `${loginIdentifier || 'this application'} on ${domain}` : (loginIdentifier || 'this application');
   const note =
     `Generated a ${platform} account password for ${scopeLabel} ` +
-    `to satisfy: ${describedRequirements.join(', ')}.`;
+    `${sourceContext} to satisfy: ${describedRequirements.join(', ')}.`;
 
   return {
     credential: {
@@ -278,9 +304,9 @@ export function generatePlatformCredential(
 export function resolvePlatformAccountPassword(
   profile: Record<string, unknown>,
   platform: string | null,
-  options?: { validationText?: string | null },
+  options?: { validationText?: string | null; sourceUrl?: string | null; domain?: string | null },
 ): { password: string; source: AccountPasswordSource } {
-  const override = getPlatformOverride(profile, platform);
+  const override = getPlatformOverride(profile, platform, options);
   const explicitPlatformPassword = firstNonEmptyString(
     override?.password,
     override?.secret,
