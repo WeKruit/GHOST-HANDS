@@ -35,27 +35,30 @@ function buildAnthropicClientOptions(config?: AnthropicClientConfig): Constructo
   return Object.keys(options).length > 0 ? options : undefined;
 }
 
-function estimateAnthropicCostUsd(model: string, inputTokens: number, outputTokens: number): number {
-  const normalized = normalizeModel(model).toLowerCase();
-
-  if (normalized.includes('haiku')) {
-    return (inputTokens * 0.25 + outputTokens * 1.25) / 1_000_000;
-  }
-
-  if (normalized.includes('sonnet')) {
-    return (inputTokens * 3.0 + outputTokens * 15.0) / 1_000_000;
-  }
-
-  return 0;
-}
+/**
+ * Cost callback type — allows the caller to report token usage
+ * to the CostTracker (which uses real costs from adapter events)
+ * rather than estimating locally with hardcoded rates.
+ */
+export type OnTokenUsage = (usage: {
+  inputTokens: number;
+  outputTokens: number;
+  model: string;
+}) => void;
 
 export class PageDecisionEngine {
   private readonly client: Anthropic;
   private readonly model: string;
+  private readonly onTokenUsage?: OnTokenUsage;
 
-  constructor(config: { anthropicConfig?: AnthropicClientConfig; model?: string } = {}) {
+  constructor(config: {
+    anthropicConfig?: AnthropicClientConfig;
+    model?: string;
+    onTokenUsage?: OnTokenUsage;
+  } = {}) {
     this.client = new Anthropic(buildAnthropicClientOptions(config.anthropicConfig));
     this.model = normalizeModel(config.model);
+    this.onTokenUsage = config.onTokenUsage;
   }
 
   async decide(
@@ -64,7 +67,6 @@ export class PageDecisionEngine {
     platform: string,
   ): Promise<DecisionAction & {
     tokenUsage: { input: number; output: number };
-    costUsd: number;
     durationMs: number;
   }> {
     const startedAt = Date.now();
@@ -130,7 +132,6 @@ export class PageDecisionEngine {
         reasoning: `Anthropic API call failed after ${MAX_API_RETRIES + 1} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
         confidence: 0.05,
         tokenUsage: { input: 0, output: 0 },
-        costUsd: 0,
         durationMs,
       };
     }
@@ -138,7 +139,12 @@ export class PageDecisionEngine {
     const inputTokens = response.usage?.input_tokens ?? 0;
     const outputTokens = response.usage?.output_tokens ?? 0;
     const durationMs = Date.now() - startedAt;
-    const costUsd = estimateAnthropicCostUsd(this.model, inputTokens, outputTokens);
+
+    // Report token usage to CostTracker via callback instead of estimating locally.
+    // The CostTracker receives real cost data from adapter tokensUsed events for
+    // adapter calls. For direct Anthropic calls (decision engine), the CostTracker
+    // uses the token counts for tracking; actual billing goes through VALET proxy.
+    this.onTokenUsage?.({ inputTokens, outputTokens, model: this.model });
 
     const toolUse = response.content.find(
       (block): block is ToolUseBlock =>
@@ -154,7 +160,6 @@ export class PageDecisionEngine {
           input: inputTokens,
           output: outputTokens,
         },
-        costUsd,
         durationMs,
       };
     }
@@ -172,7 +177,6 @@ export class PageDecisionEngine {
           input: inputTokens,
           output: outputTokens,
         },
-        costUsd,
         durationMs,
       };
     }
@@ -183,7 +187,6 @@ export class PageDecisionEngine {
         input: inputTokens,
         output: outputTokens,
       },
-      costUsd,
       durationMs,
     };
   }

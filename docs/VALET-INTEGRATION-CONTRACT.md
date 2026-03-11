@@ -191,7 +191,7 @@ Rich application request with full profile data.
 | `quality` | enum | No | balanced | speed, balanced, quality (maps to budget tier) |
 | `model` | string | No | qwen-72b | LLM model alias for reasoning (see Model Reference) |
 | `image_model` | string | No | same as model | Separate vision model for screenshots (must have vision support) |
-| `execution_mode` | enum | No | auto | auto, ai_only, cookbook_only |
+| `execution_mode` | enum | No | auto | auto, ai_only, hybrid, smart_apply, agent_apply, mastra, mastra_decision |
 | `priority` | 1-10 | No | 5 | Higher = processed sooner |
 | `timeout_seconds` | 30-1800 | No | 300 | Max execution time |
 | `idempotency_key` | string | No | - | Prevents duplicate submissions |
@@ -263,6 +263,8 @@ All SiliconFlow-hosted models (qwen*) use your existing `SILICONFLOW_API_KEY` �
 | `auto` | Check ManualStore for cookbook → replay if healthy → fallback to Magnitude AI |
 | `ai_only` | Skip cookbook lookup, always use Magnitude LLM exploration |
 | `cookbook_only` | Use cookbook only — fail if no manual exists or health < 30% |
+| `mastra` | Mastra workflow with SmartApplyHandler (current default for hosted workers) |
+| `mastra_decision` | Mastra workflow with text-first decision engine (observe→decide→act loop using LLM tool_use). Opt-in per job. Uses a three-tier execution cascade: DOM ($0) → Stagehand → Magnitude. Supports HITL suspend/resume for blockers detected during the loop. Returns `decision_engine` metadata in completion callbacks. |
 
 ### 4.1.3 Worker Selection
 

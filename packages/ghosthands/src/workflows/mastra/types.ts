@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { BrowserAutomationAdapter, HitlCapableAdapter } from '../../adapters/types.js';
 import type { PageContextService } from '../../context/PageContextService.js';
+import { DecisionLoopStateSchema } from '../../engine/decision/types.js';
 import type { CostTracker } from '../../workers/costControl.js';
 import type { ProgressTracker } from '../../workers/progressTracker.js';
 import type { EmailVerificationService } from '../../workers/emailVerification/types.js';
@@ -59,33 +60,9 @@ export const workflowState = z.object({
     'failed',
   ]).default('running'),
 
-  // Decision loop state (only present when using page_decision_loop step)
-  decisionLoop: z.object({
-    iteration: z.number().int().nonnegative().default(0),
-    pagesProcessed: z.number().int().nonnegative().default(0),
-    currentPageFingerprint: z.string().nullable().default(null),
-    previousPageFingerprint: z.string().nullable().default(null),
-    samePageCount: z.number().int().nonnegative().default(0),
-    actionHistory: z.array(z.object({
-      iteration: z.number(),
-      action: z.string(),
-      target: z.string(),
-      result: z.enum(['success', 'partial', 'failed', 'skipped']),
-      layer: z.enum(['dom', 'stagehand', 'magnitude']).nullable(),
-      costUsd: z.number(),
-      durationMs: z.number(),
-      fieldsAttempted: z.number().optional(),
-      fieldsFilled: z.number().optional(),
-      pageFingerprint: z.string(),
-      timestamp: z.number(),
-    })).default([]),
-    loopCostUsd: z.number().default(0),
-    terminalState: z.enum([
-      'running', 'confirmation', 'review_page', 'submitted',
-      'blocked', 'stuck', 'budget_exceeded', 'error', 'max_iterations',
-    ]).default('running'),
-    terminationReason: z.string().nullable().default(null),
-  }).optional(),
+  // Decision loop state (only present when using page_decision_loop step).
+  // Schema imported from the canonical source in engine/decision/types.
+  decisionLoop: DecisionLoopStateSchema.optional(),
 });
 
 export type WorkflowState = z.infer<typeof workflowState>;

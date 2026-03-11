@@ -1,5 +1,5 @@
 export * from './types';
-export { PageDecisionEngine } from './PageDecisionEngine';
+export { PageDecisionEngine, type OnTokenUsage } from './PageDecisionEngine';
 export { PageSnapshotBuilder } from './pageSnapshotBuilder';
 export { DecisionLoopRunner } from './DecisionLoopRunner';
 export { ActionExecutor } from './actionExecutor';

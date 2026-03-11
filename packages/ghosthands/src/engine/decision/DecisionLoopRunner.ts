@@ -1,4 +1,5 @@
 import type { BrowserAutomationAdapter } from '../../adapters/types';
+import type { CostTracker } from '../../workers/costControl';
 import type { AnthropicClientConfig } from '../../workers/taskHandlers/types';
 import type { Page } from 'playwright';
 import { ActionExecutor } from './actionExecutor';
@@ -120,6 +121,7 @@ export class DecisionLoopRunner {
   private readonly profile: Record<string, any>;
   private readonly platform: string;
   private readonly budgetUsd: number;
+  private readonly costTracker?: CostTracker;
   private readonly onProgress?: (event: ProgressEvent) => void;
   private readonly maxIterations: number;
   private readonly snapshotBuilder: PageSnapshotBuilder;
@@ -135,6 +137,7 @@ export class DecisionLoopRunner {
     profile: Record<string, any>;
     platform: string;
     budgetUsd: number;
+    costTracker?: CostTracker;
     anthropicConfig?: AnthropicClientConfig;
     model?: string;
     onProgress?: (event: { type: string; message: string; iteration: number }) => void;
@@ -147,12 +150,21 @@ export class DecisionLoopRunner {
     this.profile = config.profile;
     this.platform = config.platform;
     this.budgetUsd = config.budgetUsd;
+    this.costTracker = config.costTracker;
     this.onProgress = config.onProgress;
     this.maxIterations = Math.max(1, Math.min(config.maxIterations ?? MAX_ITERATIONS, MAX_ITERATIONS));
     this.snapshotBuilder = new PageSnapshotBuilder(config.platform);
     this.decisionEngine = new PageDecisionEngine({
       anthropicConfig: config.anthropicConfig,
       model: config.model,
+      onTokenUsage: config.costTracker
+        ? (usage) => {
+            config.costTracker!.recordTokenUsage({
+              inputTokens: usage.inputTokens,
+              outputTokens: usage.outputTokens,
+            });
+          }
+        : undefined,
     });
     this.actionExecutor = new ActionExecutor(config.page, config.adapter);
     this.profileSummary = summarizeProfile(config.profile);
@@ -208,7 +220,8 @@ export class DecisionLoopRunner {
           this.profileSummary,
           this.platform,
         );
-        loopState.loopCostUsd += decisionResult.costUsd;
+        // Cost is tracked by CostTracker via onTokenUsage callback (decision calls)
+        // and adapter tokensUsed events (Stagehand/Magnitude calls).
 
         const guardedDecision = this.applyGuardrails(decisionResult, snapshot);
         this.emit({
@@ -218,7 +231,12 @@ export class DecisionLoopRunner {
         });
 
         const executorResult = await this.actionExecutor.execute(guardedDecision, snapshot);
-        loopState.loopCostUsd += executorResult.costUsd;
+
+        // Sync loopCostUsd from CostTracker if available (real costs),
+        // otherwise it stays at 0 (costs still tracked externally).
+        if (this.costTracker) {
+          loopState.loopCostUsd = this.costTracker.getSnapshot().totalCost;
+        }
 
         const historyEntry: ActionHistoryEntry = {
           iteration: loopState.iteration,
@@ -226,7 +244,7 @@ export class DecisionLoopRunner {
           target: guardedDecision.target || '',
           result: deriveActionResult(guardedDecision, executorResult),
           layer: executorResult.layer,
-          costUsd: decisionResult.costUsd + executorResult.costUsd,
+          costUsd: 0, // Real cost tracked by CostTracker, not per-action estimates
           durationMs: decisionResult.durationMs + executorResult.durationMs,
           fieldsAttempted: executorResult.fieldsAttempted,
           fieldsFilled: executorResult.fieldsFilled,
