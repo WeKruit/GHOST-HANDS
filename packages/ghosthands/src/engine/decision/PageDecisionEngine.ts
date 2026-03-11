@@ -39,7 +39,7 @@ function estimateAnthropicCostUsd(model: string, inputTokens: number, outputToke
   const normalized = normalizeModel(model).toLowerCase();
 
   if (normalized.includes('haiku')) {
-    return (inputTokens * 1.0 + outputTokens * 5.0) / 1_000_000;
+    return (inputTokens * 0.25 + outputTokens * 1.25) / 1_000_000;
   }
 
   if (normalized.includes('sonnet')) {
@@ -78,9 +78,10 @@ export class PageDecisionEngine {
     let lastError: unknown;
 
     for (let attempt = 0; attempt <= MAX_API_RETRIES; attempt++) {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+        timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
 
         response = await this.client.messages.create(
           {
@@ -107,6 +108,7 @@ export class PageDecisionEngine {
         lastError = null;
         break;
       } catch (err) {
+        clearTimeout(timeout);
         lastError = err;
         const isRateLimit = err instanceof Anthropic.RateLimitError;
         const isTimeout = err instanceof Error && err.name === 'AbortError';

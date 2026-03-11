@@ -1515,7 +1515,7 @@ export class JobExecutor {
     const workflow = job.execution_mode === 'mastra_decision'
       ? buildDecisionApplyWorkflow(rt, {
           create(options) {
-            const { DecisionLoopRunner } = require('../../engine/decision/index.js');
+            const { DecisionLoopRunner } = require('../engine/decision/index.js');
             return new DecisionLoopRunner({
               page: options.page,
               adapter: options.adapter,
@@ -1524,6 +1524,8 @@ export class JobExecutor {
               budgetUsd: options.budgetUsd,
               anthropicConfig: rt.llmClientConfig?.anthropic,
               model: (rt.job.metadata as Record<string, any>)?.decision_model,
+              previousActionHistory: options.previousActionHistory,
+              previousIteration: options.previousIteration,
               onProgress: options.logEvent
                 ? (event: { type: string; message: string; iteration: number }) => {
                     options.logEvent(`decision_loop_${event.type}`, {

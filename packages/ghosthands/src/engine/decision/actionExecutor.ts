@@ -8,6 +8,9 @@ import type {
 } from './types';
 import { ExecutorResultSchema } from './types';
 
+const ESTIMATED_STAGEHAND_COST_USD = 0.0005;
+const ESTIMATED_MAGNITUDE_COST_USD = 0.005;
+
 type ExecutionAttempt = {
   ok: boolean;
   layer: ExecutorResult['layer'];
@@ -333,7 +336,7 @@ export class ActionExecutor {
         layer: 'stagehand',
         fieldsAttempted: fieldLabels.length || context.fields.filter((field) => field.isVisible && field.isEmpty).length,
         fieldsFilled: result.success ? (fieldLabels.length || context.fields.filter((field) => field.isVisible && field.isEmpty).length) : 0,
-        costUsd: 0,
+        costUsd: ESTIMATED_STAGEHAND_COST_USD,
         pageNavigated: beforeUrl !== this.safePageUrl(),
         summary: result.message || 'Stagehand fill attempt completed.',
         error: result.success ? undefined : result.message,
@@ -344,7 +347,7 @@ export class ActionExecutor {
         layer: 'stagehand',
         fieldsAttempted: this.resolveTargetFields(action, context).length,
         fieldsFilled: 0,
-        costUsd: 0,
+        costUsd: ESTIMATED_STAGEHAND_COST_USD,
         pageNavigated: false,
         summary: 'Stagehand fill attempt failed.',
         error: error instanceof Error ? error.message : String(error),
@@ -375,7 +378,7 @@ export class ActionExecutor {
         layer: 'magnitude',
         fieldsAttempted: fieldLabels.length || context.fields.filter((field) => field.isVisible && field.isEmpty).length,
         fieldsFilled: result.success ? (fieldLabels.length || context.fields.filter((field) => field.isVisible && field.isEmpty).length) : 0,
-        costUsd: 0,
+        costUsd: ESTIMATED_MAGNITUDE_COST_USD,
         pageNavigated: beforeUrl !== this.safePageUrl(),
         summary: result.message || 'Magnitude fill attempt completed.',
         error: result.success ? undefined : result.message,
@@ -386,7 +389,7 @@ export class ActionExecutor {
         layer: 'magnitude',
         fieldsAttempted: this.resolveTargetFields(action, context).length,
         fieldsFilled: 0,
-        costUsd: 0,
+        costUsd: ESTIMATED_MAGNITUDE_COST_USD,
         pageNavigated: false,
         summary: 'Magnitude fill attempt failed.',
         error: error instanceof Error ? error.message : String(error),
@@ -465,7 +468,7 @@ export class ActionExecutor {
         layer: 'stagehand',
         fieldsAttempted: 0,
         fieldsFilled: 0,
-        costUsd: 0,
+        costUsd: ESTIMATED_STAGEHAND_COST_USD,
         pageNavigated: beforeUrl !== this.safePageUrl(),
         summary: result.message || 'Stagehand click attempt completed.',
         error: result.success ? undefined : result.message,
@@ -476,7 +479,7 @@ export class ActionExecutor {
         layer: 'stagehand',
         fieldsAttempted: 0,
         fieldsFilled: 0,
-        costUsd: 0,
+        costUsd: ESTIMATED_STAGEHAND_COST_USD,
         pageNavigated: false,
         summary: 'Stagehand click attempt failed.',
         error: error instanceof Error ? error.message : String(error),
@@ -501,7 +504,7 @@ export class ActionExecutor {
         layer: 'magnitude',
         fieldsAttempted: 0,
         fieldsFilled: 0,
-        costUsd: 0,
+        costUsd: ESTIMATED_MAGNITUDE_COST_USD,
         pageNavigated: beforeUrl !== this.safePageUrl(),
         summary: result.message || 'Magnitude click attempt completed.',
         error: result.success ? undefined : result.message,
@@ -512,7 +515,7 @@ export class ActionExecutor {
         layer: 'magnitude',
         fieldsAttempted: 0,
         fieldsFilled: 0,
-        costUsd: 0,
+        costUsd: ESTIMATED_MAGNITUDE_COST_USD,
         pageNavigated: false,
         summary: 'Magnitude click attempt failed.',
         error: error instanceof Error ? error.message : String(error),
@@ -521,15 +524,17 @@ export class ActionExecutor {
   }
 
   private async executeAdapterAuthAction(instruction: string): Promise<ExecutionAttempt> {
+    const layer: ExecutorResult['layer'] = this.adapter.observe ? 'stagehand' : 'magnitude';
+    const estimatedCost = layer === 'stagehand' ? ESTIMATED_STAGEHAND_COST_USD : ESTIMATED_MAGNITUDE_COST_USD;
     try {
       const beforeUrl = this.safePageUrl();
       const result = await this.adapter.act(instruction);
       return {
         ok: result.success,
-        layer: this.adapter.observe ? 'stagehand' : 'magnitude',
+        layer,
         fieldsAttempted: 0,
         fieldsFilled: 0,
-        costUsd: 0,
+        costUsd: estimatedCost,
         pageNavigated: beforeUrl !== this.safePageUrl(),
         summary: result.message || 'Adapter auth action completed.',
         error: result.success ? undefined : result.message,
@@ -538,10 +543,10 @@ export class ActionExecutor {
     } catch (error) {
       return {
         ok: false,
-        layer: this.adapter.observe ? 'stagehand' : 'magnitude',
+        layer,
         fieldsAttempted: 0,
         fieldsFilled: 0,
-        costUsd: 0,
+        costUsd: estimatedCost,
         pageNavigated: false,
         summary: 'Adapter auth action failed.',
         error: error instanceof Error ? error.message : String(error),

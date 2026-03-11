@@ -82,7 +82,7 @@ export const workflowState = z.object({
     loopCostUsd: z.number().default(0),
     terminalState: z.enum([
       'running', 'confirmation', 'review_page', 'submitted',
-      'stuck', 'budget_exceeded', 'error', 'max_iterations',
+      'blocked', 'stuck', 'budget_exceeded', 'error', 'max_iterations',
     ]).default('running'),
     terminationReason: z.string().nullable().default(null),
   }).optional(),

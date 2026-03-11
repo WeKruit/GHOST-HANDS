@@ -95,7 +95,7 @@ async function detectBlockerSafe(
 // ---------------------------------------------------------------------------
 
 interface DecisionLoopResult {
-  terminalState: 'confirmation' | 'review_page' | 'submitted' | 'stuck' | 'budget_exceeded' | 'error' | 'max_iterations';
+  terminalState: 'confirmation' | 'review_page' | 'submitted' | 'blocked' | 'stuck' | 'budget_exceeded' | 'error' | 'max_iterations';
   terminationReason: string;
   iteration: number;
   pagesProcessed: number;
