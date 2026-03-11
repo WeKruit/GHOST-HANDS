@@ -28,6 +28,8 @@ import { VERIFICATION_INPUT_SELECTOR_QUERY } from '../verificationSelectors.js';
 const PAGE_TRANSITION_WAIT_MS = 3_000;
 const MAX_FORM_PAGES = 15;
 const MIN_LLM_GAP_MS = 5_000; // Minimum gap between LLM calls to stay under rate limits
+/** Polyfill for bun's __name() wrapper that crashes inside page.evaluate() after navigations. */
+const NAME_POLYFILL = 'if(typeof globalThis.__name==="undefined"){globalThis.__name=function(f){return f}}';
 
 // MagnitudeHand (Phase 2.75) — last-resort general GUI agent fallback
 const MAGNITUDE_HAND_BUDGET_CAP = 0.50;       // Max $ to spend in MagnitudeHand per page
@@ -358,18 +360,14 @@ export class SmartApplyHandler implements TaskHandler {
     // references into serialized page.evaluate() callbacks. Define it as a
     // no-op both now (for the current page) and via addInitScript (survives
     // SPA navigations).
-    const namePolyfill = 'if(typeof globalThis.__name==="undefined"){globalThis.__name=function(f){return f}}';
-    await adapter.page.addInitScript(namePolyfill);
-    await adapter.page.evaluate(namePolyfill);
+    await adapter.page.addInitScript(NAME_POLYFILL);
+    await adapter.page.evaluate(NAME_POLYFILL);
     this.attachPageDebugListeners(adapter);
 
-    // Resolve platform config from URL
-    // When running under Mastra, force generic config — skip platform-specific
-    // logic (e.g. Workday skills/dropdown handlers) so the generic flow is exercised.
-    const config = job.execution_mode === 'mastra'
-      ? detectPlatformFromUrl('')   // empty URL → GenericPlatformConfig
-      : detectPlatformFromUrl(job.target_url);
-    console.log(`[SmartApply] Platform: ${config.displayName} (${config.platformId})${job.execution_mode === 'mastra' ? ' (forced generic for Mastra)' : ''}`);
+    // Resolve platform config from URL (known platforms get optimized configs,
+    // unknown URLs fall back to GenericPlatformConfig automatically).
+    const config = detectPlatformFromUrl(job.target_url);
+    console.log(`[SmartApply] Platform: ${config.displayName} (${config.platformId})`);
     console.log(`[SmartApply] Starting application for ${job.target_url}`);
     console.log(`[SmartApply] Applicant: ${userProfile.first_name} ${userProfile.last_name}`);
 
@@ -737,6 +735,7 @@ export class SmartApplyHandler implements TaskHandler {
               progress,
               pageContext,
               ctx.llmClientConfig,
+              qaMap,
             );
 
             if (result === 'review') {
@@ -1160,13 +1159,19 @@ export class SmartApplyHandler implements TaskHandler {
    * Priority 1: Prefer Google SSO when available.
    */
   private async clickPreferredGoogleSignIn(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    // Selectors that explicitly reference Google sign-in / OAuth.
+    // IMPORTANT: Do NOT use broad selectors like [aria-label*="google" i]
+    // because that matches social media footer icons (e.g. Workday's
+    // "Follow Us" Google icon), which opens random Google blog pages.
     const selectors = [
       'button:has-text("Sign in with Google")',
       'button:has-text("Continue with Google")',
       'a:has-text("Sign in with Google")',
       'a:has-text("Continue with Google")',
-      '[data-automation-id*="google" i]',
-      '[aria-label*="google" i]',
+      '[data-automation-id*="googleSignIn" i]',
+      '[data-automation-id*="google_sign_in" i]',
+      '[aria-label*="sign in with google" i]',
+      '[aria-label*="continue with google" i]',
     ];
 
     for (const sel of selectors) {
@@ -1190,7 +1195,11 @@ export class SmartApplyHandler implements TaskHandler {
         const isGoogle = text.includes('google') || aria.includes('google');
         const isSignIn = text.includes('sign in') || text.includes('continue') || text.includes('log in')
           || aria.includes('sign in') || aria.includes('continue') || aria.includes('log in');
+        // Exclude footer/social links — they live inside footers, nav bars, or
+        // have very short text ("Google") without sign-in context.
         if (isGoogle && isSignIn) {
+          const inFooter = !!el.closest('footer, [role="contentinfo"], [class*="footer" i]');
+          if (inFooter) continue;
           el.click();
           return true;
         }
@@ -2153,6 +2162,22 @@ Click only ONE button, then report the task as done.`,
         return rect.width > 0 && rect.height > 0;
       };
 
+      // General heuristic: verification pages are simple (1-2 inputs).
+      // Application forms have many fields. If we see 4+ visible form inputs,
+      // this is a form page — not a verification challenge — regardless of
+      // whether some field names happen to contain "code" or "verification".
+      const allFormInputs = document.querySelectorAll<HTMLElement>(
+        'input[type="text"]:not([disabled]), input[type="email"]:not([disabled]), ' +
+        'input[type="tel"]:not([disabled]), input[type="number"]:not([disabled]), ' +
+        'select:not([disabled]), textarea:not([disabled]), ' +
+        '[role="combobox"]:not([aria-disabled="true"])'
+      );
+      let visibleFormFieldCount = 0;
+      for (const el of allFormInputs) {
+        if (isVisible(el)) visibleFormFieldCount++;
+        if (visibleFormFieldCount >= 4) return false;
+      }
+
       const text = document.body.innerText.toLowerCase();
       const keywordMatch =
         text.includes('enter verification code') ||
@@ -2170,7 +2195,17 @@ Click only ONE button, then report the task as done.`,
 
       const hasLikelyCodeInput = Array.from(document.querySelectorAll<HTMLInputElement>(
         verificationSelectorQuery,
-      )).some((input) => isVisible(input) && !input.disabled);
+      )).some((input) => {
+        if (!isVisible(input) || input.disabled) return false;
+        // Exclude common false positives: postal/zip code, country code, area code
+        const name = (input.name || '').toLowerCase();
+        const id = (input.id || '').toLowerCase();
+        const label = (input.getAttribute('aria-label') || '').toLowerCase();
+        const falsePositives = ['postal', 'zip', 'country', 'area', 'phone', 'mobile', 'currency'];
+        const combined = `${name} ${id} ${label}`;
+        if (falsePositives.some(fp => combined.includes(fp))) return false;
+        return true;
+      });
 
       // Prefer concrete UI signals. Generic instructional text alone is not enough.
       if (hasLikelyCodeInput) return true;
@@ -2469,6 +2504,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
     currentUrl: string;
     validationText: string;
   }> {
+    await adapter.page.evaluate(NAME_POLYFILL).catch(() => {});
     const currentUrl = await adapter.getCurrentUrl().catch(() => adapter.page.url() || '');
     const validationText = await this.readAccountCreationValidationText(adapter);
     const domState = await adapter.page.evaluate(() => {
@@ -2576,6 +2612,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
     progress?: TaskContext['progress'],
     pageContext?: PageContextService,
     llmClientConfig?: TaskContext['llmClientConfig'],
+    qaMap?: Record<string, string>,
   ): Promise<'navigated' | 'review' | 'complete'> {
     const MAX_DEPTH = 3;
 
@@ -2600,6 +2637,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       const fillResult = await fillFormOnPage(adapter.page, adapter, profileText, resumePath, {
         forceMagnitude: escalate,
         anthropicClientConfig: llmClientConfig?.anthropic,
+        qaMap,
         onVisualFillStart: progress
           ? () => progress.setStatusMessage?.('Attempting visual form fill...')
           : undefined,
@@ -2648,6 +2686,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
           progress,
           pageContext,
           llmClientConfig,
+          qaMap,
         );
       }
 
@@ -2705,6 +2744,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
           progress,
           pageContext,
           llmClientConfig,
+          qaMap,
         );
       }
 
@@ -2742,6 +2782,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
           progress,
           pageContext,
           llmClientConfig,
+          qaMap,
         );
       }
 
@@ -3355,6 +3396,10 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
     } catch {
       // Non-fatal
     }
+    // Re-inject __name polyfill after every navigation — patchright-core's
+    // addInitScript doesn't persist across all navigation types. Without this,
+    // bun-transpiled arrow functions crash inside page.evaluate().
+    await adapter.page.evaluate(NAME_POLYFILL).catch(() => {});
   }
 
   /**

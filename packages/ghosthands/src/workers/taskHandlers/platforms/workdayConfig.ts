@@ -400,6 +400,14 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
       'State/Province': p.address.state,
       'Phone Device Type': p.phone_device_type || 'Mobile',
       'Phone Type': p.phone_device_type || 'Mobile',
+      'Country Phone Code': p.phone_country_code || 'United States of America (+1)',
+      'Phone Country Code': p.phone_country_code || 'United States of America (+1)',
+      'Phone Extension': '',
+      // Prevent "I have a preferred name" checkbox — it reveals required fields that won't be filled
+      'I have a preferred name': 'no',
+      // Source / referral — use hierarchical format for Workday dropdowns
+      'How Did You Hear About Us': 'Job Board/Social Media Web Site > LinkedIn',
+      'How did you hear about this position': 'Job Board/Social Media Web Site > LinkedIn',
       // Name fields — specific entries MUST come before generic "Name"
       'First Name': p.first_name,
       'Legal First Name': p.first_name,

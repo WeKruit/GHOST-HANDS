@@ -28,6 +28,7 @@ import type { NormalizedQuestionDraft } from '../../context/QuestionNormalizer.j
 import type { AnswerDecision, AnswerMode, QuestionOutcome, QuestionSnapshot } from '../../context/types.js';
 import type { WorkdayUserProfile } from './workday/workdayTypes.js';
 import type { AnthropicClientConfig } from './types.js';
+import { findBestAnswer } from './platforms/genericConfig.js';
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -94,6 +95,8 @@ export interface FillFormOptions {
   observers?: FillObservers;
   anthropicClientConfig?: AnthropicClientConfig;
   onVisualFillStart?(): Promise<void> | void;
+  /** Platform-specific QA overrides (e.g. WorkdayConfig.buildQAMap). Keyed by field label. */
+  qaMap?: Record<string, string>;
 }
 
 interface GenerateResult {
@@ -1355,6 +1358,29 @@ async function dismissDropdown(page: Page): Promise<void> {
   await page.waitForTimeout(150);
 }
 
+/** Dismiss dropdown AND wait for activeListContainer to be removed from DOM.
+ *  Prevents Workday's shared portal from leaking stale options into subsequent dropdowns. */
+async function dismissDropdownAndWait(page: Page): Promise<void> {
+  await dismissDropdown(page);
+  // Wait up to 1.5s for Workday to remove the shared activeListContainer
+  for (let i = 0; i < 10; i++) {
+    const still = await page.evaluate(() => {
+      const c = (window as any).__ff?.queryOne?.('[data-automation-id="activeListContainer"]')
+        ?? document.querySelector('[data-automation-id="activeListContainer"]');
+      return c ? (c as HTMLElement).offsetHeight > 0 : false;
+    }).catch(() => false);
+    if (!still) return;
+    await page.waitForTimeout(150);
+  }
+  // Force one more dismiss if container is stubborn
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.evaluate(() => {
+    (document.activeElement as HTMLElement)?.blur();
+    document.body.click();
+  }).catch(() => {});
+  await page.waitForTimeout(200);
+}
+
 // ── Dropdown option discovery ────────────────────────────────
 
 /** Open each custom dropdown briefly to discover its options at fill-time.
@@ -1366,9 +1392,8 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
     if (!f.name) continue;
 
     try {
-      // Dismiss any lingering dropdown portal before opening next
-      await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
-      await page.waitForTimeout(300);
+      // Dismiss any lingering dropdown portal before opening next — wait for container to vanish
+      await dismissDropdownAndWait(page);
 
       await clickComboboxTrigger(page, f.id);
       await page.waitForTimeout(500);
@@ -1450,11 +1475,8 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
               allOptions.push(`${category} > ${sub}`);
             }
 
-            // Close and dismiss before next category
-            await page.keyboard.press('Escape');
-            await page.waitForTimeout(200);
-            await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
-            await page.waitForTimeout(200);
+            // Close and dismiss before next category — wait for container to vanish
+            await dismissDropdownAndWait(page);
           }
 
           f.options = allOptions;
@@ -1507,10 +1529,8 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
         }
       }
 
-      // Ensure dropdown is fully closed
-      await page.keyboard.press('Escape');
-      await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
-      await page.waitForTimeout(300);
+      // Ensure dropdown is fully closed — wait for container to vanish
+      await dismissDropdownAndWait(page);
     } catch {
       // Ignore — some fields won't open
     }
@@ -1960,6 +1980,12 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
       const answer = getAnswer(answers, field);
       const isSkillField = isSkillLikeFieldName(field.name);
 
+      // Explicitly empty answer (e.g. from qaMap override) → skip the field entirely
+      if (answer === '') {
+        console.log(`[formFiller]   skip ${tag} (answer explicitly empty)`);
+        return true;
+      }
+
       // Skip if already shows correct value
       if (answer && !field.isNative) {
         const currentDisplay = await page.evaluate((ffId) => {
@@ -2342,6 +2368,8 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
 
       // Use Playwright locator clicks (proper events for Workday UXI)
       try {
+        // Ensure no stale activeListContainer from previous dropdown fill
+        await dismissDropdownAndWait(page);
         await clickComboboxTrigger(page, field.id);
         await page.waitForTimeout(600);
 
@@ -3837,6 +3865,26 @@ export async function fillFormOnPage(
     console.log(`[formFiller] Total resolved answers: ${Object.keys(fieldIdToResolvedAnswer).length}.`);
   } else {
     console.log('[formFiller] No non-file fields for LLM — skipping answer generation.');
+  }
+
+  // 6d. Apply platform-specific QA overrides (e.g. "Phone Device Type" → "Mobile").
+  // These take priority over LLM answers since they come from known-correct platform config.
+  if (opts?.qaMap && Object.keys(opts.qaMap).length > 0) {
+    let qaOverrideCount = 0;
+    for (const field of llmFields) {
+      const qaAnswer = findBestAnswer(field.name, opts.qaMap);
+      if (qaAnswer != null) {
+        const prev = fieldIdToResolvedAnswer[field.id];
+        if (prev !== qaAnswer) {
+          console.log(`[formFiller] QA override: "${field.name}" "${prev ?? '(empty)'}" → "${qaAnswer}"`);
+          fieldIdToResolvedAnswer[field.id] = qaAnswer;
+          qaOverrideCount++;
+        }
+      }
+    }
+    if (qaOverrideCount > 0) {
+      console.log(`[formFiller] QA map overrode ${qaOverrideCount} answer(s).`);
+    }
   }
 
   // 7. Iterative fill loop

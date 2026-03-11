@@ -232,7 +232,16 @@ export class GenericPlatformConfig implements PlatformConfig {
         || bodyText.includes('check your email');
       const hasVerificationInput = Array.from(document.querySelectorAll<HTMLInputElement>(
         verificationSelectorQuery,
-      )).some((input) => isVisible(input) && !input.disabled);
+      )).some((input) => {
+        if (!isVisible(input) || input.disabled) return false;
+        // Exclude common false positives: postal/zip code, country code, phone, etc.
+        const name = (input.name || '').toLowerCase();
+        const id = (input.id || '').toLowerCase();
+        const label = (input.getAttribute('aria-label') || '').toLowerCase();
+        const combined = `${name} ${id} ${label}`;
+        if (['postal', 'zip', 'country', 'area', 'phone', 'mobile', 'currency'].some(fp => combined.includes(fp))) return false;
+        return true;
+      });
       const hasSignInWithGoogle = bodyText.includes('sign in with google') || bodyText.includes('continue with google');
       const hasSignInClickable = clickableTexts.some(t =>
         t === 'sign in' || t === 'log in' || t === 'login' ||
@@ -245,7 +254,17 @@ export class GenericPlatformConfig implements PlatformConfig {
         || headingText.includes('create account')
         || headingText.includes('register')
         || headingText.includes('sign up');
-      const isVerificationCodePage = (hasVerificationInput || hasVerificationKeyword) && !hasPasswordField;
+
+      // Verification pages are simple (1-2 inputs). If there are 4+ visible
+      // form fields, this is an application form, not a verification challenge.
+      const visibleFormFieldCount = Array.from(document.querySelectorAll(
+        'input[type="text"]:not([disabled]), input[type="email"]:not([disabled]), ' +
+        'input[type="tel"]:not([disabled]), input[type="number"]:not([disabled]), ' +
+        'select:not([disabled]), textarea:not([disabled]), ' +
+        '[role="combobox"]:not([aria-disabled="true"])'
+      )).filter((el) => isVisible(el)).length;
+      const isVerificationCodePage = visibleFormFieldCount < 4
+        && (hasVerificationInput || hasVerificationKeyword) && !hasPasswordField;
       // Require password field OR Google SSO OR (email + sign-in button).
       // A standalone "Sign In" link in a nav bar should NOT classify as login.
       const isLoginPage = (hasPasswordField && !isAccountCreation) || hasSignInWithGoogle ||
@@ -384,7 +403,15 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
         || allText.includes('check your email');
       const hasVerificationInput = Array.from(document.querySelectorAll<HTMLInputElement>(
         verificationSelectorQuery,
-      )).some((input) => isVisible(input) && !input.disabled);
+      )).some((input) => {
+        if (!isVisible(input) || input.disabled) return false;
+        const name = (input.name || '').toLowerCase();
+        const id = (input.id || '').toLowerCase();
+        const label = (input.getAttribute('aria-label') || '').toLowerCase();
+        const combined = `${name} ${id} ${label}`;
+        if (['postal', 'zip', 'country', 'area', 'phone', 'mobile', 'currency'].some(fp => combined.includes(fp))) return false;
+        return true;
+      });
       const hasSignInClickable = clickableTexts.some(t =>
         t === 'sign in' || t === 'log in' || t === 'login' || t === 'sign in with google'
       );
@@ -397,8 +424,9 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
       // Job listing: has an Apply button
       if (hasApplyButton) return 'job_listing' as PageType;
 
-      // Verification code challenge
-      if ((hasVerificationInput || hasVerificationKeyword) && !hasPasswordField) return 'verification_code' as PageType;
+      // Verification code challenge — only if page is simple (few fields).
+      // Application forms with 4+ inputs are not verification pages.
+      if ((hasVerificationInput || hasVerificationKeyword) && !hasPasswordField && allEditableInputs.length < 4) return 'verification_code' as PageType;
 
       // Login: has a sign-in button/link or password field
       if (hasPasswordField || hasSignInClickable) return 'login' as PageType;
@@ -534,6 +562,13 @@ IMPORTANT: Many job sites show a "Submit" button on EVERY page — this does NOT
       map['Phone Number'] = profile.phone;
       map['Mobile'] = profile.phone;
     }
+    map['Phone Device Type'] = profile.phone_device_type || 'Mobile';
+    map['Phone Type'] = profile.phone_device_type || 'Mobile';
+    map['Country Phone Code'] = profile.phone_country_code || 'United States of America (+1)';
+    map['Phone Country Code'] = profile.phone_country_code || 'United States of America (+1)';
+    map['Phone Extension'] = '';
+    // Prevent "I have a preferred name" checkbox — reveals required fields
+    map['I have a preferred name'] = 'no';
 
     // Address
     const addr = profile.address || {};

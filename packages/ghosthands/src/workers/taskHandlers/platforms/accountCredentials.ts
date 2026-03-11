@@ -162,6 +162,8 @@ export function resolvePlatformAccountEmail(
 ): string {
   const override = getPlatformOverride(profile, platform, options);
   return firstNonEmptyString(
+    // Dev/test override — will be replaced by VALET onboarding credentials
+    process.env.TEST_GMAIL_EMAIL,
     override?.email,
     override?.login_identifier,
     override?.loginIdentifier,
@@ -169,7 +171,6 @@ export function resolvePlatformAccountEmail(
     platform ? profile[`${platform}_email`] : undefined,
     platform ? profile[`${platform}Email`] : undefined,
     profile.email,
-    process.env.TEST_GMAIL_EMAIL,
   ) ?? '';
 }
 
@@ -306,6 +307,17 @@ export function resolvePlatformAccountPassword(
   platform: string | null,
   options?: { validationText?: string | null; sourceUrl?: string | null; domain?: string | null },
 ): { password: string; source: AccountPasswordSource } {
+  // Dev/test override — will be replaced by VALET onboarding credentials
+  if (process.env.TEST_GMAIL_PASSWORD?.trim()) {
+    return {
+      password: strengthenPasswordForRequirements(
+        process.env.TEST_GMAIL_PASSWORD,
+        inferPasswordRequirements(options?.validationText, platform),
+      ),
+      source: 'platform_override',
+    };
+  }
+
   const override = getPlatformOverride(profile, platform, options);
   const explicitPlatformPassword = firstNonEmptyString(
     override?.password,
@@ -347,16 +359,6 @@ export function resolvePlatformAccountPassword(
         inferPasswordRequirements(options?.validationText, platform),
       ),
       source: 'profile_password',
-    };
-  }
-
-  if (process.env.TEST_GMAIL_PASSWORD?.trim()) {
-    return {
-      password: strengthenPasswordForRequirements(
-        process.env.TEST_GMAIL_PASSWORD,
-        inferPasswordRequirements(options?.validationText, platform),
-      ),
-      source: 'env',
     };
   }
 
