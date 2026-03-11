@@ -1375,6 +1375,7 @@ export class JobExecutor {
     resumeFilePath: string | null;
     emailVerification?: EmailVerificationService | null;
     logEventFn: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
+    llmClientConfig?: { anthropic?: import('./taskHandlers/types.js').AnthropicClientConfig };
   }): Promise<void> {
     const {
       job,
@@ -1388,6 +1389,7 @@ export class JobExecutor {
       emailVerification,
       logEventFn,
     } = opts;
+    const llmClientConfig = opts.llmClientConfig;
     const logger = getLogger({ service: 'mastra-executor' });
     const pageContext = new LivePageContextService(
       job.id,
@@ -1412,6 +1414,7 @@ export class JobExecutor {
       logEvent: logEventFn,
       workerId: this.workerId,
       uploadScreenshot: (jid: string, name: string, buf: Buffer) => this.uploadScreenshot(jid, name, buf),
+      llmClientConfig,
 
       // Allow handlers to pause mid-execution for manual user actions (email verification, etc.)
       waitForManualAction: async (actionOpts) => {
@@ -1519,6 +1522,7 @@ export class JobExecutor {
               profile: (rt.job.metadata as Record<string, any>)?.profile ?? {},
               platform: options.platform,
               budgetUsd: options.budgetUsd,
+              anthropicConfig: rt.llmClientConfig?.anthropic,
               model: (rt.job.metadata as Record<string, any>)?.decision_model,
               onProgress: options.logEvent
                 ? (event: { type: string; message: string; iteration: number }) => {

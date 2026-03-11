@@ -5,7 +5,7 @@ import type { PageContextService } from '../../context/PageContextService.js';
 import type { CostTracker } from '../../workers/costControl.js';
 import type { ProgressTracker } from '../../workers/progressTracker.js';
 import type { EmailVerificationService } from '../../workers/emailVerification/types.js';
-import type { TaskHandler, AutomationJob } from '../../workers/taskHandlers/types.js';
+import type { TaskHandler, AutomationJob, AnthropicClientConfig } from '../../workers/taskHandlers/types.js';
 
 // ---------------------------------------------------------------------------
 // Serializable Workflow State (persisted by Mastra in PostgresStore)
@@ -109,6 +109,10 @@ export interface RuntimeContext {
   logEvent: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
   workerId: string;
   uploadScreenshot?: (jobId: string, name: string, buffer: Buffer) => Promise<string>;
+  /** LLM client config for the decision engine (VALET proxy baseURL + managed grant). */
+  llmClientConfig?: {
+    anthropic?: AnthropicClientConfig;
+  };
   /** Block handler execution until human completes a manual action (email verification, etc.) */
   waitForManualAction?: (options: {
     type: string;
