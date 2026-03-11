@@ -396,7 +396,7 @@ function isExplicitFalse(value?: string): boolean {
 
 async function readBinaryControlState(page: Page, ffId: string): Promise<boolean | null> {
   return page.evaluate((id) => {
-    const el = document.querySelector(`[data-ff-id="${id}"]`) as HTMLElement | null;
+    const el = (window as any).__ff?.byId(id) as HTMLElement | null;
     if (!el) return null;
 
     if (el.tagName === 'INPUT') {
@@ -454,18 +454,19 @@ async function uploadResumeIfPresent(page: Page, resumePath?: string | null): Pr
 
   // Get file inputs with their labels so we can skip non-resume fields
   const fileInputInfo = await page.evaluate(() => {
-    const inputs = Array.from(document.querySelectorAll('input[type="file"]')) as HTMLInputElement[];
+    const ff = (window as any).__ff;
+    const inputs = Array.from(ff?.queryAll('input[type="file"]') ?? []) as HTMLInputElement[];
     return inputs.map((input, idx) => {
       const hasFile = (input.files?.length || 0) > 0 || (input.value || '').trim().length > 0;
       // Gather accessible label: aria-label, associated <label>, or nearby text
       let label = input.getAttribute('aria-label') || '';
       if (!label) {
-        const labelEl = input.id ? document.querySelector(`label[for="${input.id}"]`) : null;
+        const labelEl = input.id ? ff?.queryOne(`label[for="${input.id}"]`) : null;
         label = labelEl?.textContent?.trim() || '';
       }
       if (!label) {
         // Check parent/sibling text
-        const parent = input.closest('.field, .form-group, .form-field, [class*="upload"]');
+        const parent = ff?.closestCrossRoot(input, '.field, .form-group, .form-field, [class*="upload"]');
         if (parent) {
           const clone = parent.cloneNode(true) as HTMLElement;
           clone.querySelectorAll('input, button').forEach((el: any) => el.remove());
@@ -635,13 +636,87 @@ async function injectHelpers(page: Page): Promise<void> {
     window.__ff = {
       SELECTOR: ${selectorStr},
 
+      rootParent: function(node) {
+        if (!node) return null;
+        if (node.parentElement) return node.parentElement;
+        var root = node.getRootNode ? node.getRootNode() : null;
+        if (root && root.host) return root.host;
+        return null;
+      },
+
+      allRoots: function() {
+        var roots = [document];
+        var seen = new Set([document]);
+        for (var i = 0; i < roots.length; i++) {
+          var root = roots[i];
+          if (!root.querySelectorAll) continue;
+          root.querySelectorAll('*').forEach(function(el) {
+            if (el.shadowRoot && !seen.has(el.shadowRoot)) {
+              seen.add(el.shadowRoot);
+              roots.push(el.shadowRoot);
+            }
+          });
+        }
+        return roots;
+      },
+
+      queryAll: function(selector) {
+        var results = [];
+        var seen = new Set();
+        window.__ff.allRoots().forEach(function(root) {
+          if (!root.querySelectorAll) return;
+          root.querySelectorAll(selector).forEach(function(el) {
+            if (seen.has(el)) return;
+            seen.add(el);
+            results.push(el);
+          });
+        });
+        return results;
+      },
+
+      queryOne: function(selector) {
+        var hits = window.__ff.queryAll(selector);
+        return hits.length > 0 ? hits[0] : null;
+      },
+
+      byId: function(id) {
+        return window.__ff.queryOne('[data-ff-id="' + id + '"]');
+      },
+
+      getByDomId: function(id) {
+        if (!id) return null;
+        var escapedId = String(id).replace(/"/g, '\\"');
+        var roots = window.__ff.allRoots();
+        for (var i = 0; i < roots.length; i++) {
+          var root = roots[i];
+          if (root.getElementById) {
+            var direct = root.getElementById(id);
+            if (direct) return direct;
+          }
+          if (root.querySelector) {
+            var queried = root.querySelector('[id="' + escapedId + '"]');
+            if (queried) return queried;
+          }
+        }
+        return null;
+      },
+
+      closestCrossRoot: function(el, selector) {
+        var node = el;
+        while (node) {
+          if (node.matches && node.matches(selector)) return node;
+          node = window.__ff.rootParent(node);
+        }
+        return null;
+      },
+
       getAccessibleName: function(el) {
         var lblBy = el.getAttribute('aria-labelledby');
         if (lblBy) {
-          var uxiC = el.closest('[data-uxi-widget-type]') || el.closest('[role="combobox"]');
+          var uxiC = window.__ff.closestCrossRoot(el, '[data-uxi-widget-type]') || window.__ff.closestCrossRoot(el, '[role="combobox"]');
           var t = lblBy.split(/\\s+/)
             .map(function(id) {
-              var r = document.getElementById(id);
+              var r = window.__ff.getByDomId(id);
               if (!r) return '';
               if (uxiC && uxiC.contains(r)) return '';
               if (el.contains(r)) return '';
@@ -670,7 +745,7 @@ async function injectHelpers(page: Page): Promise<void> {
           if (al) return al;
         }
         if (el.id) {
-          var lbl = document.querySelector('label[for="' + el.id + '"]');
+          var lbl = window.__ff.queryOne('label[for="' + el.id + '"]');
           if (lbl) {
             var c = lbl.cloneNode(true);
             c.querySelectorAll('input, .required, span[aria-hidden]').forEach(function(x) { x.remove(); });
@@ -681,10 +756,11 @@ async function injectHelpers(page: Page): Promise<void> {
         var from = el;
         var tp = el.type || el.getAttribute('role') || '';
         if (tp === 'checkbox' || tp === 'radio') {
-          var grp = el.closest('.checkbox-group, .radio-group, [role=group], [role=radiogroup]');
-          if (grp && grp.parentElement) from = grp.parentElement;
+          var grp = window.__ff.closestCrossRoot(el, '.checkbox-group, .radio-group, [role=group], [role=radiogroup]');
+          var grpParent = grp ? window.__ff.rootParent(grp) : null;
+          if (grp && grpParent) from = grpParent;
         }
-        var group = from.closest('.form-group, .field, .form-field, fieldset') || from;
+        var group = window.__ff.closestCrossRoot(from, '.form-group, .field, .form-field, fieldset') || from;
         var lbl2 = group.querySelector(':scope > label, :scope > legend');
         if (lbl2) {
           var c2 = lbl2.cloneNode(true);
@@ -693,9 +769,9 @@ async function injectHelpers(page: Page): Promise<void> {
           if (tx2) return tx2;
         }
         if (el.type === 'file') {
-          var card = el.closest('.card, .section, [class*="upload"], [class*="drop"]');
+          var card = window.__ff.closestCrossRoot(el, '.card, .section, [class*="upload"], [class*="drop"]');
           if (card) {
-            var parent = card.closest('.card, .section') || card;
+            var parent = window.__ff.closestCrossRoot(card, '.card, .section') || card;
             var hdr = parent.querySelector('h1, h2, h3, h4, legend, [class*="heading"], [class*="title"]');
             if (hdr) {
               var ht = hdr.textContent.trim();
@@ -712,17 +788,17 @@ async function injectHelpers(page: Page): Promise<void> {
           var s = window.getComputedStyle(n);
           if (s.display === 'none' || s.visibility === 'hidden') return false;
           if (n.getAttribute && n.getAttribute('aria-hidden') === 'true') return false;
-          n = n.parentElement;
+          n = window.__ff.rootParent(n);
         }
         return true;
       },
 
       getSection: function(el) {
-        var n = el.parentElement;
+        var n = window.__ff.rootParent(el);
         while (n) {
           var h = n.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > legend');
           if (h) return h.textContent.trim();
-          n = n.parentElement;
+          n = window.__ff.rootParent(n);
         }
         return '';
       },
@@ -747,15 +823,15 @@ async function extractFields(page: Page): Promise<FormField[]> {
     const out: any[] = [];
 
     const shouldSkip = (el: any): boolean => {
-      if (el.closest('[class*="select-dropdown"], [class*="select-option"]')) return true;
-      if (el.closest('.iti__dropdown-content')) return true;
-      if (el.closest('[data-automation-id="activeListContainer"]')) return true;
+      if (ff.closestCrossRoot(el, '[class*="select-dropdown"], [class*="select-option"]')) return true;
+      if (ff.closestCrossRoot(el, '.iti__dropdown-content')) return true;
+      if (ff.closestCrossRoot(el, '[data-automation-id="activeListContainer"]')) return true;
       if (el.getAttribute('role') === 'listbox' && el.closest('[role="combobox"]')) return true;
       if (el.getAttribute('role') === 'listbox' && el.id) {
-        const controller = document.querySelector('[role="combobox"][aria-controls="' + el.id + '"]');
+        const controller = ff.queryOne('[role="combobox"][aria-controls="' + el.id + '"]');
         if (controller) return true;
       }
-      if (el.tagName === 'INPUT' && el.type === 'search' && el.closest('[class*="dropdown"], [role="dialog"]')) return true;
+      if (el.tagName === 'INPUT' && el.type === 'search' && ff.closestCrossRoot(el, '[class*="dropdown"], [role="dialog"]')) return true;
       if (el.tagName === 'INPUT' && (el.type === 'radio' || el.type === 'checkbox') && window.getComputedStyle(el).display === 'none') return true;
       return false;
     };
@@ -766,7 +842,7 @@ async function extractFields(page: Page): Promise<FormField[]> {
       return clone.textContent?.trim() || '';
     };
 
-    document.querySelectorAll(ff.SELECTOR).forEach((el: any) => {
+    ff.queryAll(ff.SELECTOR).forEach((el: any) => {
       if (seen.has(el)) return;
       seen.add(el);
       if (shouldSkip(el)) return;
@@ -825,9 +901,9 @@ async function extractFields(page: Page): Promise<FormField[]> {
             .filter(Boolean);
         } else {
           const ctrlId = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
-          let src = ctrlId ? document.getElementById(ctrlId) : null;
+          let src = ctrlId ? ff.getByDomId(ctrlId) : null;
           if (!src && el.tagName === 'INPUT') {
-            src = el.closest('[class*="select"], [class*="combobox"], .form-group, .field');
+            src = ff.closestCrossRoot(el, '[class*="select"], [class*="combobox"], .form-group, .field');
           }
           if (!src) src = el;
           if (src) {
@@ -1100,12 +1176,13 @@ async function extractFields(page: Page): Promise<FormField[]> {
 
 async function clickComboboxTrigger(page: Page, id: string): Promise<void> {
   const targetSelector = await page.evaluate((ffId) => {
-    const el = document.querySelector(`[data-ff-id="${ffId}"]`) as HTMLElement;
+    const ff = (window as any).__ff;
+    const el = ff?.byId(ffId) as HTMLElement;
     if (!el) return null;
 
     if (el.tagName === 'INPUT') {
-      const control = el.closest('[class*="select__control"]') ||
-        el.closest('[class*="control"]') || el.closest('[class*="select-shell"]');
+      const control = ff?.closestCrossRoot(el, '[class*="select__control"]') ||
+        ff?.closestCrossRoot(el, '[class*="control"]') || ff?.closestCrossRoot(el, '[class*="select-shell"]');
       if (control) {
         if (!control.hasAttribute('data-ff-id')) {
           control.setAttribute('data-ff-click-target', ffId);
@@ -1141,6 +1218,7 @@ async function clickComboboxTrigger(page: Page, id: string): Promise<void> {
 /** Read de-duplicated option texts from any visible dropdown portal. */
 async function readActiveListOptions(page: Page): Promise<string[]> {
   return page.evaluate(() => {
+    const ff = (window as any).__ff;
     const results: string[] = [];
     function collect(items: Element[]) {
       for (const o of items) {
@@ -1152,20 +1230,20 @@ async function readActiveListOptions(page: Page): Promise<string[]> {
     }
 
     // 1. Workday activeListContainer portal
-    const container = document.querySelector('[data-automation-id="activeListContainer"]');
+    const container = ff?.queryOne('[data-automation-id="activeListContainer"]');
     if (container) {
-      let items = Array.from(container.querySelectorAll('[role="option"]'));
+      let items = Array.from(container.querySelectorAll('[role="option"]')) as Element[];
       if (items.length === 0) {
         items = Array.from(container.querySelectorAll(
           '[data-automation-id="promptOption"], [data-automation-id="menuItem"]'
-        ));
+        )) as Element[];
       }
       collect(items);
     }
 
     // 2. Any visible [role="listbox"]
     if (results.length === 0) {
-      const listboxes = document.querySelectorAll('[role="listbox"]');
+      const listboxes = ff?.queryAll('[role="listbox"]') ?? [];
       for (const lb of listboxes) {
         const r = (lb as HTMLElement).getBoundingClientRect();
         if (r.height > 0) {
@@ -1176,7 +1254,7 @@ async function readActiveListOptions(page: Page): Promise<string[]> {
 
     // 3. Any visible standalone [role="option"]
     if (results.length === 0) {
-      collect(Array.from(document.querySelectorAll('[role="option"]')).filter(el => {
+      collect(((ff?.queryAll('[role="option"]') ?? []) as Element[]).filter((el) => {
         const r = (el as HTMLElement).getBoundingClientRect();
         return r.height > 0;
       }));
@@ -1184,9 +1262,9 @@ async function readActiveListOptions(page: Page): Promise<string[]> {
 
     // 4. Generic dropdown li items
     if (results.length === 0) {
-      const dropdowns = document.querySelectorAll(
+      const dropdowns = ff?.queryAll(
         '[class*="dropdown"]:not([style*="display: none"]), [class*="menu"]:not([style*="display: none"]), [class*="listbox"]:not([style*="display: none"])'
-      );
+      ) ?? [];
       for (const dd of dropdowns) {
         const r = (dd as HTMLElement).getBoundingClientRect();
         if (r.height > 0) {
@@ -1301,7 +1379,7 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
       if (topLevel.length > 0) {
         // Detect chevrons indicating hierarchical sub-categories
         const hasChevrons = await page.evaluate(() => {
-          const container = document.querySelector('[data-automation-id="activeListContainer"]');
+          const container = (window as any).__ff?.queryOne('[data-automation-id="activeListContainer"]');
           if (!container) return false;
           return container.querySelector('svg.wd-icon-chevron-right-small') !== null ||
             container.querySelector('[data-uxi-multiselectlistitem-hassidecharm="true"]') !== null;
@@ -1326,7 +1404,7 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
 
             // Read sub-options, handling virtualized lists
             const info = await page.evaluate(() => {
-              const c = document.querySelector('[data-automation-id="activeListContainer"]');
+              const c = (window as any).__ff?.queryOne('[data-automation-id="activeListContainer"]');
               if (!c) return { setsize: 0, texts: [] as string[] };
               const items = c.querySelectorAll('[role="option"]');
               const setsize = parseInt(items[0]?.getAttribute('aria-setsize') || '0', 10);
@@ -1343,13 +1421,13 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
             if (info.setsize > info.texts.length) {
               for (let scrollAttempt = 0; scrollAttempt < 20; scrollAttempt++) {
                 await page.evaluate(() => {
-                  const c = document.querySelector('[data-automation-id="activeListContainer"]') as HTMLElement;
+                  const c = (window as any).__ff?.queryOne('[data-automation-id="activeListContainer"]') as HTMLElement;
                   if (c) c.scrollTop += 300;
                 });
                 await page.waitForTimeout(200);
 
                 const moreTexts = await page.evaluate(() => {
-                  const c = document.querySelector('[data-automation-id="activeListContainer"]');
+                  const c = (window as any).__ff?.queryOne('[data-automation-id="activeListContainer"]');
                   if (!c) return [];
                   return Array.from(c.querySelectorAll('[role="option"]'))
                     .filter((o: any) => o.getBoundingClientRect().height > 0)
@@ -1389,9 +1467,9 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
       } else {
         // No activeListContainer — fall back to standard option extraction
         const options = await page.evaluate((ffId) => {
-          const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-          if (!el) return [];
           const ff = (window as any).__ff;
+          const el = ff?.byId(ffId);
+          if (!el) return [];
           const results: string[] = [];
 
           function collect(container: Element) {
@@ -1407,15 +1485,15 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
           collect(el);
           const ctrlId = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
           if (ctrlId) {
-            const popup = document.getElementById(ctrlId);
+            const popup = ff?.getByDomId(ctrlId);
             if (popup) collect(popup);
           }
           if (el.tagName === 'INPUT') {
-            const container = el.closest('[class*="select"], [class*="combobox"], .form-group');
+            const container = ff?.closestCrossRoot(el, '[class*="select"], [class*="combobox"], .form-group');
             if (container) collect(container);
           }
           // Workday button dropdowns
-          const listboxes = document.querySelectorAll('[role="listbox"]');
+          const listboxes = ff?.queryAll('[role="listbox"]') ?? [];
           for (const lb of listboxes) {
             const r = (lb as HTMLElement).getBoundingClientRect();
             if (r.height > 0) collect(lb);
@@ -1654,11 +1732,11 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
 
   const exists = await page.evaluate(({ ffId, type }) => {
     const ff = (window as any).__ff;
-    const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+    const el = ff.byId(ffId);
     if (!el) return false;
     if (ff.isVisible(el)) return true;
     if (type === 'file') {
-      const container = el.closest('[class*=upload], [class*=drop], .form-group, .field');
+      const container = ff.closestCrossRoot(el, '[class*=upload], [class*=drop], .form-group, .field');
       return container ? ff.isVisible(container) : false;
     }
     return false;
@@ -1675,7 +1753,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
     case 'search': {
       // Detect searchable dropdowns (Workday selectinput, comboboxes, etc.)
       const searchDropdown = await page.evaluate((ffId) => {
-        const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+        const el = (window as any).__ff?.byId(ffId);
         if (!el) return false;
         return (
           el.getAttribute('role') === 'combobox' ||
@@ -1774,19 +1852,24 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
       try {
         // Workday date components
         const isWorkdayDate = await page.evaluate((ffId) => {
-          const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+          const ff = (window as any).__ff;
+          const el = ff?.byId(ffId);
           if (!el) return false;
           const auto = el.getAttribute('data-automation-id') || '';
           if (auto.includes('dateSection')) return true;
-          const parent = el.closest('[data-automation-id*="dateSection"]');
+          const parent = ff?.closestCrossRoot(el, '[data-automation-id*="dateSection"]');
           return !!parent;
         }, field.id);
 
         if (isWorkdayDate) {
           await page.evaluate((ffId) => {
-            const el = document.querySelector(`[data-ff-id="${ffId}"]`) as HTMLElement;
+            const ff = (window as any).__ff;
+            const el = ff?.byId(ffId) as HTMLElement;
             if (!el) return;
-            const section = el.closest('[data-automation-id*="dateSection"]:not([data-automation-id*="-input"]):not([data-automation-id*="-display"])') as HTMLElement;
+            const section = ff?.closestCrossRoot(
+              el,
+              '[data-automation-id*="dateSection"]:not([data-automation-id*="-input"]):not([data-automation-id*="-display"])'
+            ) as HTMLElement;
             if (section) section.click();
             else el.parentElement?.click();
           }, field.id);
@@ -1880,12 +1963,13 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
       // Skip if already shows correct value
       if (answer && !field.isNative) {
         const currentDisplay = await page.evaluate((ffId) => {
-          const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+          const ff = (window as any).__ff;
+          const el = ff?.byId(ffId);
           if (!el) return '';
           if (el.tagName === 'INPUT') return (el as HTMLInputElement).value.trim();
           const searchInput = el.querySelector('[data-automation-id="searchBox"], .wd-selectinput-search');
           if (searchInput) return (searchInput as HTMLInputElement).value.trim();
-          const pills = el.closest('[data-automation-id]')
+          const pills = ff?.closestCrossRoot(el, '[data-automation-id]')
             ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
           if (pills) return pills.textContent?.trim() || '';
           const trigger = el.querySelector('.custom-select-trigger, .multi-select-trigger, [class*="select-trigger"]');
@@ -1910,7 +1994,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
             } catch {
               const matched = await page.evaluate(
                 ({ ffId, text }) => {
-                  const el = document.querySelector(`[data-ff-id="${ffId}"]`) as HTMLSelectElement;
+                  const el = (window as any).__ff?.byId(ffId) as HTMLSelectElement;
                   if (!el) return null;
                   const lower = text.toLowerCase();
                   for (const opt of el.options) {
@@ -1989,8 +2073,9 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
           let added = 0;
           for (const val of values) {
             const beforePillCount = await page.evaluate((ffId) => {
-              const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-              const scope = el?.closest('[data-automation-id], .form-group, .field, form') || document;
+              const ff = (window as any).__ff;
+              const el = ff?.byId(ffId);
+              const scope = ff?.closestCrossRoot(el, '[data-automation-id], .form-group, .field, form') || document;
               return scope.querySelectorAll(
                 '[data-automation-id="multiSelectPill"], [data-automation-id="selectedItem"], [class*="pill"]'
               ).length;
@@ -2008,8 +2093,9 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
               // Tag matching option and click with Playwright locator
               try {
                 const tagged = await page.evaluate((searchText) => {
-                  document.querySelectorAll('[data-ff-click-target="skill"]').forEach(el => el.removeAttribute('data-ff-click-target'));
-                  const containers = document.querySelectorAll(
+                  const ff = (window as any).__ff;
+                  ff.queryAll('[data-ff-click-target="skill"]').forEach((el: Element) => el.removeAttribute('data-ff-click-target'));
+                  const containers = ff.queryAll(
                     '[role="listbox"], [data-automation-id="activeListContainer"], ' +
                     '[class*="dropdown"], [class*="suggestions"], [class*="autocomplete"]'
                   );
@@ -2030,7 +2116,10 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
                 }, val);
                 if (tagged) {
                   await page.locator('[data-ff-click-target="skill"]').first().click({ timeout: 2000 });
-                  await page.evaluate(() => document.querySelectorAll('[data-ff-click-target="skill"]').forEach(el => el.removeAttribute('data-ff-click-target')));
+                  await page.evaluate(() =>
+                    (window as any).__ff?.queryAll('[data-ff-click-target="skill"]')
+                      .forEach((el: Element) => el.removeAttribute('data-ff-click-target'))
+                  );
                   picked = true;
                 }
               } catch { /* no dropdown */ }
@@ -2053,8 +2142,9 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
               if (!picked) {
                 try {
                   const tagged = await page.evaluate((searchText) => {
-                    document.querySelectorAll('[data-ff-click-target="skill"]').forEach(el => el.removeAttribute('data-ff-click-target'));
-                    const containers = document.querySelectorAll(
+                    const ff = (window as any).__ff;
+                    ff.queryAll('[data-ff-click-target="skill"]').forEach((el: Element) => el.removeAttribute('data-ff-click-target'));
+                    const containers = ff.queryAll(
                       '[role="listbox"], [data-automation-id="activeListContainer"], ' +
                       '[class*="dropdown"], [class*="suggestions"], [class*="autocomplete"]'
                     );
@@ -2075,7 +2165,10 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
                   }, val);
                   if (tagged) {
                     await page.locator('[data-ff-click-target="skill"]').first().click({ timeout: 2000 });
-                    await page.evaluate(() => document.querySelectorAll('[data-ff-click-target="skill"]').forEach(el => el.removeAttribute('data-ff-click-target')));
+                    await page.evaluate(() =>
+                      (window as any).__ff?.queryAll('[data-ff-click-target="skill"]')
+                        .forEach((el: Element) => el.removeAttribute('data-ff-click-target'))
+                    );
                     picked = true;
                   }
                 } catch { /* no dropdown */ }
@@ -2088,8 +2181,9 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
             }
 
             const afterPillCount = await page.evaluate((ffId) => {
-              const el = document.querySelector(`[data-ff-id="${ffId}"]`);
-              const scope = el?.closest('[data-automation-id], .form-group, .field, form') || document;
+              const ff = (window as any).__ff;
+              const el = ff?.byId(ffId);
+              const scope = ff?.closestCrossRoot(el, '[data-automation-id], .form-group, .field, form') || document;
               return scope.querySelectorAll(
                 '[data-automation-id="multiSelectPill"], [data-automation-id="selectedItem"], [class*="pill"]'
               ).length;
@@ -2136,7 +2230,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
           await page.waitForTimeout(500);
 
           const hasContainer = await page.evaluate(() =>
-            !!document.querySelector('[data-automation-id="activeListContainer"]')
+            !!(window as any).__ff?.queryOne('[data-automation-id="activeListContainer"]')
           );
 
           if (hasContainer) {
@@ -2145,16 +2239,17 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
               await page.waitForTimeout(1000);
 
               const portalOpen = await page.evaluate(() =>
-                !!document.querySelector('[data-automation-id="activeListContainer"]')
+                !!(window as any).__ff?.queryOne('[data-automation-id="activeListContainer"]')
               );
 
               if (portalOpen) {
                 // Find and click sub-option, handling virtualized lists
                 const findAndTag = async (): Promise<boolean> => {
                   return page.evaluate((searchText) => {
-                    const c = document.querySelector('[data-automation-id="activeListContainer"]');
+                    const ff = (window as any).__ff;
+                    const c = ff?.queryOne('[data-automation-id="activeListContainer"]');
                     if (!c) return false;
-                    const items = Array.from(c.querySelectorAll('[role="option"]'));
+                    const items = Array.from(c.querySelectorAll('[role="option"]')) as Element[];
                     const lower = searchText.toLowerCase().trim();
                     for (const item of items) {
                       const r = (item as HTMLElement).getBoundingClientRect();
@@ -2175,7 +2270,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
                 if (!foundSub) {
                   for (let scrollAttempt = 0; scrollAttempt < 30; scrollAttempt++) {
                     await page.evaluate(() => {
-                      const c = document.querySelector('[data-automation-id="activeListContainer"]') as HTMLElement;
+                      const c = (window as any).__ff?.queryOne('[data-automation-id="activeListContainer"]') as HTMLElement;
                       if (c) c.scrollTop += 300;
                     });
                     await page.waitForTimeout(150);
@@ -2186,7 +2281,10 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
 
                 if (foundSub) {
                   await page.locator('[data-ff-click-target="sub"]').first().click({ timeout: 2000 });
-                  await page.evaluate(() => document.querySelectorAll('[data-ff-click-target]').forEach(el => el.removeAttribute('data-ff-click-target')));
+                  await page.evaluate(() =>
+                    (window as any).__ff?.queryAll('[data-ff-click-target]')
+                      .forEach((el: Element) => el.removeAttribute('data-ff-click-target'))
+                  );
                   await dismissDropdown(page);
                   console.log(`[formFiller]   select ${tag} → "${category} > ${value}"`);
                   return true;
@@ -2258,7 +2356,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
         // Type-to-search: if selectinput has a search box, type to filter
         try {
           const hasSearch = await page.evaluate((ffId) => {
-            const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+            const el = (window as any).__ff?.byId(ffId);
             if (!el) return false;
             const input = el.querySelector('input[type="text"], input:not([type])') as HTMLInputElement;
             if (input && document.activeElement === input) return true;
@@ -2335,11 +2433,12 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
         // Native <select> fallback: hidden native select inside/near element
         try {
           const nativeSelect = await page.evaluate((ffId) => {
-            const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+            const ff = (window as any).__ff;
+            const el = ff?.byId(ffId);
             if (!el) return null;
             let sel = el.querySelector('select') as HTMLSelectElement | null;
             if (!sel) {
-              const group = el.closest('.form-group, .field, .form-field, fieldset, .select-container');
+              const group = ff?.closestCrossRoot(el, '.form-group, .field, .form-field, fieldset, .select-container');
               if (group) sel = group.querySelector('select');
             }
             if (!sel && el.nextElementSibling?.tagName === 'SELECT') {
@@ -2360,7 +2459,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
             } catch {
               const matched = await page.evaluate(
                 ({ selector, text }) => {
-                  const el = document.querySelector(selector) as HTMLSelectElement;
+                  const el = (window as any).__ff?.queryOne(selector) as HTMLSelectElement;
                   if (!el) return null;
                   const lower = text.toLowerCase();
                   for (const o of el.options) {
@@ -2394,9 +2493,10 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
       const choice = getAnswer(answers, field) ?? field.choices?.[0];
       const clicked = await page.evaluate(
         ({ ffId, text }) => {
-          const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+          const ff = (window as any).__ff;
+          const el = ff?.byId(ffId);
           if (!el) return false;
-          const group = el.closest('[role="radiogroup"], [role="group"], .radio-cards, .radio-group') || el;
+          const group = ff?.closestCrossRoot(el, '[role="radiogroup"], [role="group"], .radio-cards, .radio-group') || el;
           const items = group.querySelectorAll('[role="radio"], label.radio-card, .radio-card');
           if (text) {
             for (const item of items) {
@@ -2423,9 +2523,10 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
       }
       const status = await page.evaluate(
         ({ ffId, text }) => {
+          const ff = (window as any).__ff;
           const normalize = (v: string) => v.trim().toLowerCase();
           const target = normalize(text);
-          const el = document.querySelector(`[data-ff-id="${ffId}"]`) as HTMLElement | null;
+          const el = ff?.byId(ffId) as HTMLElement | null;
           if (!el) return { clicked: false, alreadyChecked: false };
 
           const ownInput = (el.tagName === 'INPUT' ? el : el.querySelector('input[type="radio"]')) as HTMLInputElement | null;
@@ -2433,21 +2534,24 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
           if (ownInput?.name) {
             const root: ParentNode = ownInput.form || document;
             radios = Array.from(root.querySelectorAll<HTMLInputElement>(`input[type="radio"][name="${CSS.escape(ownInput.name)}"]`));
+            if (radios.length === 0) {
+              radios = ff?.queryAll(`input[type="radio"][name="${CSS.escape(ownInput.name)}"]`) ?? [];
+            }
           } else {
-            const group = el.closest('[role="radiogroup"], [role="group"], fieldset, .radio-group') || el.parentElement || el;
+            const group = ff?.closestCrossRoot(el, '[role="radiogroup"], [role="group"], fieldset, .radio-group') || ff?.rootParent(el) || el;
             radios = Array.from(group.querySelectorAll('input[type="radio"], [role="radio"]')) as Array<HTMLInputElement | HTMLElement>;
           }
           if (radios.length === 0) radios = [el];
 
           const getLabel = (node: HTMLInputElement | HTMLElement): string => {
             if (node instanceof HTMLInputElement && node.id) {
-              const byFor = document.querySelector(`label[for="${CSS.escape(node.id)}"]`);
+              const byFor = ff?.queryOne(`label[for="${CSS.escape(node.id)}"]`);
               if (byFor?.textContent?.trim()) return byFor.textContent.trim();
             }
             const nodeEl = node as HTMLElement;
             const ariaLabel = nodeEl.getAttribute('aria-label');
             if (ariaLabel?.trim()) return ariaLabel.trim();
-            const wrap = nodeEl.closest('label, [role="radio"], .radio-card, .radio-option');
+            const wrap = ff?.closestCrossRoot(nodeEl, 'label, [role="radio"], .radio-card, .radio-option');
             return (wrap?.textContent || nodeEl.textContent || '').trim();
           };
 
@@ -2499,7 +2603,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
       }
       const clicked = await page.evaluate(
         ({ ffId, text }) => {
-          const container = document.querySelector(`[data-ff-id="${ffId}"]`);
+          const container = (window as any).__ff?.byId(ffId);
           if (!container) return false;
           const textLower = text.toLowerCase().trim();
           const btns = container.querySelectorAll('button, [role="button"]');
@@ -2536,9 +2640,10 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
         return true;
       }
       const status = await page.evaluate((ffId) => {
-        const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+        const ff = (window as any).__ff;
+        const el = ff?.byId(ffId);
         if (!el) return { clicked: false, alreadyChecked: false };
-        const group = el.closest('.checkbox-group, [role="group"]') || el;
+        const group = ff?.closestCrossRoot(el, '.checkbox-group, [role="group"]') || el;
         const cbs = Array.from(group.querySelectorAll('input[type="checkbox"], [role="checkbox"]')) as HTMLElement[];
         if (cbs.length === 0) return { clicked: false, alreadyChecked: false };
         for (const cb of cbs) {
@@ -2578,9 +2683,10 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
         }
       } catch {
         const clicked = await page.evaluate((ffId) => {
-          const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+          const ff = (window as any).__ff;
+          const el = ff?.byId(ffId);
           if (!el) return false;
-          const label = el.closest('label') || el;
+          const label = ff?.closestCrossRoot(el, 'label') || el;
           (label as HTMLElement).click();
           return true;
         }, field.id);
@@ -2611,7 +2717,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
         return true;
       }
       await page.evaluate((ffId) => {
-        const el = document.querySelector(`[data-ff-id="${ffId}"]`) as any;
+        const el = (window as any).__ff?.byId(ffId) as any;
         if (el) el.click();
       }, field.id);
       const after = await readBinaryControlState(page, field.id);
@@ -2652,20 +2758,21 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
       } catch {
         try {
           const fallbackSelector = await page.evaluate((ffId) => {
-            const root = document.querySelector(`[data-ff-id="${ffId}"]`);
+            const ff = (window as any).__ff;
+            const root = ff?.byId(ffId);
             const candidates: HTMLInputElement[] = [];
 
             if (root instanceof HTMLInputElement && root.type === 'file') {
               candidates.push(root);
             }
 
-            const container = root?.closest('form, .form-group, .field, .form-field, [data-automation-id]') || document;
-            container.querySelectorAll('input[type="file"]').forEach((el) => {
+            const container = ff?.closestCrossRoot(root, 'form, .form-group, .field, .form-field, [data-automation-id]') || document;
+            container.querySelectorAll('input[type="file"]').forEach((el: Element) => {
               candidates.push(el as HTMLInputElement);
             });
 
             if (candidates.length === 0) {
-              document.querySelectorAll('input[type="file"]').forEach((el) => {
+              ff.queryAll('input[type="file"]').forEach((el: Element) => {
                 candidates.push(el as HTMLInputElement);
               });
             }
@@ -2702,7 +2809,8 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
 
 async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
   return page.evaluate(([ffId, phSource]) => {
-    const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+    const ff = (window as any).__ff;
+    const el = ff?.byId(ffId);
     if (!el) return true;
     const tag = el.tagName;
     const type = (el as HTMLInputElement).type || '';
@@ -2730,8 +2838,10 @@ async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
     if (type === 'radio') {
       const name = (el as HTMLInputElement).name;
       if (name) {
-        const form = el.closest('form') || document;
-        return !!form.querySelector(`input[type="radio"][name="${name}"]:checked`);
+        const form = ff?.closestCrossRoot(el, 'form') || document;
+        const scoped = form.querySelector(`input[type="radio"][name="${name}"]:checked`);
+        if (scoped) return true;
+        return ff?.queryOne(`input[type="radio"][name="${name}"]:checked`) != null;
       }
       return (el as HTMLInputElement).checked;
     }
@@ -2761,7 +2871,7 @@ async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
       const text = trigger?.textContent?.trim() || '';
       if (text && !new RegExp(phSource, 'i').test(text)) return true;
       // Check Workday pills
-      const pills = el.closest('[data-automation-id]')
+      const pills = ff?.closestCrossRoot(el, '[data-automation-id]')
         ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
       if (pills && pills.textContent?.trim()) return true;
       // Check inner input value
@@ -2772,7 +2882,7 @@ async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
     if (role === 'combobox' && tag === 'INPUT') return ((el as HTMLInputElement).value?.trim() || '').length > 0;
     // Workday selectinput/button: check for selected text
     if (el.getAttribute('data-uxi-widget-type') === 'selectinput' || el.getAttribute('aria-haspopup') === 'listbox') {
-      const pills = el.closest('[data-automation-id]')
+      const pills = ff?.closestCrossRoot(el, '[data-automation-id]')
         ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
       if (pills && pills.textContent?.trim()) return true;
       const innerInput = el.querySelector('input');
@@ -2784,7 +2894,8 @@ async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
 
 async function hasFieldValueForRerender(page: Page, ffId: string): Promise<boolean> {
   return page.evaluate(([id, phSource]) => {
-    const el = document.querySelector(`[data-ff-id="${id}"]`) as HTMLElement | null;
+    const ff = (window as any).__ff;
+    const el = ff?.byId(id) as HTMLElement | null;
     if (!el) return false;
 
     const tag = el.tagName;
@@ -2813,7 +2924,7 @@ async function hasFieldValueForRerender(page: Page, ffId: string): Promise<boole
     }
 
     if (role === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox') {
-      const pills = el.closest('[data-automation-id]')
+      const pills = ff?.closestCrossRoot(el, '[data-automation-id]')
         ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
       if (pills && pills.textContent?.trim()) return true;
       const input = (el as HTMLInputElement).value ? (el as HTMLInputElement) : el.querySelector('input');
@@ -3991,7 +4102,7 @@ export async function fillFormOnPage(
       }
 
       await page.evaluate((ffId) => {
-        const el = document.querySelector(`[data-ff-id="${ffId}"]`);
+        const el = (window as any).__ff?.byId(ffId);
         el?.scrollIntoView({ block: 'center', behavior: 'auto' });
       }, field.id);
       await page.waitForTimeout(300);
@@ -4022,7 +4133,7 @@ export async function fillFormOnPage(
         }
       } else if (field.type === 'search' || field.type === 'text') {
         const role = await page.evaluate((ffId) => {
-          return document.querySelector(`[data-ff-id="${ffId}"]`)?.getAttribute('role') || '';
+          return (window as any).__ff?.byId(ffId)?.getAttribute('role') || '';
         }, field.id);
         if (role === 'combobox') {
           prompt += `. This is an autocomplete/typeahead field. Type the value, wait for suggestions to appear, then click the matching suggestion from the dropdown.`;
