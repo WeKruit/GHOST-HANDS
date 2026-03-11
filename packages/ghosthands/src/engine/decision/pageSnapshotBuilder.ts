@@ -1,9 +1,17 @@
 import type { Page } from 'playwright';
+import type { BrowserAutomationAdapter } from '../../adapters/types';
 import { detectPageType, detectPlatform } from '../PageObserver';
 import { PageScanner } from '../v3/PageScanner';
+import { extractAXFields } from './axTreeExtractor';
+import type { AXFieldNode, DurableFieldRecord, MergedPageObservation } from './mergedObserverTypes';
+import { mergeObservations } from './observerMerger';
 import { PLATFORM_GUARDRAILS } from './prompts';
 import type { ActionHistoryEntry, PageDecisionContext } from './types';
 import { PageDecisionContextSchema } from './types';
+
+export type ObservationScope = 'current_view' | 'full_page_audit';
+
+const MAX_AX_EXTRACTION_MS = 200;
 
 type ExtractorResult<T> = {
   ok: boolean;
@@ -38,6 +46,8 @@ export class PageSnapshotBuilder {
   constructor(
     private readonly platform?: string,
     private readonly viewportOnly: boolean = true,
+    private readonly scope: ObservationScope = 'current_view',
+    private readonly adapter?: BrowserAutomationAdapter,
   ) {}
 
   async buildSnapshot(
@@ -45,7 +55,11 @@ export class PageSnapshotBuilder {
     actionHistory: ActionHistoryEntry[] = [],
   ): Promise<PageDecisionContext> {
     const url = page.url();
-    const platform = this.platform || detectPlatform(url);
+    const normalizedHint = (this.platform || '').trim().toLowerCase();
+    const platform =
+      !normalizedHint || normalizedHint === 'other' || normalizedHint === 'generic' || normalizedHint === 'unknown'
+        ? detectPlatform(url)
+        : this.platform!;
     const scanner = new PageScanner(page, platform);
 
     // Inject shadow DOM traversal helpers so repeater detection and fingerprinting
@@ -53,7 +67,7 @@ export class PageSnapshotBuilder {
     await this.injectShadowDOMHelpers(page);
 
     const scanResult = await safeExtract(
-      async () => scanner.scan(),
+      async () => this.scope === 'current_view' ? scanner.scanCurrentViewport() : scanner.scan(),
       {
         url,
         platform,
@@ -71,6 +85,7 @@ export class PageSnapshotBuilder {
       titleResult,
       pageTypeResult,
       headingsResult,
+      quickProbeResult,
       repeatersResult,
       fingerprintResult,
       blockerResult,
@@ -79,6 +94,13 @@ export class PageSnapshotBuilder {
       safeExtract(async () => page.title(), ''),
       safeExtract(async () => detectPageType(page), scanResult.value.pageType ?? 'unknown'),
       safeExtract(async () => this.extractHeadings(page), [] as string[]),
+      safeExtract(async () => this.quickProbeVisibleControls(page), {
+        headings: [] as string[],
+        fields: [] as PageDecisionContext['fields'],
+        buttons: [] as PageDecisionContext['buttons'],
+        fieldCount: 0,
+        filledCount: 0,
+      }),
       safeExtract(async () => this.detectRepeaters(page), [] as PageDecisionContext['repeaters']),
       safeExtract(async () => this.extractFingerprint(page), {
         heading: scanResult.value.pageLabel ?? '',
@@ -97,12 +119,13 @@ export class PageSnapshotBuilder {
       safeExtract(async () => this.extractStepContext(page), null),
     ]);
 
-    const totalExtractors = 8;
+    const totalExtractors = 9;
     const successfulExtractors = [
       scanResult.ok,
       titleResult.ok,
       pageTypeResult.ok,
       headingsResult.ok,
+      quickProbeResult.ok,
       repeatersResult.ok,
       fingerprintResult.ok,
       blockerResult.ok,
@@ -115,11 +138,12 @@ export class PageSnapshotBuilder {
       platform,
       pageType: pageTypeResult.value || scanResult.value.pageType || 'unknown',
       headings: headingsResult.value,
-      fields: scanResult.value.fields.map((field) => ({
+      fields: scanResult.value.fields.map((field, ordinalIndex) => ({
         id: field.id,
         selector: field.selector,
         label: field.label || field.name || field.fieldId || field.id,
         fieldType: field.fieldType,
+        ordinalIndex,
         isRequired: field.isRequired,
         isVisible: field.isVisible,
         isDisabled: field.isDisabled,
@@ -145,9 +169,47 @@ export class PageSnapshotBuilder {
       observedAt: Date.now(),
     };
 
+    if (this.scope === 'current_view') {
+      if (snapshot.headings.length === 0 && quickProbeResult.value.headings.length > 0) {
+        snapshot.headings = quickProbeResult.value.headings.slice(0, 25);
+      }
+
+      const mergedFields = new Map(snapshot.fields.map((field) => [field.selector, field] as const));
+      for (const field of quickProbeResult.value.fields) {
+        if (!mergedFields.has(field.selector)) {
+          mergedFields.set(field.selector, field);
+        }
+      }
+      snapshot.fields = Array.from(mergedFields.values());
+      snapshot.fields.forEach((field, idx) => { field.ordinalIndex = idx; });
+
+      const mergedButtons = new Map(snapshot.buttons.map((button) => [button.selector, button] as const));
+      for (const button of quickProbeResult.value.buttons) {
+        if (!mergedButtons.has(button.selector)) {
+          mergedButtons.set(button.selector, button);
+        }
+      }
+      snapshot.buttons = Array.from(mergedButtons.values());
+
+      snapshot.fingerprint.fieldCount = Math.max(
+        snapshot.fingerprint.fieldCount,
+        quickProbeResult.value.fieldCount,
+        snapshot.fields.length,
+      );
+      snapshot.fingerprint.filledCount = Math.max(
+        snapshot.fingerprint.filledCount,
+        quickProbeResult.value.filledCount,
+        snapshot.fields.filter((field) => !field.isEmpty).length,
+      );
+      snapshot.fingerprint.hash = hashString(
+        `${snapshot.fingerprint.heading}|fields:${snapshot.fingerprint.fieldCount}|filled:${snapshot.fingerprint.filledCount}|active:${snapshot.fingerprint.activeStep}`,
+      );
+    }
+
     // Filter to viewport-visible elements only to avoid exposing offscreen
-    // submit buttons and future-step CTAs to the LLM prematurely
-    if (this.viewportOnly) {
+    // submit buttons and future-step CTAs to the LLM prematurely.
+    // Current-view scans are already limited to the visible viewport.
+    if (this.viewportOnly && this.scope !== 'current_view') {
       const visibleSelectors = await this.getViewportVisibleSelectors(page, [
         ...snapshot.fields.map((f) => f.selector),
         ...snapshot.buttons.map((b) => b.selector),
@@ -157,6 +219,183 @@ export class PageSnapshotBuilder {
     }
 
     return PageDecisionContextSchema.parse(snapshot);
+  }
+
+  async buildMergedSnapshot(
+    page: Page,
+    actionHistory: ActionHistoryEntry[] = [],
+    durableContext: Map<string, DurableFieldRecord> = new Map(),
+    tiebreakerFn?: Parameters<typeof mergeObservations>[3],
+    domSnapshotOverride?: PageDecisionContext,
+    adapter: Parameters<typeof mergeObservations>[5] = this.adapter,
+  ): Promise<MergedPageObservation> {
+    const domSnapshot = domSnapshotOverride ?? await this.buildSnapshot(page, actionHistory);
+    const axFields = await Promise.race<AXFieldNode[]>([
+      extractAXFields(page),
+      new Promise<AXFieldNode[]>((resolve) => {
+        setTimeout(() => resolve([]), MAX_AX_EXTRACTION_MS);
+      }),
+    ]);
+
+    return mergeObservations(domSnapshot, axFields, durableContext, tiebreakerFn, page, adapter);
+  }
+
+  private async quickProbeVisibleControls(
+    page: Page,
+  ): Promise<{
+    headings: string[];
+    fields: PageDecisionContext['fields'];
+    buttons: PageDecisionContext['buttons'];
+    fieldCount: number;
+    filledCount: number;
+  }> {
+    return page.evaluate((scope: ObservationScope) => {
+      const ff = (window as Window & { __ff?: any }).__ff;
+      const qAll = <T extends Element = HTMLElement>(selector: string): T[] =>
+        ff?.queryAll?.(selector) ?? Array.from(document.querySelectorAll<T>(selector));
+      const inView = (node: Element | null): node is HTMLElement => {
+        if (!(node instanceof HTMLElement)) return false;
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+        if (node.getAttribute('aria-hidden') === 'true') return false;
+        if (scope === 'current_view') {
+          return rect.bottom > 0 && rect.top < window.innerHeight;
+        }
+        return true;
+      };
+      const buildSelector = (el: Element, prefix: string, idx: number): string => {
+        const id = el.getAttribute('id');
+        if (id) return `#${CSS.escape(id)}`;
+        const testId = el.getAttribute('data-testid');
+        if (testId) return `[data-testid="${CSS.escape(testId)}"]`;
+        const autoId = el.getAttribute('data-automation-id');
+        if (autoId) return `[data-automation-id="${CSS.escape(autoId)}"]`;
+        const name = el.getAttribute('name');
+        if (name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`;
+        const marker = `${prefix}-${idx}`;
+        el.setAttribute('data-gh-quick-probe', marker);
+        return `[data-gh-quick-probe="${marker}"]`;
+      };
+      const labelFor = (el: Element): string => {
+        const direct = (
+          el.getAttribute('aria-label') ||
+          el.getAttribute('placeholder') ||
+          ('labels' in el && (el as HTMLInputElement).labels && (el as HTMLInputElement).labels![0]?.textContent) ||
+          ''
+        ).trim();
+        if (direct) return direct.replace(/\s+/g, ' ').trim();
+        const id = el.getAttribute('id');
+        if (id) {
+          const label = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+          const text = (label?.textContent || '').replace(/\s+/g, ' ').trim();
+          if (text) return text.replace(/\*/g, '').trim();
+        }
+        const previous = el.previousElementSibling;
+        const prevText = (previous?.textContent || '').replace(/\s+/g, ' ').trim();
+        if (prevText) return prevText.replace(/\*/g, '').trim();
+        const name = el.getAttribute('name') || el.getAttribute('id') || el.tagName.toLowerCase();
+        return name.replace(/[_-]/g, ' ').replace(/([A-Z])/g, ' $1').replace(/\s+/g, ' ').trim();
+      };
+
+      const headings = Array.from(
+        new Set(
+          qAll<HTMLElement>('h1, h2, h3, h4, legend, [role="heading"]')
+            .filter((node) => inView(node))
+            .map((node) => (node.textContent || '').replace(/\s+/g, ' ').trim())
+            .filter(Boolean),
+        ),
+      ).slice(0, 25);
+
+      let filledCount = 0;
+      const fields = qAll<HTMLElement>(
+        'input:not([type="hidden"]), textarea, select, [role="combobox"], [contenteditable="true"]',
+      )
+        .filter((node) => inView(node) && !node.hasAttribute('disabled'))
+        .map((node, index) => {
+          const tag = node.tagName.toLowerCase();
+          const rawType = (node.getAttribute('type') || '').toLowerCase();
+          const fieldType: PageDecisionContext['fields'][number]['fieldType'] =
+            tag === 'textarea'
+              ? 'textarea'
+              : tag === 'select'
+                ? 'select'
+                : tag === 'input' && rawType === 'email'
+                  ? 'email'
+                  : tag === 'input' && rawType === 'tel'
+                    ? 'phone'
+                    : tag === 'input' && rawType === 'number'
+                      ? 'number'
+                      : tag === 'input' && rawType === 'date'
+                        ? 'date'
+                        : tag === 'input' && rawType === 'password'
+                          ? 'password'
+                          : rawType === 'checkbox'
+                            ? 'checkbox'
+                            : node.getAttribute('role') === 'combobox'
+                              ? 'custom_dropdown'
+                              : tag === 'input' || tag === 'div'
+                                ? 'text'
+                                : 'unknown';
+          const currentValue =
+            tag === 'input' || tag === 'textarea' || tag === 'select'
+              ? ((node as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement).value || '')
+              : (node.textContent || '').trim();
+          const isEmpty = !currentValue.trim();
+          if (!isEmpty) filledCount += 1;
+          return {
+            id: `quick-field-${index}`,
+            selector: buildSelector(node, 'field', index),
+            label: labelFor(node) || `Field ${index + 1}`,
+            fieldType,
+            ordinalIndex: index,
+            isRequired:
+              node.getAttribute('aria-required') === 'true' ||
+              (tag === 'input' || tag === 'textarea' || tag === 'select'
+                ? (node as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement).required
+                : false),
+            isVisible: true,
+            isDisabled: false,
+            isEmpty,
+            currentValue,
+          };
+        });
+
+      const buttons = qAll<HTMLElement>('button, [role="button"], input[type="submit"], input[type="button"]')
+        .filter((node) => inView(node) && node.getAttribute('aria-disabled') !== 'true' && !node.hasAttribute('disabled'))
+        .map((node, index) => {
+          const text = (
+            node.textContent ||
+            (node as HTMLInputElement).value ||
+            node.getAttribute('aria-label') ||
+            ''
+          ).replace(/\s+/g, ' ').trim();
+          return {
+            selector: buildSelector(node, 'button', index),
+            text,
+            role: (
+              /apply|submit/i.test(text)
+                ? 'submit'
+                : /continue|next|save/i.test(text)
+                  ? 'navigation'
+                  : /add/i.test(text)
+                    ? 'add'
+                    : 'unknown'
+            ) as PageDecisionContext['buttons'][number]['role'],
+            isDisabled: false,
+          };
+        })
+        .filter((button) => button.text.length > 0);
+
+      return {
+        headings,
+        fields,
+        buttons,
+        fieldCount: fields.length,
+        filledCount,
+      };
+    }, this.scope);
   }
 
   /**
@@ -191,13 +430,14 @@ export class PageSnapshotBuilder {
   }
 
   private async extractHeadings(page: Page): Promise<string[]> {
-    return page.evaluate(() => {
+    return page.evaluate((scope: ObservationScope) => {
       const ff = (window as Window & { __ff?: any }).__ff;
       const selectors = 'h1, h2, h3, h4, legend, [role="heading"]';
       const nodes: HTMLElement[] = ff?.queryAll?.(selectors) ?? Array.from(document.querySelectorAll<HTMLElement>(selectors));
       const visible = nodes.filter((node) => {
         const rect = node.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return false;
+        if (scope === 'current_view' && (rect.bottom <= 0 || rect.top >= window.innerHeight)) return false;
         const style = window.getComputedStyle(node);
         return (
           style.display !== 'none' &&
@@ -211,7 +451,7 @@ export class PageSnapshotBuilder {
           .map((node) => (node.textContent || '').replace(/\s+/g, ' ').trim())
           .filter(Boolean),
       )).slice(0, 25);
-    });
+    }, this.scope);
   }
 
   private async detectRepeaters(page: Page): Promise<PageDecisionContext['repeaters']> {
@@ -350,12 +590,23 @@ export class PageSnapshotBuilder {
   private async extractFingerprint(
     page: Page,
   ): Promise<PageDecisionContext['fingerprint']> {
-    const fingerprint = await page.evaluate(() => {
+    const fingerprint = await page.evaluate((scope: ObservationScope) => {
       const ff = (window as Window & { __ff?: any }).__ff;
       const qAll = <T extends Element = HTMLElement>(selector: string): T[] =>
         ff?.queryAll?.(selector) ?? Array.from(document.querySelectorAll<T>(selector));
+      const inCurrentView = (node: Element | null): boolean => {
+        if (!(node instanceof HTMLElement)) return false;
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+        if (scope === 'current_view') {
+          return rect.bottom > 0 && rect.top < window.innerHeight;
+        }
+        return true;
+      };
 
-      const headingNode = qAll<HTMLElement>('h1, h2, h3, [role="heading"]')[0] ?? null;
+      const headingNode = qAll<HTMLElement>('h1, h2, h3, [role="heading"]').find((node) => inCurrentView(node)) ?? null;
       const heading = (headingNode?.textContent || '').trim().substring(0, 60);
 
       const fields = qAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(
@@ -364,8 +615,7 @@ export class PageSnapshotBuilder {
       let fieldCount = 0;
       let filledCount = 0;
       for (const field of fields) {
-        const rect = field.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
+        if (inCurrentView(field)) {
           fieldCount++;
           if (field.value && field.value.trim()) filledCount++;
         }
@@ -391,7 +641,7 @@ export class PageSnapshotBuilder {
       }
 
       return { heading, fieldCount, filledCount, activeStep };
-    });
+    }, this.scope);
 
     const base = `${fingerprint.heading}|fields:${fingerprint.fieldCount}|filled:${fingerprint.filledCount}|active:${fingerprint.activeStep}`;
     return {

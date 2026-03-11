@@ -33,6 +33,7 @@ export interface InteractionInfo {
 export interface CallbackPayload {
   job_id: string;
   valet_task_id: string | null;
+  valet_user_id?: string | null;
   status: 'completed' | 'failed' | 'needs_human' | 'resumed' | 'running' | 'awaiting_review';
   worker_id?: string;
   result_data?: Record<string, any>;
@@ -84,6 +85,7 @@ export class CallbackNotifier {
   async notifyFromJob(job: {
     id: string;
     valet_task_id?: string | null;
+    user_id?: string | null;
     callback_url?: string | null;
     status: string;
     worker_id?: string;
@@ -106,6 +108,7 @@ export class CallbackNotifier {
     const payload: CallbackPayload = {
       job_id: job.id,
       valet_task_id: job.valet_task_id || null,
+      ...(job.user_id ? { valet_user_id: job.user_id } : {}),
       status:
         job.status === 'awaiting_review'
           ? 'awaiting_review'
@@ -310,9 +313,17 @@ export class CallbackNotifier {
           return true;
         }
 
+        let responseBody: string | undefined;
+        try {
+          responseBody = (await response.text()).slice(0, 500);
+        } catch {
+          responseBody = undefined;
+        }
+
         logger.warn('Callback returned non-OK status', {
           url, jobId: payload.job_id, status: response.status,
           attempt: attempt + 1, maxAttempts: MAX_RETRIES + 1,
+          ...(responseBody ? { body: responseBody } : {}),
         });
       } catch (err) {
         logger.warn('Callback request failed', {

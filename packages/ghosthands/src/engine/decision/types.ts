@@ -40,6 +40,7 @@ export const FieldSnapshotSchema = z.object({
   selector: z.string().min(1),
   label: z.string().min(1),
   fieldType: z.enum(FIELD_TYPE_VALUES),
+  ordinalIndex: z.number().int().nonnegative(),
   isRequired: z.boolean(),
   isVisible: z.boolean(),
   isDisabled: z.boolean(),

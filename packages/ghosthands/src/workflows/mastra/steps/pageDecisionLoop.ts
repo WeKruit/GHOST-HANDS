@@ -96,6 +96,7 @@ async function detectBlockerSafe(
 
 import type { DecisionLoopState, ActionHistoryEntry } from '../../../engine/decision/types.js';
 import type { CostTracker } from '../../../workers/costControl.js';
+import type { PageContextService } from '../../../context/PageContextService.js';
 
 /** Result returned by DecisionLoopRunner.run() */
 type DecisionLoopResult = DecisionLoopState & {
@@ -120,6 +121,7 @@ interface DecisionLoopRunnerFactory {
     logEvent: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
     previousActionHistory?: ActionHistoryEntry[];
     previousIteration?: number;
+    pageContext?: PageContextService;
   }): DecisionLoopRunnerInterface;
 }
 
@@ -273,6 +275,7 @@ export function buildPageDecisionLoopStep(
           logEvent: rt.logEvent,
           previousActionHistory: state.decisionLoop.actionHistory,
           previousIteration: state.decisionLoop.iteration,
+          pageContext: rt.pageContext,
         });
 
         result = await runner.run();

@@ -6,6 +6,16 @@ import * as path from 'path';
 
 let _logStream: fs.WriteStream | null = null;
 let _logStreamInitialized = false;
+let _workerLogPath: string | null = null;
+let _activeJobLogStream: fs.WriteStream | null = null;
+let _activeJobLogPath: string | null = null;
+let _activeJobActSummaryPath: string | null = null;
+let _activeJobInferenceLogStream: fs.WriteStream | null = null;
+let _activeJobInferenceLogPath: string | null = null;
+
+function ensureLogDir(dirPath: string): void {
+  if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
+}
 
 export function getLogStream(): fs.WriteStream | null {
   if (_logStreamInitialized) return _logStream;
@@ -13,15 +23,119 @@ export function getLogStream(): fs.WriteStream | null {
 
   if (process.env.GH_LOG_FILE !== 'true') return null;
 
+  const configuredPath = process.env.GH_LOG_FILE_PATH?.trim();
   const logsDir = path.resolve(process.cwd(), 'logs');
-  if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const logPath = path.join(logsDir, `worker-${timestamp}.log`);
-  _logStream = fs.createWriteStream(logPath, { flags: 'a' });
+  const logPath = configuredPath
+    ? path.resolve(configuredPath)
+    : path.join(logsDir, `worker-${timestamp}.log`);
+  const logDir = path.dirname(logPath);
+  ensureLogDir(logDir);
+  const flags = process.env.GH_LOG_FILE_TRUNCATE === 'true' ? 'w' : 'a';
+  _logStream = fs.createWriteStream(logPath, { flags });
+  _workerLogPath = logPath;
   // Log to console so the user knows where the file is
   console.log(`[logger] Writing logs to: ${logPath}`);
   return _logStream;
 }
+
+export function getWorkerLogPath(): string | null {
+  getLogStream();
+  return _workerLogPath;
+}
+
+function closeJobLogStream(): void {
+  if (_activeJobInferenceLogStream) {
+    _activeJobInferenceLogStream.end();
+    _activeJobInferenceLogStream = null;
+  }
+  if (_activeJobLogStream) {
+    _activeJobLogStream.end();
+    _activeJobLogStream = null;
+  }
+  _activeJobLogPath = null;
+  _activeJobActSummaryPath = null;
+  _activeJobInferenceLogPath = null;
+}
+
+export function startJobLogCapture(
+  jobId: string,
+): { logPath: string; actSummaryPath: string; inferenceLogPath: string } | null {
+  if (process.env.GH_LOG_FILE !== 'true') return null;
+
+  closeJobLogStream();
+
+  const jobsDir = path.resolve(process.cwd(), 'logs', 'jobs');
+  ensureLogDir(jobsDir);
+
+  const safeJobId = jobId.replace(/[^a-zA-Z0-9._-]+/g, '-');
+  const logPath = path.join(jobsDir, `${safeJobId}.log.txt`);
+  const actSummaryPath = path.join(jobsDir, `${safeJobId}.act_summary.json`);
+  const inferenceLogPath = path.join(jobsDir, `${safeJobId}.inference.log.txt`);
+
+  _activeJobLogStream = fs.createWriteStream(logPath, { flags: 'w' });
+  _activeJobInferenceLogStream = fs.createWriteStream(inferenceLogPath, { flags: 'w' });
+  _activeJobLogPath = logPath;
+  _activeJobActSummaryPath = actSummaryPath;
+  _activeJobInferenceLogPath = inferenceLogPath;
+  _activeJobLogStream.write(
+    [
+      `=== job-log-start ${new Date().toISOString()} ===`,
+      `jobId=${jobId}`,
+      `workerLogPath=${_workerLogPath ?? ''}`,
+      `jobLogPath=${logPath}`,
+      `actSummaryPath=${actSummaryPath}`,
+      `inferenceLogPath=${inferenceLogPath}`,
+      '',
+    ].join('\n'),
+  );
+  _activeJobInferenceLogStream.write(
+    [
+      `=== inference-log-start ${new Date().toISOString()} ===`,
+      `jobId=${jobId}`,
+      `workerLogPath=${_workerLogPath ?? ''}`,
+      `jobLogPath=${logPath}`,
+      `actSummaryPath=${actSummaryPath}`,
+      `inferenceLogPath=${inferenceLogPath}`,
+      '',
+    ].join('\n'),
+  );
+
+  return { logPath, actSummaryPath, inferenceLogPath };
+}
+
+export function stopJobLogCapture(): void {
+  closeJobLogStream();
+}
+
+export function getActiveJobLogPath(): string | null {
+  return _activeJobLogPath;
+}
+
+export function getActiveJobActSummaryPath(): string | null {
+  return _activeJobActSummaryPath;
+}
+
+export function getActiveJobInferenceLogPath(): string | null {
+  return _activeJobInferenceLogPath;
+}
+
+export function writeMirroredOutput(raw: string): void {
+  const text = raw.replace(/\x1b\[[0-9;]*m/g, '');
+  getLogStream();
+  if (_logStream) _logStream.write(text);
+  if (_activeJobLogStream) _activeJobLogStream.write(text);
+}
+
+export function writeInferenceOutput(raw: string): void {
+  const text = raw.replace(/\x1b\[[0-9;]*m/g, '');
+  if (_activeJobInferenceLogStream) _activeJobInferenceLogStream.write(text);
+}
+
+process.on('exit', () => {
+  if (_logStream) _logStream.end();
+  closeJobLogStream();
+});
 
 // --- Types ---
 

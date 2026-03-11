@@ -16,9 +16,15 @@ if (!(process.stdout.write as any).__ghFiltered) {
   let _suppressingBaml = false;
 
   function _suppress(
+    chunk?: any,
     encodingOrCb?: BufferEncoding | ((err?: Error) => void),
     cb?: (err?: Error) => void,
   ): boolean {
+    if (chunk !== undefined) {
+      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      writeMirroredOutput(text);
+      writeInferenceOutput(text);
+    }
     const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
     if (callback) callback();
     return true;
@@ -31,15 +37,15 @@ if (!(process.stdout.write as any).__ghFiltered) {
     origWrite: typeof process.stdout.write = _origStdoutWrite,
   ): boolean {
     const str = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-    if (str.includes('\u25C6 [act]')) return _suppress(encodingOrCb, cb);
-    if (str.includes('[BAML')) { _suppressingBaml = true; return _suppress(encodingOrCb, cb); }
+    if (str.includes('\u25C6 [act]')) return _suppress(chunk, encodingOrCb, cb);
+    if (str.includes('[BAML')) { _suppressingBaml = true; return _suppress(chunk, encodingOrCb, cb); }
     if (_suppressingBaml) {
       const trimmed = str.trimStart();
       if (trimmed.startsWith('[') && !trimmed.startsWith('[BAML')) {
         _suppressingBaml = false;
         return origWrite(chunk, encodingOrCb as any, cb as any);
       }
-      return _suppress(encodingOrCb, cb);
+      return _suppress(chunk, encodingOrCb, cb);
     }
     return origWrite(chunk, encodingOrCb as any, cb as any);
   }
@@ -63,7 +69,8 @@ import { JobPoller } from './JobPoller.js';
 import { PgBossConsumer } from './PgBossConsumer.js';
 import { JobExecutor } from './JobExecutor.js';
 import { registerBuiltinHandlers } from './taskHandlers/index.js';
-import { getLogger, getLogStream } from '../monitoring/logger.js';
+import { getLogger, getLogStream, writeInferenceOutput, writeMirroredOutput } from '../monitoring/logger.js';
+import { startInferenceSummaryMirror } from '../monitoring/inferenceSummaryMirror.js';
 import { fetchEc2InstanceId, fetchEc2Ip, completeLifecycleAction } from './asg-lifecycle.js';
 import { resolveWorkerId } from './resolveWorkerId.js';
 import { SessionManager } from '../sessions/SessionManager.js';
@@ -88,22 +95,31 @@ const logger = getLogger({ service: 'Worker' });
 
     console.log = (...args: any[]) => {
       origLog(...args);
-      stream.write(stripAnsi(args.map(String).join(' ')) + '\n');
+      writeMirroredOutput(stripAnsi(args.map(String).join(' ')) + '\n');
     };
     console.error = (...args: any[]) => {
       origError(...args);
-      stream.write(stripAnsi(args.map(String).join(' ')) + '\n');
+      writeMirroredOutput(stripAnsi(args.map(String).join(' ')) + '\n');
     };
     console.warn = (...args: any[]) => {
       origWarn(...args);
-      stream.write(stripAnsi(args.map(String).join(' ')) + '\n');
+      writeMirroredOutput(stripAnsi(args.map(String).join(' ')) + '\n');
     };
     console.debug = (...args: any[]) => {
       origDebug(...args);
-      stream.write(stripAnsi(args.map(String).join(' ')) + '\n');
+      writeMirroredOutput(stripAnsi(args.map(String).join(' ')) + '\n');
     };
+
+    if (process.env.GH_LOG_FILE_PATH) {
+      console.log(`[logger] Writing logs to: ${process.env.GH_LOG_FILE_PATH}`);
+    }
+    if (process.env.GH_ACT_SUMMARY_MIRROR_PATH) {
+      console.log(`[logger] Action summary mirror path: ${process.env.GH_ACT_SUMMARY_MIRROR_PATH}`);
+    }
   }
 }
+
+startInferenceSummaryMirror();
 
 /**
  * GhostHands Worker Entry Point
@@ -281,6 +297,58 @@ async function main(): Promise<void> {
   // SIGTERM arrives while fetchEc2InstanceId() is still in-flight).
   let ec2InstanceId: string = 'unknown';
 
+  const cancelLocalWorkerJobs = async (signal: string): Promise<void> => {
+    if (ec2InstanceId !== 'unknown') return;
+
+    try {
+      const result = await pgDirect.query(
+        `
+        UPDATE gh_automation_jobs
+        SET
+          status = 'cancelled',
+          completed_at = NOW(),
+          updated_at = NOW(),
+          error_details = COALESCE(error_details, '{}'::jsonb) || jsonb_build_object(
+            'cancelled_by', $1::TEXT,
+            'reason', 'worker_shutdown_local_dev',
+            'signal', $2::TEXT
+          )
+        WHERE
+          (
+            worker_id = $1
+            AND status IN ('queued', 'running', 'paused', 'needs_human', 'awaiting_review')
+          )
+          OR (
+            target_worker_id = $1
+            AND status IN ('pending', 'queued')
+          )
+          OR (
+            status = 'pending'
+            AND error_details->>'released_by' = $1
+            AND error_details->>'reason' = 'worker_shutdown'
+          )
+        RETURNING id
+        `,
+        [WORKER_ID, signal],
+      );
+
+      if (result.rows.length > 0) {
+        logger.info('Cancelled local worker jobs on shutdown', {
+          signal,
+          workerId: WORKER_ID,
+          count: result.rows.length,
+          jobIds: result.rows.map((row: { id: string }) => row.id),
+        });
+      }
+    } catch (err) {
+      logger.warn('Local shutdown job cancellation failed', {
+        signal,
+        workerId: WORKER_ID,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) {
       // Second signal -- force shutdown
@@ -288,6 +356,7 @@ async function main(): Promise<void> {
       logger.info('Force-releasing claimed jobs');
       try {
         await releaseJobs();
+        await cancelLocalWorkerJobs(signal);
       } catch (err) {
         logger.error('Force release failed', { error: err instanceof Error ? err.message : String(err) });
       }
@@ -310,6 +379,7 @@ async function main(): Promise<void> {
     if (boss) {
       try { await boss.stop({ graceful: true, timeout: 10_000 }); } catch { /* ignore */ }
     }
+    await cancelLocalWorkerJobs(signal);
     await deregisterWorker();
 
     // Complete ASG lifecycle action if configured (signals ASG that

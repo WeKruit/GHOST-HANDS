@@ -174,7 +174,7 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
 
     const start = Date.now();
     const ACT_TIMEOUT_MS = context?.timeoutMs ?? 60_000;
-    const MAX_SCHEMA_RETRIES = 1;
+    const MAX_SCHEMA_RETRIES = 2;
     let instructionWithFormatHint = instruction;
 
     for (let attempt = 0; attempt <= MAX_SCHEMA_RETRIES; attempt++) {
@@ -209,10 +209,26 @@ export class MagnitudeAdapter implements HitlCapableAdapter {
         const missingReasoningField =
           /missing required field:\s*reasoning/i.test(msg)
           || (/failed while parsing required fields/i.test(msg) && /reasoning/i.test(msg));
+        const noActionsGenerated =
+          /no actions generated/i.test(msg)
+          || /actions:\s*\[\s*\]/i.test(msg)
+          || /expected.*actions/i.test(msg);
+        const malformedClickCoordinates =
+          /failed while parsing required fields/i.test(msg)
+          || /invalid json/i.test(msg)
+          || /mouse:click/i.test(msg)
+          || /variant/i.test(msg) && /x|y/i.test(msg);
 
-        if (missingReasoningField && attempt < MAX_SCHEMA_RETRIES) {
+        if ((missingReasoningField || noActionsGenerated || malformedClickCoordinates) && attempt < MAX_SCHEMA_RETRIES) {
           instructionWithFormatHint =
-            `${instruction}\n\nFORMAT REQUIREMENT: Include a non-empty "reasoning" field and exactly one action.`;
+            [
+              instruction,
+              'FORMAT REQUIREMENT:',
+              '- Include a non-empty "reasoning" field.',
+              '- Always return at least one action.',
+              '- If you use mouse:click, x and y MUST each be plain integers, never arrays, never strings, never bracketed values.',
+              '- Return exactly one immediate next action unless task completion is directly observed.',
+            ].join('\n');
           continue;
         }
 

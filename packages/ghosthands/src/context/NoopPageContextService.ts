@@ -34,6 +34,11 @@ export class NoopPageContextService implements PageContextService {
       riskyQuestionKeys: [],
     };
   }
+  async annotateActivePage(
+    _metadata: Record<string, unknown>,
+    _notes?: string,
+    _actor?: 'system' | 'dom' | 'llm' | 'magnitude' | 'human' | 'mastra',
+  ): Promise<void> {}
   async finalizeActivePage(_input?: PageFinalizeInput): Promise<void> {}
   async markAwaitingReview(): Promise<void> {}
   async markFailed(): Promise<void> {}

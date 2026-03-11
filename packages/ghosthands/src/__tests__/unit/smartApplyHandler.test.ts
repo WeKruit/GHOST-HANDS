@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   SmartApplyHandler,
   inferAccountCreationTransition,
+  resolvePlatformConfigForExecution,
+  shouldAllowGoogleSsoForLogin,
   shouldStopForManualReviewAfterStableRepeat,
 } from '../../workers/taskHandlers/smartApplyHandler.js';
 
@@ -104,6 +106,10 @@ describe('SmartApplyHandler', () => {
         note: 'Generated a tenant-scoped Workday credential.',
       },
     );
+    mutableHandler.confirmGeneratedPlatformCredential(
+      'workday',
+      'https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers/login?redirect=apply',
+    );
 
     const result = mutableHandler.withAccountCreationMetadata({
       success: true,
@@ -163,6 +169,33 @@ describe('SmartApplyHandler', () => {
         totalFields: 16,
         pageType: 'personal_info',
       }),
+    ).toBe(false);
+  });
+
+  test('preserves Workday platform config for mastra execution', () => {
+    const config = resolvePlatformConfigForExecution(
+      'https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers/job/SAN-JOSE/Software-Engineer-I_R53533-1/apply/applyManually',
+      'mastra',
+    );
+
+    expect(config.platformId).toBe('workday');
+  });
+
+  test('disables Google SSO on Workday-host login flows', () => {
+    expect(
+      shouldAllowGoogleSsoForLogin(
+        'https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers/login?redirect=apply',
+        {},
+      ),
+    ).toBe(false);
+  });
+
+  test('disables Google SSO after account creation even on non-Workday hosts', () => {
+    expect(
+      shouldAllowGoogleSsoForLogin(
+        'https://jobs.example.com/login',
+        { _accountCreationCompleted: true },
+      ),
     ).toBe(false);
   });
 });

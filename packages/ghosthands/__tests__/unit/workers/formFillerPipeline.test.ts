@@ -5,8 +5,12 @@ import type { AnswerMode } from '../../../src/context/types';
 import {
   applyNeverEmptyFallback,
   buildFallbackDecisions,
+  classifyFieldContextState,
   classifyFallbackAnswerMode,
+  getAnswerForField,
   isPlaceholderValue,
+  matchesSelectDisplayValue,
+  resolveDesiredAnswerForField,
   sanitizeNoGuessAnswer,
 } from '../../../src/workers/taskHandlers/formFiller';
 import { redactSensitiveValue } from '../../../src/context/PageContextReducer';
@@ -17,7 +21,7 @@ import { redactSensitiveValue } from '../../../src/context/PageContextReducer';
  */
 
 describe('formFiller observation pipeline integration', () => {
-  it('planned answers map back to field IDs via fieldIdToResolvedAnswer', () => {
+  it('does not blindly copy grouped planned answers onto every field in the group', () => {
     const fields: QuestionNormalizerField[] = [
       { id: 'f1', name: 'First name', type: 'text', section: 'Info', required: true },
       { id: 'f2', name: 'Last name', type: 'text', section: 'Info', required: true },
@@ -30,23 +34,15 @@ describe('formFiller observation pipeline integration', () => {
     ];
     const snapshots = reconcileNormalizedQuestions(heuristic, llmDrafts, fields);
 
-    const answerPlans = [
-      { questionKey: snapshots[0].questionKey, answer: 'John Doe', confidence: 0.95, answerMode: 'profile_backed' as AnswerMode },
-      { questionKey: snapshots[1].questionKey, answer: 'Yes', confidence: 0.9, answerMode: 'profile_backed' as AnswerMode },
-    ];
-
     const fieldIdToResolvedAnswer: Record<string, string> = {};
-    for (const plan of answerPlans) {
-      const snapshot = snapshots.find((q) => q.questionKey === plan.questionKey);
-      if (!snapshot) continue;
-      for (const fieldId of snapshot.fieldIds) {
-        fieldIdToResolvedAnswer[fieldId] = plan.answer;
-      }
+    for (const snapshot of snapshots) {
+      if (snapshot.fieldIds.length !== 1) continue;
+      fieldIdToResolvedAnswer[snapshot.fieldIds[0]!] = snapshot.promptText;
     }
 
-    expect(fieldIdToResolvedAnswer['f1']).toBe('John Doe');
-    expect(fieldIdToResolvedAnswer['f2']).toBe('John Doe');
-    expect(fieldIdToResolvedAnswer['f3']).toBe('Yes');
+    expect(fieldIdToResolvedAnswer['f1']).toBeUndefined();
+    expect(fieldIdToResolvedAnswer['f2']).toBeUndefined();
+    expect(fieldIdToResolvedAnswer['f3']).toBe('Willing to relocate?');
   });
 
   it('fieldIdToResolvedAnswer is checked before legacy answers in fill loop', () => {
@@ -58,6 +54,122 @@ describe('formFiller observation pipeline integration', () => {
 
     const resolved2 = fieldIdToResolvedAnswer['f99'] ?? 'Legacy fallback';
     expect(resolved2).toBe('Legacy fallback');
+  });
+
+  it('prefers authoritative phone-code answers over mapped sibling phone values', () => {
+    const resolved = getAnswerForField(
+      {
+        'Phone Number': '5717788080',
+        'Country Phone Code': '+1',
+        'Phone Country Code': '+1',
+      },
+      {
+        id: 'f1',
+        name: 'Country Phone Code*',
+        type: 'select',
+        section: 'Phone',
+        required: true,
+        isNative: false,
+        visibleByDefault: true,
+      } as any,
+      { f1: 'Phone Number' },
+    );
+
+    expect(resolved).toBe('+1');
+  });
+
+  it('falls back to authoritative Workday contact defaults before sibling mapped values', () => {
+    const resolved = getAnswerForField(
+      {
+        'Phone Number': '5717788080',
+      },
+      {
+        id: 'f1',
+        name: 'Phone Device Type',
+        type: 'select',
+        section: 'Phone',
+        required: true,
+        isNative: false,
+        visibleByDefault: true,
+      } as any,
+      { f1: 'Phone Number' },
+    );
+
+    expect(resolved).toBe('Mobile');
+  });
+
+  it('leaves optional phone extension empty without explicit user data', () => {
+    const resolved = resolveDesiredAnswerForField(
+      {
+        id: 'f1',
+        name: 'Phone Extension',
+        type: 'text',
+        section: 'Phone',
+        required: false,
+        isNative: false,
+        visibleByDefault: true,
+      } as any,
+      {
+        'Phone Information': '5717788080',
+        'Phone Number': '5717788080',
+      },
+      {
+        phone: '5717788080',
+      } as any,
+      { f1: 'Phone Information' },
+    );
+
+    expect(resolved.value).toBeUndefined();
+    expect(resolved.source).toBe('none');
+  });
+
+  it('ignores grouped question mappings when resolving a specific required field answer', () => {
+    const resolved = resolveDesiredAnswerForField(
+      {
+        id: 'f1',
+        name: 'Postal Code',
+        type: 'text',
+        section: 'Address',
+        required: true,
+        isNative: false,
+        visibleByDefault: true,
+      } as any,
+      {
+        Address: 'Chantilly, VA',
+      },
+      {
+        city: 'Chantilly',
+        state: 'VA',
+      } as any,
+      { f1: 'Address' },
+    );
+
+    expect(resolved.value).toBeUndefined();
+    expect(resolved.source).toBe('none');
+  });
+
+  it('treats a visible selected value as valid when the desired answer is only best-effort', () => {
+    const state = classifyFieldContextState(
+      {
+        type: 'select',
+        required: true,
+      } as any,
+      'Telephone',
+      {
+        value: 'Mobile',
+        source: 'best_effort',
+      },
+      [],
+      true,
+    );
+
+    expect(state).toBe('valid');
+  });
+
+  it('matches selected dropdown display values semantically', () => {
+    expect(matchesSelectDisplayValue('United States of America (+1)', '+1')).toBe(true);
+    expect(matchesSelectDisplayValue('Mobile', 'Mobile')).toBe(true);
+    expect(matchesSelectDisplayValue('Virginia', 'California')).toBe(false);
   });
 
   it('applyNeverEmptyFallback produces type-valid defaults for required field types', () => {

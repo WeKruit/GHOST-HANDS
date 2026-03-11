@@ -42,6 +42,28 @@ const WorkdayPageStateSchema = z.object({
   error_message: z.string().catch(''),
 });
 
+type WorkdayAuthOutcome =
+  | 'still_create_account'
+  | 'native_login'
+  | 'verification_required'
+  | 'authenticated_or_application_resumed'
+  | 'explicit_auth_error'
+  | 'unknown_pending';
+
+type WorkdayAuthObservation = {
+  state: WorkdayAuthOutcome;
+  currentUrl: string;
+  pageTitle: string;
+  primaryHeading: string;
+  visiblePasswordCount: number;
+  hasSignInIndicators: boolean;
+  hasCreateAccountIndicators: boolean;
+  hasVerificationIndicators: boolean;
+  visibleErrors: string[];
+  tenantCredentialPresent: boolean;
+  postCreateLogin: boolean;
+};
+
 // ---------------------------------------------------------------------------
 // Workday-specific fuzzy matching (5-pass: exact, contains, reverse, word, stem)
 // ---------------------------------------------------------------------------
@@ -238,18 +260,19 @@ export class WorkdayPlatformConfig implements PlatformConfig {
     return `${urlContext}Analyze the current page and determine what type of page this is in a Workday job application process.
 
 CLASSIFICATION RULES (check in this order):
-1. If the page has a "Sign in with Google" button, OR shows login/sign-in options (even if "Create Account" is also present) → classify as "login".
-2. If the page heading/title contains "Application Questions" or "Additional Questions" or you see screening questions (radio buttons, dropdowns, text inputs asking about eligibility, availability, referral source, etc.) → classify as "questions".
-3. If the page shows a summary of the entire application with a prominent "Submit" or "Submit Application" button → classify as "review".
-4. If the page heading says "My Experience" or "Work Experience" or asks for resume upload → classify as "experience" or "resume_upload".
-5. If the page asks for name, email, phone, address fields → classify as "personal_info".
-6. If the page heading says "Voluntary Disclosures" and asks about gender, race/ethnicity, veteran status → classify as "voluntary_disclosure".
-7. If the page heading says "Self Identify" or "Self-Identification" or asks specifically about disability status (e.g. "Please indicate if you have a disability") → classify as "self_identify".
-8. If the page asks about gender, race/ethnicity, veteran status, disability but doesn't match rules 6 or 7 → classify as "voluntary_disclosure".
-9. If you see ONLY a "Create Account" or "Sign Up" form with no sign-in option → classify as "account_creation".
+1. If the page visibly contains a Create Account form with BOTH password and verify/confirm password fields, classify as "account_creation" even if a Sign In link/tab is also present.
+2. If the page has login/sign-in options or a native sign-in form (without a visible confirm-password field) → classify as "login".
+3. If the page heading/title contains "Application Questions" or "Additional Questions" or you see screening questions (radio buttons, dropdowns, text inputs asking about eligibility, availability, referral source, etc.) → classify as "questions".
+4. If the page shows a summary of the entire application with a prominent "Submit" or "Submit Application" button → classify as "review".
+5. If the page heading says "My Experience" or "Work Experience" or asks for resume upload → classify as "experience" or "resume_upload".
+6. If the page asks for name, email, phone, address fields → classify as "personal_info".
+7. If the page heading says "Voluntary Disclosures" and asks about gender, race/ethnicity, veteran status → classify as "voluntary_disclosure".
+8. If the page heading says "Self Identify" or "Self-Identification" or asks specifically about disability status (e.g. "Please indicate if you have a disability") → classify as "self_identify".
+9. If the page asks about gender, race/ethnicity, veteran status, disability but doesn't match rules 7 or 8 → classify as "voluntary_disclosure".
+10. If you see ONLY a "Create Account" or "Sign Up" form with no sign-in option → classify as "account_creation".
 
 IMPORTANT: Pages titled "Application Questions (1 of N)" or "(2 of N)" are ALWAYS "questions", never "experience".
-IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify as "login" (NOT "account_creation").`;
+IMPORTANT: A Sign In tab/link does NOT override a visible create-account form with confirm-password fields.`;
   }
 
   async classifyByDOMFallback(adapter: BrowserAutomationAdapter): Promise<PageType> {
@@ -398,6 +421,8 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
       'Country/Territory': p.address.country,
       'State': p.address.state,
       'State/Province': p.address.state,
+      'Country Phone Code': p.phone_country_code || '+1',
+      'Phone Country Code': p.phone_country_code || '+1',
       'Phone Device Type': p.phone_device_type || 'Mobile',
       'Phone Type': p.phone_device_type || 'Mobile',
       // Name fields — specific entries MUST come before generic "Name"
@@ -1803,6 +1828,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
       (profile as any)._forceNativeLoginAfterAccountCreation ||
       (profile as any)._accountCreationCompleted,
     );
+    const hasTenantCredential = Boolean(workdayEmail) && workdayPassword.source === 'platform_override';
     const shouldReuseExactNativePassword =
       forceNativeLogin || workdayPassword.source === 'platform_override';
 
@@ -1974,7 +2000,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
     console.log('[Workday] On login page...');
     console.log(
       `[Workday] Native credential source: email=${workdayEmail ? 'present' : 'missing'}, ` +
-      `passwordSource=${workdayPassword.source}`,
+      `passwordSource=${workdayPassword.source}, tenantCredential=${hasTenantCredential ? 'present' : 'missing'}`,
     );
     if (forceNativeLogin) {
       console.log('[Workday] Using post-account-creation native sign-in path.');
@@ -1983,7 +2009,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
     // Step 1: Detect page layout — Workday shows "Create Account" by default with
     // a "Sign In" tab. We need to click the tab FIRST before filling credentials,
     // otherwise we'd fill the Create Account form by mistake.
-    const pageContext = await adapter.page.evaluate(() => {
+    const authViewContext = await adapter.page.evaluate(() => {
       const passwordFields = document.querySelectorAll('input[type="password"]:not([disabled])');
       const hasConfirmPassword = passwordFields.length > 1;
       const headings = Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]'));
@@ -2008,21 +2034,53 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
     });
 
     console.log(
-      `[Workday] Page context: createAccount=${pageContext.isCreateAccountView}, ` +
-      `signInTab=${pageContext.hasSignInTab}, confirmPassword=${pageContext.hasConfirmPassword}, ` +
-      `password=${pageContext.hasPasswordField}`,
+      `[Workday] Page context: createAccount=${authViewContext.isCreateAccountView}, ` +
+      `signInTab=${authViewContext.hasSignInTab}, confirmPassword=${authViewContext.hasConfirmPassword}, ` +
+      `password=${authViewContext.hasPasswordField}`,
     );
+
+    if (!hasTenantCredential && !forceNativeLogin) {
+      console.log('[Workday] No tenant credential for this host — preferring native account creation.');
+      (profile as any)._workdayForceAccountCreation = true;
+
+      if (!authViewContext.isCreateAccountView) {
+        const clickedCreate = await adapter.page.evaluate(() => {
+          const TEXTS = ['create account', 'sign up', 'register', 'create an account',
+            "don't have an account", 'new user', 'get started'];
+          const els = document.querySelectorAll('a, button, [role="button"], [role="link"], [role="tab"], span');
+          for (const el of els) {
+            const text = (el.textContent || '').trim().toLowerCase();
+            if (TEXTS.some(t => text.includes(t))) {
+              (el as HTMLElement).click();
+              return true;
+            }
+          }
+          return false;
+        });
+        if (clickedCreate) {
+          console.log('[Workday] Opened account creation view.');
+          await adapter.page.waitForTimeout(1500);
+        } else {
+          await adapter.act(
+            'Open the native "Create Account" view for this Workday page. Do NOT click "Sign in with Google". Do NOT click any sign-in option. Click ONLY ONE create-account control, then report done.',
+          );
+          await adapter.page.waitForTimeout(2000);
+        }
+      }
+
+      return;
+    }
 
     // Only hand off to account creation when we've explicitly chosen that path
     // after exhausting login attempts. Workday often keeps "Create Account" as the
     // page heading even while a working sign-in form is visible.
-    if (pageContext.isCreateAccountView && (profile as any)._workdayForceAccountCreation) {
+    if (authViewContext.isCreateAccountView && (profile as any)._workdayForceAccountCreation) {
       console.log('[Workday] Account creation was explicitly selected after login failure — returning.');
       return;
     }
 
     // If on Create Account view, click "Sign In" tab first to switch views
-    if (pageContext.isCreateAccountView && pageContext.hasSignInTab) {
+    if (authViewContext.isCreateAccountView && authViewContext.hasSignInTab) {
       console.log('[Workday] Create Account view — clicking Sign In tab first...');
       const tabClicked = await adapter.page.evaluate(() => {
         const els = document.querySelectorAll('button, a, [role="tab"], [role="button"], [role="link"]');
@@ -2038,7 +2096,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
       if (tabClicked) {
         await adapter.page.waitForTimeout(1500);
       }
-    } else if (!pageContext.hasPasswordField) {
+    } else if (!authViewContext.hasPasswordField) {
       // No password field visible at all — keep chasing the native sign-in view.
       console.log(
         `[Workday] No login form visible — ${forceNativeLogin ? 'staying on native sign-in path' : 'using LLM to find sign-in'}...`,
@@ -2050,7 +2108,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
     }
 
     // Helper: fill the sign-in modal/form and submit with the given password
-    const tryLogin = async (pw: string): Promise<string | null> => {
+    const tryLogin = async (pw: string): Promise<WorkdayAuthObservation> => {
       const fillResult = await adapter.page.evaluate((creds: { email: string; password: string }) => {
         const modal = document.querySelector<HTMLElement>(
           '[role="dialog"], [aria-modal="true"], [data-automation-id="popUpDialog"]'
@@ -2129,45 +2187,60 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
         console.log(`[Workday] Filled login form with email="${workdayEmail}", pw=***. submitted=${fillResult.submitted}`);
       } else {
         console.log('[Workday] Could not find login form fields to fill.');
-        return null;
+        const observation = await this.observeAuthState(adapter, {
+          tenantCredentialPresent: hasTenantCredential,
+          postCreateLogin: forceNativeLogin,
+        });
+        this.storeAuthObservation(profile, observation);
+        this.logAuthObservation(observation);
+        return observation;
       }
 
       if (fillResult.filled && !fillResult.submitted) {
         await adapter.act('Click the "Sign In" or "Log In" button to submit the login form. Do NOT click "Create Account". Click ONLY ONE button.');
       }
 
-      await adapter.page.waitForTimeout(3000);
-
-      // Check for login errors
-      const loginError = await adapter.page.evaluate(() => {
-        const patterns = ['incorrect', 'invalid', 'wrong', 'not found', "doesn't exist",
-          'does not exist', 'failed', 'try again', 'not recognized', 'no account', 'unable'];
-        const alertEls = document.querySelectorAll(
-          '[role="alert"], [class*="error"], [class*="alert"], [data-automation-id*="error" i]'
-        );
-        for (const el of alertEls) {
-          const rect = (el as HTMLElement).getBoundingClientRect();
-          if (rect.width === 0 || rect.height === 0) continue;
-          const text = (el.textContent || '').trim().toLowerCase();
-          if (text && patterns.some(p => text.includes(p))) return text.substring(0, 200);
-        }
-        return null;
+      await adapter.page.waitForTimeout(1500);
+      let observation = await this.observeAuthState(adapter, {
+        tenantCredentialPresent: hasTenantCredential,
+        postCreateLogin: forceNativeLogin,
       });
-
-      return loginError;
+      if (observation.state === 'unknown_pending') {
+        await adapter.page.waitForTimeout(1500);
+        observation = await this.observeAuthState(adapter, {
+          tenantCredentialPresent: hasTenantCredential,
+          postCreateLogin: forceNativeLogin,
+        });
+      }
+      this.storeAuthObservation(profile, observation);
+      this.logAuthObservation(observation);
+      return observation;
     };
 
     // Step 2: Try login with base password
     const PASSWORD_SUFFIX = 'aA1!';
-    let loginError = await tryLogin(workdayPassword.password);
-    if (!loginError) {
+    let loginObservation = await tryLogin(workdayPassword.password);
+    if (
+      loginObservation.state === 'authenticated_or_application_resumed' ||
+      loginObservation.state === 'unknown_pending'
+    ) {
       (profile as any)._forceNativeLoginAfterAccountCreation = false;
       (profile as any)._workdayForceAccountCreation = false;
       return;
     }
+    if (loginObservation.state === 'verification_required') {
+      throw new Error(
+        'Workday verification is required after account creation. Browser open for manual review.',
+      );
+    }
 
     // Step 2b: If base password failed, try with suffix appended
-    if (loginError && workdayPassword.password && !shouldReuseExactNativePassword) {
+    if (
+      loginObservation.state === 'explicit_auth_error' &&
+      workdayPassword.password &&
+      !shouldReuseExactNativePassword
+    ) {
+      const loginError = loginObservation.visibleErrors[0] || 'unknown auth error';
       console.log(`[Workday] Login failed with base password: "${loginError}" — retrying with strengthened password...`);
       // Dismiss error / re-open sign-in form
       await adapter.page.keyboard.press('Escape');
@@ -2189,27 +2262,41 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
         });
         await adapter.page.waitForTimeout(1500);
       }
-      loginError = await tryLogin(workdayPassword.password + PASSWORD_SUFFIX);
-      if (!loginError) {
+      loginObservation = await tryLogin(workdayPassword.password + PASSWORD_SUFFIX);
+      if (
+        loginObservation.state === 'authenticated_or_application_resumed' ||
+        loginObservation.state === 'unknown_pending'
+      ) {
         (profile as any)._forceNativeLoginAfterAccountCreation = false;
         (profile as any)._workdayForceAccountCreation = false;
         return;
+      }
+      if (loginObservation.state === 'verification_required') {
+        throw new Error(
+          'Workday verification is required after account creation. Browser open for manual review.',
+        );
       }
     }
 
     // Mark that we attempted login
     (profile as any)._loginAttempted = true;
 
-    if (loginError && forceNativeLogin) {
+    if (loginObservation.state === 'explicit_auth_error' && forceNativeLogin) {
       (profile as any)._forceNativeLoginAfterAccountCreation = false;
       (profile as any)._workdayForceAccountCreation = false;
       throw new Error(
         'Workday native sign-in failed immediately after account creation. Browser open for manual review.',
       );
     }
+    if (forceNativeLogin) {
+      throw new Error(
+        'Workday native sign-in did not reach an authenticated state after account creation. Browser open for manual review.',
+      );
+    }
 
     // Step 3: Both passwords failed → navigate to account creation
-    if (loginError) {
+    if (loginObservation.state === 'explicit_auth_error') {
+      const loginError = loginObservation.visibleErrors[0] || 'unknown auth error';
       console.log(`[Workday] Login failed: "${loginError}" — navigating to account creation...`);
       (profile as any)._workdayForceAccountCreation = true;
       // Close modal if open
@@ -2241,6 +2328,152 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
   // =========================================================================
   // Private Helpers
   // =========================================================================
+
+  private storeAuthObservation(
+    profile: Record<string, any>,
+    observation: WorkdayAuthObservation,
+  ): void {
+    (profile as any)._lastAuthObservation = observation;
+  }
+
+  private logAuthObservation(observation: WorkdayAuthObservation): void {
+    console.log(`[Workday] Auth observation: ${JSON.stringify(observation)}`);
+  }
+
+  private classifyAuthObservation(input: {
+    currentUrl: string;
+    pageTitle: string;
+    primaryHeading: string;
+    visiblePasswordCount: number;
+    hasSignInIndicators: boolean;
+    hasCreateAccountIndicators: boolean;
+    hasVerificationIndicators: boolean;
+    visibleErrors: string[];
+  }): WorkdayAuthOutcome {
+    const normalizedUrl = input.currentUrl.toLowerCase();
+    if (input.hasVerificationIndicators) return 'verification_required';
+    if (
+      input.visibleErrors.length > 0 &&
+      input.visibleErrors.some((error) =>
+        /incorrect|invalid|wrong|not found|does not exist|failed|try again|not recognized|unable|locked/i.test(error),
+      )
+    ) {
+      return 'explicit_auth_error';
+    }
+    if (
+      (input.visiblePasswordCount > 1 && input.hasCreateAccountIndicators) ||
+      (input.hasCreateAccountIndicators && !input.hasSignInIndicators)
+    ) {
+      return 'still_create_account';
+    }
+    if (
+      input.visiblePasswordCount >= 1 &&
+      (input.hasSignInIndicators || /\/login\b|signin/i.test(normalizedUrl))
+    ) {
+      return 'native_login';
+    }
+    if (
+      !/\/login\b|signin/i.test(normalizedUrl) &&
+      !input.hasCreateAccountIndicators &&
+      !input.hasSignInIndicators &&
+      !input.hasVerificationIndicators
+    ) {
+      return 'authenticated_or_application_resumed';
+    }
+    return 'unknown_pending';
+  }
+
+  private async observeAuthState(
+    adapter: BrowserAutomationAdapter,
+    options: {
+      tenantCredentialPresent: boolean;
+      postCreateLogin: boolean;
+    },
+  ): Promise<WorkdayAuthObservation> {
+    const currentUrl = await adapter.getCurrentUrl().catch(() => adapter.page.url() || '');
+    const pageTitle =
+      typeof (adapter.page as { title?: unknown }).title === 'function'
+        ? await adapter.page.title().catch(() => '')
+        : '';
+    const snapshot = await adapter.page.evaluate(() => {
+      const visible = (node: Element | null): node is HTMLElement => {
+        if (!node) return false;
+        const element = node as HTMLElement;
+        const style = window.getComputedStyle(element);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+          return false;
+        }
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
+      const headings = Array.from(
+        document.querySelectorAll<HTMLElement>('h1, h2, h3, [role="heading"], [data-automation-id*="pageHeader"]'),
+      ).filter((heading) => visible(heading));
+      const primaryHeading = (headings[0]?.textContent || '').replace(/\s+/g, ' ').trim();
+      const passwordInputs = Array.from(
+        document.querySelectorAll<HTMLInputElement>('input[type="password"]:not([disabled])'),
+      ).filter((input) => visible(input));
+      const clickables = Array.from(
+        document.querySelectorAll<HTMLElement>('button, a, [role="tab"], [role="button"], [role="link"]'),
+      ).filter((candidate) => visible(candidate));
+      const clickableText = clickables
+        .map((candidate) => (candidate.textContent || candidate.getAttribute('aria-label') || '').trim().toLowerCase())
+        .filter((text) => text.length > 0)
+        .join(' ');
+      const bodyText = document.body.innerText.toLowerCase();
+      const errorNodes = Array.from(
+        document.querySelectorAll<HTMLElement>(
+          '[role="alert"], [aria-live="assertive"], [data-automation-id*="error" i], [class*="error"], [class*="Error"]',
+        ),
+      ).filter((candidate) => visible(candidate));
+      const visibleErrors = Array.from(
+        new Set(
+          errorNodes
+            .map((candidate) => (candidate.textContent || '').replace(/\s+/g, ' ').trim())
+            .filter((text) => text.length > 0),
+        ),
+      ).slice(0, 10);
+
+      return {
+        primaryHeading,
+        visiblePasswordCount: passwordInputs.length,
+        hasSignInIndicators:
+          clickableText.includes('sign in') ||
+          clickableText.includes('log in') ||
+          bodyText.includes('sign in to your account'),
+        hasCreateAccountIndicators:
+          primaryHeading.toLowerCase().includes('create account') ||
+          primaryHeading.toLowerCase().includes('register') ||
+          clickableText.includes('create account') ||
+          bodyText.includes('creating your candidate home account'),
+        hasVerificationIndicators:
+          bodyText.includes('verification code') ||
+          bodyText.includes('verify your email') ||
+          bodyText.includes('check your email') ||
+          bodyText.includes('one-time code'),
+        visibleErrors,
+      };
+    });
+
+    return {
+      ...snapshot,
+      currentUrl,
+      pageTitle,
+      state: this.classifyAuthObservation({
+        currentUrl,
+        pageTitle,
+        primaryHeading: snapshot.primaryHeading,
+        visiblePasswordCount: snapshot.visiblePasswordCount,
+        hasSignInIndicators: snapshot.hasSignInIndicators,
+        hasCreateAccountIndicators: snapshot.hasCreateAccountIndicators,
+        hasVerificationIndicators: snapshot.hasVerificationIndicators,
+        visibleErrors: snapshot.visibleErrors,
+      }),
+      tenantCredentialPresent: options.tenantCredentialPresent,
+      postCreateLogin: options.postCreateLogin,
+    };
+  }
 
   /**
    * Find and click a dropdown option matching the target answer.

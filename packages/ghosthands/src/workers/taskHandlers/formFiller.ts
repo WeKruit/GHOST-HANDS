@@ -25,7 +25,11 @@ import { z } from 'zod';
 import type { BrowserAutomationAdapter } from '../../adapters/types.js';
 import { buildAnswerDecisionsFromFieldAnswers, normalizeExtractedQuestions, reconcileNormalizedQuestions } from '../../context/QuestionNormalizer.js';
 import type { NormalizedQuestionDraft } from '../../context/QuestionNormalizer.js';
-import type { AnswerDecision, AnswerMode, QuestionOutcome, QuestionSnapshot } from '../../context/types.js';
+import type { PageContextService } from '../../context/PageContextService.js';
+import type { AnswerDecision, AnswerMode, ContextEvent, QuestionOutcome, QuestionRecord, QuestionSnapshot } from '../../context/types.js';
+import type { DurableFieldRecord, MergedFieldState } from '../../engine/decision/mergedObserverTypes.js';
+import { questionStateToMergedState } from '../../engine/decision/mergedObserverTypes.js';
+import { commitMagnitudeResult, partitionByEscalationTier } from '../../engine/decision/magnitudeGate.js';
 import type { WorkdayUserProfile } from './workday/workdayTypes.js';
 import type { AnthropicClientConfig } from './types.js';
 
@@ -75,6 +79,7 @@ export interface FillResult {
   questionOutcomes?: QuestionOutcome[];
   unresolvedQuestionKeys?: string[];
   riskyQuestionKeys?: string[];
+  pageFillContext?: PageFillContext;
 }
 
 export interface FillObservers {
@@ -94,6 +99,7 @@ export interface FillFormOptions {
   observers?: FillObservers;
   anthropicClientConfig?: AnthropicClientConfig;
   onVisualFillStart?(): Promise<void> | void;
+  pageContext?: PageContextService;
 }
 
 interface GenerateResult {
@@ -103,11 +109,78 @@ interface GenerateResult {
   outputTokens: number;
 }
 
+type FieldContextState =
+  | 'valid'
+  | 'empty'
+  | 'missing_required'
+  | 'invalid'
+  | 'wrong_value'
+  | 'ambiguous'
+  | 'skipped_optional';
+
+type FieldAnswerSource =
+  | 'explicit_profile'
+  | 'authoritative_override'
+  | 'best_effort'
+  | 'none';
+
+interface ValidationErrorSnapshot {
+  summaryItems: string[];
+  inlineByFieldKey: Record<string, string[]>;
+}
+
+interface FieldContext {
+  fieldKey: string;
+  fieldId: string;
+  name: string;
+  section: string;
+  required: boolean;
+  desiredAnswer?: string;
+  answerSource: FieldAnswerSource;
+  currentValue: string;
+  visibleErrors: string[];
+  lastAction?: string;
+  state: FieldContextState;
+}
+
+interface RepeaterContext {
+  repeaterKey: string;
+  label: string;
+  currentCount: number;
+  desiredCount: number;
+  addVisible: boolean;
+  addAttempts: number;
+  satisfied: boolean;
+}
+
+interface PageFillContext {
+  url: string;
+  title: string;
+  fields: FieldContext[];
+  repeaters: RepeaterContext[];
+  validationErrors: ValidationErrorSnapshot;
+  updatedAt: string;
+}
+
 interface RepeaterInfo {
   label: string;
   addButtonSelector: string;
   currentCount: number;
 }
+
+interface SelectFieldMemory {
+  options?: string[];
+  currentDisplay?: string;
+}
+
+interface FormFillSessionState {
+  routeKey: string;
+  selectFieldCache: Map<string, SelectFieldMemory>;
+  resolvedAnswersByFieldKey: Map<string, string>;
+  lastPageFillContext?: PageFillContext;
+}
+
+const FORM_FILL_SESSION = new WeakMap<Page, FormFillSessionState>();
 
 // ── Constants ────────────────────────────────────────────────
 
@@ -133,6 +206,280 @@ const PLACEHOLDER_RE_SOURCE = PLACEHOLDER_RE.source;
 const MAGNITUDE_HAND_ACT_TIMEOUT_MS = 30_000;
 const NAV_CONTROL_RE =
   /\b(kla careers|search for jobs|candidate home|job alerts|privacy policy|follow us|about us|navigation menu|careers home|menu)\b/i;
+
+function getStableFieldKey(
+  field: Pick<FormField, 'type' | 'section' | 'name' | 'rawLabel' | 'fieldFingerprint'>,
+): string {
+  const fingerprint = normalizeName(field.fieldFingerprint || '');
+  if (fingerprint) {
+    return `${normalizeName(field.type)}|${fingerprint}`;
+  }
+  return [
+    normalizeName(field.type),
+    normalizeName(field.section || ''),
+    normalizeName(field.name || field.rawLabel || ''),
+  ].join('|');
+}
+
+function normalizeQuestionType(value: string | undefined | null): string {
+  switch ((value || '').trim().toLowerCase()) {
+    case 'tel':
+      return 'phone';
+    case 'radio-group':
+    case 'aria_radio':
+    case 'button-group':
+      return 'radio';
+    case 'checkbox-group':
+    case 'toggle':
+      return 'checkbox';
+    default:
+      return (value || '').trim().toLowerCase();
+  }
+}
+
+function buildDurableStateHistory(history: ContextEvent[]): DurableFieldRecord['stateHistory'] {
+  const transitions: DurableFieldRecord['stateHistory'] = [];
+  let previousState: MergedFieldState | null = null;
+
+  for (const event of history) {
+    const nextQuestionState = typeof event.after?.state === 'string'
+      ? event.after.state
+      : null;
+    if (!nextQuestionState) continue;
+
+    const nextState = questionStateToMergedState(nextQuestionState as any);
+    if (previousState && previousState !== nextState) {
+      transitions.push({
+        from: previousState,
+        to: nextState,
+        actor: event.actor,
+        timestamp: event.timestamp,
+      });
+    }
+    previousState = nextState;
+  }
+
+  return transitions.slice(-5);
+}
+
+function questionRecordToDurableField(
+  question: QuestionRecord,
+  history: ContextEvent[] = [],
+): DurableFieldRecord {
+  const questionHistory = history.filter((event) => event.targetQuestionKey === question.questionKey);
+  const lastEvent = questionHistory[questionHistory.length - 1];
+  const lastActor = question.lastActor
+    ?? (lastEvent?.actor === 'dom' || lastEvent?.actor === 'magnitude' || lastEvent?.actor === 'human'
+      ? lastEvent.actor
+      : null);
+
+  return {
+    fieldKey: question.questionKey,
+    lastMergedState: questionStateToMergedState(question.state),
+    lastProvenance: question.observerProvenance
+      ? {
+          sources: [...question.observerProvenance.sources],
+          concordant: question.observerProvenance.concordant,
+        }
+      : {
+          sources: ['dom'],
+          concordant: null,
+        },
+    lastActor,
+    lastActorTimestamp: lastEvent?.timestamp ?? question.lastUpdatedAt ?? null,
+    fillAttemptCount: question.attemptCount,
+    magnitudeAttemptCount: questionHistory.filter(
+      (event) => event.actor === 'magnitude' && event.type === 'fill_attempted',
+    ).length,
+    lastCommittedValue: question.currentValue ?? question.lastAnswer ?? null,
+    expectedValue: question.lastAnswer ?? null,
+    sectionFingerprint: question.sectionFingerprint ?? null,
+    stateHistory: buildDurableStateHistory(questionHistory),
+  };
+}
+
+function questionMatchesFormField(question: QuestionRecord, field: FormField): boolean {
+  if (question.fieldIds.includes(field.id)) return true;
+
+  const questionLabel = normalizeName(question.promptText || question.normalizedPrompt || '');
+  const fieldLabel = normalizeName(field.name || field.rawLabel || '');
+  if (!questionLabel || !fieldLabel) return false;
+
+  if (normalizeQuestionType(question.questionType) !== normalizeQuestionType(field.type)) {
+    return false;
+  }
+
+  const questionSection = normalizeName(question.sectionLabel || '');
+  const fieldSection = normalizeName(field.section || '');
+  const sectionMatches =
+    !questionSection ||
+    !fieldSection ||
+    questionSection === fieldSection ||
+    questionSection.includes(fieldSection) ||
+    fieldSection.includes(questionSection);
+
+  if (!sectionMatches) return false;
+
+  return (
+    questionLabel === fieldLabel ||
+    questionLabel.includes(fieldLabel) ||
+    fieldLabel.includes(questionLabel)
+  );
+}
+
+async function loadDurableRecordsForFields(
+  pageContext: PageContextService | undefined,
+  fields: FormField[],
+  fieldIdToQuestionKey: Record<string, string>,
+): Promise<Map<string, DurableFieldRecord>> {
+  if (!pageContext || fields.length === 0) {
+    return new Map();
+  }
+
+  const session = await pageContext.getSession().catch(() => null);
+  const lastPage = session && session.pages.length > 0
+    ? session.pages[session.pages.length - 1]
+    : undefined;
+  const activePage = session?.pages.find((page) => page.pageId === session.activePageId)
+    ?? lastPage;
+  if (!activePage) {
+    return new Map();
+  }
+
+  const durableRecords = new Map<string, DurableFieldRecord>();
+  const usedQuestionKeys = new Set<string>();
+
+  for (const field of fields) {
+    const stableKey = getStableFieldKey(field);
+    const mappedQuestionKey = fieldIdToQuestionKey[field.id];
+    const explicitMatch = mappedQuestionKey
+      ? activePage.questions.find((question) => question.questionKey === mappedQuestionKey)
+      : undefined;
+    const directFieldMatch = explicitMatch ?? activePage.questions.find((question) =>
+      !usedQuestionKeys.has(question.questionKey) && question.fieldIds.includes(field.id),
+    );
+    const fallbackMatch = directFieldMatch ?? activePage.questions.find((question) =>
+      !usedQuestionKeys.has(question.questionKey) && questionMatchesFormField(question, field),
+    );
+    if (!fallbackMatch) continue;
+
+    usedQuestionKeys.add(fallbackMatch.questionKey);
+    durableRecords.set(
+      stableKey,
+      questionRecordToDurableField(fallbackMatch, activePage.history),
+    );
+  }
+
+  return durableRecords;
+}
+
+function fieldContextStateToMergedState(state: FieldContextState): MergedFieldState {
+  switch (state) {
+    case 'valid':
+      return 'valid';
+    case 'missing_required':
+      return 'missing_required';
+    case 'invalid':
+      return 'invalid_after_fill';
+    case 'wrong_value':
+      return 'wrong_value';
+    case 'ambiguous':
+      return 'ambiguous_observer_mismatch';
+    case 'skipped_optional':
+      return 'skipped_optional';
+    default:
+      return 'empty';
+  }
+}
+
+function getFormFillRouteKey(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl);
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return rawUrl;
+  }
+}
+
+function getOrCreateFormFillSession(page: Page): FormFillSessionState {
+  const routeKey = getFormFillRouteKey(page.url());
+  const existing = FORM_FILL_SESSION.get(page);
+  if (existing && existing.routeKey === routeKey) {
+    return existing;
+  }
+  const session: FormFillSessionState = {
+    routeKey,
+    selectFieldCache: new Map<string, SelectFieldMemory>(),
+    resolvedAnswersByFieldKey: new Map<string, string>(),
+  };
+  FORM_FILL_SESSION.set(page, session);
+  return session;
+}
+
+function rememberSelectFieldOptions(
+  cache: Map<string, SelectFieldMemory>,
+  field: Pick<FormField, 'type' | 'section' | 'name' | 'rawLabel' | 'fieldFingerprint'>,
+  options: string[] | undefined,
+): void {
+  if (field.type !== 'select' || !options || options.length === 0) return;
+  const key = getStableFieldKey(field);
+  const existing = cache.get(key) || {};
+  cache.set(key, { ...existing, options: [...options] });
+}
+
+function rememberSelectFieldDisplay(
+  cache: Map<string, SelectFieldMemory>,
+  field: Pick<FormField, 'type' | 'section' | 'name' | 'rawLabel' | 'fieldFingerprint'>,
+  currentDisplay: string | undefined,
+): void {
+  if (field.type !== 'select' || !currentDisplay || isPlaceholderSelectDisplay(currentDisplay)) return;
+  const key = getStableFieldKey(field);
+  const existing = cache.get(key) || {};
+  cache.set(key, { ...existing, currentDisplay });
+}
+
+function rememberResolvedAnswer(
+  cache: Map<string, string>,
+  field: Pick<FormField, 'type' | 'section' | 'name' | 'rawLabel' | 'fieldFingerprint'>,
+  value: string | undefined,
+): void {
+  if (!value) return;
+  cache.set(getStableFieldKey(field), value);
+}
+
+function hydrateResolvedAnswers(
+  fields: FormField[],
+  cache: Map<string, string>,
+  fieldIdToResolvedAnswer: Record<string, string>,
+  answers: AnswerMap,
+): number {
+  let hydrated = 0;
+  for (const field of fields) {
+    const cached = cache.get(getStableFieldKey(field));
+    if (!cached) continue;
+    if (fieldIdToResolvedAnswer[field.id] !== undefined) continue;
+    fieldIdToResolvedAnswer[field.id] = cached;
+    if (field.name && answers[field.name] === undefined) {
+      answers[field.name] = cached;
+    }
+    hydrated += 1;
+  }
+  return hydrated;
+}
+
+function hydrateSelectFieldCache(
+  fields: FormField[],
+  cache: Map<string, SelectFieldMemory>,
+): void {
+  for (const field of fields) {
+    if (field.type !== 'select') continue;
+    const cached = cache.get(getStableFieldKey(field));
+    if (!cached) continue;
+    if ((!field.options || field.options.length === 0) && cached.options && cached.options.length > 0) {
+      field.options = [...cached.options];
+    }
+  }
+}
 
 function formatDebugError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -307,8 +654,15 @@ function parseProfileSkills(profileText: string): string[] {
 }
 
 interface ProfileEvidence {
+  firstName?: string;
+  lastName?: string;
   email?: string;
   phone?: string;
+  city?: string;
+  state?: string;
+  zip?: string;
+  phoneDeviceType?: string;
+  phoneCountryCode?: string;
   linkedin?: string;
   portfolio?: string;
   github?: string;
@@ -323,14 +677,37 @@ function parseProfileEvidence(profileText: string): ProfileEvidence {
     return value && value.length > 0 ? value : undefined;
   };
 
+  const name = readLine('Name');
+  const firstName = name?.split(/\s+/)[0];
+  const lastName = name?.split(/\s+/).slice(1).join(' ') || undefined;
   const linkedin = readLine('LinkedIn');
   const portfolio = readLine('Portfolio') || readLine('Website');
   const githubFromText = profileText.match(/https?:\/\/(?:www\.)?github\.com\/[^\s)]+/i)?.[0];
   const twitterFromText = profileText.match(/https?:\/\/(?:www\.)?(?:twitter\.com|x\.com)\/[^\s)]+/i)?.[0];
+  const location = readLine('Location');
+  let city: string | undefined;
+  let state: string | undefined;
+  let zip: string | undefined;
+  if (location) {
+    const parts = location.split(',').map((part) => part.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      city = parts[0];
+      const stateZip = parts[1].split(/\s+/).filter(Boolean);
+      state = stateZip[0];
+      zip = stateZip[1];
+    }
+  }
 
   return {
+    firstName,
+    lastName,
     email: readLine('Email'),
     phone: readLine('Phone'),
+    city,
+    state,
+    zip,
+    phoneDeviceType: 'Mobile',
+    phoneCountryCode: '+1',
     linkedin,
     portfolio,
     github: githubFromText,
@@ -344,8 +721,20 @@ const SOCIAL_OR_ID_NO_GUESS_RE =
 function knownProfileValueForField(fieldName: string, evidence: ProfileEvidence): string | undefined {
   const name = normalizeName(fieldName);
   if (!name) return undefined;
+  if (name.includes('first name') && evidence.firstName) return evidence.firstName;
+  if (name.includes('last name') && evidence.lastName) return evidence.lastName;
   if (name.includes('email')) return evidence.email;
+  if ((name.includes('phone device type') || name.includes('phone type')) && evidence.phoneDeviceType) {
+    return evidence.phoneDeviceType;
+  }
+  if ((name.includes('country phone code') || name.includes('phone country code')) && evidence.phoneCountryCode) {
+    return evidence.phoneCountryCode;
+  }
+  if (name.includes('phone extension')) return undefined;
   if (name.includes('phone') || name.includes('mobile') || name.includes('telephone')) return evidence.phone;
+  if (name === 'city' || name.includes(' city')) return evidence.city;
+  if (name === 'state' || name.includes('state/province') || name.includes('province')) return evidence.state;
+  if (name.includes('postal') || name.includes('zip')) return evidence.zip;
   if (name.includes('linkedin')) return evidence.linkedin;
   if (name.includes('github')) return evidence.github;
   if (name.includes('twitter') || /\bx\b/.test(name) || name.includes('x handle')) return evidence.twitter;
@@ -543,13 +932,67 @@ function getAnswer(answers: AnswerMap, field: FormField): string | undefined {
   return undefined;
 }
 
-function getAnswerForField(
+const AUTHORITATIVE_SELECT_KEYS: Record<string, string[]> = {
+  'country phone code': ['Country Phone Code', 'Phone Country Code'],
+  'phone country code': ['Phone Country Code', 'Country Phone Code'],
+  'phone device type': ['Phone Device Type', 'Phone Type'],
+  'phone type': ['Phone Type', 'Phone Device Type'],
+};
+
+const AUTHORITATIVE_SELECT_DEFAULTS: Record<string, string> = {
+  'country phone code': '+1',
+  'phone country code': '+1',
+  'phone device type': 'Mobile',
+  'phone type': 'Mobile',
+};
+
+function getAnswerByCandidateKeys(
+  answers: AnswerMap,
+  candidateKeys: string[],
+): string | undefined {
+  for (const candidateKey of candidateKeys) {
+    if (candidateKey in answers) return answers[candidateKey];
+  }
+
+  const normalizedCandidates = candidateKeys.map((key) => normalizeName(key));
+  for (const [key, val] of Object.entries(answers)) {
+    if (normalizedCandidates.includes(normalizeName(key))) {
+      return val;
+    }
+  }
+
+  return undefined;
+}
+
+function isFieldSpecificMappedKey(fieldName: string, mappedKey?: string): boolean {
+  if (!mappedKey) return false;
+  const normalizedField = normalizeName(fieldName);
+  const normalizedMapped = normalizeName(mappedKey);
+  if (!normalizedField || !normalizedMapped) return false;
+  if (normalizedField === normalizedMapped) return true;
+  return normalizedField.includes(normalizedMapped) || normalizedMapped.includes(normalizedField);
+}
+
+function getAuthoritativeSelectAnswer(
+  answers: AnswerMap,
+  field: Pick<FormField, 'name' | 'type'>,
+): string | undefined {
+  if (field.type !== 'select') return undefined;
+  const normalizedFieldName = normalizeName(field.name);
+  const candidateKeys = AUTHORITATIVE_SELECT_KEYS[normalizedFieldName];
+  if (!candidateKeys) return undefined;
+  return getAnswerByCandidateKeys(answers, candidateKeys) ?? AUTHORITATIVE_SELECT_DEFAULTS[normalizedFieldName];
+}
+
+export function getAnswerForField(
   answers: AnswerMap,
   field: FormField,
   fieldIdMap?: Record<string, string>,
 ): string | undefined {
+  const authoritative = getAuthoritativeSelectAnswer(answers, field);
+  if (authoritative !== undefined) return authoritative;
   const mappedKey = fieldIdMap?.[field.id];
-  if (mappedKey) {
+  if (mappedKey && isFieldSpecificMappedKey(field.name || '', mappedKey)) {
     if (mappedKey in answers) return answers[mappedKey];
     const mappedNorm = normalizeName(mappedKey);
     for (const [key, val] of Object.entries(answers)) {
@@ -557,6 +1000,270 @@ function getAnswerForField(
     }
   }
   return getAnswer(answers, field);
+}
+
+function getNonAuthoritativeAnswerForField(
+  answers: AnswerMap,
+  field: FormField,
+  fieldIdMap?: Record<string, string>,
+): string | undefined {
+  const mappedKey = fieldIdMap?.[field.id];
+  if (mappedKey && isFieldSpecificMappedKey(field.name || '', mappedKey)) {
+    if (mappedKey in answers) return answers[mappedKey];
+    const mappedNorm = normalizeName(mappedKey);
+    for (const [key, val] of Object.entries(answers)) {
+      if (normalizeName(key) === mappedNorm) return val;
+    }
+  }
+  return getAnswer(answers, field);
+}
+
+export function resolveDesiredAnswerForField(
+  field: FormField,
+  answers: AnswerMap,
+  profileEvidence: ProfileEvidence,
+  fieldIdMap?: Record<string, string>,
+  effectiveRequired: boolean = field.required,
+): { value?: string; source: FieldAnswerSource } {
+  const explicit = knownProfileValueForField(field.name || '', profileEvidence);
+  if (explicit && explicit.trim().length > 0) {
+    return { value: explicit, source: 'explicit_profile' };
+  }
+
+  const authoritative = getAuthoritativeSelectAnswer(answers, field);
+  if (authoritative !== undefined && authoritative.trim().length > 0) {
+    return { value: authoritative, source: 'authoritative_override' };
+  }
+
+  const fallback = getNonAuthoritativeAnswerForField(answers, field, fieldIdMap);
+  if (!effectiveRequired) {
+    return { value: undefined, source: 'none' };
+  }
+  if (fallback && fallback.trim().length > 0) {
+    return { value: fallback, source: 'best_effort' };
+  }
+
+  return { value: undefined, source: 'none' };
+}
+
+function isInferredAnswerSource(source: FieldAnswerSource): boolean {
+  return source === 'authoritative_override' || source === 'best_effort';
+}
+
+export function classifyFieldContextState(
+  field: Pick<FormField, 'type' | 'required'>,
+  currentValue: string,
+  desired: { value?: string; source: FieldAnswerSource },
+  visibleErrors: string[],
+  effectiveRequired: boolean,
+): FieldContextState {
+  const hasCurrentValue =
+    field.type === 'select'
+      ? !isPlaceholderSelectDisplay(currentValue)
+      : currentValue.trim().length > 0;
+
+  if (!desired.value && !effectiveRequired) return 'skipped_optional';
+  if (visibleErrors.length > 0) return hasCurrentValue ? 'invalid' : 'missing_required';
+  if (!hasCurrentValue) return effectiveRequired ? 'missing_required' : 'skipped_optional';
+  if (!desired.value) return 'valid';
+  if (matchesFieldValue(field as FormField, currentValue, desired.value)) return 'valid';
+
+  // Best-effort/default answers should never override a concrete visible value.
+  if (isInferredAnswerSource(desired.source)) return 'valid';
+
+  return 'wrong_value';
+}
+
+async function readFieldCurrentValue(page: Page, field: FormField): Promise<string> {
+  switch (field.type) {
+    case 'select':
+      return readSelectCurrentDisplay(page, field.id);
+    case 'checkbox':
+    case 'toggle': {
+      const state = await readBinaryControlState(page, field.id);
+      return state === true ? 'checked' : '';
+    }
+    case 'radio':
+    case 'radio-group':
+    case 'button-group':
+      return page.evaluate((ffId) => {
+        const ff = (window as any).__ff;
+        const el = ff?.byId(ffId) as HTMLElement | null;
+        if (!el) return '';
+        const selected = el.querySelector(
+          '[aria-checked="true"], [aria-selected="true"], [aria-pressed="true"], .selected, .active',
+        ) as HTMLElement | null;
+        return selected?.textContent?.trim() || '';
+      }, field.id).catch(() => '');
+    default:
+      return page.evaluate((ffId) => {
+        const ff = (window as any).__ff;
+        const el = ff?.byId(ffId) as HTMLElement | null;
+        if (!el) return '';
+        if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+          return el.value?.trim() || '';
+        }
+        return el.textContent?.trim() || '';
+      }, field.id).catch(() => '');
+  }
+}
+
+async function readFieldCurrentDomValueViaLocator(page: Page, field: FormField): Promise<string> {
+  const selector = `[data-ff-id="${field.id.replace(/"/g, '\\"')}"]`;
+  return page.locator(selector).evaluate((el) => {
+    if (el instanceof HTMLSelectElement) {
+      const selected = Array.from(el.selectedOptions || [])
+        .map((option) => option.textContent?.trim() || option.value?.trim() || '')
+        .filter(Boolean);
+      return selected[0] || el.value?.trim() || '';
+    }
+    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+      return el.value?.trim() || '';
+    }
+    return (el as HTMLElement).textContent?.trim() || '';
+  }).catch(() => '');
+}
+
+async function captureValidationErrors(
+  page: Page,
+  fields: FormField[],
+): Promise<ValidationErrorSnapshot> {
+  const fieldMeta = fields.map((field) => ({ fieldId: field.id, fieldKey: getStableFieldKey(field) }));
+  return page.evaluate((input) => {
+    const ff = (window as any).__ff;
+    const roots = ff?.allRoots?.() ?? [document];
+    const errorSelector = [
+      '[role="alert"]',
+      '[aria-live="assertive"]',
+      '[data-automation-id*="error"]',
+      '[class*="error"]',
+      '[class*="Error"]',
+    ].join(', ');
+
+    const visible = (node: Element | null): boolean => {
+      if (!node) return false;
+      const el = node as HTMLElement;
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+
+    const summarizeText = (text: string): string[] =>
+      text
+        .split(/\n+/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 5)
+        .filter((line) => /error|required|invalid|must|enter|select/i.test(line));
+
+    const summaryItems: string[] = [];
+    const seenSummary = new Set<string>();
+    for (const root of roots) {
+      if (!root.querySelectorAll) continue;
+      for (const node of Array.from(root.querySelectorAll(errorSelector)) as Element[]) {
+        if (!visible(node)) continue;
+        const lines = summarizeText((node.textContent || '').trim());
+        for (const line of lines) {
+          if (seenSummary.has(line)) continue;
+          seenSummary.add(line);
+          summaryItems.push(line);
+        }
+      }
+    }
+
+    const inlineByFieldKey: Record<string, string[]> = {};
+    for (const { fieldId, fieldKey } of input) {
+      const el = ff?.byId?.(fieldId) as HTMLElement | null;
+      if (!el) continue;
+      const scope =
+        ff?.closestCrossRoot?.(el, '[data-automation-id], .form-group, .field, .form-field, fieldset')
+        || el;
+      const errors = (Array.from(scope.querySelectorAll(errorSelector)) as Element[])
+        .filter((node) => visible(node))
+        .flatMap((node) => summarizeText((node.textContent || '').trim()));
+      if (errors.length > 0) {
+        inlineByFieldKey[fieldKey] = [...new Set(errors)];
+      }
+    }
+
+    return { summaryItems, inlineByFieldKey };
+  }, fieldMeta).catch(() => ({ summaryItems: [], inlineByFieldKey: {} }));
+}
+
+function logValidationErrors(snapshot: ValidationErrorSnapshot, label: string): void {
+  if (snapshot.summaryItems.length === 0 && Object.keys(snapshot.inlineByFieldKey).length === 0) {
+    return;
+  }
+  console.warn(`[formFiller] ${label}: ${JSON.stringify(snapshot)}`);
+}
+
+function buildRepeaterContexts(
+  repeaters: RepeaterInfo[],
+  profileText: string,
+  attempts: Map<string, number>,
+): RepeaterContext[] {
+  return repeaters.map((repeater) => {
+    const repeaterKey = normalizeName(repeater.label);
+    const desiredCount = countProfileEntries(profileText, repeater.label);
+    const currentCount = repeater.currentCount;
+    const addVisible = repeater.addButtonSelector.length > 0;
+    const addAttempts = attempts.get(repeaterKey) || 0;
+    return {
+      repeaterKey,
+      label: repeater.label,
+      currentCount,
+      desiredCount,
+      addVisible,
+      addAttempts,
+      satisfied: currentCount >= desiredCount,
+    };
+  });
+}
+
+async function buildPageFillContext(
+  page: Page,
+  fields: FormField[],
+  answers: AnswerMap,
+  profileEvidence: ProfileEvidence,
+  fieldIdMap: Record<string, string>,
+  lastActions: Map<string, string>,
+  validationErrors: ValidationErrorSnapshot,
+  repeaters: RepeaterContext[],
+): Promise<PageFillContext> {
+  const url = await page.url();
+  const title = await page.title().catch(() => '');
+  const contexts: FieldContext[] = [];
+
+  for (const field of fields) {
+    const fieldKey = getStableFieldKey(field);
+    const visibleErrors = validationErrors.inlineByFieldKey[fieldKey] || [];
+    const effectiveRequired = field.required || visibleErrors.length > 0;
+    const desired = resolveDesiredAnswerForField(field, answers, profileEvidence, fieldIdMap, effectiveRequired);
+    const currentValue = await readFieldCurrentValue(page, field);
+    const state = classifyFieldContextState(field, currentValue, desired, visibleErrors, effectiveRequired);
+
+    contexts.push({
+      fieldKey,
+      fieldId: field.id,
+      name: field.name,
+      section: field.section,
+      required: effectiveRequired,
+      desiredAnswer: desired.value,
+      answerSource: desired.source,
+      currentValue,
+      visibleErrors,
+      lastAction: lastActions.get(fieldKey),
+      state,
+    });
+  }
+
+  return {
+    url,
+    title,
+    fields: contexts,
+    repeaters,
+    validationErrors,
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 // ── MagnitudeHand neighbor context ───────────────────────────
@@ -1180,37 +1887,86 @@ async function clickComboboxTrigger(page: Page, id: string): Promise<void> {
     const el = ff?.byId(ffId) as HTMLElement;
     if (!el) return null;
 
+    ff?.queryAll?.('[data-ff-click-target]').forEach((node: Element) =>
+      node.removeAttribute('data-ff-click-target')
+    );
+
+    let target: HTMLElement | null = null;
     if (el.tagName === 'INPUT') {
-      const control = ff?.closestCrossRoot(el, '[class*="select__control"]') ||
-        ff?.closestCrossRoot(el, '[class*="control"]') || ff?.closestCrossRoot(el, '[class*="select-shell"]');
-      if (control) {
-        if (!control.hasAttribute('data-ff-id')) {
-          control.setAttribute('data-ff-click-target', ffId);
-        }
-        return `[data-ff-click-target="${ffId}"], [data-ff-id="${ffId}"]`;
+      const siblingToggle =
+        (el.parentElement?.querySelector('button[aria-label*="Toggle"]') as HTMLElement | null) ||
+        (el.closest('.select-shell, .select__container, .field-wrapper')?.querySelector('button[aria-label*="Toggle"]') as HTMLElement | null);
+      if (siblingToggle) {
+        target = siblingToggle;
       }
     }
 
-    const trigger = el.querySelector(':scope > [class*="trigger"]') ||
-      el.querySelector(':scope > button') || el.querySelector(':scope > div');
-    if (trigger && trigger !== el) {
-      (trigger as HTMLElement).click();
-      return '__already_clicked__';
+    if (!target && el.tagName === 'INPUT') {
+      const control = ff?.closestCrossRoot(el, '[class*="select__control"]') ||
+        ff?.closestCrossRoot(el, '[class*="control"]') ||
+        ff?.closestCrossRoot(el, '[class*="select-shell"]') ||
+        ff?.closestCrossRoot(el, '[role="combobox"]') ||
+        ff?.closestCrossRoot(el, '[aria-haspopup="listbox"]');
+      if (control) {
+        target = control as HTMLElement;
+      }
     }
-    el.click();
-    return '__already_clicked__';
+
+    if (!target) {
+      target = (
+        el.querySelector(':scope > [role="combobox"]') ||
+        el.querySelector(':scope > [aria-haspopup="listbox"]') ||
+        el.querySelector(':scope > [class*="select__control"]') ||
+        el.querySelector(':scope > [class*="control"]') ||
+        el.querySelector(':scope > [class*="trigger"]') ||
+        el.querySelector(':scope > button') ||
+        el.querySelector(':scope > input') ||
+        el
+      ) as HTMLElement | null;
+    }
+
+    if (!target) return null;
+    target.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+    target.setAttribute('data-ff-click-target', ffId);
+    return `[data-ff-click-target="${ffId}"]`;
   }, id);
 
   if (!targetSelector) throw new Error(`Combobox ${id} not found`);
 
-  if (targetSelector !== '__already_clicked__') {
+  const trigger = page.locator(targetSelector).first();
+  try {
+    await trigger.scrollIntoViewIfNeeded();
+  } catch {
+    // Best effort.
+  }
+
+  let clicked = false;
+  try {
+    await trigger.click({ timeout: 2000 });
+    clicked = true;
+  } catch {
+    // Fall back to focus + keyboard open below.
+  }
+
+  if (!clicked) {
     try {
-      await page.click(targetSelector, { timeout: 2000 });
+      await trigger.focus({ timeout: 1000 });
     } catch {
-      await page.focus(`[data-ff-id="${id}"]`);
+      await page.focus(`[data-ff-id="${id}"]`).catch(() => {});
     }
   }
-  await page.waitForTimeout(600);
+
+  await page.waitForTimeout(250);
+  let open = await isDropdownPopupOpen(page);
+  if (!open) {
+    await page.keyboard.press('Space').catch(() => {});
+    await page.waitForTimeout(250);
+    open = await isDropdownPopupOpen(page);
+  }
+  if (!open) {
+    await page.keyboard.press('ArrowDown').catch(() => {});
+  }
+  await page.waitForTimeout(300);
 }
 
 // ── Workday portal helpers ───────────────────────────────────
@@ -1355,17 +2111,126 @@ async function dismissDropdown(page: Page): Promise<void> {
   await page.waitForTimeout(150);
 }
 
+async function readSelectCurrentDisplay(page: Page, fieldId: string): Promise<string> {
+  return page.evaluate((ffId) => {
+    const ff = (window as any).__ff;
+    const el = ff?.byId(ffId);
+    if (!el) return '';
+    const scopedContainer = ff?.closestCrossRoot(el, '[data-automation-id], .form-group, .field, .form-field');
+    const selectedItem = scopedContainer?.querySelector(
+      [
+        '[data-automation-id="selectedItem"]',
+        '[data-automation-id="multiSelectPill"]',
+        '[aria-selected="true"]',
+        '[class*="singleValue"]',
+        '[class*="single-value"]',
+        '[class*="value-container"] [class*="single"]',
+      ].join(', '),
+    );
+    if (selectedItem) return selectedItem.textContent?.trim() || '';
+    if (el.tagName === 'INPUT') {
+      const inputValue = (el as HTMLInputElement).value.trim();
+      if (inputValue) return inputValue;
+    }
+    const searchInput = el.querySelector('[data-automation-id="searchBox"], .wd-selectinput-search');
+    if (searchInput) {
+      const searchValue = (searchInput as HTMLInputElement).value.trim();
+      if (searchValue) return searchValue;
+    }
+    const trigger = (
+      scopedContainer?.querySelector(
+        [
+          '.custom-select-trigger',
+          '.multi-select-trigger',
+          '[class*="select-trigger"]',
+          '[class*="singleValue"]',
+          '[class*="single-value"]',
+          '[class*="placeholder"]',
+        ].join(', '),
+      ) ||
+      el.querySelector('.custom-select-trigger, .multi-select-trigger, [class*="select-trigger"]')
+    );
+    if (trigger) return trigger.textContent?.trim() || '';
+    const clone = el.cloneNode(true) as HTMLElement;
+    clone.querySelectorAll('[role="listbox"], [class*="dropdown"], [class*="select-dropdown"]').forEach((x: any) => x.remove());
+    return clone.textContent?.trim() || '';
+  }, fieldId).catch(() => '');
+}
+
+function isPlaceholderSelectDisplay(display: string): boolean {
+  return !display || /^(select|choose|pick|prefer not|--|—|\+\d{1,3}$)/i.test(display.trim());
+}
+
+export function matchesSelectDisplayValue(display: string, answer: string): boolean {
+  const current = normalizeName(display);
+  const desired = normalizeName(answer);
+  if (!current || !desired) return false;
+  return current === desired || current.includes(desired) || desired.includes(current);
+}
+
+function matchesFieldValue(field: FormField, currentValue: string, answer: string): boolean {
+  if (!currentValue || !answer) return false;
+  if (field.type === 'select' || field.type === 'radio' || field.type === 'radio-group' || field.type === 'button-group') {
+    return matchesSelectDisplayValue(currentValue, answer);
+  }
+  return normalizeName(currentValue) === normalizeName(answer);
+}
+
+async function isDropdownPopupOpen(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const ff = (window as any).__ff;
+    const visible = (el: Element | null): boolean => {
+      if (!el) return false;
+      const node = el as HTMLElement;
+      const rect = node.getBoundingClientRect();
+      const style = window.getComputedStyle(node);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+
+    if (visible(ff?.queryOne?.('[data-automation-id="activeListContainer"]') ?? null)) {
+      return true;
+    }
+
+    const candidates = document.querySelectorAll(
+      '[role="listbox"], [role="dialog"], [aria-modal="true"], [data-automation-id="activeListContainer"], [class*="dropdown"], [class*="select-dropdown"]',
+    );
+    return Array.from(candidates).some((candidate) => visible(candidate));
+  }).catch(() => false);
+}
+
+async function dismissDropdownIfOpen(page: Page): Promise<void> {
+  if (!(await isDropdownPopupOpen(page))) return;
+  await dismissDropdown(page);
+}
+
 // ── Dropdown option discovery ────────────────────────────────
 
 /** Open each custom dropdown briefly to discover its options at fill-time.
  *  For hierarchical Workday dropdowns (with chevron sub-categories),
  *  drills into each category and stores options as "Category > SubOption". */
-async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise<void> {
+async function discoverDropdownOptions(
+  page: Page,
+  fields: FormField[],
+  cache?: Map<string, SelectFieldMemory>,
+): Promise<void> {
   for (const f of fields) {
     if (f.type !== 'select' || f.isNative || (f.options && f.options.length > 0)) continue;
     if (!f.name) continue;
 
     try {
+      const cached = cache?.get(getStableFieldKey(f));
+      if ((!f.options || f.options.length === 0) && cached?.options && cached.options.length > 0) {
+        f.options = [...cached.options];
+        continue;
+      }
+
+      const currentDisplay = await readSelectCurrentDisplay(page, f.id);
+      if (!isPlaceholderSelectDisplay(currentDisplay)) {
+        rememberSelectFieldDisplay(cache ?? new Map(), f, currentDisplay);
+        console.log(`[formFiller] skip discovering "${f.name}" (already has "${currentDisplay}")`);
+        continue;
+      }
+
       // Dismiss any lingering dropdown portal before opening next
       await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
       await page.waitForTimeout(300);
@@ -1458,10 +2323,12 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
           }
 
           f.options = allOptions;
+          rememberSelectFieldOptions(cache ?? new Map(), f, allOptions);
           console.log(`[formFiller] discovered ${allOptions.length} hierarchical options for "${f.name}"`);
         } else {
           // Flat dropdown — use top-level options directly
           f.options = topLevel;
+          rememberSelectFieldOptions(cache ?? new Map(), f, topLevel);
           console.log(`[formFiller] discovered ${topLevel.length} options for "${f.name}"`);
         }
       } else {
@@ -1503,12 +2370,13 @@ async function discoverDropdownOptions(page: Page, fields: FormField[]): Promise
 
         if (options.length > 0) {
           f.options = options;
+          rememberSelectFieldOptions(cache ?? new Map(), f, options);
           console.log(`[formFiller] discovered ${options.length} options for "${f.name}" (fallback)`);
         }
       }
 
       // Ensure dropdown is fully closed
-      await page.keyboard.press('Escape');
+      await dismissDropdownIfOpen(page);
       await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
       await page.waitForTimeout(300);
     } catch {
@@ -1957,29 +2825,13 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
     }
 
     case 'select': {
-      const answer = getAnswer(answers, field);
+      const answer = getAnswerForField(answers, field);
       const isSkillField = isSkillLikeFieldName(field.name);
 
       // Skip if already shows correct value
       if (answer && !field.isNative) {
-        const currentDisplay = await page.evaluate((ffId) => {
-          const ff = (window as any).__ff;
-          const el = ff?.byId(ffId);
-          if (!el) return '';
-          if (el.tagName === 'INPUT') return (el as HTMLInputElement).value.trim();
-          const searchInput = el.querySelector('[data-automation-id="searchBox"], .wd-selectinput-search');
-          if (searchInput) return (searchInput as HTMLInputElement).value.trim();
-          const pills = ff?.closestCrossRoot(el, '[data-automation-id]')
-            ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
-          if (pills) return pills.textContent?.trim() || '';
-          const trigger = el.querySelector('.custom-select-trigger, .multi-select-trigger, [class*="select-trigger"]');
-          if (trigger) return trigger.textContent?.trim() || '';
-          const clone = el.cloneNode(true) as HTMLElement;
-          clone.querySelectorAll('[role="listbox"], [class*="dropdown"], [class*="select-dropdown"]').forEach((x: any) => x.remove());
-          return clone.textContent?.trim() || '';
-        }, field.id);
-        const isPlaceholder = !currentDisplay || /^(select|choose|pick|prefer not|--|—|\+\d{1,3}$)/i.test(currentDisplay);
-        if (!isPlaceholder && currentDisplay.toLowerCase().includes(answer.toLowerCase())) {
+        const currentDisplay = await readSelectCurrentDisplay(page, field.id);
+        if (!isPlaceholderSelectDisplay(currentDisplay) && matchesSelectDisplayValue(currentDisplay, answer)) {
           console.log(`[formFiller]   skip ${tag} (already has "${currentDisplay}")`);
           return true;
         }
@@ -2059,7 +2911,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
         } catch { /* open failed */ }
 
         if (clicked > 0) {
-          await dismissDropdown(page);
+          await dismissDropdownIfOpen(page);
           console.log(`[formFiller]   multi-select ${tag} → ${clicked}/${values.length} options`);
           return true;
         }
@@ -2206,7 +3058,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
           }
         } catch { /* typeahead failed */ }
 
-        await page.keyboard.press('Escape').catch(() => {});
+        await dismissDropdownIfOpen(page);
         console.log(`[formFiller]   skip ${tag} (multi-select failed)`);
         return false;
       }
@@ -2223,7 +3075,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
       if (answer && answer.includes(' > ')) {
         const [category, value] = answer.split(' > ', 2);
         try {
-          await page.keyboard.press('Escape').catch(() => {});
+          await dismissDropdownIfOpen(page);
           await page.waitForTimeout(300);
 
           await clickComboboxTrigger(page, field.id);
@@ -2285,7 +3137,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
                     (window as any).__ff?.queryAll('[data-ff-click-target]')
                       .forEach((el: Element) => el.removeAttribute('data-ff-click-target'))
                   );
-                  await dismissDropdown(page);
+                  await dismissDropdownIfOpen(page);
                   console.log(`[formFiller]   select ${tag} → "${category} > ${value}"`);
                   return true;
                 }
@@ -2293,7 +3145,7 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
                 // clickActiveListOption fallback
                 const subClicked = await clickActiveListOption(page, value);
                 if (subClicked) {
-                  await dismissDropdown(page);
+                  await dismissDropdownIfOpen(page);
                   console.log(`[formFiller]   select ${tag} → "${category} > ${value}"`);
                   return true;
                 }
@@ -2302,10 +3154,9 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
           }
 
           // Hierarchical path didn't work — close and fall through
-          await page.keyboard.press('Escape').catch(() => {});
-          await dismissDropdown(page);
+          await dismissDropdownIfOpen(page);
         } catch {
-          await page.keyboard.press('Escape').catch(() => {});
+          await dismissDropdownIfOpen(page);
         }
         opt = value; // try just the sub-option text as flat select
       }
@@ -2326,12 +3177,16 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
           if (options.length > 0) {
             const clicked = await clickActiveListOption(page, options[0]);
             if (clicked) {
-              await dismissDropdown(page);
-              console.log(`[formFiller]   select ${tag} → first available option`);
-              return true;
+              await page.waitForTimeout(250);
+              const currentDisplay = await readSelectCurrentDisplay(page, field.id);
+              if (!isPlaceholderSelectDisplay(currentDisplay)) {
+                await dismissDropdownIfOpen(page);
+                console.log(`[formFiller]   select ${tag} → "${currentDisplay}"`);
+                return true;
+              }
             }
           }
-          await page.keyboard.press('Escape');
+          await dismissDropdownIfOpen(page);
           console.log(`[formFiller]   skip ${tag} (no options found)`);
           return false;
         } catch {
@@ -2348,9 +3203,13 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
         // Try direct Playwright locator click
         let clicked = await clickActiveListOption(page, opt);
         if (clicked) {
-          await dismissDropdown(page);
-          console.log(`[formFiller]   select ${tag} → "${opt}"`);
-          return true;
+          await page.waitForTimeout(250);
+          const currentDisplay = await readSelectCurrentDisplay(page, field.id);
+          if (!isPlaceholderSelectDisplay(currentDisplay) && matchesSelectDisplayValue(currentDisplay, opt)) {
+            await dismissDropdownIfOpen(page);
+            console.log(`[formFiller]   select ${tag} → "${currentDisplay}"`);
+            return true;
+          }
         }
 
         // Type-to-search: if selectinput has a search box, type to filter
@@ -2367,9 +3226,13 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
             await page.waitForTimeout(800);
             clicked = await clickActiveListOption(page, opt);
             if (clicked) {
-              await dismissDropdown(page);
-              console.log(`[formFiller]   select ${tag} → "${opt}" (typed)`);
-              return true;
+              await page.waitForTimeout(250);
+              const currentDisplay = await readSelectCurrentDisplay(page, field.id);
+              if (!isPlaceholderSelectDisplay(currentDisplay) && matchesSelectDisplayValue(currentDisplay, opt)) {
+                await dismissDropdownIfOpen(page);
+                console.log(`[formFiller]   select ${tag} → "${currentDisplay}" (typed)`);
+                return true;
+              }
             }
           }
         } catch { /* type-to-search failed */ }
@@ -2397,15 +3260,19 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
         if (match) {
           clicked = await clickActiveListOption(page, match);
           if (clicked) {
-            await dismissDropdown(page);
-            console.log(`[formFiller]   select ${tag} → "${match}"`);
-            return true;
+            await page.waitForTimeout(250);
+            const currentDisplay = await readSelectCurrentDisplay(page, field.id);
+            if (!isPlaceholderSelectDisplay(currentDisplay) && matchesSelectDisplayValue(currentDisplay, match)) {
+              await dismissDropdownIfOpen(page);
+              console.log(`[formFiller]   select ${tag} → "${currentDisplay}"`);
+              return true;
+            }
           }
         }
 
         // Last resort: re-open via trigger child, find option inside field's dropdown
         try {
-          await page.keyboard.press('Escape').catch(() => {});
+          await dismissDropdownIfOpen(page);
           await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); document.body.dispatchEvent(new MouseEvent('click', { bubbles: true })); }).catch(() => {});
           await page.waitForTimeout(200);
           const triggerChild = page.locator(`${sel} > [class*="trigger"], ${sel} > button, ${sel} > div`).first();
@@ -2423,9 +3290,13 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
             const directOption = page.locator(optSel).filter({ hasText: opt }).first();
             if (await directOption.count() > 0) {
               await directOption.click({ timeout: 2000 });
-              await dismissDropdown(page);
-              console.log(`[formFiller]   select ${tag} → "${opt}" (direct)`);
-              return true;
+              await page.waitForTimeout(250);
+              const currentDisplay = await readSelectCurrentDisplay(page, field.id);
+              if (!isPlaceholderSelectDisplay(currentDisplay) && matchesSelectDisplayValue(currentDisplay, opt)) {
+                await dismissDropdownIfOpen(page);
+                console.log(`[formFiller]   select ${tag} → "${currentDisplay}" (direct)`);
+                return true;
+              }
             }
           }
         } catch { /* direct approach failed */ }
@@ -2479,12 +3350,19 @@ async function fillField(page: Page, field: FormField, answers: AnswerMap, resum
           }
         } catch { /* native fallback failed */ }
 
-        await page.keyboard.press('Escape');
+        const currentDisplay = await readSelectCurrentDisplay(page, field.id);
+        if (!isPlaceholderSelectDisplay(currentDisplay) && matchesSelectDisplayValue(currentDisplay, opt)) {
+          await dismissDropdownIfOpen(page);
+          console.log(`[formFiller]   select ${tag} → "${currentDisplay}" (validated)`);
+          return true;
+        }
+
+        await dismissDropdownIfOpen(page);
         console.log(`[formFiller]   skip ${tag} (could not click option "${opt}", available: ${available.slice(0, 5).join(', ')})`);
         return false;
       } catch (e: any) {
         console.log(`[formFiller]   skip ${tag} (${e.message?.slice(0, 50)})`);
-        await page.keyboard.press('Escape').catch(() => {});
+        await dismissDropdownIfOpen(page);
         return false;
       }
     }
@@ -2854,6 +3732,40 @@ async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
     if (type === 'checkbox') return (el as HTMLInputElement).checked;
     if (type === 'range') return true;
     if (type === 'file') return true;
+    const placeholderRe = new RegExp(phSource, 'i');
+    const isSelectLike =
+      role === 'combobox' ||
+      el.getAttribute('aria-haspopup') === 'listbox' ||
+      el.getAttribute('data-uxi-widget-type') === 'selectinput';
+    if (isSelectLike) {
+      const scope = ff?.closestCrossRoot(el, '[data-automation-id], .form-group, .field, .form-field') || el;
+      const selected = scope.querySelector(
+        [
+          '[data-automation-id="selectedItem"]',
+          '[data-automation-id="multiSelectPill"]',
+          '[aria-selected="true"]',
+          '[class*="singleValue"]',
+          '[class*="single-value"]',
+          '[class*="value-container"] [class*="single"]',
+        ].join(', '),
+      );
+      const selectedText = selected?.textContent?.trim() || '';
+      if (selectedText && !placeholderRe.test(selectedText)) return true;
+      const trigger = scope.querySelector(
+        [
+          '.custom-select-trigger span',
+          '.custom-select-trigger',
+          '.multi-select-trigger',
+          '[class*="select-trigger"]',
+          '[class*="singleValue"]',
+          '[class*="single-value"]',
+          '[class*="value-container"] [class*="single"]',
+        ].join(', '),
+      );
+      const triggerText = trigger?.textContent?.trim() || '';
+      if (triggerText && !placeholderRe.test(triggerText)) return true;
+      return false;
+    }
     if (el.getAttribute('contenteditable') === 'true') return (el.textContent?.trim() || '').length > 0;
     if (tag === 'INPUT' || tag === 'TEXTAREA') return ((el as HTMLInputElement).value?.trim() || '').length > 0;
     if (tag === 'SELECT') {
@@ -2862,31 +3774,7 @@ async function isFieldFilled(page: Page, ffId: string): Promise<boolean> {
       const selectedOpt = sel.options[sel.selectedIndex];
       if (!selectedOpt) return false;
       const text = selectedOpt.textContent?.trim() || '';
-      const placeholderRe = new RegExp(phSource, 'i');
       return val !== '' && !placeholderRe.test(text);
-    }
-    // Custom combobox: check for selected value
-    if (role === 'combobox' && tag !== 'INPUT' && tag !== 'SELECT') {
-      const trigger = el.querySelector('.custom-select-trigger span');
-      const text = trigger?.textContent?.trim() || '';
-      if (text && !new RegExp(phSource, 'i').test(text)) return true;
-      // Check Workday pills
-      const pills = ff?.closestCrossRoot(el, '[data-automation-id]')
-        ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
-      if (pills && pills.textContent?.trim()) return true;
-      // Check inner input value
-      const innerInput = el.querySelector('input');
-      if (innerInput && innerInput.value.trim()) return true;
-      return !!el.querySelector('.custom-select-option.selected, [aria-selected="true"]');
-    }
-    if (role === 'combobox' && tag === 'INPUT') return ((el as HTMLInputElement).value?.trim() || '').length > 0;
-    // Workday selectinput/button: check for selected text
-    if (el.getAttribute('data-uxi-widget-type') === 'selectinput' || el.getAttribute('aria-haspopup') === 'listbox') {
-      const pills = ff?.closestCrossRoot(el, '[data-automation-id]')
-        ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
-      if (pills && pills.textContent?.trim()) return true;
-      const innerInput = el.querySelector('input');
-      if (innerInput && innerInput.value.trim()) return true;
     }
     return (el.textContent?.trim() || '').length > 0;
   }, [ffId, PLACEHOLDER_RE_SOURCE]);
@@ -2901,6 +3789,41 @@ async function hasFieldValueForRerender(page: Page, ffId: string): Promise<boole
     const tag = el.tagName;
     const role = el.getAttribute('role') || '';
     const type = (el as HTMLInputElement).type || '';
+    const placeholderRe = new RegExp(phSource, 'i');
+    const isSelectLike =
+      role === 'combobox' ||
+      el.getAttribute('aria-haspopup') === 'listbox' ||
+      el.getAttribute('data-uxi-widget-type') === 'selectinput';
+
+    if (isSelectLike) {
+      const scope = ff?.closestCrossRoot(el, '[data-automation-id], .form-group, .field, .form-field') || el;
+      const selected = scope.querySelector(
+        [
+          '[data-automation-id="selectedItem"]',
+          '[data-automation-id="multiSelectPill"]',
+          '[aria-selected="true"]',
+          '[class*="singleValue"]',
+          '[class*="single-value"]',
+          '[class*="value-container"] [class*="single"]',
+        ].join(', '),
+      );
+      const selectedText = selected?.textContent?.trim() || '';
+      if (selectedText && !placeholderRe.test(selectedText)) return true;
+      const trigger = scope.querySelector(
+        [
+          '.custom-select-trigger span',
+          '.custom-select-trigger',
+          '.multi-select-trigger',
+          '[class*="select-trigger"]',
+          '[class*="singleValue"]',
+          '[class*="single-value"]',
+          '[class*="value-container"] [class*="single"]',
+        ].join(', '),
+      );
+      const triggerText = trigger?.textContent?.trim() || '';
+      if (triggerText && !placeholderRe.test(triggerText)) return true;
+      return false;
+    }
 
     if (tag === 'INPUT' || tag === 'TEXTAREA') {
       if (type === 'checkbox' || type === 'radio') {
@@ -2914,27 +3837,13 @@ async function hasFieldValueForRerender(page: Page, ffId: string): Promise<boole
       const selectedOpt = sel.options[sel.selectedIndex];
       if (!selectedOpt) return false;
       const text = selectedOpt.textContent?.trim() || '';
-      return sel.value !== '' && !new RegExp(phSource, 'i').test(text);
+      return sel.value !== '' && !placeholderRe.test(text);
     }
 
     if (role === 'checkbox' || role === 'radio' || role === 'switch') {
       if (el.getAttribute('aria-checked') === 'true') return true;
       const inner = el.querySelector('input[type="checkbox"], input[type="radio"]') as HTMLInputElement | null;
       return !!inner?.checked;
-    }
-
-    if (role === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox') {
-      const pills = ff?.closestCrossRoot(el, '[data-automation-id]')
-        ?.querySelector('[data-automation-id="selectedItem"], [data-automation-id="multiSelectPill"]');
-      if (pills && pills.textContent?.trim()) return true;
-      const input = (el as HTMLInputElement).value ? (el as HTMLInputElement) : el.querySelector('input');
-      if (input && (input as HTMLInputElement).value?.trim()) return true;
-      const trigger = el.querySelector('.custom-select-trigger span');
-      if (trigger && trigger.textContent?.trim()) {
-        const t = trigger.textContent.trim();
-        if (!new RegExp(phSource, 'i').test(t)) return true;
-      }
-      return false;
     }
 
     if (el.getAttribute('contenteditable') === 'true') {
@@ -3141,9 +4050,13 @@ function countProfileEntries(profileText: string, sectionLabel: string): number 
   return 1;
 }
 
-async function expandRepeaters(page: Page, profileText: string): Promise<void> {
+async function expandRepeaters(
+  page: Page,
+  profileText: string,
+  attempts?: Map<string, number>,
+): Promise<RepeaterContext[]> {
   const repeaters = await detectRepeaters(page);
-  if (repeaters.length === 0) return;
+  if (repeaters.length === 0) return [];
 
   const targetSections = /(work|experience|employment|education|school|university)/i;
   const deduped = new Map<string, RepeaterInfo>();
@@ -3159,13 +4072,14 @@ async function expandRepeaters(page: Page, profileText: string): Promise<void> {
         `[formFiller] Observed ${repeaters.length} visible Add button(s), but none mapped to work/education repeaters.`,
       );
     }
-    return;
+    return buildRepeaterContexts(repeaters, profileText, attempts || new Map());
   }
   console.log(`[formFiller] Found ${deduped.size} repeater section(s).`);
 
   for (const rep of deduped.values()) {
     const needed = countProfileEntries(profileText, rep.label);
     const toAdd = Math.max(0, needed - rep.currentCount);
+    const repeaterKey = normalizeName(rep.label);
     console.log(
       `[formFiller] repeater "${rep.label}": need ${needed}, have ${rep.currentCount}, adding ${toAdd}`
     );
@@ -3173,7 +4087,14 @@ async function expandRepeaters(page: Page, profileText: string): Promise<void> {
     for (let i = 0; i < toAdd; i++) {
       try {
         await page.click(rep.addButtonSelector, { timeout: 3000 });
+        attempts?.set(repeaterKey, (attempts.get(repeaterKey) || 0) + 1);
         await page.waitForTimeout(500);
+        const currentRepeaters = await detectRepeaters(page);
+        const updated = currentRepeaters.find((candidate) => normalizeName(candidate.label) === repeaterKey);
+        if (!updated || updated.currentCount <= rep.currentCount + i) {
+          console.log(`[formFiller] repeater "${rep.label}" did not increase after Add — stopping retries`);
+          break;
+        }
       } catch (e: any) {
         console.log(`[formFiller] repeater "${rep.label}" add failed: ${e.message?.slice(0, 80)}`);
         break;
@@ -3182,6 +4103,7 @@ async function expandRepeaters(page: Page, profileText: string): Promise<void> {
   }
 
   await page.waitForTimeout(500);
+  return buildRepeaterContexts(await detectRepeaters(page), profileText, attempts || new Map());
 }
 
 // ── LLM Normalization + Answer Planning via adapter.extract ──
@@ -3485,6 +4407,18 @@ export async function fillFormOnPage(
     inputTokens: 0,
     outputTokens: 0,
   };
+  const fillSession = getOrCreateFormFillSession(page);
+  const selectFieldCache = fillSession.selectFieldCache;
+  const fieldLastAction = new Map<string, string>();
+  const previousFieldContextByKey = new Map(
+    (fillSession.lastPageFillContext?.fields || []).map((fieldCtx) => [fieldCtx.fieldKey, fieldCtx]),
+  );
+  for (const previousField of previousFieldContextByKey.values()) {
+    if (previousField.lastAction) {
+      fieldLastAction.set(previousField.fieldKey, previousField.lastAction);
+    }
+  }
+  const repeaterAttempts = new Map<string, number>();
 
   // 0. Ensure __name polyfill (esbuild/bun may inject __name into serialized
   //    page.evaluate callbacks; define it in browser context and re-inject
@@ -3509,7 +4443,7 @@ export async function fillFormOnPage(
   });
 
   // 3. Expand repeater sections (Work Experience / Education) first.
-  await expandRepeaters(page, profileText);
+  let repeaterContexts = await expandRepeaters(page, profileText, repeaterAttempts);
   await injectHelpers(page);
 
   // Track whether the resume has already been uploaded to ANY file input.
@@ -3521,6 +4455,7 @@ export async function fillFormOnPage(
   console.log('[formFiller] Extracting form fields…');
   const allFields = await extractFields(page);
   const visibleFields = allFields.filter((f) => f.visibleByDefault);
+  hydrateSelectFieldCache(visibleFields, selectFieldCache);
 
   // Assign synthetic labels to unlabeled visible non-file controls so they reach normalization
   let syntheticCounter = 0;
@@ -3543,6 +4478,7 @@ export async function fillFormOnPage(
   const profileSkillsCsv = profileSkills.join(', ');
   const profileEvidence = parseProfileEvidence(profileText);
   const observers = opts?.observers;
+  const pageContext = opts?.pageContext;
   const notifyObserver = async (
     label: keyof FillObservers,
     fn: (() => Promise<void>) | (() => void) | undefined,
@@ -3554,6 +4490,63 @@ export async function fillFormOnPage(
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[formFiller] observer ${String(label)} failed: ${message}`);
     }
+  };
+  const syncQuestions = async (
+    questions: QuestionSnapshot[],
+    syncOpts?: { isFullSync?: boolean },
+  ): Promise<void> => {
+    await notifyObserver(
+      'onQuestionsNormalized',
+      observers?.onQuestionsNormalized
+        ? () => observers.onQuestionsNormalized!(questions, syncOpts)
+        : pageContext
+          ? () => pageContext.syncQuestions(questions, syncOpts)
+          : undefined,
+    );
+  };
+  const recordAnswerPlan = async (decisions: AnswerDecision[]): Promise<void> => {
+    await notifyObserver(
+      'onAnswerPlanned',
+      observers?.onAnswerPlanned
+        ? () => observers.onAnswerPlanned!(decisions)
+        : pageContext
+          ? () => pageContext.recordAnswerPlan(decisions)
+          : undefined,
+    );
+  };
+  const recordFieldAttempt = async (
+    questionKey: string,
+    actor: 'dom' | 'magnitude' | 'human',
+    notes?: string,
+  ): Promise<void> => {
+    await notifyObserver(
+      'onFieldAttempt',
+      observers?.onFieldAttempt
+        ? () => observers.onFieldAttempt!(questionKey, actor, notes)
+        : pageContext
+          ? () => pageContext.recordFieldAttempt(questionKey, actor, notes)
+          : undefined,
+    );
+  };
+  const recordFieldResult = async (outcome: QuestionOutcome): Promise<void> => {
+    await notifyObserver(
+      'onFieldResult',
+      observers?.onFieldResult
+        ? () => observers.onFieldResult!(outcome)
+        : pageContext
+          ? () => pageContext.recordFieldResult(outcome)
+          : undefined,
+    );
+  };
+  const recordVerification = async (outcome: QuestionOutcome): Promise<void> => {
+    await notifyObserver(
+      'onVerification',
+      observers?.onVerification
+        ? () => observers.onVerification!(outcome)
+        : pageContext
+          ? () => pageContext.recordFieldResult(outcome)
+          : undefined,
+    );
   };
 
   // 4a. Heuristic seed normalization (deterministic, fast)
@@ -3605,19 +4598,26 @@ export async function fillFormOnPage(
     return result;
   }
 
-  // 5. Discover dropdown options (including hierarchical Workday dropdowns)
-  console.log('[formFiller] Discovering dropdown options…');
-  await discoverDropdownOptions(page, allFields);
-
   // 6. LLM Normalization → Reconciliation → Answer Planning (new observation pipeline)
   let answers: AnswerMap = {};
   const fieldIdMap: Record<string, string> = {};
   const fieldIdToQuestionKey: Record<string, string> = {};
   const fieldIdToResolvedAnswer: Record<string, string> = {};
   const fieldIdToFillSource = new Map<string, 'dom' | 'magnitude'>();
+  const cachedResolvedCount = hydrateResolvedAnswers(
+    llmFields,
+    fillSession.resolvedAnswersByFieldKey,
+    fieldIdToResolvedAnswer,
+    answers,
+  );
+  const planningFields = llmFields.filter((field) => fieldIdToResolvedAnswer[field.id] === undefined);
+
+  // 5. Discover dropdown options (including hierarchical Workday dropdowns)
+  console.log('[formFiller] Discovering dropdown options…');
+  await discoverDropdownOptions(page, allFields, selectFieldCache);
 
   // Build normalizer-compatible field list for reconciliation
-  const normalizerFields = llmFields.map((f) => ({
+  const normalizerFields = planningFields.map((f) => ({
     id: f.id,
     name: f.name,
     type: f.type,
@@ -3637,10 +4637,14 @@ export async function fillFormOnPage(
     }
   };
 
-  if (llmFields.length > 0) {
+  if (cachedResolvedCount > 0) {
+    console.log(`[formFiller] Reused ${cachedResolvedCount} cached answer(s) for visible fields.`);
+  }
+
+  if (planningFields.length > 0) {
     // 6a. LLM normalization via adapter.extract
     console.log('[formFiller] Running LLM normalization…');
-    const llmDrafts = await normalizeObservedQuestions(llmFields, adapter);
+    const llmDrafts = await normalizeObservedQuestions(planningFields, adapter);
     result.llmCalls++;
 
     if (llmDrafts.length > 0) {
@@ -3651,10 +4655,12 @@ export async function fillFormOnPage(
     } else {
       // LLM normalization failed — fall back to heuristic snapshots
       console.log('[formFiller] LLM normalization returned empty — using heuristic snapshots.');
-      initialQuestionSnapshots = heuristicSnapshots;
+      initialQuestionSnapshots = heuristicSnapshots.filter((snapshot) =>
+        snapshot.fieldIds.some((fieldId) => planningFields.some((field) => field.id === fieldId)),
+      );
     }
   } else {
-    initialQuestionSnapshots = heuristicSnapshots;
+    initialQuestionSnapshots = [];
   }
 
   result.questionSnapshots = initialQuestionSnapshots;
@@ -3677,28 +4683,24 @@ export async function fillFormOnPage(
   }
 
   if (initialQuestionSnapshots.length > 0) {
-    await notifyObserver(
-      'onQuestionsNormalized',
-      observers?.onQuestionsNormalized
-        ? () => observers.onQuestionsNormalized!(initialQuestionSnapshots, { isFullSync: true })
-        : undefined,
-    );
+    await syncQuestions(initialQuestionSnapshots, { isFullSync: true });
   }
 
-  if (llmFields.length > 0) {
+  if (planningFields.length > 0) {
     if (usedNewPipeline) {
       // 6c-i. Generate actual fill answers via proven legacy path
       console.log('[formFiller] Asking LLM for answers…');
-      const genResult = await generateAnswers(llmFields, profileText, opts?.anthropicClientConfig);
-      answers = { ...genResult.answers };
+      const genResult = await generateAnswers(planningFields, profileText, opts?.anthropicClientConfig);
+      answers = { ...answers, ...genResult.answers };
       Object.assign(fieldIdMap, genResult.fieldIdToKey);
       result.llmCalls++;
       result.inputTokens += genResult.inputTokens;
       result.outputTokens += genResult.outputTokens;
-      for (const field of llmFields) {
-        const answer = getAnswerForField(answers, field, fieldIdMap);
-        if (answer !== undefined) {
-          fieldIdToResolvedAnswer[field.id] = answer;
+      for (const field of planningFields) {
+        const desired = resolveDesiredAnswerForField(field, answers, profileEvidence, fieldIdMap);
+        if (desired.value !== undefined) {
+          fieldIdToResolvedAnswer[field.id] = desired.value;
+          rememberResolvedAnswer(fillSession.resolvedAnswersByFieldKey, field, desired.value);
         }
       }
       console.log(`[formFiller] LLM provided ${Object.keys(answers).length} answers.`);
@@ -3711,23 +4713,42 @@ export async function fillFormOnPage(
       // Build answer decisions — prefer observation metadata if we can match keys
       if (answerPlans.length > 0) {
         const matchedDecisions: AnswerDecision[] = [];
-        let mappedFieldAnswers = 0;
         for (const plan of answerPlans) {
           const snapshot = findSnapshotForPlan(initialQuestionSnapshots, plan.questionKey);
           if (!snapshot) continue;
           const normalizedAnswer = (plan.answer || '').trim();
           let decisionAnswer = '';
-          for (const fieldId of snapshot.fieldIds) {
-            const field = llmFieldById.get(fieldId);
-            const safeAnswer = sanitizeNoGuessAnswer(
-              field || { name: snapshot.promptText, required: snapshot.required },
+          if (snapshot.fieldIds.length === 1) {
+            const fieldId = snapshot.fieldIds[0];
+            const field = fieldId ? llmFieldById.get(fieldId) : undefined;
+            const safeAnswer = field
+              ? resolveDesiredAnswerForField(
+                  field,
+                  { ...answers, [field.name]: normalizedAnswer },
+                  profileEvidence,
+                  undefined,
+                  field.required,
+                ).value
+              : sanitizeNoGuessAnswer(
+                  { name: snapshot.promptText, required: snapshot.required },
+                  normalizedAnswer,
+                  profileEvidence,
+                );
+            if (safeAnswer && fieldId && fieldIdToResolvedAnswer[fieldId] === undefined) {
+              fieldIdToResolvedAnswer[fieldId] = safeAnswer;
+              const fieldForAnswer = fieldId ? llmFieldById.get(fieldId) : undefined;
+              if (fieldForAnswer) {
+                rememberResolvedAnswer(fillSession.resolvedAnswersByFieldKey, fieldForAnswer, safeAnswer);
+              }
+              decisionAnswer = safeAnswer;
+            }
+          }
+          if (!decisionAnswer) {
+            decisionAnswer = sanitizeNoGuessAnswer(
+              { name: snapshot.promptText, required: snapshot.required },
               normalizedAnswer,
               profileEvidence,
             );
-            if (!safeAnswer) continue;
-            fieldIdToResolvedAnswer[fieldId] = safeAnswer;
-            if (!decisionAnswer) decisionAnswer = safeAnswer;
-            mappedFieldAnswers++;
           }
           if (!decisionAnswer) continue;
           matchedDecisions.push({
@@ -3740,15 +4761,7 @@ export async function fillFormOnPage(
         }
         if (matchedDecisions.length > 0) {
           result.answerDecisions = matchedDecisions;
-          await notifyObserver(
-            'onAnswerPlanned',
-            observers?.onAnswerPlanned
-              ? () => observers.onAnswerPlanned!(matchedDecisions)
-              : undefined,
-          );
-        }
-        if (mappedFieldAnswers > 0) {
-          console.log(`[formFiller] Applied ${mappedFieldAnswers} planned answers to field map.`);
+          await recordAnswerPlan(matchedDecisions);
         }
         console.log(`[formFiller] LLM answer planning provided ${answerPlans.length} answers.`);
       }
@@ -3761,31 +4774,27 @@ export async function fillFormOnPage(
         );
         result.answerDecisions = initialDecisions;
         if (initialDecisions.length > 0) {
-          await notifyObserver(
-            'onAnswerPlanned',
-            observers?.onAnswerPlanned
-              ? () => observers.onAnswerPlanned!(initialDecisions)
-              : undefined,
-          );
+          await recordAnswerPlan(initialDecisions);
         }
       }
     } else {
       // Heuristic-only path — use legacy generateAnswers
       console.log('[formFiller] Using legacy generateAnswers (heuristic path)…');
       const genResult = await generateAnswers(
-        llmFields,
+        planningFields,
         profileText,
         opts?.anthropicClientConfig,
       );
-      answers = { ...genResult.answers };
+      answers = { ...answers, ...genResult.answers };
       Object.assign(fieldIdMap, genResult.fieldIdToKey);
       result.llmCalls++;
       result.inputTokens += genResult.inputTokens;
       result.outputTokens += genResult.outputTokens;
-      for (const field of llmFields) {
-        const answer = getAnswerForField(answers, field, fieldIdMap);
-        if (answer !== undefined) {
-          fieldIdToResolvedAnswer[field.id] = answer;
+      for (const field of planningFields) {
+        const desired = resolveDesiredAnswerForField(field, answers, profileEvidence, fieldIdMap);
+        if (desired.value !== undefined) {
+          fieldIdToResolvedAnswer[field.id] = desired.value;
+          rememberResolvedAnswer(fillSession.resolvedAnswersByFieldKey, field, desired.value);
         }
       }
       const initialDecisions = buildAnswerDecisionsFromFieldAnswers(
@@ -3795,12 +4804,7 @@ export async function fillFormOnPage(
       );
       result.answerDecisions = initialDecisions;
       if (initialDecisions.length > 0) {
-        await notifyObserver(
-          'onAnswerPlanned',
-          observers?.onAnswerPlanned
-            ? () => observers.onAnswerPlanned!(initialDecisions)
-            : undefined,
-        );
+        await recordAnswerPlan(initialDecisions);
       }
     }
 
@@ -3826,15 +4830,12 @@ export async function fillFormOnPage(
     );
     if (fallbackDecisions.length > 0) {
       result.answerDecisions = [...(result.answerDecisions || []), ...fallbackDecisions];
-      await notifyObserver(
-        'onAnswerPlanned',
-        observers?.onAnswerPlanned
-          ? () => observers.onAnswerPlanned!(fallbackDecisions)
-          : undefined,
-      );
+      await recordAnswerPlan(fallbackDecisions);
     }
 
     console.log(`[formFiller] Total resolved answers: ${Object.keys(fieldIdToResolvedAnswer).length}.`);
+  } else if (cachedResolvedCount > 0) {
+    console.log('[formFiller] Skipping LLM normalization — visible fields already have cached answers.');
   } else {
     console.log('[formFiller] No non-file fields for LLM — skipping answer generation.');
   }
@@ -3858,6 +4859,8 @@ export async function fillFormOnPage(
     }
     const fields = await extractFields(page);
     const visible = fields.filter((f) => f.visibleByDefault);
+    hydrateSelectFieldCache(visible, selectFieldCache);
+    const durableRecords = await loadDurableRecordsForFields(pageContext, visible, fieldIdToQuestionKey);
 
     const candidates = visible.filter((f) => !attempted.has(f.id));
     if (candidates.length === 0) break;
@@ -3865,9 +4868,105 @@ export async function fillFormOnPage(
     // Skip React re-rendered replacements that already contain a value.
     const toFill: FormField[] = [];
     for (const field of candidates) {
+      const stableFieldKey = getStableFieldKey(field);
+      const durableRecord = durableRecords.get(stableFieldKey) ?? null;
+      const previousFieldContext = previousFieldContextByKey.get(stableFieldKey);
       if (isLikelyNavigationField(field)) {
         attempted.add(field.id);
         continue;
+      }
+      if (
+        durableRecord?.lastMergedState === 'valid'
+        || (durableRecord?.lastMergedState === 'skipped_optional' && !field.required)
+      ) {
+        const currentDomValue = await readFieldCurrentValue(page, field);
+        const committedValue = durableRecord.lastCommittedValue ?? '';
+        const domMatchesCommitted = durableRecord.lastMergedState === 'valid'
+          ? !!committedValue && matchesFieldValue(field, currentDomValue, committedValue)
+          : !currentDomValue.trim() || (field.type === 'select' && isPlaceholderSelectDisplay(currentDomValue));
+
+        if (domMatchesCommitted) {
+          attempted.add(field.id);
+          if (durableRecord.lastMergedState === 'valid') {
+            domFilledOk.add(field.id);
+            fieldIdToFillSource.set(
+              field.id,
+              durableRecord.lastActor === 'magnitude' ? 'magnitude' : 'dom',
+            );
+            fieldIdToResolvedAnswer[field.id] = committedValue || currentDomValue;
+            rememberResolvedAnswer(
+              fillSession.resolvedAnswersByFieldKey,
+              field,
+              committedValue || currentDomValue,
+            );
+          }
+          fieldLastAction.set(
+            stableFieldKey,
+            durableRecord.lastMergedState === 'valid' ? 'dom_skip_durable' : 'skip_optional_durable',
+          );
+          const tag = field.name ? `[${field.name}]` : `[${field.type}]`;
+          console.log(
+            `[formFiller]   skip ${tag} (${durableRecord.lastMergedState} durable match "${currentDomValue}")`,
+          );
+          continue;
+        }
+
+        if (durableRecord.lastMergedState === 'valid') {
+          durableRecord.lastMergedState = 'stale_context_mismatch';
+        }
+      }
+      if (previousFieldContext) {
+        const desired = resolveDesiredAnswerForField(field, answers, profileEvidence, fieldIdMap);
+        const desiredAnswer = fieldIdToResolvedAnswer[field.id] ?? desired.value;
+        const currentDomValue = previousFieldContext.state === 'valid'
+          ? await readFieldCurrentDomValueViaLocator(page, field)
+          : '';
+        const hasMatchingContextValue =
+          previousFieldContext.state === 'valid'
+          && previousFieldContext.currentValue
+          && matchesFieldValue(field, currentDomValue, previousFieldContext.currentValue)
+          && (
+            !desiredAnswer
+            || matchesFieldValue(field, previousFieldContext.currentValue, desiredAnswer)
+            || isInferredAnswerSource(desired.source)
+          );
+        if (hasMatchingContextValue) {
+          attempted.add(field.id);
+          domFilledOk.add(field.id);
+          fieldIdToFillSource.set(field.id, 'dom');
+          fieldIdToResolvedAnswer[field.id] = desiredAnswer ?? previousFieldContext.currentValue;
+          rememberResolvedAnswer(
+            fillSession.resolvedAnswersByFieldKey,
+            field,
+            desiredAnswer ?? previousFieldContext.currentValue,
+          );
+          fieldLastAction.set(stableFieldKey, 'dom_skip_context');
+          const tag = field.name ? `[${field.name}]` : `[${field.type}]`;
+          console.log(`[formFiller]   skip ${tag} (context says "${previousFieldContext.currentValue}")`);
+          continue;
+        }
+      }
+      if (field.type === 'select' && !field.isNative) {
+        const currentDisplay = await readSelectCurrentDisplay(page, field.id);
+        if (!isPlaceholderSelectDisplay(currentDisplay)) {
+          rememberSelectFieldDisplay(selectFieldCache, field, currentDisplay);
+          const desired = resolveDesiredAnswerForField(field, answers, profileEvidence, fieldIdMap);
+          const desiredAnswer = fieldIdToResolvedAnswer[field.id] ?? desired.value;
+          if (
+            !desiredAnswer
+            || matchesSelectDisplayValue(currentDisplay, desiredAnswer)
+            || isInferredAnswerSource(desired.source)
+          ) {
+            attempted.add(field.id);
+            domFilledOk.add(field.id);
+            fieldIdToFillSource.set(field.id, 'dom');
+            fieldIdToResolvedAnswer[field.id] = desiredAnswer ?? currentDisplay;
+            fieldLastAction.set(stableFieldKey, 'dom_skip_existing');
+            const tag = field.name ? `[${field.name}]` : `[${field.type}]`;
+            console.log(`[formFiller]   skip ${tag} (already has "${currentDisplay}")`);
+            continue;
+          }
+        }
       }
       if (round > 1) {
         const hasValue = await hasFieldValueForRerender(page, field.id);
@@ -3886,8 +4985,8 @@ export async function fillFormOnPage(
       (f) => {
         if (f.type === 'file') return false;
         if (isSkillLikeFieldName(f.name) && profileSkillsCsv) return false;
-        return fieldIdToResolvedAnswer[f.id] === undefined
-          && getAnswerForField(answers, f, fieldIdMap) === undefined;
+        const desired = resolveDesiredAnswerForField(f, answers, profileEvidence, fieldIdMap);
+        return fieldIdToResolvedAnswer[f.id] === undefined && desired.value === undefined;
       }
     );
     if (unseen.length > 0 && round > 1) {
@@ -3943,12 +5042,7 @@ export async function fillFormOnPage(
 
       if (newSnapshots.length > 0) {
         rememberCanonicalSnapshots(newSnapshots);
-        await notifyObserver(
-          'onQuestionsNormalized',
-          observers?.onQuestionsNormalized
-            ? () => observers.onQuestionsNormalized!(newSnapshots, { isFullSync: false })
-            : undefined,
-        );
+        await syncQuestions(newSnapshots, { isFullSync: false });
         for (const question of newSnapshots) {
           const isDemographic = DEMOGRAPHIC_RE.test(question.promptText || '');
           for (const fieldId of question.fieldIds) {
@@ -3976,9 +5070,9 @@ export async function fillFormOnPage(
       result.inputTokens += extraResult.inputTokens;
       result.outputTokens += extraResult.outputTokens;
       for (const field of unseen) {
-        const answer = getAnswerForField(answers, field, fieldIdMap);
-        if (answer !== undefined) {
-          fieldIdToResolvedAnswer[field.id] = answer;
+        const desired = resolveDesiredAnswerForField(field, answers, profileEvidence, fieldIdMap);
+        if (desired.value !== undefined) {
+          fieldIdToResolvedAnswer[field.id] = desired.value;
         }
       }
 
@@ -3992,6 +5086,23 @@ export async function fillFormOnPage(
         for (const plan of newAnswerPlans) {
           const snapshot = findSnapshotForPlan(newSnapshots, plan.questionKey);
           if (!snapshot) continue;
+          if (snapshot.fieldIds.length === 1) {
+            const fieldId = snapshot.fieldIds[0];
+            const field = fieldId ? llmFieldById.get(fieldId) : undefined;
+            const normalizedAnswer = (plan.answer || '').trim();
+            const safeAnswer = field
+              ? resolveDesiredAnswerForField(
+                  field,
+                  { ...answers, [field.name]: normalizedAnswer },
+                  profileEvidence,
+                  undefined,
+                  field.required,
+                ).value
+              : undefined;
+            if (fieldId && safeAnswer && fieldIdToResolvedAnswer[fieldId] === undefined) {
+              fieldIdToResolvedAnswer[fieldId] = safeAnswer;
+            }
+          }
           matchedDecisions.push({
             questionKey: snapshot.questionKey,
             answer: plan.answer,
@@ -4003,12 +5114,7 @@ export async function fillFormOnPage(
         if (matchedDecisions.length > 0) {
           result.answerDecisions = [...(result.answerDecisions || []), ...matchedDecisions];
           extraDecisionsAdded = true;
-          await notifyObserver(
-            'onAnswerPlanned',
-            observers?.onAnswerPlanned
-              ? () => observers.onAnswerPlanned!(matchedDecisions)
-              : undefined,
-          );
+          await recordAnswerPlan(matchedDecisions);
         }
       }
       // Fallback: build decisions from generateAnswers results if observation didn't match
@@ -4020,12 +5126,7 @@ export async function fillFormOnPage(
         );
         if (extraDecisions.length > 0) {
           result.answerDecisions = [...(result.answerDecisions || []), ...extraDecisions];
-          await notifyObserver(
-            'onAnswerPlanned',
-            observers?.onAnswerPlanned
-              ? () => observers.onAnswerPlanned!(extraDecisions)
-              : undefined,
-          );
+          await recordAnswerPlan(extraDecisions);
         }
       }
     }
@@ -4034,45 +5135,45 @@ export async function fillFormOnPage(
 
     for (const field of toFill) {
       attempted.add(field.id);
-      let resolved = fieldIdToResolvedAnswer[field.id] ?? getAnswerForField(answers, field, fieldIdMap);
+      let resolved = fieldIdToResolvedAnswer[field.id]
+        ?? resolveDesiredAnswerForField(field, answers, profileEvidence, fieldIdMap).value;
       if (!resolved && isSkillLikeFieldName(field.name) && profileSkillsCsv) {
         resolved = profileSkillsCsv;
       }
+      if (resolved === undefined && !field.required) {
+        fieldLastAction.set(getStableFieldKey(field), 'skip_optional');
+        continue;
+      }
       if (resolved !== undefined) {
         fieldIdToResolvedAnswer[field.id] = resolved;
+        rememberResolvedAnswer(fillSession.resolvedAnswersByFieldKey, field, resolved);
       }
       const questionKey = fieldIdToQuestionKey[field.id];
       if (questionKey) {
-        await notifyObserver(
-          'onFieldAttempt',
-          observers?.onFieldAttempt
-            ? () => observers.onFieldAttempt!(questionKey, 'dom')
-            : undefined,
-        );
+        await recordFieldAttempt(questionKey, 'dom');
       }
       const fieldAnswers = resolved !== undefined ? { ...answers, [field.name]: resolved } : answers;
       const ok = await fillField(page, field, fieldAnswers, resumePath, resumeAlreadyUploaded);
+      fieldLastAction.set(getStableFieldKey(field), ok ? 'dom_fill' : 'dom_failed');
+      const committedValue = ok ? await readFieldCurrentValue(page, field) : undefined;
       if (ok) {
         domFilledOk.add(field.id);
         fieldIdToFillSource.set(field.id, 'dom');
         if (field.type === 'file') resumeAlreadyUploaded = true;
+        if (resolved !== undefined) {
+          rememberResolvedAnswer(fillSession.resolvedAnswersByFieldKey, field, resolved);
+        }
       }
       if (questionKey) {
-        await notifyObserver(
-          'onFieldResult',
-          observers?.onFieldResult
-            ? () =>
-                observers.onFieldResult!({
-                  questionKey,
-                  state: ok ? 'filled' : 'failed',
-                  currentValue: ok ? resolved : undefined,
-                  confidence: ok
-                    ? FIELD_RESULT_CONFIDENCE.domFilled
-                    : FIELD_RESULT_CONFIDENCE.domFailed,
-                  source: 'dom',
-                })
-            : undefined,
-        );
+        await recordFieldResult({
+          questionKey,
+          state: ok ? 'filled' : 'failed',
+          currentValue: ok ? (committedValue || resolved) : undefined,
+          confidence: ok
+            ? FIELD_RESULT_CONFIDENCE.domFilled
+            : FIELD_RESULT_CONFIDENCE.domFailed,
+          source: 'dom',
+        });
       }
     }
 
@@ -4090,42 +5191,128 @@ export async function fillFormOnPage(
   const forceMagnitude = opts?.forceMagnitude === true;
   await page.waitForTimeout(500);
   const postFields = await extractFields(page);
-  const postVisible = postFields.filter((f) => f.visibleByDefault);
-
-  const unfilledFields: FormField[] = [];
+  let postVisible = postFields.filter((f) => f.visibleByDefault);
+  hydrateSelectFieldCache(postVisible, selectFieldCache);
   const filledIds = new Set<string>(domFilledOk);
-  for (const f of postVisible) {
-    if (isLikelyNavigationField(f)) continue;
-    // Skip file inputs and non-interactive types from MagnitudeHand
-    if (f.type === 'file') continue;
+  const validationSnapshot = await captureValidationErrors(page, postVisible);
+  logValidationErrors(validationSnapshot, 'DOM validation snapshot');
+  repeaterContexts = buildRepeaterContexts(await detectRepeaters(page), profileText, repeaterAttempts);
+  let currentPageFillContext = await buildPageFillContext(
+    page,
+    postVisible,
+    answers,
+    profileEvidence,
+    fieldIdMap,
+    fieldLastAction,
+    validationSnapshot,
+    repeaterContexts,
+  );
+  result.pageFillContext = currentPageFillContext;
 
-    if (forceMagnitude) {
-      // Escalation mode: still check DOM values — only send fields that are
-      // genuinely empty. Previously this sent ALL fields, but that wastes
-      // Magnitude calls on already-correct fields and causes issues with
-      // complex widgets (e.g. Workday date pickers) that MagnitudeHand
-      // can't handle well.
-      const filled = await isFieldFilled(page, f.id);
-      if (filled) {
-        filledIds.add(f.id);
-        continue;
+  const targetedDomRetryFields = currentPageFillContext.fields
+    .filter((fieldCtx) =>
+      fieldCtx.state === 'missing_required'
+      || fieldCtx.state === 'invalid'
+      || fieldCtx.state === 'wrong_value',
+    )
+    .filter((fieldCtx) => !!fieldCtx.desiredAnswer)
+    .map((fieldCtx) => postVisible.find((field) => getStableFieldKey(field) === fieldCtx.fieldKey))
+    .filter((field): field is FormField => Boolean(field));
+
+  if (targetedDomRetryFields.length > 0) {
+    console.log(
+      `[formFiller] DOM sanity retry for ${targetedDomRetryFields.length} field(s): ${targetedDomRetryFields.map((field) => field.name).join(', ')}`,
+    );
+    for (const field of targetedDomRetryFields) {
+      const resolved = resolveDesiredAnswerForField(field, answers, profileEvidence, fieldIdMap).value;
+      if (!resolved) continue;
+      const fieldAnswers = { ...answers, [field.name]: resolved };
+      const ok = await fillField(page, field, fieldAnswers, resumePath, resumeAlreadyUploaded);
+      fieldLastAction.set(getStableFieldKey(field), ok ? 'dom_sanity_retry' : 'dom_sanity_failed');
+      if (ok) {
+        domFilledOk.add(field.id);
+        filledIds.add(field.id);
+        fieldIdToFillSource.set(field.id, 'dom');
+        fieldIdToResolvedAnswer[field.id] = resolved;
+        rememberResolvedAnswer(fillSession.resolvedAnswersByFieldKey, field, resolved);
       }
-      unfilledFields.push(f);
-      continue;
     }
 
-    if (domFilledOk.has(f.id)) continue;
+    const refreshedFields = (await extractFields(page)).filter((field) => field.visibleByDefault);
+    postVisible = refreshedFields;
+    hydrateSelectFieldCache(postVisible, selectFieldCache);
+    const refreshedValidationSnapshot = await captureValidationErrors(page, postVisible);
+    logValidationErrors(refreshedValidationSnapshot, 'DOM validation snapshot after sanity retry');
+    repeaterContexts = buildRepeaterContexts(await detectRepeaters(page), profileText, repeaterAttempts);
+    currentPageFillContext = await buildPageFillContext(
+      page,
+      postVisible,
+      answers,
+      profileEvidence,
+      fieldIdMap,
+      fieldLastAction,
+      refreshedValidationSnapshot,
+      repeaterContexts,
+    );
+    result.pageFillContext = currentPageFillContext;
+  }
 
-    const filled = await isFieldFilled(page, f.id);
-    if (filled) {
-      filledIds.add(f.id);
-    } else {
-      const answer = fieldIdToResolvedAnswer[f.id]
-        ?? getAnswerForField(answers, f, fieldIdMap)
-        ?? (isSkillLikeFieldName(f.name) && profileSkillsCsv ? profileSkillsCsv : undefined);
-      if (answer !== undefined && answer.trim() === '') continue;
-      unfilledFields.push(f);
-    }
+  const unresolvedContexts = currentPageFillContext.fields.filter((fieldCtx) =>
+    fieldCtx.state !== 'valid' && fieldCtx.state !== 'skipped_optional',
+  );
+  if (unresolvedContexts.length > 0) {
+    console.log(
+      `[formFiller] DOM sanity unresolved fields: ${JSON.stringify(unresolvedContexts.map((fieldCtx) => ({
+        name: fieldCtx.name,
+        state: fieldCtx.state,
+        currentValue: fieldCtx.currentValue,
+        desiredAnswer: fieldCtx.desiredAnswer,
+        answerSource: fieldCtx.answerSource,
+        visibleErrors: fieldCtx.visibleErrors,
+      })))}`,
+    );
+  }
+
+  const magnitudeCandidateContexts = unresolvedContexts.filter((fieldCtx) =>
+    forceMagnitude
+      ? fieldCtx.state !== 'skipped_optional' && fieldCtx.state !== 'valid'
+      : fieldCtx.state === 'ambiguous' || fieldCtx.state === 'missing_required' || fieldCtx.state === 'invalid' || fieldCtx.state === 'wrong_value',
+  );
+  const durableRecordsForEscalation = await loadDurableRecordsForFields(
+    pageContext,
+    postVisible,
+    fieldIdToQuestionKey,
+  );
+  const escalationStates = new Map<string, {
+    mergedState: MergedFieldState;
+    durableRecord: DurableFieldRecord | null;
+    required?: boolean;
+  }>();
+  for (const fieldCtx of magnitudeCandidateContexts) {
+    escalationStates.set(fieldCtx.fieldKey, {
+      mergedState: fieldContextStateToMergedState(fieldCtx.state),
+      durableRecord: durableRecordsForEscalation.get(fieldCtx.fieldKey) ?? null,
+      required: fieldCtx.required,
+    });
+  }
+  const escalationPartition = partitionByEscalationTier(escalationStates);
+  const magnitudeEligibleKeys = new Set(escalationPartition.magnitudeEligible);
+  const unfilledFields = magnitudeCandidateContexts
+    .map((fieldCtx) => postVisible.find((field) => getStableFieldKey(field) === fieldCtx.fieldKey))
+    .filter((field): field is FormField => Boolean(field))
+    .filter((field) => magnitudeEligibleKeys.has(getStableFieldKey(field)))
+    .filter((field) => !isLikelyNavigationField(field) && field.type !== 'file');
+
+  if (escalationPartition.skip.length > 0 || escalationPartition.domEligible.length > 0) {
+    const gatedFieldNames = magnitudeCandidateContexts
+      .filter((fieldCtx) =>
+        escalationPartition.skip.includes(fieldCtx.fieldKey)
+        || escalationPartition.domEligible.includes(fieldCtx.fieldKey),
+      )
+      .map((fieldCtx) => fieldCtx.name || fieldCtx.fieldKey);
+    console.log(
+      `[formFiller] [MagnitudeHand] Gated/skipped fields: ${gatedFieldNames.join(', ')}`,
+    );
   }
 
   if (unfilledFields.length > 0) {
@@ -4149,7 +5336,7 @@ export async function fillFormOnPage(
       await page.waitForTimeout(300);
 
       const answer = fieldIdToResolvedAnswer[field.id]
-        ?? getAnswerForField(answers, field, fieldIdMap)
+        ?? resolveDesiredAnswerForField(field, answers, profileEvidence, fieldIdMap).value
         ?? (isSkillLikeFieldName(field.name) && profileSkillsCsv ? profileSkillsCsv : undefined);
       let prompt = `You are filling out a job application for this person. Today's date is ${new Date().toLocaleDateString('en-CA')}.\n${profileText.trim()}\n\n`;
 
@@ -4191,58 +5378,54 @@ export async function fillFormOnPage(
       try {
         const questionKey = fieldIdToQuestionKey[field.id];
         if (questionKey) {
-          await notifyObserver(
-            'onFieldAttempt',
-            observers?.onFieldAttempt
-              ? () =>
-                  observers.onFieldAttempt!(
-                    questionKey,
-                    'magnitude',
-                    neighborCtx ? 'neighbor_context' : undefined,
-                  )
-              : undefined,
-          );
+          await recordFieldAttempt(questionKey, 'magnitude', neighborCtx ? 'neighbor_context' : undefined);
         }
         await adapter.act(prompt, { timeoutMs: MAGNITUDE_HAND_ACT_TIMEOUT_MS });
         console.log(`[formFiller] [MagnitudeHand] Filled "${field.name}" OK`);
+        fieldLastAction.set(getStableFieldKey(field), 'magnitude_fill');
         filledCount++;
         filledIds.add(field.id);
         fieldIdToFillSource.set(field.id, 'magnitude');
+        if (answer !== undefined) {
+          fieldIdToResolvedAnswer[field.id] = answer;
+          rememberResolvedAnswer(fillSession.resolvedAnswersByFieldKey, field, answer);
+        }
         adapterBusyCount = 0;
         if (questionKey) {
-          await notifyObserver(
-            'onFieldResult',
-            observers?.onFieldResult
-              ? () =>
-                  observers.onFieldResult!({
-                    questionKey,
-                    state: 'filled',
-                    currentValue: answer,
-                    confidence: FIELD_RESULT_CONFIDENCE.magnitudeFilled,
-                    source: 'magnitude',
-                  })
-              : undefined,
-          );
+          const durableRecord = durableRecordsForEscalation.get(getStableFieldKey(field)) ?? null;
+          let committedValue = await readFieldCurrentValue(page, field);
+          if (pageContext && !observers?.onFieldResult && durableRecord) {
+            const committedRecord = await commitMagnitudeResult(
+              page,
+              durableRecord,
+              `[data-ff-id="${field.id}"]`,
+              pageContext,
+            );
+            committedValue = committedRecord.lastCommittedValue ?? committedValue;
+          } else {
+            await recordFieldResult({
+              questionKey,
+              state: 'filled',
+              currentValue: committedValue || answer,
+              confidence: FIELD_RESULT_CONFIDENCE.magnitudeFilled,
+              source: 'magnitude',
+            });
+          }
         }
       } catch (e: any) {
         const msg = e?.message ? String(e.message) : String(e);
         const shortMsg = msg.slice(0, 160);
         console.log(`[formFiller] [MagnitudeHand] ERROR on "${field.name}": ${shortMsg}`);
+        fieldLastAction.set(getStableFieldKey(field), 'magnitude_failed');
         const questionKey = fieldIdToQuestionKey[field.id];
         if (questionKey) {
-          await notifyObserver(
-            'onFieldResult',
-            observers?.onFieldResult
-              ? () =>
-                  observers.onFieldResult!({
-                    questionKey,
-                    state: 'failed',
-                    currentValue: undefined,
-                    confidence: FIELD_RESULT_CONFIDENCE.magnitudeFailed,
-                    source: 'magnitude',
-                  })
-              : undefined,
-          );
+          await recordFieldResult({
+            questionKey,
+            state: 'failed',
+            currentValue: undefined,
+            confidence: FIELD_RESULT_CONFIDENCE.magnitudeFailed,
+            source: 'magnitude',
+          });
         }
 
         const isBusy = msg.includes('adapter busy: previous act() still running')
@@ -4276,6 +5459,23 @@ export async function fillFormOnPage(
   } else {
     console.log('[formFiller] [MagnitudeHand] No unfilled fields — DOM filler handled everything.');
   }
+
+  postVisible = (await extractFields(page)).filter((field) => field.visibleByDefault);
+  hydrateSelectFieldCache(postVisible, selectFieldCache);
+  const finalValidationSnapshot = await captureValidationErrors(page, postVisible);
+  logValidationErrors(finalValidationSnapshot, 'Final DOM validation snapshot');
+  repeaterContexts = buildRepeaterContexts(await detectRepeaters(page), profileText, repeaterAttempts);
+  result.pageFillContext = await buildPageFillContext(
+    page,
+    postVisible,
+    answers,
+    profileEvidence,
+    fieldIdMap,
+    fieldLastAction,
+    finalValidationSnapshot,
+    repeaterContexts,
+  );
+  fillSession.lastPageFillContext = result.pageFillContext;
 
   const finalSnapshots = normalizeExtractedQuestions(
     postVisible.filter((field) => field.type !== 'file'),
@@ -4316,12 +5516,7 @@ export async function fillFormOnPage(
     result.questionSnapshots = finalSnapshots;
     if (initialQuestionSnapshots.length === 0) {
       // No prior sync — use fresh heuristic snapshots directly
-      await notifyObserver(
-        'onQuestionsNormalized',
-        observers?.onQuestionsNormalized
-          ? () => observers.onQuestionsNormalized!(finalSnapshots, { isFullSync: true })
-          : undefined,
-      );
+      await syncQuestions(finalSnapshots, { isFullSync: true });
     } else {
       // Prior sync used LLM-reconciled keys. Build retirement-safe snapshots by
       // mapping current DOM fieldIds back to existing question keys. This allows
@@ -4369,12 +5564,7 @@ export async function fillFormOnPage(
         }
       }
       outcomeSnapshots = retirementSnapshots;
-      await notifyObserver(
-        'onQuestionsNormalized',
-        observers?.onQuestionsNormalized
-          ? () => observers.onQuestionsNormalized!(retirementSnapshots, { isFullSync: true })
-          : undefined,
-      );
+      await syncQuestions(retirementSnapshots, { isFullSync: true });
     }
   }
 
@@ -4439,10 +5629,7 @@ export async function fillFormOnPage(
     .map((question) => mapSnapshotKey(question)))];
 
   for (const outcome of questionOutcomes) {
-    await notifyObserver(
-      'onVerification',
-      observers?.onVerification ? () => observers.onVerification!(outcome) : undefined,
-    );
+    await recordVerification(outcome);
   }
 
   return result;

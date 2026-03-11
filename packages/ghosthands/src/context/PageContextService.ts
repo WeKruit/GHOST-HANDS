@@ -1,6 +1,7 @@
 import {
   applyAnswerDecisions,
   applyPageEntry,
+  annotateActivePage as reduceAnnotateActivePage,
   attachReport,
   auditPage,
   createEmptySession,
@@ -71,6 +72,7 @@ function cloneResumedPage(
     lastSeenAt: new Date().toISOString(),
     visitCount: page.visitCount + 1,
     domSummary: input.domSummary || page.domSummary,
+    metadata: page.metadata ? { ...page.metadata } : undefined,
     questions: page.questions.map((question) => ({
       ...question,
       selectors: [...question.selectors],
@@ -105,6 +107,11 @@ export interface PageContextService {
   ): Promise<void>;
   recordFieldResult(outcome: QuestionOutcome): Promise<void>;
   auditBeforeAdvance(): Promise<PageAuditResult>;
+  annotateActivePage(
+    metadata: Record<string, unknown>,
+    notes?: string,
+    actor?: 'system' | 'dom' | 'llm' | 'magnitude' | 'human' | 'mastra',
+  ): Promise<void>;
   finalizeActivePage(input?: PageFinalizeInput): Promise<void>;
   markAwaitingReview(): Promise<void>;
   markFailed(): Promise<void>;
@@ -231,6 +238,17 @@ export class LivePageContextService implements PageContextService {
     this.session = result.session;
     await this.persistCurrent(baseVersion);
     return result.result;
+  }
+
+  async annotateActivePage(
+    metadata: Record<string, unknown>,
+    notes?: string,
+    actor: 'system' | 'dom' | 'llm' | 'magnitude' | 'human' | 'mastra' = 'system',
+  ): Promise<void> {
+    const session = await this.ensureSession();
+    const baseVersion = session.version;
+    this.session = reduceAnnotateActivePage(session, metadata, notes, actor);
+    await this.persistCurrent(baseVersion);
   }
 
   async finalizeActivePage(input?: PageFinalizeInput): Promise<void> {

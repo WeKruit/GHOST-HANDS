@@ -2,7 +2,7 @@ import { SupabaseClient } from "@supabase/supabase-js";
 import { Client as PgClient, Notification } from "pg";
 import { JobExecutor } from "./JobExecutor.js";
 import { callbackNotifier } from './callbackNotifier.js';
-import { getLogger } from '../monitoring/logger.js';
+import { getLogger, startJobLogCapture, stopJobLogCapture } from '../monitoring/logger.js';
 
 const logger = getLogger({ service: 'JobPoller' });
 
@@ -161,6 +161,7 @@ export class JobPoller {
             });
         }
         await this.releaseClaimedJobs();
+        stopJobLogCapture();
     }
 
     /**
@@ -236,11 +237,20 @@ export class JobPoller {
 
             this.activeJobs++;
             this._currentJobId = job.id;
+            const jobLog = startJobLogCapture(job.id);
             logger.info('Picked up job', {
                 jobId: job.id, jobType: job.job_type,
                 previousStatus: job.status,
                 activeJobs: this.activeJobs, maxConcurrent: this.maxConcurrent,
             });
+            if (jobLog) {
+                logger.info('Per-job logging enabled', {
+                    jobId: job.id,
+                    jobLogPath: jobLog.logPath,
+                    actSummaryPath: jobLog.actSummaryPath,
+                    inferenceLogPath: jobLog.inferenceLogPath,
+                });
+            }
 
             // Execute in background -- do NOT await
             this.executor
@@ -258,6 +268,7 @@ export class JobPoller {
                         jobId: job.id,
                         activeJobs: this.activeJobs, maxConcurrent: this.maxConcurrent,
                     });
+                    stopJobLogCapture();
                     // Try to pick up the next job
                     if (this.running && this.activeJobs < this.maxConcurrent) {
                         this.tryPickup().catch((err) => {

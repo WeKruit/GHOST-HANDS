@@ -21,6 +21,9 @@ import { ProgressStep } from './progressTracker.js';
 import type { TaskResult, AutomationJob } from './taskHandlers/types.js';
 import type { GeneratedPlatformCredential } from './taskHandlers/platforms/accountCredentials.js';
 import { callbackNotifier } from './callbackNotifier.js';
+import {
+  persistGeneratedPlatformCredentials,
+} from './platformCredentialStore.js';
 
 /** Minimal execution result shape used by finalization functions. */
 export interface ExecutionResult {
@@ -57,6 +60,16 @@ export interface CommonFinalizationInput {
 // ---------------------------------------------------------------------------
 
 const logger = getLogger({ service: 'finalization' });
+
+function resolveValetCallbackUrl(explicitUrl?: string | null): string | null {
+  if (explicitUrl && explicitUrl.trim().length > 0) return explicitUrl;
+  const baseUrl =
+    process.env.VALET_API_URL?.trim() ||
+    process.env.API_URL?.trim() ||
+    'http://localhost:8000';
+  if (!baseUrl) return null;
+  return `${baseUrl.replace(/\/+$/, '')}/api/v1/webhooks/ghosthands`;
+}
 
 interface FlushResult {
   report: ContextReport | undefined;
@@ -233,12 +246,16 @@ function fireCallbackBestEffort(
   finalCost: CostSnapshot,
   generatedPlatformCredentials?: GeneratedPlatformCredential[],
 ): void {
-  if (!job.callback_url) return;
+  const callbackUrl =
+    job.callback_url ||
+    (generatedPlatformCredentials?.length ? resolveValetCallbackUrl(job.callback_url) : null);
+  if (!callbackUrl) return;
   callbackNotifier
     .notifyFromJob({
       id: job.id,
       valet_task_id: job.valet_task_id,
-      callback_url: job.callback_url,
+      user_id: job.user_id,
+      callback_url: callbackUrl,
       status,
       worker_id: workerId,
       result_data: resultData,
@@ -273,6 +290,34 @@ function buildAccountCreationNote(taskResult: TaskResult): string | null {
 
   if (notes.length === 0) return null;
   return notes.join(' ');
+}
+
+async function persistGeneratedPlatformCredentialsBestEffort(
+  supabase: SupabaseClient,
+  job: AutomationJob,
+  taskResult: TaskResult,
+  reason: string,
+): Promise<void> {
+  const credentials = taskResult.runtimeMetadata?.generatedPlatformCredentials ?? [];
+  if (credentials.length === 0) return;
+
+  try {
+    await persistGeneratedPlatformCredentials({
+      supabase,
+      userId: job.user_id,
+      credentials,
+      events: taskResult.runtimeMetadata?.accountCreationEvents,
+      jobId: job.id,
+      sourceUrl: job.target_url,
+      reason,
+    });
+  } catch (err) {
+    logger.warn('Generated platform credential persistence failed', {
+      jobId: job.id,
+      error: err instanceof Error ? err.message : String(err),
+      reason,
+    });
+  }
 }
 
 /**
@@ -439,6 +484,12 @@ export async function finalizeHandlerResult(
 
     // Best-effort cost recording
     recordCostBestEffort(supabase, job.user_id, job.id, finalCost);
+    await persistGeneratedPlatformCredentialsBestEffort(
+      supabase,
+      job,
+      taskResult,
+      'awaiting_review_finalization',
+    );
 
     // Best-effort application report
     await writeReportBestEffort(supabase, job, pageContext, finalCost, taskResult, screenshotUrls, 'awaiting_review', logEvent);
@@ -526,6 +577,12 @@ export async function finalizeHandlerResult(
     });
 
     recordCostBestEffort(supabase, job.user_id, job.id, finalCost);
+    await persistGeneratedPlatformCredentialsBestEffort(
+      supabase,
+      job,
+      taskResult,
+      'failed_finalization',
+    );
 
     // Best-effort application report
     await writeReportBestEffort(supabase, job, pageContext, finalCost, taskResult, screenshotUrls, 'failed', logEvent);
@@ -590,6 +647,12 @@ export async function finalizeHandlerResult(
 
   // Best-effort cost recording
   recordCostBestEffort(supabase, job.user_id, job.id, finalCost);
+  await persistGeneratedPlatformCredentialsBestEffort(
+    supabase,
+    job,
+    taskResult,
+    'completed_finalization',
+  );
 
   // Best-effort application report
   await writeReportBestEffort(supabase, job, pageContext, finalCost, taskResult, screenshotUrls, 'completed', logEvent);
@@ -681,6 +744,12 @@ export async function finalizeHandlerSideEffects(
 
   // 4. Save fresh session cookies (Google + target domain)
   await saveFreshSessionCookies(adapter, sessionManager, job.user_id, job.target_url);
+  await persistGeneratedPlatformCredentialsBestEffort(
+    supabase,
+    job,
+    taskResult,
+    'side_effects_finalization',
+  );
 
   // 5. Persist final_mode and engine/cost metadata
   currentMetadata = {

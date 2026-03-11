@@ -47,6 +47,7 @@ import { LivePageContextService, type PageContextService } from '../context/Page
 import { RedisPageContextStore } from '../context/RedisPageContextStore.js';
 import { SupabasePageContextFlusher } from '../context/SupabasePageContextFlusher.js';
 import { VERIFICATION_INPUT_SELECTORS } from './verificationSelectors.js';
+import { detectPlatformFromUrl } from './taskHandlers/platforms/index.js';
 
 const logger = getLogger({ service: 'job-executor' });
 
@@ -217,7 +218,7 @@ export class JobExecutor {
   private canAutoRecoverAuth(job: AutomationJob): boolean {
     const executionMode = (job.execution_mode || '').toLowerCase();
     const jobType = (job.job_type || '').toLowerCase();
-    if (executionMode === 'smart_apply' || executionMode === 'agent_apply' || executionMode === 'mastra_decision') {
+    if (executionMode === 'smart_apply' || executionMode === 'agent_apply' || executionMode === 'mastra' || executionMode === 'mastra_decision') {
       return true;
     }
     return jobType === 'smart_apply' || jobType === 'workday_apply' || jobType === 'agent_apply';
@@ -1512,19 +1513,24 @@ export class JobExecutor {
     };
 
     // Build the workflow (per-job, captures rt via closure)
-    const workflow = job.execution_mode === 'mastra_decision'
+    const workflow = (job.execution_mode === 'mastra' || job.execution_mode === 'mastra_decision')
       ? buildDecisionApplyWorkflow(rt, {
           create(options) {
             const { DecisionLoopRunner } = require('../engine/decision/index.js');
             return new DecisionLoopRunner({
               page: options.page,
               adapter: options.adapter,
-              profile: (rt.job.metadata as Record<string, any>)?.profile ?? {},
+              profile: (rt.job.input_data?.user_data as Record<string, any>) ?? (rt.job.metadata as Record<string, any>)?.profile ?? {},
               platform: options.platform,
               budgetUsd: options.budgetUsd,
               costTracker: options.costTracker,
               anthropicConfig: rt.llmClientConfig?.anthropic,
               model: (rt.job.metadata as Record<string, any>)?.decision_model,
+              jobId: rt.job.id,
+              userId: rt.job.user_id,
+              callbackUrl: rt.job.callback_url,
+              resumePath: rt.resumeFilePath,
+              pageContext: options.pageContext,
               previousActionHistory: options.previousActionHistory,
               previousIteration: options.previousIteration,
               onProgress: options.logEvent
@@ -1631,7 +1637,7 @@ export class JobExecutor {
       // page_decision_loop step can also suspend for HITL.
       // When only one step is suspended, Mastra auto-detects it, but we
       // still resolve the step ID for explicit logging and correctness.
-      const externalResumeStep = job.execution_mode === 'mastra_decision'
+      const externalResumeStep = (job.execution_mode === 'mastra' || job.execution_mode === 'mastra_decision')
         ? undefined  // Let Mastra auto-detect from persisted snapshot
         : 'check_blockers_checkpoint';
 
@@ -1693,7 +1699,11 @@ export class JobExecutor {
         jobId: job.id,
         userId: job.user_id,
         targetUrl: job.target_url,
-        platform: job.metadata?.platform || 'other',
+        platform:
+          job.metadata?.platform ||
+          job.input_data?.platform ||
+          detectPlatformFromUrl(job.target_url).platformId ||
+          'other',
         qualityPreset: resolveQualityPreset(job.input_data, job.metadata),
         budgetUsd: costTracker.getRemainingBudget(),
         handler: {},
