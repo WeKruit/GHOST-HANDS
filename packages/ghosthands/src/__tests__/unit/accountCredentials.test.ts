@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   describePasswordRequirements,
   generatePlatformCredential,
+  inferCredentialDomainFromUrl,
   inferCredentialPlatformFromUrl,
   inferPasswordRequirements,
   resolvePlatformAccountEmail,
@@ -16,6 +17,14 @@ describe('accountCredentials', () => {
         'https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers/job/SAN-JOSE/apply/applyManually',
       ),
     ).toBe('workday');
+  });
+
+  test('extracts host affinity for generated account credentials', () => {
+    expect(
+      inferCredentialDomainFromUrl(
+        'https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers/job/SAN-JOSE/apply/applyManually',
+      ),
+    ).toBe('cadence.wd1.myworkdayjobs.com');
   });
 
   test('prefers explicit workday email/password overrides when present', () => {
@@ -66,10 +75,13 @@ describe('accountCredentials', () => {
       {
         validationText:
           'Password must include: an uppercase letter, a lowercase letter, a number, a special character, and at least 14 characters.',
+        sourceUrl:
+          'https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers/job/SAN-JOSE/apply/applyManually',
       },
     );
 
     expect(generated.credential.platform).toBe('workday');
+    expect(generated.credential.domain).toBe('cadence.wd1.myworkdayjobs.com');
     expect(generated.credential.loginIdentifier).toBe('profile@example.com');
     expect(generated.credential.source).toBe('generated_platform_password');
     expect(generated.event.passwordSource).toBe('generated_platform_password');
@@ -78,7 +90,7 @@ describe('accountCredentials', () => {
     expect(/[a-z]/.test(generated.credential.secret)).toBe(true);
     expect(/[0-9]/.test(generated.credential.secret)).toBe(true);
     expect(/[!@#$%^&*]/.test(generated.credential.secret)).toBe(true);
-    expect(generated.event.note).toContain('Generated a workday account password');
+    expect(generated.event.note).toContain('cadence.wd1.myworkdayjobs.com');
   });
 
   test('describes password requirements for reporting', () => {

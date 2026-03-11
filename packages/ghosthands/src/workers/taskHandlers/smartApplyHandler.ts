@@ -174,6 +174,42 @@ export class SmartApplyHandler implements TaskHandler {
     }
   }
 
+  private async closeUnexpectedSiblingPages(
+    adapter: BrowserAutomationAdapter,
+    expectedUrl: string,
+  ): Promise<void> {
+    let expectedHost = "";
+    try {
+      expectedHost = new URL(expectedUrl).hostname.toLowerCase();
+    } catch {
+      return;
+    }
+
+    const currentPage = adapter.page;
+    const siblingPages = currentPage.context().pages().filter((page) => page !== currentPage && !page.isClosed());
+    for (const sibling of siblingPages) {
+      const siblingUrl = sibling.url();
+      let siblingHost = "";
+      try {
+        siblingHost = siblingUrl ? new URL(siblingUrl).hostname.toLowerCase() : "";
+      } catch {
+        siblingHost = "";
+      }
+
+      if (!siblingHost || siblingHost === expectedHost) {
+        continue;
+      }
+
+      console.warn(
+        `[SmartApply] Closing unexpected sibling page during apply flow ` +
+        `(expected host: ${expectedHost}, found: ${siblingHost || siblingUrl || 'about:blank'})`,
+      );
+      await sibling.close().catch(() => {});
+    }
+
+    await currentPage.bringToFront().catch(() => {});
+  }
+
   validate(inputData: Record<string, any>): ValidationResult {
     const errors: string[] = [];
     const userData = inputData.user_data;
@@ -295,6 +331,9 @@ export class SmartApplyHandler implements TaskHandler {
         pagesProcessed++;
 
         await this.waitForPageLoad(adapter);
+        if (config.platformId === 'workday') {
+          await this.closeUnexpectedSiblingPages(adapter, job.target_url);
+        }
 
         // Dismiss cookie consent banners (common on many job sites)
         await this.dismissCookieBanner(adapter);
@@ -2000,6 +2039,7 @@ Click only ONE button, then report the task as done.`,
     ) {
       const generated = generatePlatformCredential(profile, platform, email, {
         validationText: initialValidationText,
+        sourceUrl: currentUrl,
       });
       this.rememberGeneratedPlatformCredential(generated.credential, generated.event);
       passwordResolution = {
@@ -2038,6 +2078,7 @@ Click only ONE button, then report the task as done.`,
               ? (() => {
                   const generated = generatePlatformCredential(profile, platform, email, {
                     validationText,
+                    sourceUrl: currentUrl,
                   });
                   this.rememberGeneratedPlatformCredential(generated.credential, generated.event);
                   return {

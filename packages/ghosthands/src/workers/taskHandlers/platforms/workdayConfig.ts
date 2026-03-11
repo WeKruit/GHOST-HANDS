@@ -1958,42 +1958,16 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
       }
     }
 
-    // Workday login page — try Google SSO first, then native email/password
+    // Workday login page — use native email/password.
+    // Do NOT initiate Google SSO here; account creation generates
+    // native Workday credentials that should be used immediately.
     console.log('[Workday] On login page...');
     console.log(
       `[Workday] Native credential source: email=${workdayEmail ? 'present' : 'missing'}, ` +
       `passwordSource=${workdayPassword.source}`,
     );
 
-    // Step 1: Try Google SSO via Playwright selectors
-    let googleClicked = false;
-    const googleBtnSelectors = [
-      'button:has-text("Sign in with Google")',
-      'button:has-text("Continue with Google")',
-      'a:has-text("Sign in with Google")',
-      '[data-automation-id*="google" i]',
-    ];
-    for (const sel of googleBtnSelectors) {
-      try {
-        const btn = adapter.page.locator(sel).first();
-        if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
-          await btn.click();
-          googleClicked = true;
-          console.log('[Workday] Clicked "Sign in with Google" via Playwright locator.');
-          break;
-        }
-      } catch { /* try next selector */ }
-    }
-
-    if (googleClicked) {
-      try {
-        await adapter.page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
-        await adapter.page.waitForTimeout(3000);
-      } catch { /* non-fatal */ }
-      return;
-    }
-
-    // Step 2: Detect page layout — Workday shows "Create Account" by default with
+    // Step 1: Detect page layout — Workday shows "Create Account" by default with
     // a "Sign In" tab. We need to click the tab FIRST before filling credentials,
     // otherwise we'd fill the Create Account form by mistake.
     const pageContext = await adapter.page.evaluate(() => {
@@ -2052,10 +2026,10 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
         await adapter.page.waitForTimeout(1500);
       }
     } else if (!pageContext.hasPasswordField) {
-      // No password field visible at all — LLM finds sign-in option
+      // No password field visible at all — find the native sign-in view.
       console.log('[Workday] No login form visible — using LLM to find sign-in...');
       await adapter.act(
-        'Look for a "Sign in with Google" button or a "Sign In" link/tab and click it to open the sign-in form. Do NOT click "Create Account". Click ONLY ONE button, then report done.',
+        'Look for a "Sign In" or "Log In" link/tab/button and click it to open the native email/password sign-in form. Do NOT click "Sign in with Google". Do NOT click "Create Account". Click ONLY ONE button, then report done.',
       );
       await adapter.page.waitForTimeout(2000);
     }
@@ -2168,11 +2142,11 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
       return loginError;
     };
 
-    // Step 3: Try login with base password
+    // Step 2: Try login with base password
     const PASSWORD_SUFFIX = 'aA1!';
     let loginError = await tryLogin(workdayPassword.password);
 
-    // Step 3b: If base password failed, try with suffix appended
+    // Step 2b: If base password failed, try with suffix appended
     if (loginError && workdayPassword.password) {
       console.log(`[Workday] Login failed with base password: "${loginError}" — retrying with strengthened password...`);
       // Dismiss error / re-open sign-in form
@@ -2201,7 +2175,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
     // Mark that we attempted login
     (profile as any)._loginAttempted = true;
 
-    // Step 4: Both passwords failed → navigate to account creation
+    // Step 3: Both passwords failed → navigate to account creation
     if (loginError) {
       console.log(`[Workday] Login failed: "${loginError}" — navigating to account creation...`);
       (profile as any)._workdayForceAccountCreation = true;
