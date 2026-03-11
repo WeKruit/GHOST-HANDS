@@ -84,15 +84,46 @@ export class ActionExecutor {
         };
         break;
       case 'upload_resume':
-        result = {
-          ok: true,
-          layer: null,
-          fieldsAttempted: 0,
-          fieldsFilled: 0,
-          costUsd: 0,
-          pageNavigated: false,
-          summary: 'Resume upload deferred to external file chooser handling.',
-        };
+        // Resume upload is handled externally via Playwright filechooser event
+        // (set up in JobExecutor). We click the file input to trigger the chooser.
+        try {
+          const fileInput = await this.page.$('input[type="file"]');
+          if (fileInput) {
+            await fileInput.click({ timeout: 3000 });
+            await sleep(1500); // Allow filechooser event to fire
+            result = {
+              ok: true,
+              layer: 'dom',
+              fieldsAttempted: 1,
+              fieldsFilled: 1,
+              costUsd: 0,
+              pageNavigated: false,
+              summary: 'Clicked file input to trigger resume upload via filechooser handler.',
+            };
+          } else {
+            result = {
+              ok: false,
+              layer: 'dom',
+              fieldsAttempted: 1,
+              fieldsFilled: 0,
+              costUsd: 0,
+              pageNavigated: false,
+              summary: 'No file input found on page; resume upload may require Stagehand/Magnitude.',
+              error: 'no_file_input',
+            };
+          }
+        } catch (error) {
+          result = {
+            ok: false,
+            layer: 'dom',
+            fieldsAttempted: 1,
+            fieldsFilled: 0,
+            costUsd: 0,
+            pageNavigated: false,
+            summary: 'File input click failed.',
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
         break;
       case 'login':
         result = await this.executeAdapterAuthAction(
@@ -221,6 +252,40 @@ export class ActionExecutor {
       };
     }
 
+    // When the LLM provides fieldValues, attempt direct DOM fill
+    const fieldValues = action.fieldValues;
+    if (fieldValues && Object.keys(fieldValues).length > 0) {
+      let filled = 0;
+      for (const field of emptyTargets) {
+        const fieldLabel = normalizeText(field.label);
+        const matchingKey = Object.keys(fieldValues).find((key) => {
+          const normalizedKey = normalizeText(key);
+          return normalizedKey === fieldLabel || fieldLabel.includes(normalizedKey) || normalizedKey.includes(fieldLabel);
+        });
+        if (!matchingKey) continue;
+
+        try {
+          await this.page.locator(field.selector).first().fill(fieldValues[matchingKey], { timeout: 3000 });
+          filled++;
+        } catch {
+          // Individual field failure is not fatal; continue with remaining fields
+        }
+      }
+
+      if (filled > 0) {
+        return {
+          ok: true,
+          layer: 'dom',
+          fieldsAttempted: emptyTargets.length,
+          fieldsFilled: filled,
+          costUsd: 0,
+          pageNavigated: false,
+          summary: `DOM-filled ${filled} of ${emptyTargets.length} fields using LLM-provided values.`,
+        };
+      }
+    }
+
+    // No fieldValues provided or none matched — escalate to next tier
     return {
       ok: false,
       layer: 'dom',
@@ -228,8 +293,8 @@ export class ActionExecutor {
       fieldsFilled: 0,
       costUsd: 0,
       pageNavigated: false,
-      summary: 'DOM fill skipped because decision actions do not yet include concrete field values.',
-      error: 'missing_field_values',
+      summary: 'DOM fill could not resolve concrete values for target fields; escalating to Stagehand.',
+      error: 'no_field_values_matched',
     };
   }
 
@@ -510,12 +575,21 @@ export class ActionExecutor {
     let clicked = 0;
     const beforeUrl = this.safePageUrl();
     for (const repeater of repeaters) {
-      try {
-        await this.page.locator(repeater.addButtonSelector).first().click({ timeout: 3000 });
-        clicked++;
-        await this.page.waitForTimeout(250);
-      } catch {
-        // Keep going so one bad repeater does not hide the rest.
+      // Determine how many clicks needed: targetCount - currentCount, minimum 1
+      const clicksNeeded = repeater.targetCount && repeater.targetCount > repeater.currentCount
+        ? repeater.targetCount - repeater.currentCount
+        : 1;
+
+      for (let i = 0; i < clicksNeeded; i++) {
+        try {
+          await this.page.locator(repeater.addButtonSelector).first().click({ timeout: 3000 });
+          clicked++;
+          // Wait for DOM to settle between expansion clicks
+          await this.page.waitForTimeout(500);
+        } catch {
+          // Stop clicking this repeater if a click fails
+          break;
+        }
       }
     }
 

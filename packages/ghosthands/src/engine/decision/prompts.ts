@@ -23,6 +23,9 @@ export const PLATFORM_GUARDRAILS: Record<string, string> = {
   smartrecruiters: [
     'SmartRecruiters may split flows across apply, login, and review steps.',
     'If authentication prompts appear, prefer login or create_account rather than generic click actions.',
+    'SmartRecruiters uses shadow DOM custom elements — "Add" buttons for work experience, education, and other repeatable sections may appear inside shadow roots.',
+    'CRITICAL: Before filling a repeater section, use expand_repeaters to click ALL visible "Add" or "+" buttons to create enough entries for the applicant profile (e.g. multiple work experiences).',
+    'After expanding, re-observe before filling to see the newly created fields.',
     'Any CAPTCHA, turnstile, or verification wall must map to report_blocked.',
   ].join('\n'),
   other: [
@@ -81,6 +84,11 @@ export const DECISION_TOOL: Tool = {
         items: { type: 'string' },
         description: 'Field labels to fill when action is fill_form.',
       },
+      fieldValues: {
+        type: 'object',
+        additionalProperties: { type: 'string' },
+        description: 'Optional map of field_label → value when you can infer exact fill values from the applicant profile. Only for fill_form.',
+      },
     },
     required: ['action', 'reasoning', 'confidence'],
   },
@@ -109,6 +117,11 @@ export function buildSystemPrompt(profileSummary: string, platformGuardrails: st
     '- Use `report_blocked` for CAPTCHA, turnstile, bot checks, or human verification challenges.',
     '- Use `login`, `create_account`, or `enter_verification` when the page is clearly in an auth flow.',
     '- If the page is ambiguous or unstable, use `wait_and_retry` instead of forcing a risky action.',
+    '',
+    'Repeater / Add button policy:',
+    '- If the page has visible "Add", "Add another", "+" buttons for repeatable sections (work experience, education, skills, etc.), use `expand_repeaters` BEFORE `fill_form`.',
+    '- The applicant may have multiple entries (e.g. 3 work experiences); expand enough entries to match their profile.',
+    '- After expanding, wait for new fields to appear before filling them.',
     '',
     'Decision policy:',
     '- Be conservative.',

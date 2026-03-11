@@ -21,15 +21,78 @@ import { createStep } from '@mastra/core/workflows';
 import { workflowState, blockerResumeSchema, type RuntimeContext, type WorkflowState } from '../types.js';
 import { getLogger } from '../../../monitoring/logger.js';
 import { callbackNotifier } from '../../../workers/callbackNotifier.js';
+import { BlockerDetector } from '../../../detection/BlockerDetector.js';
+import type { SupabaseClient } from '@supabase/supabase-js';
+
+// ---------------------------------------------------------------------------
+// HITL resume helpers (ported from factory.ts check_blockers_checkpoint)
+// ---------------------------------------------------------------------------
+
+const blockerDetector = new BlockerDetector();
+
+async function readAndClearResolutionData(
+  supabase: SupabaseClient,
+  jobId: string,
+): Promise<Record<string, unknown> | null> {
+  const { data, error } = await supabase
+    .from('gh_automation_jobs')
+    .select('interaction_data')
+    .eq('id', jobId)
+    .single();
+
+  if (error || !data?.interaction_data) return null;
+
+  const interactionData = data.interaction_data as Record<string, unknown>;
+  const resolutionData = (interactionData.resolution_data as Record<string, unknown>) ?? null;
+
+  const stripped = { ...interactionData };
+  delete stripped.resolution_data;
+  delete stripped.resolution_type;
+  delete stripped.resolved_by;
+  delete stripped.resolved_at;
+  delete stripped.otp;
+  delete stripped.credentials;
+
+  await supabase
+    .from('gh_automation_jobs')
+    .update({ interaction_data: stripped })
+    .eq('id', jobId);
+
+  return resolutionData;
+}
+
+async function injectResolution(
+  adapter: { act: (instruction: string, opts?: { data?: Record<string, unknown> }) => Promise<any> },
+  resolution: Record<string, unknown>,
+): Promise<void> {
+  const resolutionType = resolution.type as string | undefined;
+  if (resolutionType === 'code_entry' && resolution.code) {
+    await adapter.act(`Type "${resolution.code}" into the verification code input field`);
+  } else if (resolutionType === 'credentials' && resolution.username) {
+    if (resolution.username) {
+      await adapter.act(`Type "${resolution.username}" into the username or email field`);
+    }
+    if (resolution.password) {
+      await adapter.act(`Type the password into the password field`, {
+        data: { password: resolution.password as string },
+      });
+    }
+  }
+}
+
+async function detectBlockerSafe(
+  adapter: import('../../../adapters/types.js').HitlCapableAdapter,
+): Promise<{ type: string; confidence: number } | null> {
+  try {
+    return await blockerDetector.detectWithAdapter(adapter);
+  } catch {
+    return null;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Types for the decision engine classes (implemented in engine/decision/)
-// These are imported from the engine layer once it is built.
 // ---------------------------------------------------------------------------
-
-// Forward-declare the interfaces we expect from engine/decision.
-// The actual implementations will be created in a subsequent task.
-// For now, this step defines the contract it expects.
 
 interface DecisionLoopResult {
   terminalState: 'confirmation' | 'review_page' | 'submitted' | 'stuck' | 'budget_exceeded' | 'error' | 'max_iterations';
@@ -143,11 +206,41 @@ export function buildPageDecisionLoopStep(
           iteration: state.decisionLoop.iteration,
         });
 
-        // Inject resolution into adapter (same pattern as check_blockers_checkpoint)
+        // Read sensitive resolution data from DB (OTP codes, credentials, etc.)
+        const resolutionData = await readAndClearResolutionData(rt.supabase, state.jobId);
+
+        // Inject resolution data (2FA code, login credentials) into adapter
+        if (resolutionData && (resolutionData.code || resolutionData.username)) {
+          await injectResolution(rt.adapter, {
+            ...resolutionData,
+            type: resumeData.resolutionType,
+          });
+        }
+
+        // Resume the adapter
         await rt.adapter.resume?.({ resolutionType: resumeData.resolutionType });
 
-        // Allow page to settle after human resolution
-        await new Promise((r) => setTimeout(r, 2000));
+        // Verify blocker is actually cleared (up to 3 attempts, 2s apart)
+        let stillBlocked = false;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          await new Promise((r) => setTimeout(r, 2000));
+          const blockerCheck = await detectBlockerSafe(rt.adapter);
+          if (!blockerCheck) {
+            stillBlocked = false;
+            break;
+          }
+          stillBlocked = true;
+        }
+
+        if (stillBlocked) {
+          // Blocker persists after human resolution — re-suspend
+          logger.warn('Blocker persists after HITL resolution', {
+            jobId: state.jobId,
+            resolutionType: resumeData.resolutionType,
+          });
+          const currentUrl = await rt.adapter.getCurrentUrl?.().catch(() => state.targetUrl) ?? state.targetUrl;
+          return await suspend({ blockerType: 'context_lost', pageUrl: currentUrl });
+        }
 
         // Resume job status in DB
         await rt.supabase
