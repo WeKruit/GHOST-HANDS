@@ -1803,6 +1803,8 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
       (profile as any)._forceNativeLoginAfterAccountCreation ||
       (profile as any)._accountCreationCompleted,
     );
+    const shouldReuseExactNativePassword =
+      forceNativeLogin || workdayPassword.source === 'platform_override';
 
     // Google sign-in page — handle each sub-page with DOM clicks
     if (currentUrl.includes('accounts.google.com')) {
@@ -2165,7 +2167,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
     }
 
     // Step 2b: If base password failed, try with suffix appended
-    if (loginError && workdayPassword.password) {
+    if (loginError && workdayPassword.password && !shouldReuseExactNativePassword) {
       console.log(`[Workday] Login failed with base password: "${loginError}" — retrying with strengthened password...`);
       // Dismiss error / re-open sign-in form
       await adapter.page.keyboard.press('Escape');
@@ -2197,6 +2199,14 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
 
     // Mark that we attempted login
     (profile as any)._loginAttempted = true;
+
+    if (loginError && forceNativeLogin) {
+      (profile as any)._forceNativeLoginAfterAccountCreation = false;
+      (profile as any)._workdayForceAccountCreation = false;
+      throw new Error(
+        'Workday native sign-in failed immediately after account creation. Browser open for manual review.',
+      );
+    }
 
     // Step 3: Both passwords failed → navigate to account creation
     if (loginError) {
