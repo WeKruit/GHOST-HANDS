@@ -93,6 +93,7 @@ export interface FillFormOptions {
   forceMagnitude?: boolean;
   observers?: FillObservers;
   anthropicClientConfig?: AnthropicClientConfig;
+  onVisualFillStart?(): Promise<void> | void;
 }
 
 interface GenerateResult {
@@ -3355,6 +3356,7 @@ export async function fillFormOnPage(
     }
 
     console.log('[formFiller] No visible DOM fields found — attempting Magnitude visual fill.');
+    await opts?.onVisualFillStart?.();
     try {
       const today = new Date().toLocaleDateString('en-CA');
       const visualPrompt =
