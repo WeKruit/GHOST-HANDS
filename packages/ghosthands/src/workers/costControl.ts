@@ -128,12 +128,20 @@ export class CostTracker {
     qualityPreset?: QualityPreset;
     jobType?: string;
     maxActions?: number;
+    /** VALET credit-derived USD budget cap. When provided, the effective task
+     *  budget becomes min(internalBudget, maxBudgetOverride). */
+    maxBudgetOverride?: number;
   }) {
     this.jobId = opts.jobId;
     // Per-job-type budget overrides take precedence over quality preset
-    this.taskBudget =
+    const internalBudget =
       (opts.jobType ? JOB_TYPE_BUDGET_OVERRIDES[opts.jobType] : undefined) ??
       TASK_BUDGET[opts.qualityPreset || 'balanced'];
+
+    // Use the stricter of internal budget and VALET credit budget
+    this.taskBudget = opts.maxBudgetOverride != null
+      ? Math.min(internalBudget, opts.maxBudgetOverride)
+      : internalBudget;
     this.actionLimit =
       opts.maxActions ??
       (opts.jobType ? JOB_TYPE_ACTION_LIMITS[opts.jobType] : undefined) ??
