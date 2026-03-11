@@ -134,8 +134,13 @@ export class CallbackNotifier {
       total_tokens: job.total_tokens || 0,
     };
 
-    // WEK-162: Include Kasm session URL if available (from job metadata or env)
+    // Include cost_breakdown from job metadata (populated by JobExecutor on success/failure)
     const jobMeta = typeof job.metadata === 'object' ? (job.metadata || {}) : {};
+    if (jobMeta.cost_breakdown) {
+      payload.cost_breakdown = jobMeta.cost_breakdown as CallbackPayload['cost_breakdown'];
+    }
+
+    // WEK-162: Include Kasm session URL if available (from job metadata or env)
     const kasmUrl = jobMeta.kasm_session_url || jobMeta.kasm_url || process.env.KASM_SESSION_URL;
     if (kasmUrl) {
       payload.kasm_url = kasmUrl;
