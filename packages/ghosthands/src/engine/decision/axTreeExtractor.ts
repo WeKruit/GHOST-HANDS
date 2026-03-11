@@ -165,6 +165,7 @@ export function flattenAXTree(
 export async function extractAXFields(page: Page): Promise<AXFieldNode[]> {
   const castPage = page as PageWithAccessibility;
   if (!castPage.accessibility?.snapshot) {
+    console.log('[axTreeExtractor] page.accessibility not available — skipping AX extraction');
     return [];
   }
 
@@ -177,7 +178,8 @@ export async function extractAXFields(page: Page): Promise<AXFieldNode[]> {
     const results: AXFieldNode[] = [];
     flattenAXTree(snapshot, 0, null, results);
     return results;
-  } catch {
+  } catch (err) {
+    console.log(`[axTreeExtractor] AX extraction failed: ${err instanceof Error ? err.message : String(err)}`);
     return [];
   }
 }

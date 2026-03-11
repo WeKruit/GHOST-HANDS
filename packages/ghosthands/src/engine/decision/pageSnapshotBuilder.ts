@@ -230,14 +230,26 @@ export class PageSnapshotBuilder {
     adapter: Parameters<typeof mergeObservations>[5] = this.adapter,
   ): Promise<MergedPageObservation> {
     const domSnapshot = domSnapshotOverride ?? await this.buildSnapshot(page, actionHistory);
+    const axStart = Date.now();
     const axFields = await Promise.race<AXFieldNode[]>([
       extractAXFields(page).catch(() => []),
       new Promise<AXFieldNode[]>((resolve) => {
         setTimeout(() => resolve([]), MAX_AX_EXTRACTION_MS);
       }),
     ]);
+    const axMs = Date.now() - axStart;
 
-    return mergeObservations(domSnapshot, axFields, durableContext, tiebreakerFn, page, adapter);
+    const merged = await mergeObservations(domSnapshot, axFields, durableContext, tiebreakerFn, page, adapter);
+
+    console.log(
+      `[mergedObserver] DOM fields=${domSnapshot.fields.length} AX fields=${axFields.length} (${axMs}ms)` +
+      ` | merged=${merged.fieldMergeResults.size} concordant=${Array.from(merged.fieldMergeResults.values()).filter(r => r.provenance.concordant === true).length}` +
+      ` disagreements=${Array.from(merged.fieldMergeResults.values()).filter(r => r.mergedState === 'ambiguous_observer_mismatch').length}` +
+      ` domOnly=${merged.domOnlyFieldIds.length} axOnly=${merged.axOnlyFields.length}` +
+      ` stagehand=${merged.stagehandInvoked} confidence=${merged.observationConfidence.toFixed(2)}`,
+    );
+
+    return merged;
   }
 
   private async quickProbeVisibleControls(
