@@ -2042,7 +2042,9 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       const fillResult = await fillFormOnPage(adapter.page, adapter, profileText, resumePath, {
         forceMagnitude: escalate,
         anthropicClientConfig: llmClientConfig?.anthropic,
-        onVisualFillStart: () => progress.setStatusMessage?.('Attempting visual form fill...'),
+        onVisualFillStart: progress
+          ? () => progress.setStatusMessage?.('Attempting visual form fill...')
+          : undefined,
         observers: pageContext
           ? {
               onQuestionsNormalized: async (questions, opts) => pageContext.syncQuestions(questions, opts),
