@@ -38,6 +38,51 @@ const VERIFICATION_EMAIL_CONTEXT_BODY_MAX_CHARS = 4_000;
 const VERIFICATION_AGENT_MAX_ATTEMPTS = 2;
 const VERIFICATION_AGENT_RETRY_DELAY_MS = 1_500;
 
+function asMutableRecord(value: unknown): Record<string, any> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, any>;
+}
+
+function rememberCredentialOnProfile(
+  profile: Record<string, any>,
+  credential: GeneratedPlatformCredential,
+): void {
+  const platformKey = credential.platform;
+  const platformCredentials =
+    asMutableRecord(profile.platform_credentials) ??
+    asMutableRecord(profile.platformCredentials) ??
+    {};
+  const existingPlatformEntry = asMutableRecord(platformCredentials[platformKey]) ?? {};
+  const scopedByDomain = asMutableRecord(existingPlatformEntry.byDomain) ?? {};
+
+  if (credential.domain) {
+    scopedByDomain[credential.domain] = {
+      domain: credential.domain,
+      email: credential.loginIdentifier,
+      loginIdentifier: credential.loginIdentifier,
+      password: credential.secret,
+      secret: credential.secret,
+    };
+  }
+
+  platformCredentials[platformKey] = {
+    ...existingPlatformEntry,
+    email: credential.loginIdentifier,
+    loginIdentifier: credential.loginIdentifier,
+    password: credential.secret,
+    secret: credential.secret,
+    domain: credential.domain ?? null,
+    ...(Object.keys(scopedByDomain).length > 0 ? { byDomain: scopedByDomain } : {}),
+  };
+
+  profile.platform_credentials = platformCredentials;
+  profile.platformCredentials = platformCredentials;
+  profile[`${platformKey}_email`] = credential.loginIdentifier;
+  profile[`${platformKey}Email`] = credential.loginIdentifier;
+  profile[`${platformKey}_password`] = credential.secret;
+  profile[`${platformKey}Password`] = credential.secret;
+}
+
 // --- Handler ---
 
 export class SmartApplyHandler implements TaskHandler {
@@ -64,11 +109,15 @@ export class SmartApplyHandler implements TaskHandler {
   }
 
   private rememberGeneratedPlatformCredential(
+    profile: Record<string, any>,
     credential: GeneratedPlatformCredential,
     event: AccountCreationEvent,
   ): void {
     const existingCredentialIndex = this.generatedPlatformCredentials.findIndex(
-      (entry) => entry.platform === credential.platform,
+      (entry) =>
+        entry.platform === credential.platform &&
+        (entry.domain ?? null) === (credential.domain ?? null) &&
+        entry.loginIdentifier === credential.loginIdentifier,
     );
     if (existingCredentialIndex >= 0) {
       this.generatedPlatformCredentials[existingCredentialIndex] = credential;
@@ -79,6 +128,7 @@ export class SmartApplyHandler implements TaskHandler {
     const existingEventIndex = this.accountCreationEvents.findIndex(
       (entry) =>
         entry.platform === event.platform &&
+        (entry.domain ?? null) === (event.domain ?? null) &&
         entry.action === event.action &&
         entry.loginIdentifier === event.loginIdentifier,
     );
@@ -87,6 +137,8 @@ export class SmartApplyHandler implements TaskHandler {
     } else {
       this.accountCreationEvents.push(event);
     }
+
+    rememberCredentialOnProfile(profile, credential);
   }
 
   private withAccountCreationMetadata(result: TaskResult): TaskResult {
@@ -2041,7 +2093,7 @@ Click only ONE button, then report the task as done.`,
         validationText: initialValidationText,
         sourceUrl: currentUrl,
       });
-      this.rememberGeneratedPlatformCredential(generated.credential, generated.event);
+      this.rememberGeneratedPlatformCredential(profile, generated.credential, generated.event);
       passwordResolution = {
         password: generated.credential.secret,
         source: generated.credential.source,
@@ -2080,7 +2132,7 @@ Click only ONE button, then report the task as done.`,
                     validationText,
                     sourceUrl: currentUrl,
                   });
-                  this.rememberGeneratedPlatformCredential(generated.credential, generated.event);
+                  this.rememberGeneratedPlatformCredential(profile, generated.credential, generated.event);
                   return {
                     password: generated.credential.secret,
                     source: generated.credential.source,
@@ -2500,11 +2552,45 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
 
     // Fallback review detection
     const hasSubmitFallback = await adapter.page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a.btn'));
-      return btns.some(b => {
-        const text = (b.textContent || (b as HTMLInputElement).value || '').trim().toLowerCase();
-        return text.includes('submit') || text === 'send application';
-      });
+      const roots: ParentNode[] = [document];
+      const seenShadowRoots = new Set<ShadowRoot>();
+      for (let index = 0; index < roots.length; index += 1) {
+        const root = roots[index];
+        const elements = Array.from(root.querySelectorAll<HTMLElement>('*'));
+        for (const element of elements) {
+          const shadowRoot = element.shadowRoot;
+          if (shadowRoot && !seenShadowRoots.has(shadowRoot)) {
+            seenShadowRoots.add(shadowRoot);
+            roots.push(shadowRoot);
+          }
+        }
+      }
+
+      for (const root of roots) {
+        const clickables = Array.from(
+          root.querySelectorAll<HTMLElement>(
+            'button, [role="button"], [role="link"], input[type="submit"], input[type="button"], a[href], a.btn, a[class*="btn"], a[class*="button"]',
+          ),
+        );
+        for (const clickable of clickables) {
+          const rect = clickable.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          const text = (
+            clickable.textContent ||
+            clickable.getAttribute('value') ||
+            clickable.getAttribute('aria-label') ||
+            clickable.getAttribute('title') ||
+            ''
+          )
+            .trim()
+            .toLowerCase();
+          if (text.includes('submit') || text === 'send application' || text.includes('review')) {
+            return true;
+          }
+        }
+      }
+
+      return false;
     });
     if (hasSubmitFallback) {
       const domReview = await this.checkIfReviewPage(adapter);
@@ -3134,26 +3220,57 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
    */
   private async checkIfReviewPage(adapter: BrowserAutomationAdapter): Promise<boolean> {
     return adapter.page.evaluate(() => {
-      const headings = Array.from(document.querySelectorAll('h1, h2, h3'));
+      const roots: ParentNode[] = [document];
+      const seenShadowRoots = new Set<ShadowRoot>();
+      for (let index = 0; index < roots.length; index += 1) {
+        const root = roots[index];
+        const elements = Array.from(root.querySelectorAll<HTMLElement>('*'));
+        for (const element of elements) {
+          const shadowRoot = element.shadowRoot;
+          if (shadowRoot && !seenShadowRoots.has(shadowRoot)) {
+            seenShadowRoots.add(shadowRoot);
+            roots.push(shadowRoot);
+          }
+        }
+      }
+
+      const headings = roots.flatMap((root) => Array.from(root.querySelectorAll('h1, h2, h3, [role="heading"]')));
       const isReviewHeading = headings.some(h => (h.textContent || '').toLowerCase().includes('review'));
       if (!isReviewHeading) return false;
-      const buttons = Array.from(document.querySelectorAll('button'));
+      const buttons = roots.flatMap((root) =>
+        Array.from(
+          root.querySelectorAll('button, [role="button"], [role="link"], input[type="submit"], input[type="button"], a[href]'),
+        ),
+      );
       const SUBMIT_TEXTS = ['submit', 'submit application', 'submit my application', 'submit this application', 'send application'];
       const hasSubmit = buttons.some(b => {
-        const text = (b.textContent?.trim().toLowerCase() || '');
+        const text = (
+          b.textContent ||
+          b.getAttribute('value') ||
+          b.getAttribute('aria-label') ||
+          b.getAttribute('title') ||
+          ''
+        )
+          .trim()
+          .toLowerCase();
         return SUBMIT_TEXTS.indexOf(text) !== -1 || text.startsWith('submit');
       });
       if (!hasSubmit) return false;
       // Check entire page for any editable form elements
-      const editableCount = document.querySelectorAll(
-        'input[type="text"]:not([readonly]):not([disabled]), ' +
-        'input[type="email"]:not([readonly]):not([disabled]), ' +
-        'input[type="tel"]:not([readonly]):not([disabled]), ' +
-        'textarea:not([readonly]):not([disabled]), ' +
-        'select:not([disabled]), ' +
-        'input[type="radio"]:not([disabled]), ' +
-        'input[type="checkbox"]:not([disabled])'
-      ).length;
+      const editableCount = roots.reduce((count, root) => {
+        return (
+          count +
+          root.querySelectorAll(
+            'input[type="text"]:not([readonly]):not([disabled]), ' +
+              'input[type="email"]:not([readonly]):not([disabled]), ' +
+              'input[type="tel"]:not([readonly]):not([disabled]), ' +
+              'textarea:not([readonly]):not([disabled]), ' +
+              'select:not([disabled]), ' +
+              'input[type="radio"]:not([disabled]), ' +
+              'input[type="checkbox"]:not([disabled])',
+          ).length
+        );
+      }, 0);
       // If there are interactive form elements, probably not a true review page
       return editableCount === 0;
     });
