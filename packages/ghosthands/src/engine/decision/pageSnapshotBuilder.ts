@@ -1,0 +1,455 @@
+import type { Page } from 'playwright';
+import { detectPageType, detectPlatform } from '../PageObserver';
+import { PageScanner } from '../v3/PageScanner';
+import { PLATFORM_GUARDRAILS } from './prompts';
+import type { ActionHistoryEntry, PageDecisionContext } from './types';
+import { PageDecisionContextSchema } from './types';
+
+type ExtractorResult<T> = {
+  ok: boolean;
+  value: T;
+};
+
+function hashString(value: string): string {
+  let hash = 5381;
+  for (let i = 0; i < value.length; i++) {
+    hash = ((hash << 5) + hash + value.charCodeAt(i)) & 0xffffffff;
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function guardrailHintsFor(platform: string): string[] {
+  const raw = PLATFORM_GUARDRAILS[platform] ?? PLATFORM_GUARDRAILS.other;
+  return raw
+    .split('\n')
+    .map((line) => line.trim().replace(/^-+\s*/, ''))
+    .filter(Boolean);
+}
+
+async function safeExtract<T>(fn: () => Promise<T>, fallback: T): Promise<ExtractorResult<T>> {
+  try {
+    return { ok: true, value: await fn() };
+  } catch {
+    return { ok: false, value: fallback };
+  }
+}
+
+export class PageSnapshotBuilder {
+  constructor(private readonly platform?: string) {}
+
+  async buildSnapshot(
+    page: Page,
+    actionHistory: ActionHistoryEntry[] = [],
+  ): Promise<PageDecisionContext> {
+    const url = page.url();
+    const platform = this.platform || detectPlatform(url);
+    const scanner = new PageScanner(page, platform);
+
+    const scanResult = await safeExtract(
+      async () => scanner.scan(),
+      {
+        url,
+        platform,
+        pageType: 'unknown',
+        pageLabel: undefined,
+        fields: [],
+        buttons: [],
+        scrollHeight: 0,
+        viewportHeight: 0,
+        timestamp: Date.now(),
+      } as Awaited<ReturnType<PageScanner['scan']>>,
+    );
+
+    const [
+      titleResult,
+      pageTypeResult,
+      headingsResult,
+      repeatersResult,
+      fingerprintResult,
+      blockerResult,
+      stepContextResult,
+    ] = await Promise.all([
+      safeExtract(async () => page.title(), ''),
+      safeExtract(async () => detectPageType(page), scanResult.value.pageType ?? 'unknown'),
+      safeExtract(async () => this.extractHeadings(page), [] as string[]),
+      safeExtract(async () => this.detectRepeaters(page), [] as PageDecisionContext['repeaters']),
+      safeExtract(async () => this.extractFingerprint(page), {
+        heading: scanResult.value.pageLabel ?? '',
+        fieldCount: scanResult.value.fields.length,
+        filledCount: scanResult.value.fields.filter((field) => !field.isEmpty).length,
+        activeStep: '',
+        hash: hashString(
+          `${scanResult.value.pageLabel ?? ''}|${scanResult.value.fields.length}|${scanResult.value.fields.filter((field) => !field.isEmpty).length}`,
+        ),
+      }),
+      safeExtract(async () => this.detectBlocker(page), {
+        detected: false,
+        type: null,
+        confidence: 0,
+      }),
+      safeExtract(async () => this.extractStepContext(page), null),
+    ]);
+
+    const totalExtractors = 8;
+    const successfulExtractors = [
+      scanResult.ok,
+      titleResult.ok,
+      pageTypeResult.ok,
+      headingsResult.ok,
+      repeatersResult.ok,
+      fingerprintResult.ok,
+      blockerResult.ok,
+      stepContextResult.ok,
+    ].filter(Boolean).length;
+
+    const snapshot: PageDecisionContext = {
+      url,
+      title: titleResult.value,
+      platform,
+      pageType: pageTypeResult.value || scanResult.value.pageType || 'unknown',
+      headings: headingsResult.value,
+      fields: scanResult.value.fields.map((field) => ({
+        id: field.id,
+        selector: field.selector,
+        label: field.label || field.name || field.fieldId || field.id,
+        fieldType: field.fieldType,
+        isRequired: field.isRequired,
+        isVisible: field.isVisible,
+        isDisabled: field.isDisabled,
+        isEmpty: field.isEmpty,
+        currentValue: field.currentValue ?? '',
+        options: field.options,
+        groupKey: field.groupKey,
+      })),
+      buttons: scanResult.value.buttons.map((button) => ({
+        selector: button.selector,
+        text: button.text,
+        role: button.role,
+        isDisabled: button.isDisabled,
+        automationId: button.automationId,
+      })),
+      stepContext: stepContextResult.value,
+      repeaters: repeatersResult.value,
+      fingerprint: fingerprintResult.value,
+      blocker: blockerResult.value,
+      actionHistory: actionHistory.slice(-10),
+      guardrailHints: guardrailHintsFor(platform),
+      observationConfidence: Math.min(1, successfulExtractors / totalExtractors),
+      observedAt: Date.now(),
+    };
+
+    return PageDecisionContextSchema.parse(snapshot);
+  }
+
+  private async extractHeadings(page: Page): Promise<string[]> {
+    return page.evaluate(() => {
+      const selectors = 'h1, h2, h3, h4, legend, [role="heading"]';
+      const nodes = Array.from(document.querySelectorAll<HTMLElement>(selectors));
+      const visible = nodes.filter((node) => {
+        const rect = node.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        const style = window.getComputedStyle(node);
+        return (
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          node.getAttribute('aria-hidden') !== 'true'
+        );
+      });
+
+      return Array.from(new Set(
+        visible
+          .map((node) => (node.textContent || '').replace(/\s+/g, ' ').trim())
+          .filter(Boolean),
+      )).slice(0, 25);
+    });
+  }
+
+  private async detectRepeaters(page: Page): Promise<PageDecisionContext['repeaters']> {
+    return page.evaluate(() => {
+      const repeaters: PageDecisionContext['repeaters'] = [];
+      const addPattern = /^\+?\s*add\b/i;
+      const ff = (window as Window & { __ff?: any }).__ff;
+
+      const queryAll = (selector: string): HTMLElement[] =>
+        Array.from(ff?.queryAll?.(selector) ?? document.querySelectorAll<HTMLElement>(selector));
+
+      const rootParent = (node: Node | null): Element | null => {
+        if (!node) return null;
+        if (ff?.rootParent) return ff.rootParent(node);
+        return (node as Element).parentElement ?? null;
+      };
+
+      const closestCrossRoot = (el: Element | null, selector: string): Element | null => {
+        if (!el) return null;
+        if (ff?.closestCrossRoot) return ff.closestCrossRoot(el, selector);
+        return el.closest(selector);
+      };
+
+      const isWithinCrossRoot = (node: Element | null, ancestor: Element | null): boolean => {
+        let current: Element | null = node;
+        while (current) {
+          if (current === ancestor) return true;
+          current = rootParent(current);
+        }
+        return false;
+      };
+
+      const queryWithinCrossRoot = (ancestor: Element | null, selector: string): HTMLElement[] => {
+        if (!ancestor) return [];
+        return queryAll(selector).filter((candidate) => isWithinCrossRoot(candidate, ancestor));
+      };
+
+      const buttons = queryAll('button, [role="button"], a.add-btn, .add-btn');
+
+      for (const button of buttons) {
+        const rect = button.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+
+        const style = window.getComputedStyle(button);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        if (button.getAttribute('aria-hidden') === 'true') continue;
+        if (button.hasAttribute('disabled') || button.getAttribute('aria-disabled') === 'true') continue;
+
+        const text = (button.textContent || '').trim();
+        if (!addPattern.test(text)) continue;
+
+        const card = closestCrossRoot(
+          button,
+          '.card, .section, [class*="section"], [class*="card"], [data-automation-id*="Section"], [data-automation-id*="panel"], [class*="Panel"], [class*="panel"]',
+        );
+
+        let label = '';
+        if (card) {
+          const heading = queryWithinCrossRoot(
+            card,
+            'h2, h3, h4, [class*="heading"], [class*="title"], [data-automation-id*="sectionHeader"], [data-automation-id*="Title"], legend, [class*="legend"]',
+          )[0];
+          label = heading?.textContent?.trim() || '';
+        }
+
+        if (!label) {
+          let current: Element | null = rootParent(button);
+          while (current && !label) {
+            const prev = current.previousElementSibling;
+            if (prev) {
+              if (['H2', 'H3', 'H4', 'LEGEND'].includes(prev.tagName)) {
+                label = prev.textContent?.trim() || '';
+              }
+              const header = queryWithinCrossRoot(
+                prev,
+                '[data-automation-id*="sectionHeader"], [data-automation-id*="Title"]',
+              )[0];
+              if (header) label = header.textContent?.trim() || '';
+            }
+            current = rootParent(current);
+            if (current === card) break;
+          }
+        }
+
+        if (!label) {
+          label = button.getAttribute('aria-label')?.trim() || text;
+        }
+
+        let currentCount = 0;
+        if (card) {
+          const allText = card.textContent || '';
+          const sectionBase = label.replace(/\s*\d+$/, '').trim();
+          if (sectionBase) {
+            const numberedRe = new RegExp(
+              `${sectionBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+\\d+`,
+              'gi',
+            );
+            const matches = allText.match(numberedRe);
+            if (matches) {
+              currentCount = new Set(matches.map((match) => match.trim().toLowerCase())).size;
+            }
+          }
+
+          if (currentCount === 0) {
+            const list = queryWithinCrossRoot(
+              card,
+              '.repeater-list, [class*="repeater"], [class*="entries"], [data-automation-id*="itemList"], [data-automation-id*="entryList"]',
+            )[0];
+            if (list) currentCount = list.children.length;
+          }
+
+          if (currentCount === 0) {
+            const groups = queryWithinCrossRoot(card, 'fieldset, [class*="entry"], [class*="item-group"]');
+            if (groups.length > 0) currentCount = groups.length;
+          }
+
+          if (currentCount === 0) {
+            const inputs = queryWithinCrossRoot(card, 'input[type="text"], textarea');
+            currentCount = inputs.some((input) => (input as HTMLInputElement).value.trim()) ? 1 : 0;
+          }
+        }
+
+        const marker = `gh-decision-repeater-${repeaters.length}`;
+        button.setAttribute('data-gh-decision-repeater', marker);
+        repeaters.push({
+          label,
+          addButtonSelector: `[data-gh-decision-repeater="${marker}"]`,
+          currentCount,
+        });
+      }
+
+      return repeaters;
+    });
+  }
+
+  private async extractFingerprint(
+    page: Page,
+  ): Promise<PageDecisionContext['fingerprint']> {
+    const fingerprint = await page.evaluate(() => {
+      const headingNode = document.querySelector<HTMLElement>('h1, h2, h3, [role="heading"]');
+      const heading = (headingNode?.textContent || '').trim().substring(0, 60);
+
+      const fields = Array.from(document.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(
+        'input:not([type="hidden"]), select, textarea',
+      ));
+      let fieldCount = 0;
+      let filledCount = 0;
+      for (const field of fields) {
+        const rect = field.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          fieldCount++;
+          if (field.value && field.value.trim()) filledCount++;
+        }
+      }
+
+      const activeSelectors = [
+        '[aria-current="step"]',
+        '[aria-current="true"]',
+        '.active-step',
+        '.current-step',
+        'li.active',
+        'a.active',
+        '[class*="activeSection"]',
+        '[class*="currentSection"]',
+      ];
+      let activeStep = '';
+      for (const selector of activeSelectors) {
+        const active = document.querySelector<HTMLElement>(selector);
+        if (active) {
+          activeStep = (active.textContent || '').trim().substring(0, 40);
+          break;
+        }
+      }
+
+      return { heading, fieldCount, filledCount, activeStep };
+    });
+
+    const base = `${fingerprint.heading}|fields:${fingerprint.fieldCount}|filled:${fingerprint.filledCount}|active:${fingerprint.activeStep}`;
+    return {
+      ...fingerprint,
+      hash: hashString(base),
+    };
+  }
+
+  private async detectBlocker(
+    page: Page,
+  ): Promise<PageDecisionContext['blocker']> {
+    return page.evaluate(() => {
+      const bodyText = (document.body?.innerText || '').toLowerCase();
+      const passwordField = document.querySelector<HTMLInputElement>('input[type="password"]');
+
+      const captchaSignals = [
+        'captcha',
+        'recaptcha',
+        'hcaptcha',
+        'turnstile',
+        'not a robot',
+        'verify you are human',
+      ];
+      const verificationSignals = [
+        'verification code',
+        'security code',
+        'two-factor',
+        '2fa',
+      ];
+
+      if (captchaSignals.some((signal) => bodyText.includes(signal))) {
+        return {
+          detected: true,
+          type: 'captcha',
+          confidence: 0.95,
+        };
+      }
+
+      if (verificationSignals.some((signal) => bodyText.includes(signal))) {
+        return {
+          detected: true,
+          type: 'verification',
+          confidence: 0.75,
+        };
+      }
+
+      if (passwordField && /sign in|log in|login|password/i.test(bodyText)) {
+        return {
+          detected: true,
+          type: 'login',
+          confidence: 0.7,
+        };
+      }
+
+      return {
+        detected: false,
+        type: null,
+        confidence: 0,
+      };
+    });
+  }
+
+  private async extractStepContext(
+    page: Page,
+  ): Promise<PageDecisionContext['stepContext']> {
+    return page.evaluate(() => {
+      const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+      const textMatch = bodyText.match(/\b(step)\s*(\d+)\s*(?:of|\/)\s*(\d+)\b/i);
+      if (textMatch) {
+        return {
+          label: textMatch[0],
+          current: Number(textMatch[2]),
+          total: Number(textMatch[3]),
+        };
+      }
+
+      const progressBar = document.querySelector<HTMLElement>('[role="progressbar"][aria-valuenow][aria-valuemax]');
+      if (progressBar) {
+        const current = Number(progressBar.getAttribute('aria-valuenow') || 0);
+        const total = Number(progressBar.getAttribute('aria-valuemax') || 0);
+        if (current > 0 && total > 0) {
+          return {
+            label: progressBar.getAttribute('aria-label') || progressBar.textContent?.trim() || 'progress',
+            current,
+            total,
+          };
+        }
+      }
+
+      const steps = Array.from(document.querySelectorAll<HTMLElement>(
+        '[aria-current="step"], [data-step], li[class*="step"], div[class*="step"], [class*="progress-step"]',
+      )).filter((node) => {
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      });
+
+      if (steps.length > 1) {
+        const currentIndex = steps.findIndex((step) =>
+          step.getAttribute('aria-current') === 'step' ||
+          step.getAttribute('aria-current') === 'true' ||
+          /active|current/i.test(step.className),
+        );
+        if (currentIndex >= 0) {
+          return {
+            label: steps[currentIndex].textContent?.trim() || `Step ${currentIndex + 1}`,
+            current: currentIndex + 1,
+            total: steps.length,
+          };
+        }
+      }
+
+      return null;
+    });
+  }
+}

@@ -562,3 +562,9 @@ export function buildSteps(rt: RuntimeContext) {
 
   return { checkBlockers, executeHandler };
 }
+
+// ---------------------------------------------------------------------------
+// Decision Engine Step (additive — does NOT modify buildSteps above)
+// ---------------------------------------------------------------------------
+
+export { buildPageDecisionLoopStep } from './pageDecisionLoop.js';

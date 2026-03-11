@@ -58,6 +58,34 @@ export const workflowState = z.object({
     'completed',
     'failed',
   ]).default('running'),
+
+  // Decision loop state (only present when using page_decision_loop step)
+  decisionLoop: z.object({
+    iteration: z.number().int().nonnegative().default(0),
+    pagesProcessed: z.number().int().nonnegative().default(0),
+    currentPageFingerprint: z.string().nullable().default(null),
+    previousPageFingerprint: z.string().nullable().default(null),
+    samePageCount: z.number().int().nonnegative().default(0),
+    actionHistory: z.array(z.object({
+      iteration: z.number(),
+      action: z.string(),
+      target: z.string(),
+      result: z.enum(['success', 'partial', 'failed', 'skipped']),
+      layer: z.enum(['dom', 'stagehand', 'magnitude']).nullable(),
+      costUsd: z.number(),
+      durationMs: z.number(),
+      fieldsAttempted: z.number().optional(),
+      fieldsFilled: z.number().optional(),
+      pageFingerprint: z.string(),
+      timestamp: z.number(),
+    })).default([]),
+    loopCostUsd: z.number().default(0),
+    terminalState: z.enum([
+      'running', 'confirmation', 'review_page', 'submitted',
+      'stuck', 'budget_exceeded', 'error', 'max_iterations',
+    ]).default('running'),
+    terminationReason: z.string().nullable().default(null),
+  }).optional(),
 });
 
 export type WorkflowState = z.infer<typeof workflowState>;
