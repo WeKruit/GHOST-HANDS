@@ -2951,10 +2951,35 @@ async function detectRepeaters(page: Page): Promise<RepeaterInfo[]> {
   return page.evaluate(() => {
     const repeaters: RepeaterInfo[] = [];
     const ADD_RE = /^\+?\s*add\b/i;
+    const ff = (window as any).__ff;
+    const queryAll = (selector: string): HTMLElement[] => Array.from(
+      ff?.queryAll?.(selector) ??
+      document.querySelectorAll<HTMLElement>(selector),
+    );
+    const rootParent = (node: Node | null): Element | null => {
+      if (!node) return null;
+      if (ff?.rootParent) return ff.rootParent(node);
+      return (node as Element).parentElement ?? null;
+    };
+    const closestCrossRoot = (el: Element | null, selector: string): Element | null => {
+      if (!el) return null;
+      if (ff?.closestCrossRoot) return ff.closestCrossRoot(el, selector);
+      return el.closest(selector);
+    };
+    const isWithinCrossRoot = (node: Element | null, ancestor: Element | null): boolean => {
+      let current: Element | null = node;
+      while (current) {
+        if (current === ancestor) return true;
+        current = rootParent(current);
+      }
+      return false;
+    };
+    const queryWithinCrossRoot = (ancestor: Element | null, selector: string): HTMLElement[] => {
+      if (!ancestor) return [];
+      return queryAll(selector).filter((candidate) => isWithinCrossRoot(candidate, ancestor));
+    };
 
-    const buttons = Array.from(document.querySelectorAll<HTMLElement>(
-      'button, [role="button"], a.add-btn, .add-btn'
-    ));
+    const buttons = queryAll('button, [role="button"], a.add-btn, .add-btn');
 
     for (const btn of buttons) {
       const rect = btn.getBoundingClientRect();
@@ -2968,7 +2993,8 @@ async function detectRepeaters(page: Page): Promise<RepeaterInfo[]> {
       const text = (btn.textContent || '').trim();
       if (!ADD_RE.test(text)) continue;
 
-      const card = btn.closest(
+      const card = closestCrossRoot(
+        btn,
         '.card, .section, [class*="section"], [class*="card"], ' +
         '[data-automation-id*="Section"], [data-automation-id*="panel"], ' +
         '[class*="Panel"], [class*="panel"]'
@@ -2976,16 +3002,17 @@ async function detectRepeaters(page: Page): Promise<RepeaterInfo[]> {
 
       let label = '';
       if (card) {
-        const heading = card.querySelector(
+        const heading = queryWithinCrossRoot(
+          card,
           'h2, h3, h4, [class*="heading"], [class*="title"], ' +
           '[data-automation-id*="sectionHeader"], [data-automation-id*="Title"], ' +
           'legend, [class*="legend"]'
-        );
+        )[0];
         label = heading?.textContent?.trim() || '';
       }
 
       if (!label) {
-        let el: Element | null = btn.parentElement;
+        let el: Element | null = rootParent(btn);
         while (el && !label) {
           const prev = el.previousElementSibling;
           if (prev) {
@@ -2993,10 +3020,13 @@ async function detectRepeaters(page: Page): Promise<RepeaterInfo[]> {
             if (tag === 'H2' || tag === 'H3' || tag === 'H4' || tag === 'LEGEND') {
               label = prev.textContent?.trim() || '';
             }
-            const hdr = prev.querySelector('[data-automation-id*="sectionHeader"], [data-automation-id*="Title"]');
+            const hdr = queryWithinCrossRoot(
+              prev,
+              '[data-automation-id*="sectionHeader"], [data-automation-id*="Title"]',
+            )[0];
             if (hdr) label = hdr.textContent?.trim() || '';
           }
-          el = el.parentElement;
+          el = rootParent(el);
           if (el === card) break;
         }
       }
@@ -3019,20 +3049,24 @@ async function detectRepeaters(page: Page): Promise<RepeaterInfo[]> {
         }
 
         if (currentCount === 0) {
-          const list = card.querySelector(
+          const list = queryWithinCrossRoot(
+            card,
             '.repeater-list, [class*="repeater"], [class*="entries"], ' +
             '[data-automation-id*="itemList"], [data-automation-id*="entryList"]'
-          );
+          )[0];
           if (list) currentCount = list.children.length;
         }
 
         if (currentCount === 0) {
-          const fieldsets = card.querySelectorAll('fieldset, [class*="entry"], [class*="item-group"]');
+          const fieldsets = queryWithinCrossRoot(
+            card,
+            'fieldset, [class*="entry"], [class*="item-group"]',
+          );
           if (fieldsets.length > 0) currentCount = fieldsets.length;
         }
 
         if (currentCount === 0) {
-          const inputs = card.querySelectorAll('input[type="text"], textarea');
+          const inputs = queryWithinCrossRoot(card, 'input[type="text"], textarea');
           for (const inp of inputs) {
             if ((inp as HTMLInputElement).value.trim()) {
               currentCount = 1;
@@ -3119,7 +3153,14 @@ async function expandRepeaters(page: Page, profileText: string): Promise<void> {
     if (!deduped.has(key)) deduped.set(key, rep);
   }
 
-  if (deduped.size === 0) return;
+  if (deduped.size === 0) {
+    if (repeaters.length > 0) {
+      console.log(
+        `[formFiller] Observed ${repeaters.length} visible Add button(s), but none mapped to work/education repeaters.`,
+      );
+    }
+    return;
+  }
   console.log(`[formFiller] Found ${deduped.size} repeater section(s).`);
 
   for (const rep of deduped.values()) {

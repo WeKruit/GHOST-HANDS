@@ -127,9 +127,10 @@ export function shouldStopForManualReviewAfterStableRepeat(input: {
   samePageCount: number;
   totalFields: number;
   pageType: string;
+  matchedCompletedSignature?: boolean;
 }): boolean {
   if (input.result !== 'complete') return false;
-  if (input.samePageCount < 1) return false;
+  if (input.samePageCount < 1 && !input.matchedCompletedSignature) return false;
   if (input.totalFields <= 0) return false;
   return !['login', 'account_creation', 'verification_code', 'phone_2fa'].includes(input.pageType);
 }
@@ -422,6 +423,7 @@ export class SmartApplyHandler implements TaskHandler {
 
     let pagesProcessed = 0;
     let lastPageSignature = '';
+    let lastCompletedPageSignature = '';
     let samePageCount = 0;
     let consecutiveZeroFieldPages = 0;
     const ESCALATE_AFTER = 3;  // escalate to MagnitudeHand after this many stuck iterations
@@ -455,6 +457,9 @@ export class SmartApplyHandler implements TaskHandler {
         // so we also check headings, field count, and active sidebar item.
         const contentFingerprint = await this.getPageFingerprint(adapter);
         const pageSignature = `${currentPageUrl}|${contentFingerprint}`;
+        const matchedCompletedSignature =
+          Boolean(lastCompletedPageSignature) &&
+          pageSignature === lastCompletedPageSignature;
         let stuckEscalate = false;
         if (pageSignature === lastPageSignature) {
           samePageCount++;
@@ -502,6 +507,32 @@ export class SmartApplyHandler implements TaskHandler {
           domSummary: this.buildPageDomSummary(pageState),
         });
 
+        if (matchedCompletedSignature && shouldStopForManualReviewAfterStableRepeat({
+          result: 'complete',
+          samePageCount,
+          totalFields: this._lastFillTotalFields,
+          pageType: pageState.page_type,
+          matchedCompletedSignature,
+        })) {
+          console.warn(
+            `[SmartApply] Current page matches the previously completed form state ` +
+            `(url: ${currentPageUrl}, pageType: ${pageState.page_type}) — stopping for manual review before refilling.`,
+          );
+          await pageContext?.markAwaitingReview();
+          await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
+          return this.withAccountCreationMetadata({
+            success: true,
+            keepBrowserOpen: true,
+            awaitingUserReview: true,
+            data: {
+              platform: config.platformId,
+              pages_processed: pagesProcessed,
+              final_page: 'stable_repeat_review',
+              message: 'Form filled, but the site did not advance. Browser open for manual review.',
+            },
+          });
+        }
+
         // Handle based on page type
         switch (pageState.page_type) {
           case 'job_listing':
@@ -534,6 +565,18 @@ export class SmartApplyHandler implements TaskHandler {
             // present a combined auth screen, but for our desktop apply flow we want
             // a new account created unless we explicitly entered the login branch.
             if (config.platformId === 'workday') {
+              const shouldPreferNativeLogin =
+                Boolean((userProfile as any)._forceNativeLoginAfterAccountCreation) ||
+                (Boolean((userProfile as any)._accountCreationCompleted) &&
+                  /\/login\b|signin/i.test(currentPageUrl));
+              if (shouldPreferNativeLogin && config.handleLogin) {
+                console.log(
+                  '[SmartApply] Workday account was already created for this host — treating mixed auth view as native login.',
+                );
+                await config.handleLogin(adapter, userProfile);
+                this.loginAttempted = true;
+                break;
+              }
               await this.handleAccountCreation(adapter, dataPrompt, userProfile);
               break;
             }
@@ -754,6 +797,7 @@ export class SmartApplyHandler implements TaskHandler {
               samePageCount,
               totalFields: this._lastFillTotalFields,
               pageType: pageState.page_type,
+              matchedCompletedSignature,
             })) {
               console.warn(
                 `[SmartApply] Form page repeated with no navigation after a successful fill ` +
@@ -772,6 +816,13 @@ export class SmartApplyHandler implements TaskHandler {
                   message: 'Form filled, but the site did not advance. Browser open for manual review.',
                 },
               });
+            }
+            if (result === 'complete') {
+              const settledFingerprint = await this.getPageFingerprint(adapter);
+              const settledUrl = await adapter.getCurrentUrl().catch(() => currentPageUrl);
+              lastCompletedPageSignature = `${settledUrl}|${settledFingerprint}`;
+            } else {
+              lastCompletedPageSignature = '';
             }
             // 'navigated' and 'complete' both continue the main loop
             break;

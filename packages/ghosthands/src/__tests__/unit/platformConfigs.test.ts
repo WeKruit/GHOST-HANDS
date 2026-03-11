@@ -382,6 +382,69 @@ describe('WorkdayPlatformConfig', () => {
     });
     expect(actPrompts.some((prompt) => prompt.includes('Google'))).toBe(false);
   });
+
+  test('handleLogin does not bounce back to account creation when post-create native login fails', async () => {
+    const actPrompts: string[] = [];
+    const evaluateCalls: Array<{ email: string; password: string }> = [];
+    const adapter = {
+      getCurrentUrl: async () =>
+        'https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers/login?redirect=apply',
+      act: async (prompt: string) => {
+        actPrompts.push(prompt);
+        return { success: true };
+      },
+      page: {
+        evaluate: async (fn: unknown, arg?: unknown) => {
+          const text = String(fn);
+          if (text.includes('const passwordFields')) {
+            return {
+              isCreateAccountView: false,
+              hasSignInTab: false,
+              hasConfirmPassword: false,
+              hasPasswordField: true,
+            };
+          }
+          if (text.includes('const ctx = document.querySelector') || text.includes('const modal')) {
+            evaluateCalls.push(arg as { email: string; password: string });
+            return { filled: true, submitted: true };
+          }
+          if (text.includes('const patterns = [')) {
+            return 'you may have entered the wrong email address or password';
+          }
+          throw new Error(`Unexpected evaluate call: ${text.slice(0, 80)}`);
+        },
+        waitForTimeout: async () => {},
+        keyboard: {
+          press: async () => {},
+        },
+      },
+    } as any;
+
+    await expect(
+      config.handleLogin(adapter, {
+        email: 'profile@example.com',
+        _accountCreationCompleted: true,
+        _forceNativeLoginAfterAccountCreation: true,
+        platform_credentials: {
+          workday: {
+            byDomain: {
+              'cadence.wd1.myworkdayjobs.com': {
+                email: 'tenant@example.com',
+                password: 'TenantWorkday!234',
+              },
+            },
+          },
+        },
+      }),
+    ).rejects.toThrow('Workday native sign-in failed immediately after account creation');
+
+    expect(evaluateCalls).toHaveLength(1);
+    expect(evaluateCalls[0]).toEqual({
+      email: 'tenant@example.com',
+      password: 'TenantWorkday!234',
+    });
+    expect(actPrompts.some((prompt) => /create account|google/i.test(prompt))).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

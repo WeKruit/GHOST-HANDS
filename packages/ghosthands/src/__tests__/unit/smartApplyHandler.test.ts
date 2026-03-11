@@ -153,6 +153,15 @@ describe('SmartApplyHandler', () => {
         samePageCount: 0,
         totalFields: 16,
         pageType: 'personal_info',
+        matchedCompletedSignature: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldStopForManualReviewAfterStableRepeat({
+        result: 'complete',
+        samePageCount: 0,
+        totalFields: 16,
+        pageType: 'personal_info',
       }),
     ).toBe(false);
   });
