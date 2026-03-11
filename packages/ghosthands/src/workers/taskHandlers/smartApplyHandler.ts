@@ -9,6 +9,7 @@ import type { CostTracker } from '../costControl.js';
 import { detectPlatformFromUrl } from './platforms/index.js';
 import {
   generatePlatformCredential,
+  inferCredentialDomainFromUrl,
   inferCredentialPlatformFromUrl,
   resolvePlatformAccountEmail,
   resolvePlatformAccountPassword,
@@ -81,6 +82,56 @@ function rememberCredentialOnProfile(
   profile[`${platformKey}Email`] = credential.loginIdentifier;
   profile[`${platformKey}_password`] = credential.secret;
   profile[`${platformKey}Password`] = credential.secret;
+}
+
+export type AccountCreationTransitionState =
+  | 'account_creation'
+  | 'login'
+  | 'verification'
+  | 'advanced';
+
+type AccountCreationTransitionInput = {
+  currentUrl?: string | null;
+  hasPasswordField: boolean;
+  hasConfirmPassword: boolean;
+  hasSignInOption: boolean;
+  hasCreateAccountHeading: boolean;
+  hasVerificationPrompt: boolean;
+  validationText?: string | null;
+};
+
+export function inferAccountCreationTransition(
+  input: AccountCreationTransitionInput,
+): AccountCreationTransitionState {
+  const currentUrl = (input.currentUrl || '').toLowerCase();
+  if (input.hasVerificationPrompt) return 'verification';
+  if (
+    currentUrl.includes('/login') ||
+    currentUrl.includes('signin') ||
+    (input.hasPasswordField && input.hasSignInOption && !input.hasConfirmPassword)
+  ) {
+    return 'login';
+  }
+  if (
+    input.hasConfirmPassword ||
+    input.hasCreateAccountHeading ||
+    Boolean(input.validationText?.trim())
+  ) {
+    return 'account_creation';
+  }
+  return 'advanced';
+}
+
+export function shouldStopForManualReviewAfterStableRepeat(input: {
+  result: 'navigated' | 'review' | 'complete';
+  samePageCount: number;
+  totalFields: number;
+  pageType: string;
+}): boolean {
+  if (input.result !== 'complete') return false;
+  if (input.samePageCount < 1) return false;
+  if (input.totalFields <= 0) return false;
+  return !['login', 'account_creation', 'verification_code', 'phone_2fa'].includes(input.pageType);
 }
 
 // --- Handler ---
@@ -697,6 +748,30 @@ export class SmartApplyHandler implements TaskHandler {
               }
             } else {
               consecutiveZeroFieldPages = 0;
+            }
+            if (shouldStopForManualReviewAfterStableRepeat({
+              result,
+              samePageCount,
+              totalFields: this._lastFillTotalFields,
+              pageType: pageState.page_type,
+            })) {
+              console.warn(
+                `[SmartApply] Form page repeated with no navigation after a successful fill ` +
+                `(url: ${currentPageUrl}, pageType: ${pageState.page_type}) — stopping for manual review.`,
+              );
+              await pageContext?.markAwaitingReview();
+              await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
+              return this.withAccountCreationMetadata({
+                success: true,
+                keepBrowserOpen: true,
+                awaitingUserReview: true,
+                data: {
+                  platform: config.platformId,
+                  pages_processed: pagesProcessed,
+                  final_page: 'stable_repeat_review',
+                  message: 'Form filled, but the site did not advance. Browser open for manual review.',
+                },
+              });
             }
             // 'navigated' and 'complete' both continue the main loop
             break;
@@ -2079,9 +2154,12 @@ Click only ONE button, then report the task as done.`,
 
     const currentUrl = adapter.page.url();
     const platform = inferCredentialPlatformFromUrl(currentUrl);
-    const email = resolvePlatformAccountEmail(profile, platform);
+    const email = resolvePlatformAccountEmail(profile, platform, { sourceUrl: currentUrl });
     const initialValidationText = await this.readAccountCreationValidationText(adapter);
-    let passwordResolution = resolvePlatformAccountPassword(profile, platform);
+    let passwordResolution = resolvePlatformAccountPassword(profile, platform, {
+      validationText: initialValidationText,
+      sourceUrl: currentUrl,
+    });
     let password = passwordResolution.password;
 
     if (
@@ -2120,10 +2198,11 @@ Click only ONE button, then report the task as done.`,
       await adapter.page.waitForTimeout(3000);
       await this.waitForPageLoad(adapter);
 
-      let stillOnCreateAccount = await this.isStillOnAccountCreationPage(adapter);
+      let transition = await this.inspectAccountCreationTransition(adapter);
+      let stillOnCreateAccount = transition.state === 'account_creation';
 
       if (stillOnCreateAccount && passwordResolution.source !== 'platform_override') {
-        const validationText = await this.readAccountCreationValidationText(adapter);
+        const validationText = transition.validationText;
         if (validationText) {
           const strengthened =
             platform === 'workday' && email
@@ -2140,6 +2219,7 @@ Click only ONE button, then report the task as done.`,
                 })()
               : resolvePlatformAccountPassword(profile, platform, {
                   validationText,
+                  sourceUrl: currentUrl,
                 });
           if (strengthened.password !== password) {
             passwordResolution = strengthened;
@@ -2153,14 +2233,16 @@ Click only ONE button, then report the task as done.`,
             if (retried) {
               await adapter.page.waitForTimeout(3000);
               await this.waitForPageLoad(adapter);
-              stillOnCreateAccount = await this.isStillOnAccountCreationPage(adapter);
+              transition = await this.inspectAccountCreationTransition(adapter);
+              stillOnCreateAccount = transition.state === 'account_creation';
             }
           }
         }
       }
 
       if (!stillOnCreateAccount) {
-        console.log('[SmartApply] Account creation succeeded (DOM-only).');
+        this.markAccountCreationCompleted(profile, platform, transition);
+        console.log(`[SmartApply] Account creation succeeded (DOM-only → ${transition.state}).`);
         return;
       }
       console.log('[SmartApply] Still on account creation page after DOM submit — falling back to MagnitudeHand...');
@@ -2183,17 +2265,28 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
     );
 
     if (!result.success) {
-      const hasPasswordField = await adapter.page.evaluate(() =>
-        document.querySelectorAll('input[type="password"]').length > 0
-      );
-      if (!hasPasswordField) {
-        console.log('[SmartApply] act() reported failure but page has moved past account creation — continuing.');
+      const transition = await this.inspectAccountCreationTransition(adapter);
+      if (transition.state !== 'account_creation') {
+        this.markAccountCreationCompleted(profile, platform, transition);
+        console.log(
+          `[SmartApply] act() reported failure but account creation transitioned to ${transition.state} — continuing.`,
+        );
         return;
       }
       throw new Error(`Failed to create account: ${result.message}`);
     }
 
     await this.waitForPageLoad(adapter);
+    const transition = await this.inspectAccountCreationTransition(adapter);
+    if (transition.state !== 'account_creation') {
+      this.markAccountCreationCompleted(profile, platform, transition);
+      console.log(`[SmartApply] Account creation succeeded (Magnitude fallback → ${transition.state}).`);
+      return;
+    }
+    const validationSuffix = transition.validationText
+      ? `: ${transition.validationText.slice(0, 180)}`
+      : '';
+    throw new Error(`Account creation did not leave the create-account view${validationSuffix}`);
   }
 
   private async fillAccountCreationCredentials(
@@ -2298,10 +2391,93 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
     });
   }
 
-  private async isStillOnAccountCreationPage(adapter: BrowserAutomationAdapter): Promise<boolean> {
-    return adapter.page.evaluate(() =>
-      document.querySelectorAll('input[type="password"]:not([disabled])').length > 1,
-    );
+  private markAccountCreationCompleted(
+    profile: Record<string, any>,
+    platform: string | null,
+    transition: {
+      state: AccountCreationTransitionState;
+      currentUrl: string;
+    },
+  ): void {
+    profile._createAccountAttempted = true;
+    profile._accountCreationCompleted = true;
+    profile._workdayForceAccountCreation = false;
+    profile._lastAccountCreationTransition = transition.state;
+    const domain = inferCredentialDomainFromUrl(transition.currentUrl);
+    if (domain) {
+      profile._lastAccountCreationDomain = domain;
+    }
+    profile._forceNativeLoginAfterAccountCreation =
+      platform === 'workday' && transition.state === 'login';
+  }
+
+  private async inspectAccountCreationTransition(
+    adapter: BrowserAutomationAdapter,
+  ): Promise<{
+    state: AccountCreationTransitionState;
+    currentUrl: string;
+    validationText: string;
+  }> {
+    const currentUrl = await adapter.getCurrentUrl().catch(() => adapter.page.url() || '');
+    const validationText = await this.readAccountCreationValidationText(adapter);
+    const domState = await adapter.page.evaluate(() => {
+      const isVisible = (el: Element | null): el is HTMLElement => {
+        if (!el) return false;
+        const node = el as HTMLElement;
+        if (node.closest('[hidden], [aria-hidden="true"]')) return false;
+        const style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+          return false;
+        }
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
+      const visiblePasswordFields = Array.from(
+        document.querySelectorAll<HTMLInputElement>('input[type="password"]:not([disabled])'),
+      ).filter((input) => isVisible(input));
+      const headings = Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]'));
+      const headingText = headings
+        .map((heading) => (heading.textContent || '').toLowerCase())
+        .join(' ');
+      const clickables = Array.from(
+        document.querySelectorAll<HTMLElement>('button, a, [role="tab"], [role="button"], [role="link"]'),
+      ).filter((el) => isVisible(el));
+      const clickableText = clickables
+        .map((el) => (el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase())
+        .join(' ');
+      const bodyText = document.body.innerText.toLowerCase();
+
+      return {
+        hasPasswordField: visiblePasswordFields.length > 0,
+        hasConfirmPassword: visiblePasswordFields.length > 1,
+        hasSignInOption:
+          clickableText.includes('sign in') ||
+          clickableText.includes('log in') ||
+          clickableText.includes('continue with google') ||
+          clickableText.includes('sign in with google'),
+        hasCreateAccountHeading:
+          headingText.includes('create account') ||
+          headingText.includes('register') ||
+          headingText.includes('sign up'),
+        hasVerificationPrompt:
+          bodyText.includes('verify your email') ||
+          bodyText.includes('check your email') ||
+          bodyText.includes('verification code') ||
+          bodyText.includes('confirm your email') ||
+          bodyText.includes('one-time code'),
+      };
+    });
+
+    return {
+      state: inferAccountCreationTransition({
+        currentUrl,
+        validationText,
+        ...domState,
+      }),
+      currentUrl,
+      validationText,
+    };
   }
 
   private async readAccountCreationValidationText(adapter: BrowserAutomationAdapter): Promise<string> {

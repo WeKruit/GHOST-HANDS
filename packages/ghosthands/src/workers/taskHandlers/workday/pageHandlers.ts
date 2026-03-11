@@ -230,10 +230,15 @@ export async function handleLogin(
   userProfile: WorkdayUserProfile,
 ): Promise<void> {
   const currentUrl = await adapter.getCurrentUrl();
-  const email = resolvePlatformAccountEmail(userProfile as unknown as Record<string, unknown>, 'workday');
+  const email = resolvePlatformAccountEmail(
+    userProfile as unknown as Record<string, unknown>,
+    'workday',
+    { sourceUrl: currentUrl },
+  );
   const password = resolvePlatformAccountPassword(
     userProfile as unknown as Record<string, unknown>,
     'workday',
+    { sourceUrl: currentUrl },
   );
 
   // If we're on Google's sign-in page, handle each sub-page with DOM clicks

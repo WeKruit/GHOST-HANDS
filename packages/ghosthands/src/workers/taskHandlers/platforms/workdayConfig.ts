@@ -1793,8 +1793,16 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
     const userProfile = profile as WorkdayUserProfile;
     const googleEmail = userProfile.email;
     const googlePassword = process.env.TEST_GMAIL_PASSWORD || '';
-    const workdayEmail = resolvePlatformAccountEmail(profile, 'workday');
-    const workdayPassword = resolvePlatformAccountPassword(profile, 'workday');
+    const workdayEmail = resolvePlatformAccountEmail(profile, 'workday', {
+      sourceUrl: currentUrl,
+    });
+    const workdayPassword = resolvePlatformAccountPassword(profile, 'workday', {
+      sourceUrl: currentUrl,
+    });
+    const forceNativeLogin = Boolean(
+      (profile as any)._forceNativeLoginAfterAccountCreation ||
+      (profile as any)._accountCreationCompleted,
+    );
 
     // Google sign-in page — handle each sub-page with DOM clicks
     if (currentUrl.includes('accounts.google.com')) {
@@ -1966,6 +1974,9 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
       `[Workday] Native credential source: email=${workdayEmail ? 'present' : 'missing'}, ` +
       `passwordSource=${workdayPassword.source}`,
     );
+    if (forceNativeLogin) {
+      console.log('[Workday] Using post-account-creation native sign-in path.');
+    }
 
     // Step 1: Detect page layout — Workday shows "Create Account" by default with
     // a "Sign In" tab. We need to click the tab FIRST before filling credentials,
@@ -2026,8 +2037,10 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
         await adapter.page.waitForTimeout(1500);
       }
     } else if (!pageContext.hasPasswordField) {
-      // No password field visible at all — find the native sign-in view.
-      console.log('[Workday] No login form visible — using LLM to find sign-in...');
+      // No password field visible at all — keep chasing the native sign-in view.
+      console.log(
+        `[Workday] No login form visible — ${forceNativeLogin ? 'staying on native sign-in path' : 'using LLM to find sign-in'}...`,
+      );
       await adapter.act(
         'Look for a "Sign In" or "Log In" link/tab/button and click it to open the native email/password sign-in form. Do NOT click "Sign in with Google". Do NOT click "Create Account". Click ONLY ONE button, then report done.',
       );
@@ -2145,6 +2158,11 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
     // Step 2: Try login with base password
     const PASSWORD_SUFFIX = 'aA1!';
     let loginError = await tryLogin(workdayPassword.password);
+    if (!loginError) {
+      (profile as any)._forceNativeLoginAfterAccountCreation = false;
+      (profile as any)._workdayForceAccountCreation = false;
+      return;
+    }
 
     // Step 2b: If base password failed, try with suffix appended
     if (loginError && workdayPassword.password) {
@@ -2170,6 +2188,11 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
         await adapter.page.waitForTimeout(1500);
       }
       loginError = await tryLogin(workdayPassword.password + PASSWORD_SUFFIX);
+      if (!loginError) {
+        (profile as any)._forceNativeLoginAfterAccountCreation = false;
+        (profile as any)._workdayForceAccountCreation = false;
+        return;
+      }
     }
 
     // Mark that we attempted login

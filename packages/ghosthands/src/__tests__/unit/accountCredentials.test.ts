@@ -42,6 +42,41 @@ describe('accountCredentials', () => {
     });
   });
 
+  test('prefers tenant-specific Workday credentials over shared password for the active host', () => {
+    const profile = {
+      email: 'profile@example.com',
+      application_password: 'SharedPassword!234',
+      platform_credentials: {
+        workday: {
+          email: 'default@example.com',
+          password: 'DefaultWorkday!234',
+          byDomain: {
+            'cadence.wd1.myworkdayjobs.com': {
+              email: 'tenant@example.com',
+              password: 'TenantWorkday!234',
+            },
+          },
+        },
+      },
+    };
+
+    expect(
+      resolvePlatformAccountEmail(profile, 'workday', {
+        sourceUrl:
+          'https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers/job/SAN-JOSE/apply/applyManually',
+      }),
+    ).toBe('tenant@example.com');
+    expect(
+      resolvePlatformAccountPassword(profile, 'workday', {
+        sourceUrl:
+          'https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers/job/SAN-JOSE/apply/applyManually',
+      }),
+    ).toEqual({
+      password: 'TenantWorkday!234',
+      source: 'platform_override',
+    });
+  });
+
   test('strengthens shared application password for workday fallback requirements', () => {
     const profile = {
       email: 'profile@example.com',
@@ -91,6 +126,7 @@ describe('accountCredentials', () => {
     expect(/[0-9]/.test(generated.credential.secret)).toBe(true);
     expect(/[!@#$%^&*]/.test(generated.credential.secret)).toBe(true);
     expect(generated.event.note).toContain('cadence.wd1.myworkdayjobs.com');
+    expect(generated.event.note).toContain('apply/applyManually');
   });
 
   test('describes password requirements for reporting', () => {
