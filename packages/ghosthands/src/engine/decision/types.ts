@@ -211,6 +211,7 @@ export const DecisionLoopStateSchema = z.object({
     'confirmation',
     'review_page',
     'submitted',
+    'blocked',
     'stuck',
     'budget_exceeded',
     'error',

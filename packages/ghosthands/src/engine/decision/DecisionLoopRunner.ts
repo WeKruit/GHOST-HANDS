@@ -126,6 +126,8 @@ export class DecisionLoopRunner {
   private readonly decisionEngine: PageDecisionEngine;
   private readonly actionExecutor: ActionExecutor;
   private readonly profileSummary: string;
+  private readonly previousActionHistory: ActionHistoryEntry[];
+  private readonly previousIteration: number;
 
   constructor(config: {
     page: Page;
@@ -137,6 +139,8 @@ export class DecisionLoopRunner {
     model?: string;
     onProgress?: (event: { type: string; message: string; iteration: number }) => void;
     maxIterations?: number;
+    previousActionHistory?: ActionHistoryEntry[];
+    previousIteration?: number;
   }) {
     this.page = config.page;
     this.adapter = config.adapter;
@@ -152,30 +156,30 @@ export class DecisionLoopRunner {
     });
     this.actionExecutor = new ActionExecutor(config.page, config.adapter);
     this.profileSummary = summarizeProfile(config.profile);
+    this.previousActionHistory = config.previousActionHistory ?? [];
+    this.previousIteration = config.previousIteration ?? 0;
   }
 
-  async run(): Promise<{
-    success: boolean;
-    terminalState: string;
-    terminationReason: string;
-    loopState: DecisionLoopState;
+  async run(): Promise<DecisionLoopState & {
+    blockerDetected?: { type: string; confidence: number; pageUrl: string };
   }> {
     const loopState: DecisionLoopState = DecisionLoopStateSchema.parse({
-      iteration: 0,
+      iteration: this.previousIteration,
       pagesProcessed: 0,
       currentPageFingerprint: null,
       previousPageFingerprint: null,
       samePageCount: 0,
-      actionHistory: [],
+      actionHistory: this.previousActionHistory.slice(-ACTION_HISTORY_LIMIT),
       loopCostUsd: 0,
       terminalState: 'running',
       terminationReason: null,
     });
 
+    let blockerDetected: { type: string; confidence: number; pageUrl: string } | undefined;
+
     try {
       while (loopState.terminalState === 'running') {
         loopState.iteration += 1;
-        loopState.pagesProcessed += 1;
         this.emit({
           type: 'observe',
           iteration: loopState.iteration,
@@ -185,11 +189,13 @@ export class DecisionLoopRunner {
         const snapshot = await this.snapshotBuilder.buildSnapshot(this.page, loopState.actionHistory);
         loopState.previousPageFingerprint = loopState.currentPageFingerprint;
         loopState.currentPageFingerprint = snapshot.fingerprint.hash;
-        loopState.samePageCount =
-          loopState.previousPageFingerprint &&
-          loopState.previousPageFingerprint === loopState.currentPageFingerprint
-            ? loopState.samePageCount + 1
-            : 0;
+        const pageChanged = loopState.previousPageFingerprint !== loopState.currentPageFingerprint;
+        if (pageChanged || !loopState.previousPageFingerprint) {
+          loopState.pagesProcessed += 1;
+        }
+        loopState.samePageCount = !pageChanged && loopState.previousPageFingerprint
+          ? loopState.samePageCount + 1
+          : 0;
 
         this.emit({
           type: 'decide',
@@ -244,14 +250,15 @@ export class DecisionLoopRunner {
         });
 
         if (termination) {
-          if (termination.type === 'blocked') {
-            loopState.terminalState = 'error';
-            loopState.terminationReason = termination.reason;
-            break;
-          }
-
           loopState.terminalState = termination.type;
           loopState.terminationReason = termination.reason;
+          if (termination.type === 'blocked') {
+            blockerDetected = {
+              type: snapshot.blocker.type ?? 'unknown',
+              confidence: snapshot.blocker.confidence,
+              pageUrl: snapshot.url,
+            };
+          }
           this.emit({
             type: 'termination',
             iteration: loopState.iteration,
@@ -275,13 +282,10 @@ export class DecisionLoopRunner {
       });
     }
 
-    const terminalState = loopState.terminalState;
-    const terminationReason = loopState.terminationReason || 'Decision loop exited without a termination reason.';
+    loopState.terminationReason = loopState.terminationReason || 'Decision loop exited without a termination reason.';
     return {
-      success: terminalState === 'confirmation' || terminalState === 'review_page' || terminalState === 'submitted',
-      terminalState,
-      terminationReason,
-      loopState: DecisionLoopStateSchema.parse(loopState),
+      ...DecisionLoopStateSchema.parse(loopState),
+      ...(blockerDetected ? { blockerDetected } : {}),
     };
   }
 

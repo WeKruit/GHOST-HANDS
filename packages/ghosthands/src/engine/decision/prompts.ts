@@ -1,6 +1,7 @@
 import type { Tool } from '@anthropic-ai/sdk/resources/messages';
 import type { PageDecisionContext } from './types';
 
+const SYSTEM_PROMPT_CACHE_MAX = 20;
 const SYSTEM_PROMPT_CACHE = new Map<string, string>();
 
 export const PLATFORM_GUARDRAILS: Record<string, string> = {
@@ -38,8 +39,6 @@ export const PLATFORM_GUARDRAILS: Record<string, string> = {
 
 export const DECISION_TOOL: Tool = {
   name: 'page_decision',
-  type: 'custom',
-  strict: true,
   description:
     'Return the single safest next navigation action for the current job application page. Never submit the application.',
   input_schema: {
@@ -146,6 +145,10 @@ export function buildSystemPrompt(profileSummary: string, platformGuardrails: st
     'Use the `page_decision` tool for your answer.',
   ].join('\n');
 
+  if (SYSTEM_PROMPT_CACHE.size >= SYSTEM_PROMPT_CACHE_MAX) {
+    const oldest = SYSTEM_PROMPT_CACHE.keys().next().value;
+    if (oldest !== undefined) SYSTEM_PROMPT_CACHE.delete(oldest);
+  }
   SYSTEM_PROMPT_CACHE.set(cacheKey, prompt);
   return prompt;
 }
