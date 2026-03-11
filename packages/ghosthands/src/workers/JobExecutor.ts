@@ -310,10 +310,19 @@ export class JobExecutor {
 
     // Initialize cost tracker with budget limits
     const qualityPreset = resolveQualityPreset(job.input_data, job.metadata);
+
+    // Read VALET credit-derived budget cap from job metadata (if provided)
+    const jobMetadata = (job.metadata ?? {}) as Record<string, unknown>;
+    const creditBudgetRaw = jobMetadata.credit_budget_usd;
+    const valetBudgetCap = typeof creditBudgetRaw === 'number' && creditBudgetRaw > 0
+      ? creditBudgetRaw
+      : undefined;
+
     const costTracker = new CostTracker({
       jobId: job.id,
       qualityPreset,
       jobType: job.job_type,
+      maxBudgetOverride: valetBudgetCap,
     });
 
     const costService = new CostControlService(this.supabase);
