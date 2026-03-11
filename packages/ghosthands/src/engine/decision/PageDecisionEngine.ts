@@ -11,6 +11,9 @@ import type { DecisionAction, PageDecisionContext } from './types';
 import { DecisionActionSchema } from './types';
 
 const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
+const MAX_API_RETRIES = 2;
+const API_TIMEOUT_MS = 30_000;
+const RETRY_BACKOFF_BASE_MS = 1000;
 
 function normalizeModel(raw?: string): string {
   const trimmed = raw?.trim();
@@ -71,23 +74,64 @@ export class PageDecisionEngine {
     );
     const userMessage = buildUserMessage(context);
 
-    const response = await this.client.messages.create({
-      model: this.model,
-      max_tokens: 512,
-      temperature: 0,
-      system,
-      tools: [DECISION_TOOL],
-      tool_choice: {
-        type: 'tool',
-        name: DECISION_TOOL.name,
-      },
-      messages: [
-        {
-          role: 'user',
-          content: userMessage,
-        },
-      ],
-    });
+    let response!: Anthropic.Messages.Message;
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= MAX_API_RETRIES; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+
+        response = await this.client.messages.create(
+          {
+            model: this.model,
+            max_tokens: 512,
+            temperature: 0,
+            system,
+            tools: [DECISION_TOOL],
+            tool_choice: {
+              type: 'tool',
+              name: DECISION_TOOL.name,
+            },
+            messages: [
+              {
+                role: 'user',
+                content: userMessage,
+              },
+            ],
+          },
+          { signal: controller.signal },
+        );
+
+        clearTimeout(timeout);
+        lastError = null;
+        break;
+      } catch (err) {
+        lastError = err;
+        const isRateLimit = err instanceof Anthropic.RateLimitError;
+        const isTimeout = err instanceof Error && err.name === 'AbortError';
+        const isServerError = err instanceof Anthropic.InternalServerError;
+
+        if (attempt < MAX_API_RETRIES && (isRateLimit || isTimeout || isServerError)) {
+          const backoff = RETRY_BACKOFF_BASE_MS * Math.pow(2, attempt);
+          await new Promise((r) => setTimeout(r, backoff));
+          continue;
+        }
+        break;
+      }
+    }
+
+    if (lastError) {
+      const durationMs = Date.now() - startedAt;
+      return {
+        action: 'wait_and_retry',
+        reasoning: `Anthropic API call failed after ${MAX_API_RETRIES + 1} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+        confidence: 0.05,
+        tokenUsage: { input: 0, output: 0 },
+        costUsd: 0,
+        durationMs,
+      };
+    }
 
     const inputTokens = response.usage?.input_tokens ?? 0;
     const outputTokens = response.usage?.output_tokens ?? 0;

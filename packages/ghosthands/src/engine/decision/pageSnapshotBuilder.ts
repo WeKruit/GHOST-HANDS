@@ -35,7 +35,10 @@ async function safeExtract<T>(fn: () => Promise<T>, fallback: T): Promise<Extrac
 }
 
 export class PageSnapshotBuilder {
-  constructor(private readonly platform?: string) {}
+  constructor(
+    private readonly platform?: string,
+    private readonly viewportOnly: boolean = true,
+  ) {}
 
   async buildSnapshot(
     page: Page,
@@ -44,6 +47,10 @@ export class PageSnapshotBuilder {
     const url = page.url();
     const platform = this.platform || detectPlatform(url);
     const scanner = new PageScanner(page, platform);
+
+    // Inject shadow DOM traversal helpers so repeater detection and fingerprinting
+    // can reach elements inside shadow roots (SmartRecruiters, Workday, etc.)
+    await this.injectShadowDOMHelpers(page);
 
     const scanResult = await safeExtract(
       async () => scanner.scan(),
@@ -138,13 +145,56 @@ export class PageSnapshotBuilder {
       observedAt: Date.now(),
     };
 
+    // Filter to viewport-visible elements only to avoid exposing offscreen
+    // submit buttons and future-step CTAs to the LLM prematurely
+    if (this.viewportOnly) {
+      const visibleSelectors = await this.getViewportVisibleSelectors(page, [
+        ...snapshot.fields.map((f) => f.selector),
+        ...snapshot.buttons.map((b) => b.selector),
+      ]);
+      snapshot.fields = snapshot.fields.filter((f) => visibleSelectors.has(f.selector));
+      snapshot.buttons = snapshot.buttons.filter((b) => visibleSelectors.has(b.selector));
+    }
+
     return PageDecisionContextSchema.parse(snapshot);
+  }
+
+  /**
+   * Returns the set of selectors that are within the current viewport bounds.
+   */
+  private async getViewportVisibleSelectors(
+    page: Page,
+    selectors: string[],
+  ): Promise<Set<string>> {
+    try {
+      const visible = await page.evaluate((sels: string[]) => {
+        const vh = window.innerHeight;
+        const result: string[] = [];
+        for (const sel of sels) {
+          try {
+            const el = document.querySelector(sel);
+            if (!el) continue;
+            const rect = el.getBoundingClientRect();
+            // Element is at least partially in viewport
+            if (rect.bottom > 0 && rect.top < vh && rect.width > 0 && rect.height > 0) {
+              result.push(sel);
+            }
+          } catch { /* skip invalid selectors */ }
+        }
+        return result;
+      }, selectors);
+      return new Set(visible);
+    } catch {
+      // On failure, include all elements (safe fallback)
+      return new Set(selectors);
+    }
   }
 
   private async extractHeadings(page: Page): Promise<string[]> {
     return page.evaluate(() => {
+      const ff = (window as Window & { __ff?: any }).__ff;
       const selectors = 'h1, h2, h3, h4, legend, [role="heading"]';
-      const nodes = Array.from(document.querySelectorAll<HTMLElement>(selectors));
+      const nodes: HTMLElement[] = ff?.queryAll?.(selectors) ?? Array.from(document.querySelectorAll<HTMLElement>(selectors));
       const visible = nodes.filter((node) => {
         const rect = node.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return false;
@@ -301,12 +351,16 @@ export class PageSnapshotBuilder {
     page: Page,
   ): Promise<PageDecisionContext['fingerprint']> {
     const fingerprint = await page.evaluate(() => {
-      const headingNode = document.querySelector<HTMLElement>('h1, h2, h3, [role="heading"]');
+      const ff = (window as Window & { __ff?: any }).__ff;
+      const qAll = <T extends Element = HTMLElement>(selector: string): T[] =>
+        ff?.queryAll?.(selector) ?? Array.from(document.querySelectorAll<T>(selector));
+
+      const headingNode = qAll<HTMLElement>('h1, h2, h3, [role="heading"]')[0] ?? null;
       const heading = (headingNode?.textContent || '').trim().substring(0, 60);
 
-      const fields = Array.from(document.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(
+      const fields = qAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(
         'input:not([type="hidden"]), select, textarea',
-      ));
+      );
       let fieldCount = 0;
       let filledCount = 0;
       for (const field of fields) {
@@ -451,5 +505,72 @@ export class PageSnapshotBuilder {
 
       return null;
     });
+  }
+
+  /**
+   * Inject window.__ff shadow DOM traversal helpers into the page context
+   * so that repeater detection, fingerprinting, and heading extraction
+   * can pierce shadow roots (critical for SmartRecruiters, Workday, etc.)
+   */
+  private async injectShadowDOMHelpers(page: Page): Promise<void> {
+    try {
+      await page.evaluate(() => {
+        if ((window as any).__ff) return; // Already injected
+
+        function collectShadowRoots(node: Node): ShadowRoot[] {
+          const roots: ShadowRoot[] = [];
+          if (node instanceof Element && node.shadowRoot) {
+            roots.push(node.shadowRoot);
+          }
+          for (const child of Array.from(node.childNodes)) {
+            roots.push(...collectShadowRoots(child));
+          }
+          return roots;
+        }
+
+        function queryAll<T extends Element = HTMLElement>(selector: string): T[] {
+          const results = new Set<T>();
+          const queue: (Document | ShadowRoot)[] = [document];
+          while (queue.length > 0) {
+            const root = queue.shift()!;
+            for (const el of Array.from(root.querySelectorAll<T>(selector))) {
+              results.add(el);
+            }
+            // Discover shadow roots within this root
+            for (const el of Array.from(root.querySelectorAll('*'))) {
+              if (el.shadowRoot) queue.push(el.shadowRoot);
+            }
+          }
+          return Array.from(results);
+        }
+
+        function rootParent(node: Node | null): Element | null {
+          if (!node) return null;
+          const parent = node.parentNode;
+          if (!parent) return null;
+          if (parent instanceof ShadowRoot) return parent.host;
+          return parent instanceof Element ? parent : null;
+        }
+
+        function closestCrossRoot(el: Element | null, selector: string): Element | null {
+          let current: Element | null = el;
+          while (current) {
+            const match = current.closest(selector);
+            if (match) return match;
+            const root = current.getRootNode();
+            if (root instanceof ShadowRoot) {
+              current = root.host;
+            } else {
+              break;
+            }
+          }
+          return null;
+        }
+
+        (window as any).__ff = { queryAll, rootParent, closestCrossRoot };
+      });
+    } catch {
+      // Non-fatal — fall back to document-only queries
+    }
   }
 }

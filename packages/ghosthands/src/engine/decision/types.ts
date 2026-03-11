@@ -109,6 +109,7 @@ export const RepeaterSnapshotSchema = z.object({
   label: z.string(),
   addButtonSelector: z.string().min(1),
   currentCount: z.number().int().nonnegative(),
+  targetCount: z.number().int().nonnegative().optional(),
 }).strict();
 
 export type RepeaterSnapshot = z.infer<typeof RepeaterSnapshotSchema>;
@@ -173,6 +174,7 @@ export const DecisionActionSchema = z.object({
   target: z.string().optional(),
   confidence: z.number().min(0).max(1),
   fieldsToFill: z.array(z.string().min(1)).optional(),
+  fieldValues: z.record(z.string(), z.string()).optional(),
 }).strict();
 
 export type DecisionAction = z.infer<typeof DecisionActionSchema>;

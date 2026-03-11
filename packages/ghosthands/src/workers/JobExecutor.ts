@@ -1509,20 +1509,27 @@ export class JobExecutor {
     };
 
     // Build the workflow (per-job, captures rt via closure)
-    // For mastra_decision mode, we pass a stub DecisionLoopRunnerFactory.
-    // The actual DecisionLoopRunner is implemented in engine/decision/ and will
-    // be wired here once built. The stub throws a clear error at runtime.
     const workflow = job.execution_mode === 'mastra_decision'
       ? buildDecisionApplyWorkflow(rt, {
-          create() {
-            return {
-              async run() {
-                throw new Error(
-                  'DecisionLoopRunner is not yet implemented. ' +
-                  'Wire engine/decision/DecisionLoopRunner into buildDecisionApplyWorkflow().',
-                );
-              },
-            };
+          create(options) {
+            const { DecisionLoopRunner } = require('../../engine/decision/index.js');
+            return new DecisionLoopRunner({
+              page: options.page,
+              adapter: options.adapter,
+              profile: (rt.job.metadata as Record<string, any>)?.profile ?? {},
+              platform: options.platform,
+              budgetUsd: options.budgetUsd,
+              model: (rt.job.metadata as Record<string, any>)?.decision_model,
+              onProgress: options.logEvent
+                ? (event: { type: string; message: string; iteration: number }) => {
+                    options.logEvent(`decision_loop_${event.type}`, {
+                      iteration: event.iteration,
+                      message: event.message,
+                    });
+                  }
+                : undefined,
+              maxIterations: 100,
+            });
           },
         })
       : buildApplyWorkflow(rt);
