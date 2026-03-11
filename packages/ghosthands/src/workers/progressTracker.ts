@@ -174,6 +174,7 @@ export class ProgressTracker {
   private executionMode?: 'magnitude';
   private kasmUrl?: string;
   private pageContextReader: PageContextReader | null = null;
+  private customDescription?: string;
 
   constructor(opts: ProgressTrackerOptions) {
     this.jobId = opts.jobId;
@@ -188,6 +189,13 @@ export class ProgressTracker {
   /** Set the current step explicitly (for lifecycle transitions). */
   async setStep(step: ProgressStep): Promise<void> {
     this.currentStep = step;
+    this.customDescription = undefined;
+    await this.emit();
+  }
+
+  /** Override the emitted description without changing the underlying lifecycle step. */
+  async setStatusMessage(message: string): Promise<void> {
+    this.customDescription = message;
     await this.emit();
   }
 
@@ -213,6 +221,7 @@ export class ProgressTracker {
   /** Called when an action starts. Infers the step and emits progress. */
   async onActionStarted(actionVariant: string): Promise<void> {
     this.actionIndex++;
+    this.customDescription = undefined;
     const inferred = inferStepFromAction(actionVariant, this.currentStep, this.latestThought);
     if (STEP_ORDER.indexOf(inferred) > STEP_ORDER.indexOf(this.currentStep)) {
       this.currentStep = inferred;
@@ -245,7 +254,7 @@ export class ProgressTracker {
     return {
       step: this.currentStep,
       progress_pct: this.getProgressPct(),
-      description: STEP_DESCRIPTIONS[this.currentStep],
+      description: this.customDescription ?? STEP_DESCRIPTIONS[this.currentStep],
       action_index: this.actionIndex,
       total_actions_estimate: this.estimatedTotalActions,
       current_action: this.latestThought,

@@ -172,6 +172,8 @@ export class SmartApplyHandler implements TaskHandler {
         await this.dismissCookieBanner(adapter);
 
         // Detect current page type
+        await progress.setStatusMessage?.('Analyzing page...');
+        await progress.setStep(ProgressStep.ANALYZING_PAGE);
         const pageState = await this.detectPage(adapter, config);
         const currentPageUrl = await adapter.getCurrentUrl();
         console.log(`[SmartApply] Page ${pagesProcessed}: ${pageState.page_type} (title: ${pageState.page_title || 'N/A'})`);
@@ -2038,6 +2040,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       const fillResult = await fillFormOnPage(adapter.page, adapter, profileText, resumePath, {
         forceMagnitude: escalate,
         anthropicClientConfig: llmClientConfig?.anthropic,
+        onVisualFillStart: () => progress.setStatusMessage?.('Attempting visual form fill...'),
         observers: pageContext
           ? {
               onQuestionsNormalized: async (questions, opts) => pageContext.syncQuestions(questions, opts),
