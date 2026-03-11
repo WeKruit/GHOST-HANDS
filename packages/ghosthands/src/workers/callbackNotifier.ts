@@ -137,7 +137,16 @@ export class CallbackNotifier {
     // Include cost_breakdown from job metadata (populated by JobExecutor on success/failure)
     const jobMeta = typeof job.metadata === 'object' ? (job.metadata || {}) : {};
     if (jobMeta.cost_breakdown) {
-      payload.cost_breakdown = jobMeta.cost_breakdown as CallbackPayload['cost_breakdown'];
+      const cb = jobMeta.cost_breakdown as Record<string, unknown>;
+      payload.cost_breakdown = {
+        total_cost_usd: payload.cost?.total_cost_usd ?? 0,
+        action_count: payload.cost?.action_count ?? 0,
+        total_tokens: payload.cost?.total_tokens ?? 0,
+        magnitude_steps: (cb.magnitude_steps as number) ?? 0,
+        magnitude_cost_usd: (cb.magnitude_cost_usd as number) ?? 0,
+        image_cost_usd: (cb.image_cost_usd as number) ?? 0,
+        reasoning_cost_usd: (cb.reasoning_cost_usd as number) ?? 0,
+      };
     }
 
     // WEK-162: Include Kasm session URL if available (from job metadata or env)
