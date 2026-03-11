@@ -2699,7 +2699,7 @@ ${dataBlock}`;
       const allButtons: Array<HTMLButtonElement | HTMLAnchorElement | HTMLInputElement> = [];
       for (const root of roots) {
         const buttons = root.querySelectorAll<HTMLButtonElement | HTMLAnchorElement | HTMLInputElement>(
-          'button, [role="button"], input[type="submit"], a.btn, a[class*="btn"], a[class*="button"]'
+          'button, [role="button"], [role="link"], input[type="submit"], input[type="button"], a[href], a.btn, a[class*="btn"], a[class*="button"]'
         );
         allButtons.push(...Array.from(buttons));
       }
@@ -2708,7 +2708,7 @@ ${dataBlock}`;
         const rect = b.getBoundingClientRect();
         return {
           el: b,
-          text: (b.textContent || b.getAttribute('value') || '').trim().toLowerCase(),
+          text: (b.textContent || b.getAttribute('value') || b.getAttribute('aria-label') || b.getAttribute('title') || '').trim().toLowerCase(),
           visible: rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < vh,
         };
       });
