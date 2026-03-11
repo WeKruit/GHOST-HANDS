@@ -1137,6 +1137,7 @@ export class JobExecutor {
           llm_cost_cents: Math.round(finalCost.totalCost * 100),
           action_count: finalCost.actionCount,
           total_tokens: finalCost.inputTokens + finalCost.outputTokens,
+          metadata: job.metadata,
         };
         callbackNotifier.notifyFromJob(jobRow).catch((err) => {
           getLogger().warn('Callback notification failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
@@ -1162,6 +1163,7 @@ export class JobExecutor {
             llm_cost_cents: Math.round(snapshot.totalCost * 100),
             action_count: snapshot.actionCount,
             total_tokens: snapshot.inputTokens + snapshot.outputTokens,
+            metadata: job.metadata,
           }).catch(() => {});
         }
         return;
@@ -1322,6 +1324,7 @@ export class JobExecutor {
           llm_cost_cents: Math.round(snapshot.totalCost * 100),
           action_count: snapshot.actionCount,
           total_tokens: snapshot.inputTokens + snapshot.outputTokens,
+          metadata: job.metadata,
         }).catch((err) => {
           getLogger().warn('Callback notification failed', { jobId: job.id, error: err instanceof Error ? err.message : String(err) });
         });

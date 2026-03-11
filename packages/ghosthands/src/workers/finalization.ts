@@ -247,6 +247,7 @@ function fireCallbackBestEffort(
       llm_cost_cents: Math.round(finalCost.totalCost * 100),
       action_count: finalCost.actionCount,
       total_tokens: finalCost.inputTokens + finalCost.outputTokens,
+      metadata: job.metadata,
       ...(generatedPlatformCredentials?.length
         ? { generated_platform_credentials: generatedPlatformCredentials }
         : {}),
