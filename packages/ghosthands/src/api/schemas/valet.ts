@@ -73,6 +73,7 @@ export const ValetApplySchema = z.object({
   model: z.string().max(100).optional().describe('LLM model alias (e.g. "qwen-72b", "deepseek-chat", "claude-sonnet")'),
   image_model: z.string().max(100).optional().describe('Separate model for vision/screenshot analysis'),
   execution_mode: z.enum(['auto', 'ai_only', 'hybrid', 'smart_apply', 'agent_apply', 'mastra']).default('auto'),
+  credit_budget_usd: z.number().positive().optional().describe('VALET credit-derived USD budget cap for this task'),
 });
 
 export type ValetApplyInput = z.infer<typeof ValetApplySchema>;
@@ -97,6 +98,7 @@ export const ValetTaskSchema = z.object({
   model: z.string().max(100).optional().describe('LLM model alias (e.g. "qwen-72b", "deepseek-chat", "claude-sonnet")'),
   image_model: z.string().max(100).optional().describe('Separate model for vision/screenshot analysis'),
   execution_mode: z.enum(['auto', 'ai_only', 'hybrid', 'smart_apply', 'agent_apply', 'mastra']).default('auto'),
+  credit_budget_usd: z.number().positive().optional().describe('VALET credit-derived USD budget cap for this task'),
 });
 
 export type ValetTaskInput = z.infer<typeof ValetTaskSchema>;
