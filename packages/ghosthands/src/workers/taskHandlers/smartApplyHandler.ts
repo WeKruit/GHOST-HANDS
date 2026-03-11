@@ -45,6 +45,63 @@ export class SmartApplyHandler implements TaskHandler {
   private _lastFillDomFilled = -1;
   private _lastFillMagnitudeFilled = -1;
 
+  private attachPageDebugListeners(adapter: BrowserAutomationAdapter): void {
+    const page = adapter.page as typeof adapter.page & { __ghSmartApplyDebugAttached?: boolean };
+    if (!page.__ghSmartApplyDebugAttached) {
+      page.__ghSmartApplyDebugAttached = true;
+      page.on('close', () => {
+        console.warn(`[SmartApply] Playwright page closed (last url: ${page.url() || 'unknown'})`);
+      });
+      page.on('crash', () => {
+        console.warn(`[SmartApply] Playwright page crashed (last url: ${page.url() || 'unknown'})`);
+      });
+      page.on('popup', (popup) => {
+        console.warn(`[SmartApply] Popup opened during apply flow (url: ${popup.url() || 'about:blank'})`);
+      });
+    }
+
+    const context = page.context() as ReturnType<typeof page.context> & { __ghSmartApplyDebugAttached?: boolean };
+    if (!context.__ghSmartApplyDebugAttached) {
+      context.__ghSmartApplyDebugAttached = true;
+      context.on('close', () => {
+        console.warn('[SmartApply] Browser context closed during apply flow');
+      });
+      context.on('page', (newPage) => {
+        console.warn(`[SmartApply] New page observed in context (url: ${newPage.url() || 'about:blank'})`);
+      });
+    }
+  }
+
+  private async logAdapterPageState(adapter: BrowserAutomationAdapter, label: string): Promise<void> {
+    try {
+      const page = adapter.page;
+      const contextPages = page.context().pages().map((candidate, index) => ({
+        index,
+        url: candidate.url() || 'about:blank',
+        isClosed: candidate.isClosed(),
+      }));
+      let currentUrl = '(closed)';
+      let title = '(unavailable)';
+      if (!page.isClosed()) {
+        currentUrl = await adapter.getCurrentUrl().catch(() => page.url() || '(unavailable)');
+        title = await page.title().catch(() => '(unavailable)');
+      }
+      console.warn(
+        `[SmartApply] ${label}: ${JSON.stringify({
+          currentUrl,
+          title,
+          pageClosed: page.isClosed(),
+          adapterConnected: adapter.isConnected(),
+          contextPageCount: contextPages.length,
+          contextPages,
+        })}`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[SmartApply] ${label}: failed to snapshot page state: ${message}`);
+    }
+  }
+
   validate(inputData: Record<string, any>): ValidationResult {
     const errors: string[] = [];
     const userData = inputData.user_data;
@@ -94,6 +151,7 @@ export class SmartApplyHandler implements TaskHandler {
     const namePolyfill = 'if(typeof globalThis.__name==="undefined"){globalThis.__name=function(f){return f}}';
     await adapter.page.addInitScript(namePolyfill);
     await adapter.page.evaluate(namePolyfill);
+    this.attachPageDebugListeners(adapter);
 
     // Resolve platform config from URL
     // When running under Mastra, force generic config — skip platform-specific
@@ -176,7 +234,9 @@ export class SmartApplyHandler implements TaskHandler {
         await progress.setStep(ProgressStep.ANALYZING_PAGE);
         const pageState = await this.detectPage(adapter, config);
         const currentPageUrl = await adapter.getCurrentUrl();
-        console.log(`[SmartApply] Page ${pagesProcessed}: ${pageState.page_type} (title: ${pageState.page_title || 'N/A'})`);
+        console.log(
+          `[SmartApply] Page ${pagesProcessed}: ${pageState.page_type} (title: ${pageState.page_title || 'N/A'}, url: ${currentPageUrl})`,
+        );
 
         // Stuck detection: compare URL + visible content fingerprint.
         // On SPAs (like Amazon.jobs), the URL stays constant across sections,
@@ -445,6 +505,11 @@ export class SmartApplyHandler implements TaskHandler {
             // Bail early instead of looping through Magnitude timeouts.
             if (this._lastFillTotalFields === 0 && this._lastFillDomFilled === 0 && this._lastFillMagnitudeFilled === 0) {
               consecutiveZeroFieldPages++;
+              console.warn(
+                `[SmartApply] Zero-field page ${consecutiveZeroFieldPages}/${MAX_ZERO_FIELD_PAGES} ` +
+                `(url: ${currentPageUrl}, pageType: ${pageState.page_type})`,
+              );
+              await this.logAdapterPageState(adapter, 'Zero-field diagnostics');
               if (consecutiveZeroFieldPages >= MAX_ZERO_FIELD_PAGES) {
                 console.warn(`[SmartApply] ${consecutiveZeroFieldPages} consecutive pages with 0 detectable fields — site uses non-standard form components. Stopping.`);
                 await pageContext?.finalizeActivePage({ status: 'blocked' });
@@ -495,6 +560,9 @@ export class SmartApplyHandler implements TaskHandler {
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       console.error(`[SmartApply] Error on page ${pagesProcessed}: ${msg}`);
+      if (/Target page, context or browser has been closed/i.test(msg)) {
+        await this.logAdapterPageState(adapter, `Closed-page diagnostics after failure on page ${pagesProcessed}`);
+      }
       await pageContext?.markFailed();
 
       // If we fail mid-application, keep browser open so user can recover

@@ -134,6 +134,76 @@ const MAGNITUDE_HAND_ACT_TIMEOUT_MS = 30_000;
 const NAV_CONTROL_RE =
   /\b(kla careers|search for jobs|candidate home|job alerts|privacy policy|follow us|about us|navigation menu|careers home|menu)\b/i;
 
+function formatDebugError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function logZeroFieldDebugSnapshot(page: Page, label: string): Promise<void> {
+  try {
+    const snapshot = await page.evaluate((selector) => {
+      const roots: Array<Document | ShadowRoot> = [document];
+      let shadowRootCount = 0;
+      for (let index = 0; index < roots.length; index += 1) {
+        const root = roots[index]!;
+        for (const host of Array.from(root.querySelectorAll('*'))) {
+          const shadowRoot = (host as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+          if (shadowRoot) {
+            shadowRootCount += 1;
+            roots.push(shadowRoot);
+          }
+        }
+      }
+
+      const seen = new Set<Element>();
+      const interactiveNodes: Element[] = [];
+      for (const root of roots) {
+        for (const el of Array.from(root.querySelectorAll(selector))) {
+          if (seen.has(el)) continue;
+          seen.add(el);
+          interactiveNodes.push(el);
+        }
+      }
+
+      const preview = interactiveNodes.slice(0, 12).map((el) => {
+        const node = el as HTMLElement;
+        const rect = node.getBoundingClientRect();
+        return {
+          tag: node.tagName.toLowerCase(),
+          role: node.getAttribute('role') || '',
+          type: (node as HTMLInputElement).type || '',
+          name: node.getAttribute('name') || '',
+          ariaLabel: node.getAttribute('aria-label') || '',
+          text: (node.innerText || node.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+          inShadowRoot: node.getRootNode() !== document,
+        };
+      });
+
+      return {
+        url: window.location.href,
+        title: document.title,
+        readyState: document.readyState,
+        iframeCount: document.querySelectorAll('iframe').length,
+        formCount: document.querySelectorAll('form, [role="form"]').length,
+        shadowRootCount,
+        interactiveCountInDocument: document.querySelectorAll(selector).length,
+        interactiveCountAcrossRoots: interactiveNodes.length,
+        customElementCount: Array.from(document.querySelectorAll('*'))
+          .filter((el) => el.tagName.includes('-'))
+          .length,
+        bodyTextSample: (document.body?.innerText || '')
+          .replace(/\s+/g, ' ')
+          .slice(0, 280),
+        preview,
+      };
+    }, INTERACTIVE_SELECTOR);
+    console.warn(`[formFiller] ${label}: ${JSON.stringify(snapshot)}`);
+  } catch (error) {
+    console.warn(`[formFiller] ${label}: snapshot failed: ${formatDebugError(error)}`);
+  }
+}
+
 const FIELD_RESULT_CONFIDENCE = {
   domFilled: 0.8,
   domFailed: 0.35,
@@ -3340,6 +3410,8 @@ export async function fillFormOnPage(
   console.log(`[formFiller] Found ${visibleFields.length} visible fields (${llmFields.length} non-file).`);
 
   if (visibleFields.length === 0) {
+    await logZeroFieldDebugSnapshot(page, 'zero-field debug snapshot');
+
     // DOM scanner found no fields. Sites like SmartRecruiters use custom React
     // components that don't render as standard <input>/<select>/<textarea>.
     // Try Magnitude visual fill — but only if the adapter isn't already poisoned
@@ -3371,6 +3443,7 @@ export async function fillFormOnPage(
     } catch (err: any) {
       const msg = err?.message ?? String(err);
       console.warn(`[formFiller] Magnitude visual fill failed: ${msg}`);
+      await logZeroFieldDebugSnapshot(page, 'post-visual-fill failure snapshot');
       // After timeout, wait briefly for settle to prevent cascading busy errors
       // on subsequent pages.
       if (msg.includes('timed out') && adapter.waitForActSettle) {
