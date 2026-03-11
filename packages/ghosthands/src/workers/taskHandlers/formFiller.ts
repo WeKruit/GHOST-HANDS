@@ -3341,8 +3341,19 @@ export async function fillFormOnPage(
   if (visibleFields.length === 0) {
     // DOM scanner found no fields. Sites like SmartRecruiters use custom React
     // components that don't render as standard <input>/<select>/<textarea>.
-    // Fall through to Magnitude visual fill so the AI agent can interact with
-    // the form visually instead of returning empty.
+    // Try Magnitude visual fill — but only if the adapter isn't already poisoned
+    // from a previous timed-out act() call.
+
+    // Check if adapter mutex is poisoned (previous act() still running).
+    // If so, skip visual fill entirely — it will just fail with "adapter busy".
+    if (adapter.waitForActSettle) {
+      const settled = await adapter.waitForActSettle(1_000);
+      if (!settled) {
+        console.log('[formFiller] No visible DOM fields + adapter busy from previous act() — skipping Magnitude visual fill.');
+        return result;
+      }
+    }
+
     console.log('[formFiller] No visible DOM fields found — attempting Magnitude visual fill.');
     try {
       const today = new Date().toLocaleDateString('en-CA');
@@ -3352,11 +3363,17 @@ export async function fillFormOnPage(
         `Look at the current page and fill in ALL visible form fields using the applicant's profile. ` +
         `Fill text fields, select dropdowns, upload the resume if there is a file upload, and check any required checkboxes. ` +
         `Work through the form from top to bottom. Do NOT click any Submit or Next buttons.`;
-      await adapter.act(visualPrompt, { timeoutMs: 60_000 });
-      result.magnitudeFilled = 1; // approximate — visual fill handles multiple fields
+      await adapter.act(visualPrompt, { timeoutMs: 30_000 });
+      result.magnitudeFilled = 1;
       console.log('[formFiller] Magnitude visual fill completed (0 DOM fields, used visual agent).');
     } catch (err: any) {
-      console.warn(`[formFiller] Magnitude visual fill failed: ${err?.message ?? err}`);
+      const msg = err?.message ?? String(err);
+      console.warn(`[formFiller] Magnitude visual fill failed: ${msg}`);
+      // After timeout, wait briefly for settle to prevent cascading busy errors
+      // on subsequent pages.
+      if (msg.includes('timed out') && adapter.waitForActSettle) {
+        await adapter.waitForActSettle(5_000);
+      }
     }
     return result;
   }
