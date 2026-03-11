@@ -60,6 +60,11 @@ export const WorkdayUserProfileSchema = z.object({
   // Resume file path (relative to cwd or absolute)
   resume_path: z.string().optional(),
 
+  // ATS account credentials
+  application_password: z.string().optional(),
+  workday_email: z.string().email().optional(),
+  workday_password: z.string().optional(),
+
   // Legal/compliance
   work_authorization: z.string().default('Yes'),
   visa_sponsorship: z.string().default('No'),
