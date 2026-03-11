@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  describePasswordRequirements,
+  generatePlatformCredential,
   inferCredentialPlatformFromUrl,
   inferPasswordRequirements,
   resolvePlatformAccountEmail,
@@ -54,5 +56,46 @@ describe('accountCredentials', () => {
     expect(/[A-Z]/.test(strengthened)).toBe(true);
     expect(/[!@#$%^&*]/.test(strengthened)).toBe(true);
     expect(strengthened.length).toBeGreaterThanOrEqual(14);
+  });
+
+  test('generates a workday credential that satisfies inferred requirements', () => {
+    const generated = generatePlatformCredential(
+      { email: 'profile@example.com' },
+      'workday',
+      'profile@example.com',
+      {
+        validationText:
+          'Password must include: an uppercase letter, a lowercase letter, a number, a special character, and at least 14 characters.',
+      },
+    );
+
+    expect(generated.credential.platform).toBe('workday');
+    expect(generated.credential.loginIdentifier).toBe('profile@example.com');
+    expect(generated.credential.source).toBe('generated_platform_password');
+    expect(generated.event.passwordSource).toBe('generated_platform_password');
+    expect(generated.credential.secret.length).toBeGreaterThanOrEqual(14);
+    expect(/[A-Z]/.test(generated.credential.secret)).toBe(true);
+    expect(/[a-z]/.test(generated.credential.secret)).toBe(true);
+    expect(/[0-9]/.test(generated.credential.secret)).toBe(true);
+    expect(/[!@#$%^&*]/.test(generated.credential.secret)).toBe(true);
+    expect(generated.event.note).toContain('Generated a workday account password');
+  });
+
+  test('describes password requirements for reporting', () => {
+    expect(
+      describePasswordRequirements({
+        minLength: 12,
+        requireUppercase: true,
+        requireLowercase: true,
+        requireNumber: true,
+        requireSpecial: true,
+      }),
+    ).toEqual([
+      'minimum 12 characters',
+      'uppercase letter',
+      'lowercase letter',
+      'number',
+      'special character',
+    ]);
   });
 });

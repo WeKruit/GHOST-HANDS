@@ -19,6 +19,7 @@ import { CostControlService } from './costControl.js';
 import type { ProgressTracker } from './progressTracker.js';
 import { ProgressStep } from './progressTracker.js';
 import type { TaskResult, AutomationJob } from './taskHandlers/types.js';
+import type { GeneratedPlatformCredential } from './taskHandlers/platforms/accountCredentials.js';
 import { callbackNotifier } from './callbackNotifier.js';
 
 /** Minimal execution result shape used by finalization functions. */
@@ -225,11 +226,12 @@ function recordCostBestEffort(
 function fireCallbackBestEffort(
   job: AutomationJob,
   workerId: string,
-  status: 'completed' | 'failed',
+  status: 'completed' | 'failed' | 'awaiting_review',
   resultData: Record<string, unknown>,
   resultSummary: string,
   screenshotUrls: string[],
   finalCost: CostSnapshot,
+  generatedPlatformCredentials?: GeneratedPlatformCredential[],
 ): void {
   if (!job.callback_url) return;
   callbackNotifier
@@ -245,6 +247,9 @@ function fireCallbackBestEffort(
       llm_cost_cents: Math.round(finalCost.totalCost * 100),
       action_count: finalCost.actionCount,
       total_tokens: finalCost.inputTokens + finalCost.outputTokens,
+      ...(generatedPlatformCredentials?.length
+        ? { generated_platform_credentials: generatedPlatformCredentials }
+        : {}),
     })
     .catch((err) => {
       logger.warn('Callback notification failed', {
@@ -252,6 +257,22 @@ function fireCallbackBestEffort(
         error: err instanceof Error ? err.message : String(err),
       });
     });
+}
+
+function buildAccountCreationNote(taskResult: TaskResult): string | null {
+  const events = Array.isArray(taskResult.data?.account_creation_events)
+    ? taskResult.data.account_creation_events
+    : [];
+  const notes = events
+    .map((event) =>
+      event && typeof event === 'object' && typeof event.note === 'string'
+        ? event.note.trim()
+        : '',
+    )
+    .filter((note): note is string => note.length > 0);
+
+  if (notes.length === 0) return null;
+  return notes.join(' ');
 }
 
 /**
@@ -422,6 +443,24 @@ export async function finalizeHandlerResult(
     // Best-effort application report
     await writeReportBestEffort(supabase, job, pageContext, finalCost, taskResult, screenshotUrls, 'awaiting_review', logEvent);
 
+    const awaitingReviewSummaryBase = 'Application filled — waiting for user to review and submit';
+    const awaitingReviewAccountNote = buildAccountCreationNote(taskResult);
+    const awaitingReviewSummary =
+      awaitingReviewAccountNote != null
+        ? `${awaitingReviewSummaryBase} ${awaitingReviewAccountNote}`
+        : awaitingReviewSummaryBase;
+
+    fireCallbackBestEffort(
+      job,
+      workerId,
+      'awaiting_review',
+      resultData,
+      awaitingReviewSummary,
+      screenshotUrls,
+      finalCost,
+      taskResult.runtimeMetadata?.generatedPlatformCredentials,
+    );
+
     logger.info('Job awaiting user review', {
       jobId: job.id,
       actionCount: finalCost.actionCount,
@@ -499,6 +538,7 @@ export async function finalizeHandlerResult(
       errorMessage,
       screenshotUrls,
       finalCost,
+      taskResult.runtimeMetadata?.generatedPlatformCredentials,
     );
 
     logger.info('Job failed via handler', {
@@ -515,10 +555,15 @@ export async function finalizeHandlerResult(
   await progress.setStep(ProgressStep.COMPLETED);
   await progress.flush();
 
-  const resultSummary =
+  const baseResultSummary =
     taskResult.data?.success_message ||
     taskResult.data?.summary ||
     (taskResult.data?.submitted ? 'Application submitted successfully' : 'Task completed');
+  const accountCreationNote = buildAccountCreationNote(taskResult);
+  const resultSummary =
+    baseResultSummary && accountCreationNote
+      ? `${baseResultSummary} ${accountCreationNote}`
+      : baseResultSummary ?? accountCreationNote ?? 'Task completed';
 
   await supabase
     .from('gh_automation_jobs')
@@ -558,6 +603,7 @@ export async function finalizeHandlerResult(
     resultSummary,
     screenshotUrls,
     finalCost,
+    taskResult.runtimeMetadata?.generatedPlatformCredentials,
   );
 
   logger.info('Job completed via handler', {

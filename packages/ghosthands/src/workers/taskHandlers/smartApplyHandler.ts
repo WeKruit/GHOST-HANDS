@@ -8,9 +8,12 @@ import type { PlatformConfig, PageState, PageType, ScannedField, ScanResult } fr
 import type { CostTracker } from '../costControl.js';
 import { detectPlatformFromUrl } from './platforms/index.js';
 import {
+  generatePlatformCredential,
   inferCredentialPlatformFromUrl,
   resolvePlatformAccountEmail,
   resolvePlatformAccountPassword,
+  type AccountCreationEvent,
+  type GeneratedPlatformCredential,
 } from './platforms/accountCredentials.js';
 import { findBestAnswer } from './platforms/genericConfig.js';
 import { ProgressStep } from '../progressTracker.js';
@@ -49,6 +52,70 @@ export class SmartApplyHandler implements TaskHandler {
   private _lastFillTotalFields = -1;
   private _lastFillDomFilled = -1;
   private _lastFillMagnitudeFilled = -1;
+  private accountCreationEvents: AccountCreationEvent[] = [];
+  private generatedPlatformCredentials: GeneratedPlatformCredential[] = [];
+
+  private resetRunState(): void {
+    this.lastLlmCallTime = 0;
+    this.loginAttempted = false;
+    this.applyClicked = false;
+    this.accountCreationEvents = [];
+    this.generatedPlatformCredentials = [];
+  }
+
+  private rememberGeneratedPlatformCredential(
+    credential: GeneratedPlatformCredential,
+    event: AccountCreationEvent,
+  ): void {
+    const existingCredentialIndex = this.generatedPlatformCredentials.findIndex(
+      (entry) => entry.platform === credential.platform,
+    );
+    if (existingCredentialIndex >= 0) {
+      this.generatedPlatformCredentials[existingCredentialIndex] = credential;
+    } else {
+      this.generatedPlatformCredentials.push(credential);
+    }
+
+    const existingEventIndex = this.accountCreationEvents.findIndex(
+      (entry) =>
+        entry.platform === event.platform &&
+        entry.action === event.action &&
+        entry.loginIdentifier === event.loginIdentifier,
+    );
+    if (existingEventIndex >= 0) {
+      this.accountCreationEvents[existingEventIndex] = event;
+    } else {
+      this.accountCreationEvents.push(event);
+    }
+  }
+
+  private withAccountCreationMetadata(result: TaskResult): TaskResult {
+    if (
+      this.accountCreationEvents.length === 0 &&
+      this.generatedPlatformCredentials.length === 0
+    ) {
+      return result;
+    }
+
+    return {
+      ...result,
+      data: {
+        ...(result.data || {}),
+        ...(this.accountCreationEvents.length > 0
+          ? { account_creation_events: this.accountCreationEvents }
+          : {}),
+      },
+      runtimeMetadata: {
+        ...(result.runtimeMetadata || {}),
+        ...(this.accountCreationEvents.length > 0
+          ? { accountCreationEvents: this.accountCreationEvents }
+          : {}),
+        ...(this.generatedPlatformCredentials.length > 0
+          ? { generatedPlatformCredentials: this.generatedPlatformCredentials }
+          : {}),
+      },
+    };
+  }
 
   private attachPageDebugListeners(adapter: BrowserAutomationAdapter): void {
     const page = adapter.page as typeof adapter.page & { __ghSmartApplyDebugAttached?: boolean };
@@ -129,9 +196,7 @@ export class SmartApplyHandler implements TaskHandler {
 
     // TaskHandlerRegistry stores singleton handler instances, so reset
     // per-run state at the start of each execute() call.
-    this.lastLlmCallTime = 0;
-    this.loginAttempted = false;
-    this.applyClicked = false;
+    this.resetRunState();
 
     // Normalize address: API route stores flat (city, state, country, zip)
     // but platform configs expect nested address object
@@ -256,7 +321,7 @@ export class SmartApplyHandler implements TaskHandler {
             await pageContext?.finalizeActivePage({ status: 'blocked' });
             await pageContext?.markAwaitingReview();
             await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
-            return {
+            return this.withAccountCreationMetadata({
               success: true,
               keepBrowserOpen: true,
               awaitingUserReview: true,
@@ -266,7 +331,7 @@ export class SmartApplyHandler implements TaskHandler {
                 final_page: 'stuck',
                 message: `Application appears stuck on the same page. Browser open for manual takeover.`,
               },
-            };
+            });
           }
           if (samePageCount >= ESCALATE_AFTER) {
             console.log(`[SmartApply] Stuck ${samePageCount}/${MAX_SAME_PAGE} — escalating to MagnitudeHand for this page.`);
@@ -361,7 +426,7 @@ export class SmartApplyHandler implements TaskHandler {
             console.log('[SmartApply] DO NOT close this terminal until you are done.');
             console.log('='.repeat(70) + '\n');
 
-            return {
+            return this.withAccountCreationMetadata({
               success: true,
               keepBrowserOpen: true,
               awaitingUserReview: true,
@@ -371,12 +436,12 @@ export class SmartApplyHandler implements TaskHandler {
                 final_page: 'review',
                 message: 'Application filled. Waiting for user to review and submit.',
               },
-            };
+            });
 
           case 'confirmation':
             console.warn('[SmartApply] Unexpected: landed on confirmation page');
             await pageContext?.finalizeActivePage({ status: 'completed' });
-            return {
+            return this.withAccountCreationMetadata({
               success: true,
               data: {
                 platform: config.platformId,
@@ -384,14 +449,14 @@ export class SmartApplyHandler implements TaskHandler {
                 final_page: 'confirmation',
                 message: 'Application appears to have been submitted (unexpected).',
               },
-            };
+            });
 
           case 'error':
-            return {
+            return this.withAccountCreationMetadata({
               success: false,
               error: `Application error page: ${pageState.error_message || 'Unknown error'}`,
               data: { platform: config.platformId, pages_processed: pagesProcessed },
-            };
+            });
 
           default: {
             // ALL form pages — personal_info, experience, resume_upload, questions, etc.
@@ -500,7 +565,7 @@ export class SmartApplyHandler implements TaskHandler {
               console.log('[SmartApply] DO NOT close this terminal until you are done.');
               console.log('='.repeat(70) + '\n');
 
-              return {
+              return this.withAccountCreationMetadata({
                 success: true,
                 keepBrowserOpen: true,
                 awaitingUserReview: true,
@@ -510,7 +575,7 @@ export class SmartApplyHandler implements TaskHandler {
                   final_page: 'review',
                   message: 'Application filled. Waiting for user to review and submit.',
                 },
-              };
+              });
             }
             // Track consecutive zero-field pages: if the site consistently has
             // 0 detectable form fields, it's incompatible with our field extraction.
@@ -527,7 +592,7 @@ export class SmartApplyHandler implements TaskHandler {
                 await pageContext?.finalizeActivePage({ status: 'blocked' });
                 await pageContext?.markAwaitingReview();
                 await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
-                return {
+                return this.withAccountCreationMetadata({
                   success: true,
                   keepBrowserOpen: true,
                   awaitingUserReview: true,
@@ -537,7 +602,7 @@ export class SmartApplyHandler implements TaskHandler {
                     final_page: 'incompatible',
                     message: 'Site uses non-standard form components that cannot be automated. Browser open for manual takeover.',
                   },
-                };
+                });
               }
             } else {
               consecutiveZeroFieldPages = 0;
@@ -558,7 +623,7 @@ export class SmartApplyHandler implements TaskHandler {
       console.log('[SmartApply] DO NOT close this terminal until you are done.');
       console.log('='.repeat(70) + '\n');
 
-      return {
+      return this.withAccountCreationMetadata({
         success: true,
         keepBrowserOpen: true,
         awaitingUserReview: true,
@@ -568,7 +633,7 @@ export class SmartApplyHandler implements TaskHandler {
           final_page: 'max_pages_reached',
           message: `Processed ${pagesProcessed} pages. Browser open for manual review.`,
         },
-      };
+      });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       console.error(`[SmartApply] Error on page ${pagesProcessed}: ${msg}`);
@@ -580,19 +645,19 @@ export class SmartApplyHandler implements TaskHandler {
       // If we fail mid-application, keep browser open so user can recover
       if (pagesProcessed > 2) {
         console.log('[SmartApply] Keeping browser open for manual recovery.');
-        return {
+        return this.withAccountCreationMetadata({
           success: false,
           keepBrowserOpen: true,
           error: msg,
           data: { platform: config.platformId, pages_processed: pagesProcessed },
-        };
+        });
       }
 
-      return {
+      return this.withAccountCreationMetadata({
         success: false,
         error: msg,
         data: { platform: config.platformId, pages_processed: pagesProcessed },
-      };
+      });
     }
   }
 
@@ -1924,8 +1989,30 @@ Click only ONE button, then report the task as done.`,
     const currentUrl = adapter.page.url();
     const platform = inferCredentialPlatformFromUrl(currentUrl);
     const email = resolvePlatformAccountEmail(profile, platform);
+    const initialValidationText = await this.readAccountCreationValidationText(adapter);
     let passwordResolution = resolvePlatformAccountPassword(profile, platform);
     let password = passwordResolution.password;
+
+    if (
+      platform === 'workday' &&
+      email &&
+      passwordResolution.source !== 'platform_override'
+    ) {
+      const generated = generatePlatformCredential(profile, platform, email, {
+        validationText: initialValidationText,
+      });
+      this.rememberGeneratedPlatformCredential(generated.credential, generated.event);
+      passwordResolution = {
+        password: generated.credential.secret,
+        source: generated.credential.source,
+      };
+      password = generated.credential.secret;
+      console.log(
+        `[SmartApply] Generated ${platform} account password for ${email} ` +
+        `(${generated.credential.requirements.join(', ')})`,
+      );
+    }
+
     console.log(
       `[SmartApply] Account credentials resolved for ${platform ?? 'generic'}: ` +
       `email=${email ? 'present' : 'missing'}, passwordSource=${passwordResolution.source}`,
@@ -1946,9 +2033,21 @@ Click only ONE button, then report the task as done.`,
       if (stillOnCreateAccount && passwordResolution.source !== 'platform_override') {
         const validationText = await this.readAccountCreationValidationText(adapter);
         if (validationText) {
-          const strengthened = resolvePlatformAccountPassword(profile, platform, {
-            validationText,
-          });
+          const strengthened =
+            platform === 'workday' && email
+              ? (() => {
+                  const generated = generatePlatformCredential(profile, platform, email, {
+                    validationText,
+                  });
+                  this.rememberGeneratedPlatformCredential(generated.credential, generated.event);
+                  return {
+                    password: generated.credential.secret,
+                    source: generated.credential.source,
+                  };
+                })()
+              : resolvePlatformAccountPassword(profile, platform, {
+                  validationText,
+                });
           if (strengthened.password !== password) {
             passwordResolution = strengthened;
             password = strengthened.password;

@@ -1,3 +1,5 @@
+import { randomBytes } from 'node:crypto';
+
 type PasswordRequirements = {
   minLength: number;
   requireUppercase: boolean;
@@ -11,9 +13,28 @@ export type AccountPasswordSource =
   | 'shared_application_password'
   | 'profile_password'
   | 'env'
-  | 'generated';
+  | 'generated'
+  | 'generated_platform_password';
+
+export interface GeneratedPlatformCredential {
+  platform: string;
+  loginIdentifier: string;
+  secret: string;
+  source: 'generated_platform_password';
+  requirements: string[];
+}
+
+export interface AccountCreationEvent {
+  platform: string;
+  loginIdentifier: string;
+  action: 'generated_platform_password';
+  passwordSource: AccountPasswordSource;
+  requirements: string[];
+  note: string;
+}
 
 const FALLBACK_PASSWORD = 'ValetApply!123';
+const SPECIAL_CHARS = '!@#$%^&*';
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -161,6 +182,82 @@ export function strengthenPasswordForRequirements(
   }
 
   return password;
+}
+
+function pickRandom(chars: string): string {
+  const index = randomBytes(1)[0] % chars.length;
+  return chars[index] ?? chars[0] ?? 'A';
+}
+
+export function describePasswordRequirements(requirements: PasswordRequirements): string[] {
+  const parts: string[] = [`minimum ${requirements.minLength} characters`];
+  if (requirements.requireUppercase) parts.push('uppercase letter');
+  if (requirements.requireLowercase) parts.push('lowercase letter');
+  if (requirements.requireNumber) parts.push('number');
+  if (requirements.requireSpecial) parts.push('special character');
+  return parts;
+}
+
+export function generatePasswordForRequirements(requirements: PasswordRequirements): string {
+  const chars: string[] = [];
+  if (requirements.requireUppercase) chars.push(pickRandom('ABCDEFGHJKLMNPQRSTUVWXYZ'));
+  if (requirements.requireLowercase) chars.push(pickRandom('abcdefghijkmnopqrstuvwxyz'));
+  if (requirements.requireNumber) chars.push(pickRandom('23456789'));
+  if (requirements.requireSpecial) chars.push(pickRandom(SPECIAL_CHARS));
+
+  const pool =
+    'ABCDEFGHJKLMNPQRSTUVWXYZ' +
+    'abcdefghijkmnopqrstuvwxyz' +
+    '23456789' +
+    SPECIAL_CHARS;
+
+  while (chars.length < requirements.minLength) {
+    chars.push(pickRandom(pool));
+  }
+
+  for (let index = chars.length - 1; index > 0; index -= 1) {
+    const swapIndex = randomBytes(1)[0] % (index + 1);
+    const current = chars[index];
+    chars[index] = chars[swapIndex] ?? chars[index] ?? 'A';
+    chars[swapIndex] = current ?? chars[swapIndex] ?? 'A';
+  }
+
+  return strengthenPasswordForRequirements(chars.join(''), requirements);
+}
+
+export function generatePlatformCredential(
+  profile: Record<string, unknown>,
+  platform: string,
+  loginIdentifier: string,
+  options?: { validationText?: string | null },
+): {
+  credential: GeneratedPlatformCredential;
+  event: AccountCreationEvent;
+} {
+  const requirements = inferPasswordRequirements(options?.validationText, platform);
+  const secret = generatePasswordForRequirements(requirements);
+  const describedRequirements = describePasswordRequirements(requirements);
+  const note =
+    `Generated a ${platform} account password for ${loginIdentifier || 'this application'} ` +
+    `to satisfy: ${describedRequirements.join(', ')}.`;
+
+  return {
+    credential: {
+      platform,
+      loginIdentifier,
+      secret,
+      source: 'generated_platform_password',
+      requirements: describedRequirements,
+    },
+    event: {
+      platform,
+      loginIdentifier,
+      action: 'generated_platform_password',
+      passwordSource: 'generated_platform_password',
+      requirements: describedRequirements,
+      note,
+    },
+  };
 }
 
 export function resolvePlatformAccountPassword(
