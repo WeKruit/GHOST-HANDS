@@ -266,6 +266,70 @@ describe('finalizeHandlerResult', () => {
     expect(completedUpdate[0].status).toBe('completed');
   });
 
+  test('forwards generated platform credentials only through the callback payload', async () => {
+    const supabase = createMockSupabase();
+    const adapter = createMockAdapter();
+    const costTracker = createMockCostTracker();
+    const progress = createMockProgress();
+    const uploadScreenshot = vi.fn().mockResolvedValue('https://cdn.example.com/screenshot.png');
+    const logEvent = vi.fn().mockResolvedValue(undefined);
+
+    await finalizeHandlerResult({
+      job: makeJob({ callback_url: 'https://valet.example.com/api/v1/webhooks/ghosthands' }),
+      adapter: adapter as any,
+      costTracker: costTracker as any,
+      progress: progress as any,
+      sessionManager: null,
+      workerId: 'worker-1',
+      supabase: supabase as any,
+      logEvent,
+      uploadScreenshot,
+      taskResult: makeTaskResult({
+        awaitingUserReview: false,
+        data: {
+          submitted: true,
+          summary: 'Application submitted successfully',
+          account_creation_events: [
+            {
+              note: 'Generated a workday account password for test@example.com to satisfy: minimum 12 characters.',
+            },
+          ],
+        },
+        runtimeMetadata: {
+          generatedPlatformCredentials: [
+            {
+              platform: 'workday',
+              loginIdentifier: 'test@example.com',
+              secret: 'Generated!1234',
+              source: 'generated_platform_password',
+              requirements: ['minimum 12 characters', 'special character'],
+            },
+          ],
+        },
+      }),
+      finalMode: 'magnitude',
+      engineResult: makeEngineResult({ mode: 'magnitude', magnitudeSteps: 5 }),
+    });
+
+    expect(callbackNotifier.notifyFromJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        generated_platform_credentials: [
+          expect.objectContaining({
+            platform: 'workday',
+            loginIdentifier: 'test@example.com',
+            secret: 'Generated!1234',
+          }),
+        ],
+        result_summary: expect.stringContaining('Generated a workday account password'),
+      }),
+    );
+
+    const completedUpdate = supabase._updateFn.mock.calls.find(
+      (call: any[]) => call[0]?.status === 'completed',
+    );
+    expect(completedUpdate?.[0]?.result_data).not.toHaveProperty('generated_platform_credentials');
+  });
+
   test('does NOT block indefinitely (returns immediately)', async () => {
     const supabase = createMockSupabase();
     const adapter = createMockAdapter();
