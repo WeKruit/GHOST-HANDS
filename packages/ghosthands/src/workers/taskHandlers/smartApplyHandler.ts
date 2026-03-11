@@ -40,6 +40,10 @@ export class SmartApplyHandler implements TaskHandler {
   loginAttempted = false;
   /** True after clicking Apply — prevents SPA re-detection as job_listing */
   private applyClicked = false;
+  /** Tracks last fill result so the main loop can detect consecutive zero-field pages */
+  private _lastFillTotalFields = -1;
+  private _lastFillDomFilled = -1;
+  private _lastFillMagnitudeFilled = -1;
 
   validate(inputData: Record<string, any>): ValidationResult {
     const errors: string[] = [];
@@ -152,8 +156,10 @@ export class SmartApplyHandler implements TaskHandler {
     let pagesProcessed = 0;
     let lastPageSignature = '';
     let samePageCount = 0;
+    let consecutiveZeroFieldPages = 0;
     const ESCALATE_AFTER = 3;  // escalate to MagnitudeHand after this many stuck iterations
     const MAX_SAME_PAGE = 6;   // bail after this many total stuck iterations (3 DOM + 3 Magnitude)
+    const MAX_ZERO_FIELD_PAGES = 3; // bail if N consecutive pages have 0 fields (site incompatible)
 
     try {
       // Main detect-and-act loop
@@ -430,6 +436,31 @@ export class SmartApplyHandler implements TaskHandler {
                   message: 'Application filled. Waiting for user to review and submit.',
                 },
               };
+            }
+            // Track consecutive zero-field pages: if the site consistently has
+            // 0 detectable form fields, it's incompatible with our field extraction.
+            // Bail early instead of looping through Magnitude timeouts.
+            if (this._lastFillTotalFields === 0 && this._lastFillDomFilled === 0 && this._lastFillMagnitudeFilled === 0) {
+              consecutiveZeroFieldPages++;
+              if (consecutiveZeroFieldPages >= MAX_ZERO_FIELD_PAGES) {
+                console.warn(`[SmartApply] ${consecutiveZeroFieldPages} consecutive pages with 0 detectable fields — site uses non-standard form components. Stopping.`);
+                await pageContext?.finalizeActivePage({ status: 'blocked' });
+                await pageContext?.markAwaitingReview();
+                await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
+                return {
+                  success: true,
+                  keepBrowserOpen: true,
+                  awaitingUserReview: true,
+                  data: {
+                    platform: config.platformId,
+                    pages_processed: pagesProcessed,
+                    final_page: 'incompatible',
+                    message: 'Site uses non-standard form components that cannot be automated. Browser open for manual takeover.',
+                  },
+                };
+              }
+            } else {
+              consecutiveZeroFieldPages = 0;
             }
             // 'navigated' and 'complete' both continue the main loop
             break;
@@ -2019,6 +2050,10 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
           : undefined,
       });
       console.log(`[SmartApply] formFiller: ${fillResult.domFilled} DOM + ${fillResult.magnitudeFilled} Magnitude filled (${fillResult.llmCalls} LLM calls)`);
+      // Expose fill counts for the main loop's zero-field detection
+      this._lastFillTotalFields = fillResult.totalFields;
+      this._lastFillDomFilled = fillResult.domFilled;
+      this._lastFillMagnitudeFilled = fillResult.magnitudeFilled;
 
       // Record formFiller LLM token usage in cost tracker.
       // formFiller uses claude-haiku-4-5 directly — compute cost from known pricing.
