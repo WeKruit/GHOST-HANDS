@@ -18,6 +18,7 @@ export type AccountPasswordSource =
 
 export interface GeneratedPlatformCredential {
   platform: string;
+  domain?: string | null;
   loginIdentifier: string;
   secret: string;
   source: 'generated_platform_password';
@@ -26,6 +27,7 @@ export interface GeneratedPlatformCredential {
 
 export interface AccountCreationEvent {
   platform: string;
+  domain?: string | null;
   loginIdentifier: string;
   action: 'generated_platform_password';
   passwordSource: AccountPasswordSource;
@@ -96,6 +98,15 @@ export function inferCredentialPlatformFromUrl(url: string | null | undefined): 
   if (normalized.includes('lever.co')) return 'lever';
   if (normalized.includes('linkedin.com')) return 'linkedin';
   return null;
+}
+
+export function inferCredentialDomainFromUrl(url: string | null | undefined): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
 }
 
 export function hasPlatformPasswordOverride(
@@ -229,7 +240,7 @@ export function generatePlatformCredential(
   profile: Record<string, unknown>,
   platform: string,
   loginIdentifier: string,
-  options?: { validationText?: string | null },
+  options?: { validationText?: string | null; sourceUrl?: string | null },
 ): {
   credential: GeneratedPlatformCredential;
   event: AccountCreationEvent;
@@ -237,13 +248,16 @@ export function generatePlatformCredential(
   const requirements = inferPasswordRequirements(options?.validationText, platform);
   const secret = generatePasswordForRequirements(requirements);
   const describedRequirements = describePasswordRequirements(requirements);
+  const domain = inferCredentialDomainFromUrl(options?.sourceUrl);
+  const scopeLabel = domain ? `${loginIdentifier || 'this application'} on ${domain}` : (loginIdentifier || 'this application');
   const note =
-    `Generated a ${platform} account password for ${loginIdentifier || 'this application'} ` +
+    `Generated a ${platform} account password for ${scopeLabel} ` +
     `to satisfy: ${describedRequirements.join(', ')}.`;
 
   return {
     credential: {
       platform,
+      domain,
       loginIdentifier,
       secret,
       source: 'generated_platform_password',
@@ -251,6 +265,7 @@ export function generatePlatformCredential(
     },
     event: {
       platform,
+      domain,
       loginIdentifier,
       action: 'generated_platform_password',
       passwordSource: 'generated_platform_password',
