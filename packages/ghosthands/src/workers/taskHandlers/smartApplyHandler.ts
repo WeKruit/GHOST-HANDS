@@ -3103,12 +3103,20 @@ ${dataPrompt}`;
       const h = document.querySelector('h1, h2, h3');
       const heading = (h?.textContent || '').trim().substring(0, 60);
 
-      // Count visible form fields as a content signature
+      // Count visible form fields AND how many are filled vs empty.
+      // Including filled count ensures the fingerprint changes after formFiller
+      // fills fields — preventing false "stuck" detection on SPAs where the
+      // URL and heading stay constant across fill cycles.
       const fields = document.querySelectorAll('input:not([type="hidden"]), select, textarea');
       let visibleFieldCount = 0;
+      let filledFieldCount = 0;
       for (const f of fields) {
         const rect = f.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) visibleFieldCount++;
+        if (rect.width > 0 && rect.height > 0) {
+          visibleFieldCount++;
+          const el = f as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+          if (el.value && el.value.trim()) filledFieldCount++;
+        }
       }
 
       // Active sidebar/step indicator (common in multi-step forms)
@@ -3127,7 +3135,7 @@ ${dataPrompt}`;
         }
       }
 
-      return `${heading}|fields:${visibleFieldCount}|active:${activeText}`;
+      return `${heading}|fields:${visibleFieldCount}|filled:${filledFieldCount}|active:${activeText}`;
     });
   }
 

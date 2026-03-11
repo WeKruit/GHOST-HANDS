@@ -3339,7 +3339,25 @@ export async function fillFormOnPage(
   console.log(`[formFiller] Found ${visibleFields.length} visible fields (${llmFields.length} non-file).`);
 
   if (visibleFields.length === 0) {
-    console.log('[formFiller] No visible fields found — skipping fill.');
+    // DOM scanner found no fields. Sites like SmartRecruiters use custom React
+    // components that don't render as standard <input>/<select>/<textarea>.
+    // Fall through to Magnitude visual fill so the AI agent can interact with
+    // the form visually instead of returning empty.
+    console.log('[formFiller] No visible DOM fields found — attempting Magnitude visual fill.');
+    try {
+      const today = new Date().toLocaleDateString('en-CA');
+      const visualPrompt =
+        `You are filling out a job application for this person. Today's date is ${today}.\n` +
+        `${profileText.trim()}\n\n` +
+        `Look at the current page and fill in ALL visible form fields using the applicant's profile. ` +
+        `Fill text fields, select dropdowns, upload the resume if there is a file upload, and check any required checkboxes. ` +
+        `Work through the form from top to bottom. Do NOT click any Submit or Next buttons.`;
+      await adapter.act(visualPrompt, { timeoutMs: 60_000 });
+      result.magnitudeFilled = 1; // approximate — visual fill handles multiple fields
+      console.log('[formFiller] Magnitude visual fill completed (0 DOM fields, used visual agent).');
+    } catch (err: any) {
+      console.warn(`[formFiller] Magnitude visual fill failed: ${err?.message ?? err}`);
+    }
     return result;
   }
 
