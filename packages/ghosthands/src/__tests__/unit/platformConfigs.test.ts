@@ -271,6 +271,55 @@ describe('WorkdayPlatformConfig', () => {
     expect(personalPrompt).toContain('DATA: First Name → Happy');
     expect(personalPrompt).toContain('ZERO SCROLLING');
   });
+
+  test('detectPageByDOM treats mixed create-account/sign-in auth screens as login', async () => {
+    const adapter = {
+      page: {
+        evaluate: async () => ({
+          hasSignInWithGoogle: false,
+          hasSignIn: true,
+          hasApplyButton: false,
+          hasSubmitApplication: false,
+          isCreateAccountView: true,
+          hasConfirmPassword: false,
+          hasPasswordField: true,
+          hasSignInTab: true,
+          formFieldCount: 2,
+        }),
+      },
+    } as any;
+
+    const result = await config.detectPageByDOM(adapter);
+    expect(result).toEqual({
+      page_type: 'login',
+      page_title: 'Workday Sign-In',
+      has_sign_in_with_google: false,
+    });
+  });
+
+  test('detectPageByDOM treats confirm-password forms as account creation', async () => {
+    const adapter = {
+      page: {
+        evaluate: async () => ({
+          hasSignInWithGoogle: false,
+          hasSignIn: true,
+          hasApplyButton: false,
+          hasSubmitApplication: false,
+          isCreateAccountView: true,
+          hasConfirmPassword: true,
+          hasPasswordField: true,
+          hasSignInTab: true,
+          formFieldCount: 2,
+        }),
+      },
+    } as any;
+
+    const result = await config.detectPageByDOM(adapter);
+    expect(result).toEqual({
+      page_type: 'account_creation',
+      page_title: 'Workday Create Account',
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

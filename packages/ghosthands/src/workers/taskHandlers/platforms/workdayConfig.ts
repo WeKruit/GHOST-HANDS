@@ -146,6 +146,14 @@ export class WorkdayPlatformConfig implements PlatformConfig {
       const bodyText = document.body.innerText.toLowerCase();
       const headings = Array.from(document.querySelectorAll('h1, h2, h3, [data-automation-id*="pageHeader"], [role="heading"]'));
       const headingText = headings.map(h => (h.textContent || '').toLowerCase()).join(' ');
+      const isVisible = (el: Element | null): el is HTMLElement => {
+        if (!el) return false;
+        const node = el as HTMLElement;
+        const style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
 
       // Check for "Create Account" as the PRIMARY heading/view — means
       // the page IS an account creation form (even if it has a "Sign In" link).
@@ -154,6 +162,13 @@ export class WorkdayPlatformConfig implements PlatformConfig {
       const passwordFields = document.querySelectorAll('input[type="password"]:not([disabled])');
       const hasConfirmPassword = passwordFields.length > 1;
       const hasPasswordField = passwordFields.length > 0;
+      const hasSignInTab = Array.from(
+        document.querySelectorAll('button, a, [role="tab"], [role="button"], [role="link"]')
+      ).some((el) => {
+        if (!isVisible(el)) return false;
+        const text = (el.textContent || '').trim().toLowerCase();
+        return text === 'sign in' || text === 'log in';
+      });
 
       // Count actual form fields — if the page has many inputs, it's an application
       // form, not a login page (even if "sign in" text appears somewhere on the page)
@@ -172,15 +187,12 @@ export class WorkdayPlatformConfig implements PlatformConfig {
         hasApplyButton: bodyText.includes('apply') && !bodyText.includes('application questions'),
         hasSubmitApplication: bodyText.includes('submit application') || bodyText.includes('submit your application'),
         isCreateAccountView: isCreateAccountView || hasConfirmPassword,
+        hasConfirmPassword,
         hasPasswordField,
+        hasSignInTab,
         formFieldCount,
       };
     });
-
-    // Create Account page — classify as account_creation, NOT login
-    if (domSignals.isCreateAccountView) {
-      return { page_type: 'account_creation', page_title: 'Workday Create Account' };
-    }
 
     // Only classify as login if the page actually looks like a login form:
     // - Must have a password field OR a Google SSO button (not just "sign in" text)
@@ -188,6 +200,23 @@ export class WorkdayPlatformConfig implements PlatformConfig {
     //   that just happens to mention "sign in" somewhere on the page, e.g. header)
     const looksLikeLoginForm = domSignals.hasPasswordField || domSignals.hasSignInWithGoogle;
     const isApplicationForm = domSignals.formFieldCount >= 5;
+    const hasExplicitSignInOption =
+      domSignals.hasSignInWithGoogle ||
+      domSignals.hasSignInTab ||
+      (domSignals.hasSignIn && domSignals.hasPasswordField);
+
+    if (domSignals.hasConfirmPassword) {
+      return { page_type: 'account_creation', page_title: 'Workday Create Account' };
+    }
+
+    if (hasExplicitSignInOption && !isApplicationForm && !domSignals.hasApplyButton && !domSignals.hasSubmitApplication) {
+      return { page_type: 'login', page_title: 'Workday Sign-In', has_sign_in_with_google: domSignals.hasSignInWithGoogle };
+    }
+
+    // Create Account page — only when there is not also an explicit sign-in option.
+    if (domSignals.isCreateAccountView && !hasExplicitSignInOption) {
+      return { page_type: 'account_creation', page_title: 'Workday Create Account' };
+    }
 
     if (domSignals.hasSignInWithGoogle && !isApplicationForm) {
       return { page_type: 'login', page_title: 'Workday Sign-In', has_sign_in_with_google: true };
@@ -1976,16 +2005,22 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
       return {
         isCreateAccountView,
         hasSignInTab: !!signInTab,
+        hasConfirmPassword,
         hasPasswordField: passwordFields.length > 0,
       };
     });
 
-    console.log(`[Workday] Page context: createAccount=${pageContext.isCreateAccountView}, signInTab=${pageContext.hasSignInTab}, password=${pageContext.hasPasswordField}`);
+    console.log(
+      `[Workday] Page context: createAccount=${pageContext.isCreateAccountView}, ` +
+      `signInTab=${pageContext.hasSignInTab}, confirmPassword=${pageContext.hasConfirmPassword}, ` +
+      `password=${pageContext.hasPasswordField}`,
+    );
 
-    // If we already tried login and landed back on Create Account page,
-    // don't loop — just return so the detection pipeline classifies as account_creation.
-    if (pageContext.isCreateAccountView && (profile as any)._loginAttempted) {
-      console.log('[Workday] Already tried login — returning to let account creation handler take over.');
+    // Only hand off to account creation when we've explicitly chosen that path
+    // after exhausting login attempts. Workday often keeps "Create Account" as the
+    // page heading even while a working sign-in form is visible.
+    if (pageContext.isCreateAccountView && (profile as any)._workdayForceAccountCreation) {
+      console.log('[Workday] Account creation was explicitly selected after login failure — returning.');
       return;
     }
 
@@ -2159,6 +2194,7 @@ LINKEDIN (under "Social Network URLs" section — NOT under "Websites"):
     // Step 4: Both passwords failed → navigate to account creation
     if (loginError) {
       console.log(`[Workday] Login failed: "${loginError}" — navigating to account creation...`);
+      (profile as any)._workdayForceAccountCreation = true;
       // Close modal if open
       await adapter.page.keyboard.press('Escape');
       await adapter.page.waitForTimeout(500);
