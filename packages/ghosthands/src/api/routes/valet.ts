@@ -74,6 +74,7 @@ export function createValetRoutes(pool: pg.Pool) {
       valet_task_id: body.valet_task_id,
       callback_url: body.callback_url || null,
       resume_ref: body.resume || null,
+      credit_budget_usd: body.credit_budget_usd ?? null,
     };
 
     // Insert job — includes VALET-specific columns (callback_url, valet_task_id)
@@ -151,6 +152,7 @@ export function createValetRoutes(pool: pg.Pool) {
       quality_preset: body.quality,
       valet_task_id: body.valet_task_id,
       callback_url: body.callback_url || null,
+      credit_budget_usd: body.credit_budget_usd ?? null,
     };
 
     // Store model/image_model in input_data so JobExecutor reads them
