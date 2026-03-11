@@ -795,7 +795,7 @@ export class JobExecutor {
       // Start periodic blocker check timer (catches blockers even when adapter is stuck)
       // Only for workday_apply — SPA platforms (Greenhouse) cause page.evaluate() to hang,
       // creating contention with Magnitude's own evaluate calls
-      if (handler.type === 'workday_apply') {
+      if (handler.type === 'workday_apply' && job.execution_mode !== 'mastra_decision') {
         blockerCheckInterval = setInterval(async () => {
           if (!adapter || adapter.isPaused?.()) return; // Don't check while paused
           try {
@@ -808,7 +808,14 @@ export class JobExecutor {
           }
         }, PERIODIC_BLOCKER_CHECK_MS);
       } else {
-        logger.debug('[exec] Periodic blocker checks disabled for non-workday handler', { jobId: job.id, handler: handler.type });
+        logger.debug('[exec] Periodic blocker checks disabled', {
+          jobId: job.id,
+          handler: handler.type,
+          executionMode: job.execution_mode,
+          reason: job.execution_mode === 'mastra_decision'
+            ? 'decision loop has built-in blocker detection'
+            : 'non-workday handler',
+        });
       }
 
       // 10. Build TaskContext and delegate to handler (with crash recovery)

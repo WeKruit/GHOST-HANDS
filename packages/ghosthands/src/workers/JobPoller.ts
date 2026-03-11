@@ -84,17 +84,10 @@ export class JobPoller {
         // LISTEN state is dropped between transactions. The poll timer
         // below compensates — NOTIFY is a best-effort optimization.
         //
-        // TODO: pg_notify('gh_job_created', ...) is never called anywhere in the codebase.
-        // No trigger on gh_automation_jobs INSERT fires this notification.
-        // LISTEN is effectively a dead path — polling (5s interval) is the actual
-        // job discovery mechanism. To enable instant pickup, add a trigger:
-        //   CREATE OR REPLACE FUNCTION gh_notify_job_created() RETURNS trigger AS $$
-        //   BEGIN
-        //     PERFORM pg_notify('gh_job_created', NEW.id::text);
-        //     RETURN NEW;
-        //   END; $$ LANGUAGE plpgsql;
-        //   CREATE TRIGGER trg_gh_job_created AFTER INSERT ON gh_automation_jobs
-        //     FOR EACH ROW EXECUTE FUNCTION gh_notify_job_created();
+        // NOTE: pg_notify('gh_job_created', ...) IS fired by the VALET API route
+        // (src/api/routes/valet.ts) on job creation/resume. However, LISTEN may
+        // not work reliably through pgbouncer in transaction-pooling mode.
+        // The 5s polling interval compensates as a fallback.
         try {
             await this.pgDirect.query("LISTEN gh_job_created");
             this.pgDirect.on("notification", (_msg: Notification) => {
@@ -112,7 +105,7 @@ export class JobPoller {
         }
 
         // Poll every 5s — primary job discovery mechanism.
-        // NOTIFY is unreliable (no trigger fires it; pgbouncer drops LISTEN state).
+        // NOTIFY/LISTEN may be unreliable through pgbouncer transaction pooling.
         this.pollTimer = setInterval(() => {
             if (this.activeJobs < this.maxConcurrent) {
                 this.tryPickup().catch((err) => {

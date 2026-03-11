@@ -198,7 +198,20 @@ export class DecisionLoopRunner {
           message: 'Building page snapshot.',
         });
 
-        const snapshot = await this.snapshotBuilder.buildSnapshot(this.page, loopState.actionHistory);
+        let snapshot = await this.snapshotBuilder.buildSnapshot(this.page, loopState.actionHistory);
+        if (snapshot.fields.length === 0 && snapshot.buttons.length === 0 && loopState.iteration > 0) {
+          await new Promise((r) => setTimeout(r, 2000));
+          await this.page.waitForLoadState('domcontentloaded', { timeout: 3000 }).catch(() => {});
+          const retrySnapshot = await this.snapshotBuilder.buildSnapshot(this.page, loopState.actionHistory);
+          if (retrySnapshot.fields.length > 0 || retrySnapshot.buttons.length > 0) {
+            snapshot = retrySnapshot;
+            this.emit({
+              type: 'observe',
+              iteration: loopState.iteration,
+              message: `[decision-loop] re-observation recovered: fields=${snapshot.fields.length} buttons=${snapshot.buttons.length}`,
+            });
+          }
+        }
         loopState.previousPageFingerprint = loopState.currentPageFingerprint;
         loopState.currentPageFingerprint = snapshot.fingerprint.hash;
         const pageChanged = loopState.previousPageFingerprint !== loopState.currentPageFingerprint;
@@ -288,6 +301,9 @@ export class DecisionLoopRunner {
         if (executorResult.pageNavigated) {
           await this.page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => {});
           await sleep(2000);
+        }
+        if (executorResult.pageNavigated || executorResult.status === 'action_succeeded') {
+          await this.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
         }
       }
     } catch (error) {
