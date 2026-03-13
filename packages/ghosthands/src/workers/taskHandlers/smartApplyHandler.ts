@@ -353,6 +353,12 @@ export class SmartApplyHandler implements TaskHandler {
     }
 
     const qaOverrides = job.input_data.qa_overrides || {};
+    const answerBank = job.input_data.answer_bank || [];
+
+    // Store answerBank on userProfile so it flows into LayerContext for v3 FieldMatcher
+    if (answerBank.length > 0) {
+      (userProfile as Record<string, unknown>).answerBank = answerBank;
+    }
 
     // Polyfill __name in browser context — esbuild/bun may inject __name
     // references into serialized page.evaluate() callbacks. Define it as a

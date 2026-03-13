@@ -70,9 +70,9 @@ function classifyByHeuristic(
       'work_authorization',
     ],
     [/sponsor|visa/i, 'sponsorship_need'],
-    [/(?:how|where).?(?:did)?.?(?:you)?.?(?:hear|find|learn|discover)/i, 'referral_source'],
-    [/why.?(?:this|the|our).?(?:role|position|job|opportunity)/i, 'why_this_role'],
-    [/why.?(?:this|the|our).?(?:company|organization|firm|team)/i, 'why_this_company'],
+    [/(?:how|where).?(?:did)?.?(?:you)?.?(?:hear|find|learn|discover)|refer|referral|(?:source|channel).?(?:of|for).?(?:application|interest)/i, 'referral_source'],
+    [/why.?(?:this|the|our).?(?:role|position|job|opportunity)|why.?(?:do)?.?(?:you)?.?(?:want|interested|apply|joining)|tell.?us.?why.?(?:you)?.?(?:want)?.?(?:to)?.?join/i, 'why_this_role'],
+    [/why.?(?:this|the|our).?(?:company|organization|firm|team)|why.?(?:do)?.?(?:you)?.?(?:want).?(?:to)?.?(?:work|join).?(?:here|us|at)/i, 'why_this_company'],
     [/career.?goal|where.?(?:do)?.?(?:you)?.?see.?yourself/i, 'career_goals'],
     [
       /(?:relevant|related).?experience|experience.?(?:with|in|related)/i,

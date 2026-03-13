@@ -92,7 +92,7 @@ export class StagehandHand extends LayerHand {
   async process(observation: V3ObservationResult, ctx: LayerContext): Promise<FieldMatch[]> {
     const userData = ctx.userProfile as Record<string, string>;
     const qaAnswers = (ctx.userProfile as Record<string, unknown>)?.qaAnswers as Record<string, string> ?? {};
-    const matcher = new FieldMatcher(userData, qaAnswers, getPlatformHandler(observation.platform));
+    const matcher = new FieldMatcher(userData, qaAnswers, getPlatformHandler(observation.platform), ctx.answerBank);
 
     // Use stagehand descriptions as label fallback in the v2 page model
     const pageModel = toV2PageModel(observation);

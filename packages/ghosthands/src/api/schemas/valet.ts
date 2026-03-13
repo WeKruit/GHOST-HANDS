@@ -49,6 +49,19 @@ export const ProfileSchema = z.object({
   skills: z.array(z.string().max(100)).max(100).optional(),
 });
 
+// --- Answer Bank Entry ---
+
+export const AnswerBankEntrySchema = z.object({
+  question: z.string().max(2000),
+  answer: z.string().max(5000),
+  canonicalQuestion: z.string().max(2000).nullable().optional(),
+  intentTag: z.string().max(100).nullable().optional(),
+  usageMode: z.enum(['always_use', 'ask_each_time', 'decline_to_answer']).default('always_use'),
+  source: z.enum(['user_input', 'resume_inferred', 'application_learned']).default('user_input'),
+  confidence: z.enum(['exact', 'inferred', 'learned']).default('exact'),
+  synonyms: z.array(z.string().max(500)).nullable().optional(),
+});
+
 // --- VALET Apply Request ---
 
 export const ValetApplySchema = z.object({
@@ -62,6 +75,7 @@ export const ValetApplySchema = z.object({
   resume: ResumeRefSchema.optional(),
   profile: ProfileSchema,
   qa_answers: z.record(z.string(), z.string()).optional(),
+  answer_bank: z.array(AnswerBankEntrySchema).max(200).optional(),
   callback_url: z.string().url().max(2048).optional(),
   quality: z.enum(['speed', 'balanced', 'quality']).default('balanced'),
   priority: z.number().int().min(1).max(10).default(5),
