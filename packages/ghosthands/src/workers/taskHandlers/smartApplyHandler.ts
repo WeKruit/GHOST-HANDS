@@ -737,6 +737,7 @@ export class SmartApplyHandler implements TaskHandler {
               progress,
               pageContext,
               ctx.llmClientConfig,
+              ctx.waitForManualAction,
             );
 
             if (result === 'review') {
@@ -2576,6 +2577,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
     progress?: TaskContext['progress'],
     pageContext?: PageContextService,
     llmClientConfig?: TaskContext['llmClientConfig'],
+    waitForManualAction?: TaskContext['waitForManualAction'],
   ): Promise<'navigated' | 'review' | 'complete'> {
     const MAX_DEPTH = 3;
 
@@ -2603,6 +2605,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
         onVisualFillStart: progress
           ? () => progress.setStatusMessage?.('Attempting visual form fill...')
           : undefined,
+        waitForManualAction,
         observers: pageContext
           ? {
               onQuestionsNormalized: async (questions, opts) => pageContext.syncQuestions(questions, opts),
@@ -2648,6 +2651,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
           progress,
           pageContext,
           llmClientConfig,
+          waitForManualAction,
         );
       }
 
@@ -2705,6 +2709,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
           progress,
           pageContext,
           llmClientConfig,
+          waitForManualAction,
         );
       }
 
@@ -2742,6 +2747,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
           progress,
           pageContext,
           llmClientConfig,
+          waitForManualAction,
         );
       }
 

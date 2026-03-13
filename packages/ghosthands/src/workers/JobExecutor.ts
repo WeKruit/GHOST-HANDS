@@ -1504,7 +1504,10 @@ export class JobExecutor {
           logger.warn('Manual action timed out', { jobId: job.id, timeoutSeconds: timeout });
         }
 
-        return { resumed: result.resumed };
+        return {
+          resumed: result.resumed,
+          resolutionData: result.resolutionData as Record<string, unknown> | undefined,
+        };
       },
     };
 

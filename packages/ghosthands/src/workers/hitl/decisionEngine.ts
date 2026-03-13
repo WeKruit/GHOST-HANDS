@@ -2,6 +2,7 @@ import type { BlockerType } from '../../detection/BlockerDetector.js';
 
 export type HitlDecisionAction =
   | 'IMMEDIATE_HITL'
+  | 'PAUSE_FOR_USER'
   | 'AUTO_RECOVER'
   | 'RETRY_NO_HITL'
   | 'NO_ACTION';
@@ -11,7 +12,7 @@ export type RecoverableAuthBlockerType = 'login' | 'verification' | '2fa';
 export type HitlAttemptsByType = Partial<Record<RecoverableAuthBlockerType, number>>;
 
 export interface HitlDecisionInput {
-  blockerType: BlockerType | 'context_lost';
+  blockerType: BlockerType | 'context_lost' | 'open_question';
   confidence: number;
   source?: string;
   selector?: string;
@@ -22,7 +23,7 @@ export interface HitlDecisionInput {
 
 export interface HitlDecision {
   action: HitlDecisionAction;
-  blockerType: BlockerType | 'context_lost';
+  blockerType: BlockerType | 'context_lost' | 'open_question';
   reason:
     | 'hard_blocker'
     | 'auth_automation_unavailable'
@@ -31,7 +32,8 @@ export interface HitlDecision {
     | 'no_code_entry_path'
     | 'rate_limited_retry'
     | 'low_confidence'
-    | 'unsupported_blocker_type';
+    | 'unsupported_blocker_type'
+    | 'open_question_needs_user';
   threshold: number;
   attemptNumber?: number;
   attemptsRemaining?: number;
@@ -97,6 +99,16 @@ export function decideHitlAction(input: HitlDecisionInput): HitlDecision {
       blockerType,
       reason: 'hard_blocker',
       threshold: HITL_DECISION_THRESHOLDS.hardBlocker,
+    };
+  }
+
+  // Open questions need user input — pause the job and wait for answers
+  if (blockerType === 'open_question') {
+    return {
+      action: 'PAUSE_FOR_USER',
+      blockerType,
+      reason: 'open_question_needs_user',
+      threshold: 0, // no confidence threshold — always pause
     };
   }
 
