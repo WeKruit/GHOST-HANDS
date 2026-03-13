@@ -31,12 +31,12 @@ export interface InteractionInfo {
   description?: string;
   message?: string;
   original_blocker_type?: string;
+  /** open_question: list of questions needing user input (top-level for VALET) */
+  questions?: OpenQuestionInfo[];
   metadata?: {
     blocker_confidence?: number;
     captcha_type?: string;
     detection_method?: string;
-    /** open_question: list of questions needing user input */
-    questions?: OpenQuestionInfo[];
     /** open_question: total number of questions */
     totalQuestions?: number;
     /** open_question: originating handler */

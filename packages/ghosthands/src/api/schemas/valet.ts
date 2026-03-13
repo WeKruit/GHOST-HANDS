@@ -120,7 +120,7 @@ export type ValetTaskInput = z.infer<typeof ValetTaskSchema>;
 export const ValetResumeSchema = z.object({
   resolved_by: z.enum(['human', 'system']).default('human'),
   resolution_notes: z.string().max(500).optional(),
-  resolution_type: z.enum(['manual', 'code_entry', 'credentials', 'skip']).optional(),
+  resolution_type: z.enum(['manual', 'code_entry', 'credentials', 'skip', 'open_question_answer', 'open_question_skip']).optional(),
   resolution_data: z.record(z.unknown()).optional(),
 });
 
