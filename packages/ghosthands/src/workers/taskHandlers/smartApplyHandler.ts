@@ -3130,7 +3130,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       const expectedValue = f.matchedAnswer
         ? ` → Fill with: "${f.matchedAnswer}"`
         : f.isRequired
-          ? ' → No exact data available — enter "[NEEDS_USER_INPUT]" for this field'
+          ? ' → No exact data available — select a neutral/decline option if available, otherwise leave empty'
           : '';
       return `- "${f.label}" (${kind})${options}${expectedValue}${required}`;
     }).join('\n');
@@ -3751,7 +3751,7 @@ Set is_final_review to true ONLY if this is genuinely the last page before submi
 
     const valueInstruction = answer
       ? `Fill it with: "${answer}"`
-      : `No matching data in applicant profile. Enter "[NEEDS_USER_INPUT]" for this field.`;
+      : `No matching data in applicant profile. If a neutral/decline option exists (e.g. "Prefer not to say", "Other", "N/A"), select it. Otherwise leave this field empty.`;
 
     return `You are filling out a job application form. Focus ONLY on the single field described below. Do NOT interact with any other fields, buttons, or navigation elements.
 

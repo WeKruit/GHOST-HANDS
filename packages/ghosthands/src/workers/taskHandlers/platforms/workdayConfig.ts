@@ -416,8 +416,8 @@ IMPORTANT: If a page has BOTH "Sign In" and "Create Account" options, classify a
       'Full name': `${p.first_name} ${p.last_name}`,
       'Full Name': `${p.first_name} ${p.last_name}`,
       'Signature': `${p.first_name} ${p.last_name}`,
-      'What is your desired salary?': p.salary_expectation || '[NEEDS_USER_INPUT]',
-      'Desired salary': p.salary_expectation || '[NEEDS_USER_INPUT]',
+      'What is your desired salary?': p.salary_expectation || '',
+      'Desired salary': p.salary_expectation || '',
       // User-provided Q&A overrides take highest priority
       ...qaOverrides,
     };
