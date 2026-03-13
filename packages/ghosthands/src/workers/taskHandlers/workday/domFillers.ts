@@ -765,7 +765,7 @@ export async function fillTextFieldsProgrammatically(
   let filled = 0;
   for (const field of textFields) {
     const answer = findBestDropdownAnswer(field.label, fullQAMap);
-    if (!answer || answer === 'today') continue; // Skip date answers
+    if (!answer || answer === 'today' || answer === '[NEEDS_USER_INPUT]') continue; // Skip date answers and marker values
 
     getLogger().debug('Filling text field', { label: field.label, answer });
     const input = adapter.page.locator(`[data-gh-text-idx="${field.index}"]`);

@@ -280,8 +280,8 @@ export class WorkdayApplyHandler implements TaskHandler {
       'Full name': `${profile.first_name} ${profile.last_name}`,
       'Signature': `${profile.first_name} ${profile.last_name}`,
       'Name': `${profile.first_name} ${profile.last_name}`,
-      'What is your desired salary?': profile.salary_expectation || '[NEEDS_USER_INPUT]',
-      'Desired salary': profile.salary_expectation || '[NEEDS_USER_INPUT]',
+      'What is your desired salary?': profile.salary_expectation || '',
+      'Desired salary': profile.salary_expectation || '',
       // User-provided Q&A overrides take highest priority (spread last)
       ...qaOverrides,
     };
