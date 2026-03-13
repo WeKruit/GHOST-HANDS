@@ -89,7 +89,7 @@ export function resolveFromBank(
   if (classification.intentTag !== 'other' && classification.confidence >= 0.7) {
     for (const entry of answerBank) {
       if (entry.intentTag === classification.intentTag) {
-        if (entry.usageMode !== 'always_use') return null;
+        if (entry.usageMode !== 'always_use') continue; // skip non-auto-use, keep scanning for always_use entry
         return {
           answer: entry.answer,
           source: 'intent_match',

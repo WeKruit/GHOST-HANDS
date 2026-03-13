@@ -22,6 +22,8 @@ import { fillFormOnPage, buildProfileText } from './formFiller.js';
 import type { WorkdayUserProfile } from './workday/workdayTypes.js';
 import type { RecentInboxMessage } from '../emailVerification/types.js';
 import { VERIFICATION_INPUT_SELECTOR_QUERY } from '../verificationSelectors.js';
+import type { LayerContext } from '../../engine/v3/types.js';
+import type { AnswerBankEntry } from './answerBankResolver.js';
 
 // --- Constants ---
 
@@ -38,6 +40,30 @@ const VERIFICATION_EMAIL_CONTEXT_LIMIT = 5;
 const VERIFICATION_EMAIL_CONTEXT_BODY_MAX_CHARS = 4_000;
 const VERIFICATION_AGENT_MAX_ATTEMPTS = 2;
 const VERIFICATION_AGENT_RETRY_DELAY_MS = 1_500;
+
+/**
+ * Build a LayerContext for the v3 SectionOrchestrator.
+ * Ensures answerBank flows from job input_data / userProfile to v3 layers
+ * (DOMHand, StagehandHand, MagnitudeHand) via FieldMatcher.
+ */
+function buildLayerContext(
+  page: import('playwright').Page,
+  userProfile: Record<string, unknown>,
+  jobId: string,
+  budgetRemaining: number,
+  totalCost: number,
+  opts?: { platformHint?: string; answerBank?: AnswerBankEntry[] },
+): LayerContext {
+  return {
+    page,
+    userProfile,
+    jobId,
+    budgetRemaining,
+    totalCost,
+    platformHint: opts?.platformHint,
+    answerBank: (opts?.answerBank ?? (userProfile as any)?.answerBank) || [],
+  };
+}
 
 function asMutableRecord(value: unknown): Record<string, any> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -355,7 +381,8 @@ export class SmartApplyHandler implements TaskHandler {
     const qaOverrides = job.input_data.qa_overrides || {};
     const answerBank = job.input_data.answer_bank || [];
 
-    // Store answerBank on userProfile so it flows into LayerContext for v3 FieldMatcher
+    // Store answerBank on userProfile so buildLayerContext() can wire it into
+    // LayerContext.answerBank for v3 FieldMatcher (DOMHand, StagehandHand, MagnitudeHand).
     if (answerBank.length > 0) {
       (userProfile as Record<string, unknown>).answerBank = answerBank;
     }
