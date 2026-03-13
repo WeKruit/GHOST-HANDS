@@ -3203,8 +3203,8 @@ const AnswerPlanSchema = z.object({
     questionKey: z.string().describe('The questionKey from the normalized question'),
     answer: z.string().describe('The answer value. May be empty only for optional no-guess fields.'),
     confidence: z.number().min(0).max(1).describe('How confident you are (0-1)'),
-    answerMode: z.enum(['profile_backed', 'best_effort_guess', 'default_decline', 'system_attachment'])
-      .describe('profile_backed if from profile data, best_effort_guess if inferred, default_decline for neutral decline choices'),
+    answerMode: z.enum(['profile_backed', 'best_effort_guess', 'default_decline', 'system_attachment', 'needs_user_input'])
+      .describe('profile_backed if from profile data, best_effort_guess if inferred, default_decline for neutral decline choices, needs_user_input when the answer must come from the user'),
   })),
 });
 
@@ -3289,7 +3289,8 @@ Rules:
 - Fields marked (REQUIRED) MUST have a non-empty, meaningful answer. NEVER return an empty answer for a required field.
 - For optional fields (NOT marked REQUIRED), return an empty string "" if the profile does not contain the information. Do NOT guess or fabricate data for optional fields like address, postal code, or phone extension. Leave them empty.
 - Use answerMode "profile_backed" when the answer comes directly from the profile.
-- Use answerMode "best_effort_guess" when you infer a plausible answer not explicitly in the profile.
+- Use answerMode "needs_user_input" when no profile data matches and no neutral decline option exists. Set the answer to "[NEEDS_USER_INPUT]".
+- Use answerMode "best_effort_guess" ONLY for trivially safe defaults (e.g., "How did you hear?" -> "Other", country -> "United States").
 - Use answerMode "default_decline" for demographic/EEO fields where the profile lacks info — choose a neutral decline option like "Prefer not to say", "Decline to self-identify".
 - For questions with listed options, pick the EXACT text of one available option.
 - For Yes/No questions about relocation, sponsorship, authorization — answer based on profile data.
@@ -3421,6 +3422,7 @@ export function classifyFallbackAnswerMode(
   hasChoices: boolean,
   isDemographic: boolean = false,
 ): AnswerMode {
+  if (answer === '[NEEDS_USER_INPUT]') return 'needs_user_input';
   if (hasChoices && isDemographic && DECLINE_LEXICON.test(answer)) {
     return 'default_decline';
   }
