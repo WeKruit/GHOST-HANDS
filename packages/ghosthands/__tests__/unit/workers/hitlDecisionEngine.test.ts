@@ -75,6 +75,27 @@ describe('HitlDecisionEngine', () => {
     expect(decision.reason).toBe('rate_limited_retry');
   });
 
+  test('open_question triggers PAUSE_FOR_USER regardless of confidence', () => {
+    const decision = decideHitlAction({
+      blockerType: 'open_question',
+      confidence: 0.1,
+    });
+
+    expect(decision.action).toBe('PAUSE_FOR_USER');
+    expect(decision.reason).toBe('open_question_needs_user');
+    expect(decision.threshold).toBe(0);
+  });
+
+  test('open_question at high confidence still triggers PAUSE_FOR_USER', () => {
+    const decision = decideHitlAction({
+      blockerType: 'open_question',
+      confidence: 1.0,
+    });
+
+    expect(decision.action).toBe('PAUSE_FOR_USER');
+    expect(decision.reason).toBe('open_question_needs_user');
+  });
+
   test('increment helper tracks attempts by blocker type', () => {
     let attempts = incrementHitlAttempt({}, 'login');
     attempts = incrementHitlAttempt(attempts, 'login');

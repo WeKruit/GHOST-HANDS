@@ -40,6 +40,7 @@ export const workflowState = z.object({
     attemptsByType: z.record(z.number().int().nonnegative()).optional(),
     lastDecision: z.enum([
       'IMMEDIATE_HITL',
+      'PAUSE_FOR_USER',
       'AUTO_RECOVER',
       'RETRY_NO_HITL',
       'NO_ACTION',
@@ -87,7 +88,11 @@ export interface RuntimeContext {
     description: string;
     timeoutSeconds?: number;
     metadata?: Record<string, unknown>;
-  }) => Promise<{ resumed: boolean }>;
+  }) => Promise<{
+    resumed: boolean;
+    /** Resolution data from VALET (e.g. user-provided answers for open_question) */
+    resolutionData?: Record<string, unknown>;
+  }>;
 }
 
 // ---------------------------------------------------------------------------

@@ -87,6 +87,13 @@ export interface FillObservers {
   ): Promise<void> | void;
   onFieldResult?(outcome: QuestionOutcome): Promise<void> | void;
   onVerification?(outcome: QuestionOutcome): Promise<void> | void;
+  /** Called when fields with answerMode 'needs_user_input' are detected */
+  onNeedsUserInput?(questions: Array<{
+    questionKey: string;
+    questionText: string;
+    fieldType: string;
+    choices?: string[];
+  }>): Promise<void> | void;
 }
 
 export interface FillFormOptions {
@@ -94,6 +101,16 @@ export interface FillFormOptions {
   observers?: FillObservers;
   anthropicClientConfig?: AnthropicClientConfig;
   onVisualFillStart?(): Promise<void> | void;
+  /** If provided, formFiller can pause execution for user to answer open questions */
+  waitForManualAction?: (options: {
+    type: string;
+    description: string;
+    timeoutSeconds?: number;
+    metadata?: Record<string, unknown>;
+  }) => Promise<{
+    resumed: boolean;
+    resolutionData?: Record<string, unknown>;
+  }>;
 }
 
 interface GenerateResult {
@@ -3804,6 +3821,89 @@ export async function fillFormOnPage(
             : undefined,
         );
       }
+    }
+
+    // ── HITL: detect needs_user_input decisions and handle ──
+    const needsInputDecisions = (result.answerDecisions || []).filter(
+      (d) => d.answerMode === 'needs_user_input',
+    );
+
+    if (needsInputDecisions.length > 0) {
+      // Build question metadata for the observer/HITL callback
+      const openQuestions = needsInputDecisions.map((d) => {
+        const snapshot = initialQuestionSnapshots.find((s) => s.questionKey === d.questionKey);
+        return {
+          questionKey: d.questionKey,
+          questionText: snapshot?.promptText || d.questionKey,
+          fieldType: snapshot?.questionType || 'text',
+          choices: snapshot?.options?.map((o) => o.label),
+        };
+      });
+
+      // Notify observer (for page context / analytics)
+      await notifyObserver(
+        'onNeedsUserInput',
+        observers?.onNeedsUserInput
+          ? () => observers.onNeedsUserInput!(openQuestions)
+          : undefined,
+      );
+
+      if (opts?.waitForManualAction) {
+        // Full HITL: pause and wait for user-provided answers
+        console.log(`[formFiller] ${needsInputDecisions.length} question(s) need user input — pausing for HITL.`);
+        const hitlResult = await opts.waitForManualAction({
+          type: 'open_question',
+          description: `${needsInputDecisions.length} question(s) need your answer`,
+          timeoutSeconds: 300,
+          metadata: {
+            source: 'form_filler',
+            questions: openQuestions,
+            totalQuestions: openQuestions.length,
+          },
+        });
+
+        if (hitlResult.resumed && hitlResult.resolutionData) {
+          const userAnswers = (hitlResult.resolutionData.answers || {}) as Record<string, string>;
+          // Merge user-provided answers back into decisions and field map
+          for (const decision of result.answerDecisions || []) {
+            if (decision.answerMode === 'needs_user_input' && userAnswers[decision.questionKey]) {
+              decision.answer = userAnswers[decision.questionKey];
+              decision.answerMode = 'profile_backed'; // now user-provided
+              // Update the field-level answer map too
+              const snapshot = initialQuestionSnapshots.find((s) => s.questionKey === decision.questionKey);
+              if (snapshot) {
+                for (const fieldId of snapshot.fieldIds) {
+                  fieldIdToResolvedAnswer[fieldId] = decision.answer;
+                }
+              }
+            }
+          }
+          console.log(`[formFiller] HITL resumed — merged ${Object.keys(userAnswers).length} user answers.`);
+        } else {
+          // Timeout or skip — clear needs_user_input fields so they're skipped
+          console.log(`[formFiller] HITL timeout/skip — clearing ${needsInputDecisions.length} needs_user_input fields.`);
+          for (const decision of result.answerDecisions || []) {
+            if (decision.answerMode === 'needs_user_input') {
+              decision.answer = '';
+              decision.answerMode = 'default_decline';
+            }
+          }
+        }
+      } else {
+        // MVP: no waitForManualAction available — skip needs_user_input fields
+        console.log(`[formFiller] ${needsInputDecisions.length} question(s) need user input — skipping (no HITL context).`);
+        for (const decision of result.answerDecisions || []) {
+          if (decision.answerMode === 'needs_user_input') {
+            decision.answer = '';
+            decision.answerMode = 'default_decline';
+          }
+        }
+      }
+
+      // Track which questions were unresolved
+      result.unresolvedQuestionKeys = needsInputDecisions
+        .filter((d) => d.answerMode === 'needs_user_input' || d.answer === '')
+        .map((d) => d.questionKey);
     }
 
     // Never-empty policy: sweep ALL non-file fields and fill deterministically if empty
