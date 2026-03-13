@@ -1654,7 +1654,7 @@ ${dataBlock}`;
 
     for (const field of fieldData) {
       const answer = findBestAnswer(field.label, qaMap);
-      if (!answer) continue;
+      if (!answer || answer === '[NEEDS_USER_INPUT]') continue;
 
       const didFill = await adapter.page.evaluate(
         ({ idx, value }) => {

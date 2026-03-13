@@ -304,26 +304,37 @@ export function createValetRoutes(pool: pg.Pool) {
       // so multiple per-question resume calls accumulate all answers before the
       // worker reads them. Only open_question_skip fires NOTIFY to wake the worker.
       if (body.resolution_type === 'open_question_answer' && body.resolution_data?.answers) {
-        // Merge incoming answers with any previously accumulated answers
-        const { rows: currentRows } = await pool.query(
-          'SELECT interaction_data FROM gh_automation_jobs WHERE id = $1::UUID',
-          [jobId],
-        );
-        const existingInteraction = (currentRows[0]?.interaction_data || {}) as Record<string, any>;
-        const existingAnswers = existingInteraction?.resolution_data?.answers || {};
-        const mergedAnswers = { ...existingAnswers, ...(body.resolution_data.answers as Record<string, string>) };
-
-        await pool.query(`
+        // Atomically merge incoming answers using JSONB || operator to avoid
+        // read-then-write race condition when multiple answers arrive concurrently
+        const incomingAnswers = body.resolution_data.answers as Record<string, string>;
+        const { rows: updatedRows } = await pool.query(`
           UPDATE gh_automation_jobs
-          SET interaction_data = COALESCE(interaction_data, '{}'::jsonb) || $2::jsonb,
+          SET interaction_data = jsonb_set(
+                jsonb_set(
+                  jsonb_set(
+                    jsonb_set(
+                      COALESCE(interaction_data, '{}'::jsonb),
+                      '{resolution_type}', $2::jsonb
+                    ),
+                    '{resolved_by}', $3::jsonb
+                  ),
+                  '{resolved_at}', $4::jsonb
+                ),
+                '{resolution_data,answers}',
+                COALESCE(interaction_data->'resolution_data'->'answers', '{}'::jsonb) || $5::jsonb
+              ),
               updated_at = NOW()
           WHERE id = $1::UUID
-        `, [jobId, JSON.stringify({
-          resolution_type: body.resolution_type,
-          resolution_data: { ...body.resolution_data, answers: mergedAnswers },
-          resolved_by: body.resolved_by,
-          resolved_at: new Date().toISOString(),
-        })]);
+          RETURNING interaction_data->'resolution_data'->'answers' AS merged_answers
+        `, [
+          jobId,
+          JSON.stringify(body.resolution_type),
+          JSON.stringify(body.resolved_by),
+          JSON.stringify(new Date().toISOString()),
+          JSON.stringify(incomingAnswers),
+        ]);
+
+        const mergedCount = Object.keys((updatedRows[0]?.merged_answers || {}) as Record<string, unknown>).length;
 
         // Do NOT fire NOTIFY or change status — wait for open_question_skip to signal completion
         return c.json({
@@ -331,32 +342,38 @@ export function createValetRoutes(pool: pg.Pool) {
           status: rows[0].status,
           resolved_by: body.resolved_by,
           resolution_type: body.resolution_type,
-          answers_accumulated: Object.keys(mergedAnswers).length,
+          answers_accumulated: mergedCount,
         });
       }
 
-      // For open_question_skip: merge any final answers with accumulated ones, then wake the worker
+      // For open_question_skip: atomically merge any final answers with accumulated ones, then wake the worker
       if (body.resolution_type === 'open_question_skip') {
-        const { rows: currentRows } = await pool.query(
-          'SELECT interaction_data FROM gh_automation_jobs WHERE id = $1::UUID',
-          [jobId],
-        );
-        const existingInteraction = (currentRows[0]?.interaction_data || {}) as Record<string, any>;
-        const existingAnswers = existingInteraction?.resolution_data?.answers || {};
         const incomingAnswers = (body.resolution_data?.answers || {}) as Record<string, string>;
-        const mergedAnswers = { ...existingAnswers, ...incomingAnswers };
-
         await pool.query(`
           UPDATE gh_automation_jobs
-          SET interaction_data = COALESCE(interaction_data, '{}'::jsonb) || $2::jsonb,
+          SET interaction_data = jsonb_set(
+                jsonb_set(
+                  jsonb_set(
+                    jsonb_set(
+                      COALESCE(interaction_data, '{}'::jsonb),
+                      '{resolution_type}', $2::jsonb
+                    ),
+                    '{resolved_by}', $3::jsonb
+                  ),
+                  '{resolved_at}', $4::jsonb
+                ),
+                '{resolution_data,answers}',
+                COALESCE(interaction_data->'resolution_data'->'answers', '{}'::jsonb) || $5::jsonb
+              ),
               updated_at = NOW()
           WHERE id = $1::UUID
-        `, [jobId, JSON.stringify({
-          resolution_type: body.resolution_type,
-          resolution_data: { ...(body.resolution_data || {}), answers: mergedAnswers },
-          resolved_by: body.resolved_by,
-          resolved_at: new Date().toISOString(),
-        })]);
+        `, [
+          jobId,
+          JSON.stringify(body.resolution_type),
+          JSON.stringify(body.resolved_by),
+          JSON.stringify(new Date().toISOString()),
+          JSON.stringify(incomingAnswers),
+        ]);
       } else {
         // Non-open_question types: overwrite as before
         await pool.query(`
