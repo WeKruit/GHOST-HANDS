@@ -917,6 +917,16 @@ export class JobExecutor {
 
               logger.info('Handler resumed after manual action (legacy path)', { jobId: job.id });
             } else {
+              // Timeout: transition job back to running so VALET doesn't see stale 'paused' state
+              await this.supabase
+                .from('gh_automation_jobs')
+                .update({
+                  status: 'running',
+                  paused_at: null,
+                  status_message: 'Manual action timed out — continuing',
+                })
+                .eq('id', job.id);
+
               logger.warn('Manual action timed out (legacy path)', { jobId: job.id, timeoutSeconds: timeout });
             }
 
@@ -1599,6 +1609,16 @@ export class JobExecutor {
 
           logger.info('Handler resumed after manual action', { jobId: job.id });
         } else {
+          // Timeout: transition job back to running so VALET doesn't see stale 'paused' state
+          await this.supabase
+            .from('gh_automation_jobs')
+            .update({
+              status: 'running',
+              paused_at: null,
+              status_message: 'Manual action timed out — continuing',
+            })
+            .eq('id', job.id);
+
           logger.warn('Manual action timed out', { jobId: job.id, timeoutSeconds: timeout });
         }
 
