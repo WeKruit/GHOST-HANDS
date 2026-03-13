@@ -3118,7 +3118,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       const expectedValue = f.matchedAnswer
         ? ` → Fill with: "${f.matchedAnswer}"`
         : f.isRequired
-          ? ' → No exact data available — use your best judgment to pick a reasonable answer that benefits the applicant'
+          ? ' → No exact data available — enter "[NEEDS_USER_INPUT]" for this field'
           : '';
       return `- "${f.label}" (${kind})${options}${expectedValue}${required}`;
     }).join('\n');
@@ -3739,7 +3739,7 @@ Set is_final_review to true ONLY if this is genuinely the last page before submi
 
     const valueInstruction = answer
       ? `Fill it with: "${answer}"`
-      : `Use your best judgment based on the applicant data below to pick the most reasonable value.`;
+      : `No matching data in applicant profile. Enter "[NEEDS_USER_INPUT]" for this field.`;
 
     return `You are filling out a job application form. Focus ONLY on the single field described below. Do NOT interact with any other fields, buttons, or navigation elements.
 

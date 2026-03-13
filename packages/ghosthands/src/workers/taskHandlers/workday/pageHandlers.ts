@@ -489,7 +489,7 @@ export async function handlePersonalInfoPage(
 
 SCREENING QUESTIONS (if any appear on this page):
   ${qaList}
-  For any question not listed, pick the most reasonable answer.`;
+  For any question not listed, enter "[NEEDS_USER_INPUT]" to trigger a user prompt. NEVER guess.`;
 
   const fillPrompt = buildPersonalInfoPrompt(dataBlock);
 
