@@ -304,6 +304,15 @@ export function createValetRoutes(pool: pg.Pool) {
       // so multiple per-question resume calls accumulate all answers before the
       // worker reads them. Only open_question_skip fires NOTIFY to wake the worker.
       if (body.resolution_type === 'open_question_answer' && body.resolution_data?.answers) {
+        // Reject answers on terminal jobs — only paused jobs should accumulate answers
+        if (!['paused', 'running'].includes(rows[0].status)) {
+          return c.json({
+            job_id: jobId,
+            status: rows[0].status,
+            error: `Cannot accumulate answers: job is ${rows[0].status}`,
+          }, 409);
+        }
+
         // Atomically merge incoming answers using JSONB || operator to avoid
         // read-then-write race condition when multiple answers arrive concurrently
         const incomingAnswers = body.resolution_data.answers as Record<string, string>;
