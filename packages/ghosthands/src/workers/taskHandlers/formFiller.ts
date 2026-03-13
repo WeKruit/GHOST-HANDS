@@ -3837,7 +3837,7 @@ export async function fillFormOnPage(
 
     // ── HITL: detect needs_user_input decisions and handle ──
     const needsInputDecisions = (result.answerDecisions || []).filter(
-      (d) => d.answerMode === 'needs_user_input',
+      (d) => d.answerMode === 'needs_user_input' || d.answer === '[NEEDS_USER_INPUT]',
     );
 
     // Track field IDs that were skipped via open-question handling so the

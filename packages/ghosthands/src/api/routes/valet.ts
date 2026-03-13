@@ -417,15 +417,20 @@ export function createValetRoutes(pool: pg.Pool) {
     // Fire NOTIFY so the listening JobExecutor picks up the resume signal
     await pool.query("SELECT pg_notify('gh_job_resume', $1)", [jobId]);
 
-    // Update job status back to running
-    await pool.query(`
+    // Update job status back to running (only if still paused or running — guard against terminal state overwrites)
+    const resumeResult = await pool.query(`
       UPDATE gh_automation_jobs
       SET status = 'running',
           paused_at = NULL,
           status_message = $2,
           updated_at = NOW()
       WHERE id = $1::UUID
+        AND status IN ('paused', 'running')
     `, [jobId, `Resumed by ${body.resolved_by}${body.resolution_notes ? ': ' + body.resolution_notes : ''}`]);
+
+    if (resumeResult.rowCount === 0) {
+      return c.json({ error: 'Job already transitioned to terminal state' }, 409);
+    }
 
     return c.json({
       job_id: jobId,
