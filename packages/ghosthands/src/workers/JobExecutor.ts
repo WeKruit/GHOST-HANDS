@@ -831,6 +831,100 @@ export class JobExecutor {
           emailVerification: emailVerification || undefined,
           logEvent: logEventFn,
           ...(pageContext && { pageContext }),
+          // Wire HITL pause for open-question handling (same infrastructure as Mastra path)
+          waitForManualAction: async (actionOpts) => {
+            const timeout = actionOpts.timeoutSeconds ?? this.hitlTimeoutSeconds;
+
+            let screenshotUrl: string | undefined;
+            try {
+              const buf = await adapter!.screenshot();
+              screenshotUrl = await this.uploadScreenshot(job.id, 'manual-action', buf);
+            } catch { /* non-fatal */ }
+
+            const pageUrl = await adapter!.getCurrentUrl().catch(() => job.target_url);
+
+            await this.supabase
+              .from('gh_automation_jobs')
+              .update({
+                status: 'paused',
+                interaction_type: actionOpts.type,
+                interaction_data: {
+                  type: actionOpts.type,
+                  description: actionOpts.description,
+                  metadata: actionOpts.metadata || null,
+                  screenshot_url: screenshotUrl,
+                  page_url: pageUrl,
+                  detected_at: new Date().toISOString(),
+                },
+                paused_at: new Date().toISOString(),
+                status_message: `Waiting for human: ${actionOpts.description}`,
+              })
+              .eq('id', job.id);
+
+            await logEventFn('manual_action_required', {
+              jobId: job.id,
+              action_type: actionOpts.type,
+              description: actionOpts.description,
+            });
+
+            if (job.callback_url) {
+              const rawMeta = (actionOpts.metadata || {}) as Record<string, any>;
+              const { questions: hoistedQuestions, ...remainingMeta } = rawMeta;
+              callbackNotifier.notifyHumanNeeded(
+                job.id,
+                job.callback_url,
+                {
+                  type: actionOpts.type,
+                  screenshot_url: screenshotUrl,
+                  page_url: pageUrl,
+                  timeout_seconds: timeout,
+                  description: actionOpts.description,
+                  ...(hoistedQuestions ? { questions: hoistedQuestions } : {}),
+                  metadata: remainingMeta,
+                },
+                job.valet_task_id,
+                this.workerId,
+              ).catch(() => { /* non-fatal */ });
+            }
+
+            logger.info('Handler suspended for manual action (legacy path)', {
+              jobId: job.id,
+              type: actionOpts.type,
+              timeoutSeconds: timeout,
+            });
+
+            const result = await this.waitForResume(job.id, timeout);
+
+            if (result.resumed) {
+              await this.supabase
+                .from('gh_automation_jobs')
+                .update({
+                  status: 'running',
+                  paused_at: null,
+                  status_message: 'Resumed after manual action',
+                })
+                .eq('id', job.id);
+
+              await logEventFn('manual_action_resolved', {
+                jobId: job.id,
+                action_type: actionOpts.type,
+              });
+
+              if (job.callback_url) {
+                callbackNotifier.notifyResumed(job.id, job.callback_url, job.valet_task_id, this.workerId)
+                  .catch(() => { /* non-fatal */ });
+              }
+
+              logger.info('Handler resumed after manual action (legacy path)', { jobId: job.id });
+            } else {
+              logger.warn('Manual action timed out (legacy path)', { jobId: job.id, timeoutSeconds: timeout });
+            }
+
+            return {
+              resumed: result.resumed,
+              resolutionData: result.resolutionData as Record<string, unknown> | undefined,
+            };
+          },
         };
 
         try {
