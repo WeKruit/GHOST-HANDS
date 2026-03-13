@@ -3381,10 +3381,13 @@ export interface FallbackField {
 /**
  * Apply never-empty fallback defaults to fields without answers.
  * Returns a new map with fallback values filled in.
+ * @param skippedFieldIds - Set of field IDs that were skipped due to open-question
+ *   handling (needs_user_input → default_decline). These must NOT be refilled.
  */
 export function applyNeverEmptyFallback(
   fields: FallbackField[],
   resolved: Record<string, string>,
+  skippedFieldIds?: Set<string>,
 ): Record<string, string> {
   const result = { ...resolved };
   // Safety: scrub any leaked [NEEDS_USER_INPUT] markers before applying fallbacks
@@ -3398,6 +3401,9 @@ export function applyNeverEmptyFallback(
     const existing = result[field.id];
     if (existing && existing.trim()) continue;
     if (isLikelyNavigationField(field as any)) continue;
+    // Skip fields that were explicitly skipped via open-question handling —
+    // refilling them with synthetic values like "N/A" defeats the skip intent.
+    if (skippedFieldIds?.has(field.id)) continue;
     // Skip optional fields — leave them empty rather than filling with "N/A"
     if (!field.required) continue;
     if (field.choices?.length) {
@@ -3834,6 +3840,26 @@ export async function fillFormOnPage(
       (d) => d.answerMode === 'needs_user_input',
     );
 
+    // Track field IDs that were skipped via open-question handling so the
+    // never-empty fallback sweep does not refill them with synthetic values.
+    const skippedOpenQuestionFieldIds = new Set<string>();
+
+    // Helper: clear a skipped field from both fieldIdToResolvedAnswer and the
+    // legacy `answers` map so neither lookup path can resurrect the value.
+    const clearSkippedField = (fieldId: string): void => {
+      delete fieldIdToResolvedAnswer[fieldId];
+      skippedOpenQuestionFieldIds.add(fieldId);
+      // Also purge from legacy answers map: try mapped key first, then field name
+      const mappedKey = fieldIdMap[fieldId];
+      if (mappedKey && mappedKey in answers) {
+        delete answers[mappedKey];
+      }
+      const field = llmFields.find((f) => f.id === fieldId);
+      if (field && field.name in answers) {
+        delete answers[field.name];
+      }
+    };
+
     if (needsInputDecisions.length > 0) {
       // Build question metadata for the observer/HITL callback
       const openQuestions = needsInputDecisions.map((d) => {
@@ -3898,7 +3924,7 @@ export async function fillFormOnPage(
               const snapshot = initialQuestionSnapshots.find((s) => s.questionKey === decision.questionKey);
               if (snapshot) {
                 for (const fieldId of snapshot.fieldIds) {
-                  delete fieldIdToResolvedAnswer[fieldId];
+                  clearSkippedField(fieldId);
                 }
               }
             }
@@ -3911,12 +3937,10 @@ export async function fillFormOnPage(
             if (decision.answerMode === 'needs_user_input') {
               decision.answer = '';
               decision.answerMode = 'default_decline';
-              // Clean marker from fieldIdToResolvedAnswer so never-empty fallback
-              // doesn't find the literal "[NEEDS_USER_INPUT]" string
               const snapshot = initialQuestionSnapshots.find((s) => s.questionKey === decision.questionKey);
               if (snapshot) {
                 for (const fieldId of snapshot.fieldIds) {
-                  delete fieldIdToResolvedAnswer[fieldId];
+                  clearSkippedField(fieldId);
                 }
               }
             }
@@ -3929,12 +3953,10 @@ export async function fillFormOnPage(
           if (decision.answerMode === 'needs_user_input') {
             decision.answer = '';
             decision.answerMode = 'default_decline';
-            // Clean marker from fieldIdToResolvedAnswer so never-empty fallback
-            // doesn't find the literal "[NEEDS_USER_INPUT]" string
             const snapshot = initialQuestionSnapshots.find((s) => s.questionKey === decision.questionKey);
             if (snapshot) {
               for (const fieldId of snapshot.fieldIds) {
-                delete fieldIdToResolvedAnswer[fieldId];
+                clearSkippedField(fieldId);
               }
             }
           }
@@ -3947,9 +3969,10 @@ export async function fillFormOnPage(
         .map((d) => d.questionKey);
     }
 
-    // Never-empty policy: sweep ALL non-file fields and fill deterministically if empty
+    // Never-empty policy: sweep ALL non-file fields and fill deterministically if empty.
+    // Pass skippedOpenQuestionFieldIds so fields intentionally left blank are not refilled.
     const preFallback = { ...fieldIdToResolvedAnswer };
-    const postFallback = applyNeverEmptyFallback(llmFields, fieldIdToResolvedAnswer);
+    const postFallback = applyNeverEmptyFallback(llmFields, fieldIdToResolvedAnswer, skippedOpenQuestionFieldIds);
     for (const field of llmFields) {
       if (postFallback[field.id] && postFallback[field.id] !== preFallback[field.id]) {
         fieldIdToResolvedAnswer[field.id] = postFallback[field.id];

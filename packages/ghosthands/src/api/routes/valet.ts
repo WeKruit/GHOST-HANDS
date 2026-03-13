@@ -217,19 +217,23 @@ export function createValetRoutes(pool: pg.Pool) {
     }
 
     const isOpenQuestionResolution = body.resolution_type === 'open_question_answer' || body.resolution_type === 'open_question_skip';
+    const isMastra = rows[0].execution_mode === 'mastra';
 
     if (rows[0].status !== 'paused') {
-      // Allow open_question_answer/skip on 'running' jobs — answers accumulate
-      // across multiple resume calls before the worker reads them
-      if (!(isOpenQuestionResolution && rows[0].status === 'running')) {
+      // Allow open_question_answer/skip on 'running' jobs in legacy mode only —
+      // answers accumulate via atomic JSONB merges before the worker reads them.
+      // Mastra mode requires status='paused' because resume goes through the
+      // Mastra suspend/resume lifecycle; a running mastra job silently drops the resume.
+      const allowRunningAccumulation = isOpenQuestionResolution
+        && rows[0].status === 'running'
+        && !isMastra;
+      if (!allowRunningAccumulation) {
         return c.json({
           error: 'invalid_state',
           message: `Job is not paused (current status: ${rows[0].status})`,
         }, 409);
       }
     }
-
-    const isMastra = rows[0].execution_mode === 'mastra';
 
     // --- MASTRA-MODE RESUME (PRD V5.2 Section 8.1) ---
     if (isMastra) {
@@ -300,6 +304,17 @@ export function createValetRoutes(pool: pg.Pool) {
     // Store resolution data in interaction_data JSONB before firing NOTIFY
     // so the JobExecutor can read credentials/codes when it wakes up
     if (body.resolution_type || body.resolution_data) {
+      // Validate: open_question_answer requires a non-empty answers map
+      if (body.resolution_type === 'open_question_answer') {
+        const answersMap = body.resolution_data?.answers as Record<string, unknown> | undefined;
+        if (!answersMap || Object.keys(answersMap).length === 0) {
+          return c.json({
+            error: 'validation_error',
+            message: 'open_question_answer requires resolution_data.answers with at least one entry',
+          }, 400);
+        }
+      }
+
       // For open_question_answer: deep-merge answers into existing resolution_data
       // so multiple per-question resume calls accumulate all answers before the
       // worker reads them. Only open_question_skip fires NOTIFY to wake the worker.
