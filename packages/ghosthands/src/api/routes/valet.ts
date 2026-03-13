@@ -97,6 +97,7 @@ export function createValetRoutes(pool: pg.Pool) {
       JSON.stringify({
         user_data: userData,
         qa_overrides: body.qa_answers || {},
+        answer_bank: body.answer_bank || [],
         tier: body.quality === 'quality' ? 'pro' : body.quality === 'speed' ? 'free' : 'starter',
         platform: body.platform || 'other',
         ...(body.model ? { model: body.model } : {}),

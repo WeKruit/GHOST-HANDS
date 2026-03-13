@@ -126,7 +126,7 @@ export class MagnitudeHand extends LayerHand {
 
     const userData = ctx.userProfile as Record<string, string>;
     const qaAnswers = (ctx.userProfile as Record<string, unknown>)?.qaAnswers as Record<string, string> ?? {};
-    const matcher = new FieldMatcher(userData, qaAnswers, getPlatformHandler(observation.platform));
+    const matcher = new FieldMatcher(userData, qaAnswers, getPlatformHandler(observation.platform), ctx.answerBank);
 
     // Use stagehand descriptions as label fallback
     const pageModel = toV2PageModel(observation);

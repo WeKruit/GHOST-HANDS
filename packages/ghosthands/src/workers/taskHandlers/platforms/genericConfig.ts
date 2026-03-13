@@ -45,7 +45,7 @@ const FIELD_INTERACTION_RULES = `HOW TO FILL:
 - Radio buttons: Click the matching option.
 - Required checkboxes (terms, agreements): Check them.
 - If an OPTIONAL field has no match in the data mapping (e.g. Middle Name, Address Line 2), skip it.
-- If a REQUIRED field has no exact match in the data mapping, use your best judgment to pick a reasonable answer that benefits the applicant. Consider the applicant's background, the job role, and common-sense defaults.
+- If a REQUIRED field has no exact match in the data mapping and no neutral decline option exists, output "[NEEDS_USER_INPUT]" as the answer so the system can flag it for human review.
 - If stuck on a field after two tries, skip it and move on.`;
 
 // ---------------------------------------------------------------------------

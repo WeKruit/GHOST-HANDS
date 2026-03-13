@@ -3387,6 +3387,12 @@ export function applyNeverEmptyFallback(
   resolved: Record<string, string>,
 ): Record<string, string> {
   const result = { ...resolved };
+  // Safety: scrub any leaked [NEEDS_USER_INPUT] markers before applying fallbacks
+  for (const field of fields) {
+    if (result[field.id] === '[NEEDS_USER_INPUT]') {
+      delete result[field.id];
+    }
+  }
   const FREE_TEXT_TYPES = new Set(['text', 'textarea', 'email', 'tel', 'url', 'number', 'date', 'password', 'search']);
   for (const field of fields) {
     const existing = result[field.id];
@@ -3851,18 +3857,24 @@ export async function fillFormOnPage(
       if (opts?.waitForManualAction) {
         // Full HITL: pause and wait for user-provided answers
         console.log(`[formFiller] ${needsInputDecisions.length} question(s) need user input — pausing for HITL.`);
-        const hitlResult = await opts.waitForManualAction({
-          type: 'open_question',
-          description: `${needsInputDecisions.length} question(s) need your answer`,
-          timeoutSeconds: 300,
-          metadata: {
-            source: 'form_filler',
-            questions: openQuestions,
-            totalQuestions: openQuestions.length,
-          },
-        });
+        let hitlResult: { resumed: boolean; resolutionData?: Record<string, unknown> } | null;
+        try {
+          hitlResult = await opts.waitForManualAction({
+            type: 'open_question',
+            description: `${needsInputDecisions.length} question(s) need your answer`,
+            timeoutSeconds: 300,
+            metadata: {
+              source: 'form_filler',
+              questions: openQuestions,
+              totalQuestions: openQuestions.length,
+            },
+          });
+        } catch (err) {
+          console.warn('[formFiller] waitForManualAction rejected, treating as skip:', err);
+          hitlResult = null;
+        }
 
-        if (hitlResult.resumed && hitlResult.resolutionData) {
+        if (hitlResult?.resumed && hitlResult.resolutionData) {
           const userAnswers = (hitlResult.resolutionData.answers || {}) as Record<string, string>;
           // Merge user-provided answers back into decisions and field map
           for (const decision of result.answerDecisions || []) {
@@ -3878,6 +3890,19 @@ export async function fillFormOnPage(
               }
             }
           }
+          // Clean any remaining needs_user_input markers not answered by the user
+          for (const decision of result.answerDecisions || []) {
+            if (decision.answerMode === 'needs_user_input') {
+              decision.answer = '';
+              decision.answerMode = 'default_decline';
+              const snapshot = initialQuestionSnapshots.find((s) => s.questionKey === decision.questionKey);
+              if (snapshot) {
+                for (const fieldId of snapshot.fieldIds) {
+                  delete fieldIdToResolvedAnswer[fieldId];
+                }
+              }
+            }
+          }
           console.log(`[formFiller] HITL resumed — merged ${Object.keys(userAnswers).length} user answers.`);
         } else {
           // Timeout or skip — clear needs_user_input fields so they're skipped
@@ -3886,6 +3911,14 @@ export async function fillFormOnPage(
             if (decision.answerMode === 'needs_user_input') {
               decision.answer = '';
               decision.answerMode = 'default_decline';
+              // Clean marker from fieldIdToResolvedAnswer so never-empty fallback
+              // doesn't find the literal "[NEEDS_USER_INPUT]" string
+              const snapshot = initialQuestionSnapshots.find((s) => s.questionKey === decision.questionKey);
+              if (snapshot) {
+                for (const fieldId of snapshot.fieldIds) {
+                  delete fieldIdToResolvedAnswer[fieldId];
+                }
+              }
             }
           }
         }
@@ -3896,6 +3929,14 @@ export async function fillFormOnPage(
           if (decision.answerMode === 'needs_user_input') {
             decision.answer = '';
             decision.answerMode = 'default_decline';
+            // Clean marker from fieldIdToResolvedAnswer so never-empty fallback
+            // doesn't find the literal "[NEEDS_USER_INPUT]" string
+            const snapshot = initialQuestionSnapshots.find((s) => s.questionKey === decision.questionKey);
+            if (snapshot) {
+              for (const fieldId of snapshot.fieldIds) {
+                delete fieldIdToResolvedAnswer[fieldId];
+              }
+            }
           }
         }
       }
