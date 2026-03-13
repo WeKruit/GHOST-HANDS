@@ -18,7 +18,10 @@ RULES — follow in strict order:
 3. SKIP fields that already have text, a selection, or a checked checkbox. NEVER uncheck a checkbox that is already checked. NEVER clear a field that already has a value.
 
 4. For OPTIONAL fields with no matching data (e.g. Middle Name, Address Line 2), skip them.
-   For REQUIRED fields (marked with * or "required") with no matching data, use your best judgment to provide a reasonable answer. Think about what makes sense given the applicant's profile, the role, and the company. For example: "How did you hear about us?" → "LinkedIn", "Desired salary" → a reasonable market rate, "Start date" → "As soon as possible", etc.
+   For REQUIRED fields (marked with * or "required") with no matching data:
+   - If the field has a neutral/decline option (e.g., "Prefer not to say", "N/A", "Other"), select it.
+   - If the field is a free-text field with no decline option, enter exactly: "[NEEDS_USER_INPUT]"
+   - NEVER fabricate answers for salary expectations, start dates, referral sources, or any field where the profile does not contain the information. The "[NEEDS_USER_INPUT]" marker will trigger a pause for the user to provide the real answer.
 
 5. CRITICAL — CUT-OFF DETECTION: Before answering ANY question near the bottom half of the screen, ask yourself: "Can I see the COMPLETE question text AND every single answer option?" If the answer is no — or if an expected answer choice (like "No" or "Yes") is missing — the question is CUT OFF. DO NOT TOUCH IT.
    How to tell a question is cut off:
@@ -42,7 +45,7 @@ const FIELD_INTERACTION_RULES = `HOW TO FILL:
 - Radio buttons: Click the matching option.
 - Required checkboxes (terms, agreements): Check them.
 - If an OPTIONAL field has no match in the data mapping (e.g. Middle Name, Address Line 2), skip it.
-- If a REQUIRED field has no exact match in the data mapping, use your best judgment to pick a reasonable answer that benefits the applicant. Consider the applicant's background, the job role, and common-sense defaults.
+- If a REQUIRED field has no exact match in the data mapping and no neutral decline option exists, output "[NEEDS_USER_INPUT]" as the answer so the system can flag it for human review.
 - If stuck on a field after two tries, skip it and move on.`;
 
 // ---------------------------------------------------------------------------
@@ -1651,7 +1654,7 @@ ${dataBlock}`;
 
     for (const field of fieldData) {
       const answer = findBestAnswer(field.label, qaMap);
-      if (!answer) continue;
+      if (!answer || answer === '[NEEDS_USER_INPUT]') continue;
 
       const didFill = await adapter.page.evaluate(
         ({ idx, value }) => {

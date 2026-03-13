@@ -92,7 +92,7 @@ export class StagehandHand extends LayerHand {
   async process(observation: V3ObservationResult, ctx: LayerContext): Promise<FieldMatch[]> {
     const userData = ctx.userProfile as Record<string, string>;
     const qaAnswers = (ctx.userProfile as Record<string, unknown>)?.qaAnswers as Record<string, string> ?? {};
-    const matcher = new FieldMatcher(userData, qaAnswers, getPlatformHandler(observation.platform));
+    const matcher = new FieldMatcher(userData, qaAnswers, getPlatformHandler(observation.platform), ctx.answerBank);
 
     // Use stagehand descriptions as label fallback in the v2 page model
     const pageModel = toV2PageModel(observation);
@@ -103,7 +103,7 @@ export class StagehandHand extends LayerHand {
       }
     }
 
-    const { matches } = matcher.match(pageModel);
+    const { matches } = await matcher.match(pageModel);
 
     // Filter out matches where the v3 field can't be found — falling back to fields[0]
     // would silently map the wrong value to the wrong field.

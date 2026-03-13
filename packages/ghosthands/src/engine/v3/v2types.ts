@@ -134,6 +134,7 @@ export type MatchMethod =
   | 'label_fuzzy'
   | 'placeholder'
   | 'qa_match'
+  | 'answer_bank'
   | 'default_value';
 
 export interface FieldMatch {

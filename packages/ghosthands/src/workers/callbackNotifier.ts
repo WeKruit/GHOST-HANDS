@@ -15,6 +15,14 @@ import { getLogger } from '../monitoring/logger.js';
 import { getSupabaseClient } from '../db/client.js';
 import type { GeneratedPlatformCredential } from './taskHandlers/platforms/accountCredentials.js';
 
+export interface OpenQuestionInfo {
+  questionKey: string;
+  questionText: string;
+  fieldType: string; // 'text' | 'select' | 'radio' | 'textarea'
+  choices?: string[];
+  pageContext?: string;
+}
+
 export interface InteractionInfo {
   type: string;
   screenshot_url?: string;
@@ -23,10 +31,17 @@ export interface InteractionInfo {
   description?: string;
   message?: string;
   original_blocker_type?: string;
+  /** open_question: list of questions needing user input (top-level for VALET) */
+  questions?: OpenQuestionInfo[];
   metadata?: {
     blocker_confidence?: number;
     captcha_type?: string;
     detection_method?: string;
+    /** open_question: total number of questions */
+    totalQuestions?: number;
+    /** open_question: originating handler */
+    source?: string; // 'form_filler' | 'smart_apply' | 'agent_apply'
+    [key: string]: unknown;
   };
 }
 

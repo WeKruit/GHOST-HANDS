@@ -97,6 +97,7 @@ export function createValetRoutes(pool: pg.Pool) {
       JSON.stringify({
         user_data: userData,
         qa_overrides: body.qa_answers || {},
+        answer_bank: body.answer_bank || [],
         tier: body.quality === 'quality' ? 'pro' : body.quality === 'speed' ? 'free' : 'starter',
         platform: body.platform || 'other',
         ...(body.model ? { model: body.model } : {}),
@@ -215,14 +216,24 @@ export function createValetRoutes(pool: pg.Pool) {
       return c.json({ error: 'not_found', message: 'Job not found' }, 404);
     }
 
-    if (rows[0].status !== 'paused') {
-      return c.json({
-        error: 'invalid_state',
-        message: `Job is not paused (current status: ${rows[0].status})`,
-      }, 409);
-    }
-
+    const isOpenQuestionResolution = body.resolution_type === 'open_question_answer' || body.resolution_type === 'open_question_skip';
     const isMastra = rows[0].execution_mode === 'mastra';
+
+    if (rows[0].status !== 'paused') {
+      // Allow open_question_answer/skip on 'running' jobs in legacy mode only —
+      // answers accumulate via atomic JSONB merges before the worker reads them.
+      // Mastra mode requires status='paused' because resume goes through the
+      // Mastra suspend/resume lifecycle; a running mastra job silently drops the resume.
+      const allowRunningAccumulation = isOpenQuestionResolution
+        && rows[0].status === 'running'
+        && !isMastra;
+      if (!allowRunningAccumulation) {
+        return c.json({
+          error: 'invalid_state',
+          message: `Job is not paused (current status: ${rows[0].status})`,
+        }, 409);
+      }
+    }
 
     // --- MASTRA-MODE RESUME (PRD V5.2 Section 8.1) ---
     if (isMastra) {
@@ -293,31 +304,133 @@ export function createValetRoutes(pool: pg.Pool) {
     // Store resolution data in interaction_data JSONB before firing NOTIFY
     // so the JobExecutor can read credentials/codes when it wakes up
     if (body.resolution_type || body.resolution_data) {
-      await pool.query(`
-        UPDATE gh_automation_jobs
-        SET interaction_data = COALESCE(interaction_data, '{}'::jsonb) || $2::jsonb,
-            updated_at = NOW()
-        WHERE id = $1::UUID
-      `, [jobId, JSON.stringify({
-        resolution_type: body.resolution_type || 'manual',
-        resolution_data: body.resolution_data || null,
-        resolved_by: body.resolved_by,
-        resolved_at: new Date().toISOString(),
-      })]);
+      // Validate: open_question_answer requires a non-empty answers map
+      if (body.resolution_type === 'open_question_answer') {
+        const answersMap = body.resolution_data?.answers as Record<string, unknown> | undefined;
+        if (!answersMap || Object.keys(answersMap).length === 0) {
+          return c.json({
+            error: 'validation_error',
+            message: 'open_question_answer requires resolution_data.answers with at least one entry',
+          }, 400);
+        }
+      }
+
+      // For open_question_answer: deep-merge answers into existing resolution_data
+      // so multiple per-question resume calls accumulate all answers before the
+      // worker reads them. Only open_question_skip fires NOTIFY to wake the worker.
+      if (body.resolution_type === 'open_question_answer' && body.resolution_data?.answers) {
+        // Reject answers on terminal jobs — only paused jobs should accumulate answers
+        if (!['paused', 'running'].includes(rows[0].status)) {
+          return c.json({
+            job_id: jobId,
+            status: rows[0].status,
+            error: `Cannot accumulate answers: job is ${rows[0].status}`,
+          }, 409);
+        }
+
+        // Atomically merge incoming answers using JSONB || operator to avoid
+        // read-then-write race condition when multiple answers arrive concurrently
+        const incomingAnswers = body.resolution_data.answers as Record<string, string>;
+        const { rows: updatedRows } = await pool.query(`
+          UPDATE gh_automation_jobs
+          SET interaction_data = jsonb_set(
+                jsonb_set(
+                  jsonb_set(
+                    jsonb_set(
+                      COALESCE(interaction_data, '{}'::jsonb),
+                      '{resolution_type}', $2::jsonb
+                    ),
+                    '{resolved_by}', $3::jsonb
+                  ),
+                  '{resolved_at}', $4::jsonb
+                ),
+                '{resolution_data,answers}',
+                COALESCE(interaction_data->'resolution_data'->'answers', '{}'::jsonb) || $5::jsonb
+              ),
+              updated_at = NOW()
+          WHERE id = $1::UUID
+          RETURNING interaction_data->'resolution_data'->'answers' AS merged_answers
+        `, [
+          jobId,
+          JSON.stringify(body.resolution_type),
+          JSON.stringify(body.resolved_by),
+          JSON.stringify(new Date().toISOString()),
+          JSON.stringify(incomingAnswers),
+        ]);
+
+        const mergedCount = Object.keys((updatedRows[0]?.merged_answers || {}) as Record<string, unknown>).length;
+
+        // Do NOT fire NOTIFY or change status — wait for open_question_skip to signal completion
+        return c.json({
+          job_id: jobId,
+          status: rows[0].status,
+          resolved_by: body.resolved_by,
+          resolution_type: body.resolution_type,
+          answers_accumulated: mergedCount,
+        });
+      }
+
+      // For open_question_skip: atomically merge any final answers with accumulated ones, then wake the worker
+      if (body.resolution_type === 'open_question_skip') {
+        const incomingAnswers = (body.resolution_data?.answers || {}) as Record<string, string>;
+        await pool.query(`
+          UPDATE gh_automation_jobs
+          SET interaction_data = jsonb_set(
+                jsonb_set(
+                  jsonb_set(
+                    jsonb_set(
+                      COALESCE(interaction_data, '{}'::jsonb),
+                      '{resolution_type}', $2::jsonb
+                    ),
+                    '{resolved_by}', $3::jsonb
+                  ),
+                  '{resolved_at}', $4::jsonb
+                ),
+                '{resolution_data,answers}',
+                COALESCE(interaction_data->'resolution_data'->'answers', '{}'::jsonb) || $5::jsonb
+              ),
+              updated_at = NOW()
+          WHERE id = $1::UUID
+        `, [
+          jobId,
+          JSON.stringify(body.resolution_type),
+          JSON.stringify(body.resolved_by),
+          JSON.stringify(new Date().toISOString()),
+          JSON.stringify(incomingAnswers),
+        ]);
+      } else {
+        // Non-open_question types: overwrite as before
+        await pool.query(`
+          UPDATE gh_automation_jobs
+          SET interaction_data = COALESCE(interaction_data, '{}'::jsonb) || $2::jsonb,
+              updated_at = NOW()
+          WHERE id = $1::UUID
+        `, [jobId, JSON.stringify({
+          resolution_type: body.resolution_type || 'manual',
+          resolution_data: body.resolution_data || null,
+          resolved_by: body.resolved_by,
+          resolved_at: new Date().toISOString(),
+        })]);
+      }
     }
 
     // Fire NOTIFY so the listening JobExecutor picks up the resume signal
     await pool.query("SELECT pg_notify('gh_job_resume', $1)", [jobId]);
 
-    // Update job status back to running
-    await pool.query(`
+    // Update job status back to running (only if still paused or running — guard against terminal state overwrites)
+    const resumeResult = await pool.query(`
       UPDATE gh_automation_jobs
       SET status = 'running',
           paused_at = NULL,
           status_message = $2,
           updated_at = NOW()
       WHERE id = $1::UUID
+        AND status IN ('paused', 'running')
     `, [jobId, `Resumed by ${body.resolved_by}${body.resolution_notes ? ': ' + body.resolution_notes : ''}`]);
+
+    if (resumeResult.rowCount === 0) {
+      return c.json({ error: 'Job already transitioned to terminal state' }, 409);
+    }
 
     return c.json({
       job_id: jobId,

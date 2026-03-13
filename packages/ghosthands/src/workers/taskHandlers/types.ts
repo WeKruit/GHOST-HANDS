@@ -64,7 +64,11 @@ export interface TaskContext {
     description: string;
     timeoutSeconds?: number;
     metadata?: Record<string, unknown>;
-  }) => Promise<{ resumed: boolean }>;
+  }) => Promise<{
+    resumed: boolean;
+    /** Resolution data from VALET (e.g. user-provided answers for open_question) */
+    resolutionData?: Record<string, unknown>;
+  }>;
 }
 
 export interface AnthropicClientConfig {

@@ -22,6 +22,8 @@ import { fillFormOnPage, buildProfileText } from './formFiller.js';
 import type { WorkdayUserProfile } from './workday/workdayTypes.js';
 import type { RecentInboxMessage } from '../emailVerification/types.js';
 import { VERIFICATION_INPUT_SELECTOR_QUERY } from '../verificationSelectors.js';
+import type { LayerContext } from '../../engine/v3/types.js';
+import type { AnswerBankEntry } from './answerBankResolver.js';
 
 // --- Constants ---
 
@@ -38,6 +40,30 @@ const VERIFICATION_EMAIL_CONTEXT_LIMIT = 5;
 const VERIFICATION_EMAIL_CONTEXT_BODY_MAX_CHARS = 4_000;
 const VERIFICATION_AGENT_MAX_ATTEMPTS = 2;
 const VERIFICATION_AGENT_RETRY_DELAY_MS = 1_500;
+
+/**
+ * Build a LayerContext for the v3 SectionOrchestrator.
+ * Ensures answerBank flows from job input_data / userProfile to v3 layers
+ * (DOMHand, StagehandHand, MagnitudeHand) via FieldMatcher.
+ */
+function buildLayerContext(
+  page: import('playwright').Page,
+  userProfile: Record<string, unknown>,
+  jobId: string,
+  budgetRemaining: number,
+  totalCost: number,
+  opts?: { platformHint?: string; answerBank?: AnswerBankEntry[] },
+): LayerContext {
+  return {
+    page,
+    userProfile,
+    jobId,
+    budgetRemaining,
+    totalCost,
+    platformHint: opts?.platformHint,
+    answerBank: (opts?.answerBank ?? (userProfile as any)?.answerBank) || [],
+  };
+}
 
 function asMutableRecord(value: unknown): Record<string, any> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -353,6 +379,13 @@ export class SmartApplyHandler implements TaskHandler {
     }
 
     const qaOverrides = job.input_data.qa_overrides || {};
+    const answerBank = job.input_data.answer_bank || [];
+
+    // Store answerBank on userProfile so buildLayerContext() can wire it into
+    // LayerContext.answerBank for v3 FieldMatcher (DOMHand, StagehandHand, MagnitudeHand).
+    if (answerBank.length > 0) {
+      (userProfile as Record<string, unknown>).answerBank = answerBank;
+    }
 
     // Polyfill __name in browser context — esbuild/bun may inject __name
     // references into serialized page.evaluate() callbacks. Define it as a
@@ -737,6 +770,7 @@ export class SmartApplyHandler implements TaskHandler {
               progress,
               pageContext,
               ctx.llmClientConfig,
+              ctx.waitForManualAction,
             );
 
             if (result === 'review') {
@@ -2576,6 +2610,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
     progress?: TaskContext['progress'],
     pageContext?: PageContextService,
     llmClientConfig?: TaskContext['llmClientConfig'],
+    waitForManualAction?: TaskContext['waitForManualAction'],
   ): Promise<'navigated' | 'review' | 'complete'> {
     const MAX_DEPTH = 3;
 
@@ -2603,6 +2638,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
         onVisualFillStart: progress
           ? () => progress.setStatusMessage?.('Attempting visual form fill...')
           : undefined,
+        waitForManualAction,
         observers: pageContext
           ? {
               onQuestionsNormalized: async (questions, opts) => pageContext.syncQuestions(questions, opts),
@@ -2648,6 +2684,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
           progress,
           pageContext,
           llmClientConfig,
+          waitForManualAction,
         );
       }
 
@@ -2705,6 +2742,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
           progress,
           pageContext,
           llmClientConfig,
+          waitForManualAction,
         );
       }
 
@@ -2742,6 +2780,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
           progress,
           pageContext,
           llmClientConfig,
+          waitForManualAction,
         );
       }
 
@@ -3118,7 +3157,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       const expectedValue = f.matchedAnswer
         ? ` → Fill with: "${f.matchedAnswer}"`
         : f.isRequired
-          ? ' → No exact data available — use your best judgment to pick a reasonable answer that benefits the applicant'
+          ? ' → No exact data available — select a neutral/decline option if available, otherwise leave empty'
           : '';
       return `- "${f.label}" (${kind})${options}${expectedValue}${required}`;
     }).join('\n');
@@ -3739,7 +3778,7 @@ Set is_final_review to true ONLY if this is genuinely the last page before submi
 
     const valueInstruction = answer
       ? `Fill it with: "${answer}"`
-      : `Use your best judgment based on the applicant data below to pick the most reasonable value.`;
+      : `No matching data in applicant profile. If a neutral/decline option exists (e.g. "Prefer not to say", "Other", "N/A"), select it. Otherwise leave this field empty.`;
 
     return `You are filling out a job application form. Focus ONLY on the single field described below. Do NOT interact with any other fields, buttons, or navigation elements.
 

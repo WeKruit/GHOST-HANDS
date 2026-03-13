@@ -32,7 +32,7 @@ export type QuestionRiskLevel =
 
 export type QuestionSource = 'dom' | 'llm' | 'magnitude' | 'manual' | 'merged';
 
-export type AnswerMode = 'profile_backed' | 'best_effort_guess' | 'default_decline' | 'system_attachment';
+export type AnswerMode = 'profile_backed' | 'best_effort_guess' | 'default_decline' | 'system_attachment' | 'needs_user_input';
 
 export type QuestionType =
   | 'text'

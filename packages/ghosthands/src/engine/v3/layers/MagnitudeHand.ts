@@ -126,7 +126,7 @@ export class MagnitudeHand extends LayerHand {
 
     const userData = ctx.userProfile as Record<string, string>;
     const qaAnswers = (ctx.userProfile as Record<string, unknown>)?.qaAnswers as Record<string, string> ?? {};
-    const matcher = new FieldMatcher(userData, qaAnswers, getPlatformHandler(observation.platform));
+    const matcher = new FieldMatcher(userData, qaAnswers, getPlatformHandler(observation.platform), ctx.answerBank);
 
     // Use stagehand descriptions as label fallback
     const pageModel = toV2PageModel(observation);
@@ -137,7 +137,7 @@ export class MagnitudeHand extends LayerHand {
       }
     }
 
-    const { matches } = matcher.match(pageModel);
+    const { matches } = await matcher.match(pageModel);
 
     // Filter out matches where the v3 field can't be found — falling back to fields[0]
     // would silently map the wrong value to the wrong field.

@@ -136,6 +136,7 @@ export type MatchMethod =
   | 'placeholder'
   | 'stagehand_desc'
   | 'llm_inference'
+  | 'answer_bank'
   | 'default';
 
 export interface FieldMatch {
@@ -269,6 +270,7 @@ export interface LayerContext {
   totalCost: number;
   platformHint?: string;
   cookbook?: CookbookPageEntry;
+  answerBank?: import('../../workers/taskHandlers/answerBankResolver').AnswerBankEntry[];
   logger?: {
     info(msg: string, meta?: Record<string, unknown>): void;
     warn(msg: string, meta?: Record<string, unknown>): void;

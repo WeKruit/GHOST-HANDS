@@ -87,6 +87,13 @@ export interface FillObservers {
   ): Promise<void> | void;
   onFieldResult?(outcome: QuestionOutcome): Promise<void> | void;
   onVerification?(outcome: QuestionOutcome): Promise<void> | void;
+  /** Called when fields with answerMode 'needs_user_input' are detected */
+  onNeedsUserInput?(questions: Array<{
+    questionKey: string;
+    questionText: string;
+    fieldType: string;
+    choices?: string[];
+  }>): Promise<void> | void;
 }
 
 export interface FillFormOptions {
@@ -94,6 +101,16 @@ export interface FillFormOptions {
   observers?: FillObservers;
   anthropicClientConfig?: AnthropicClientConfig;
   onVisualFillStart?(): Promise<void> | void;
+  /** If provided, formFiller can pause execution for user to answer open questions */
+  waitForManualAction?: (options: {
+    type: string;
+    description: string;
+    timeoutSeconds?: number;
+    metadata?: Record<string, unknown>;
+  }) => Promise<{
+    resumed: boolean;
+    resolutionData?: Record<string, unknown>;
+  }>;
 }
 
 interface GenerateResult {
@@ -3203,8 +3220,8 @@ const AnswerPlanSchema = z.object({
     questionKey: z.string().describe('The questionKey from the normalized question'),
     answer: z.string().describe('The answer value. May be empty only for optional no-guess fields.'),
     confidence: z.number().min(0).max(1).describe('How confident you are (0-1)'),
-    answerMode: z.enum(['profile_backed', 'best_effort_guess', 'default_decline', 'system_attachment'])
-      .describe('profile_backed if from profile data, best_effort_guess if inferred, default_decline for neutral decline choices'),
+    answerMode: z.enum(['profile_backed', 'best_effort_guess', 'default_decline', 'system_attachment', 'needs_user_input'])
+      .describe('profile_backed if from profile data, best_effort_guess if inferred, default_decline for neutral decline choices, needs_user_input when the answer must come from the user'),
   })),
 });
 
@@ -3289,7 +3306,8 @@ Rules:
 - Fields marked (REQUIRED) MUST have a non-empty, meaningful answer. NEVER return an empty answer for a required field.
 - For optional fields (NOT marked REQUIRED), return an empty string "" if the profile does not contain the information. Do NOT guess or fabricate data for optional fields like address, postal code, or phone extension. Leave them empty.
 - Use answerMode "profile_backed" when the answer comes directly from the profile.
-- Use answerMode "best_effort_guess" when you infer a plausible answer not explicitly in the profile.
+- Use answerMode "needs_user_input" when no profile data matches and no neutral decline option exists. Set the answer to "[NEEDS_USER_INPUT]".
+- Use answerMode "best_effort_guess" ONLY for trivially safe defaults (e.g., "How did you hear?" -> "Other", country -> "United States").
 - Use answerMode "default_decline" for demographic/EEO fields where the profile lacks info — choose a neutral decline option like "Prefer not to say", "Decline to self-identify".
 - For questions with listed options, pick the EXACT text of one available option.
 - For Yes/No questions about relocation, sponsorship, authorization — answer based on profile data.
@@ -3363,17 +3381,29 @@ export interface FallbackField {
 /**
  * Apply never-empty fallback defaults to fields without answers.
  * Returns a new map with fallback values filled in.
+ * @param skippedFieldIds - Set of field IDs that were skipped due to open-question
+ *   handling (needs_user_input → default_decline). These must NOT be refilled.
  */
 export function applyNeverEmptyFallback(
   fields: FallbackField[],
   resolved: Record<string, string>,
+  skippedFieldIds?: Set<string>,
 ): Record<string, string> {
   const result = { ...resolved };
+  // Safety: scrub any leaked [NEEDS_USER_INPUT] markers before applying fallbacks
+  for (const field of fields) {
+    if (result[field.id] === '[NEEDS_USER_INPUT]') {
+      delete result[field.id];
+    }
+  }
   const FREE_TEXT_TYPES = new Set(['text', 'textarea', 'email', 'tel', 'url', 'number', 'date', 'password', 'search']);
   for (const field of fields) {
     const existing = result[field.id];
     if (existing && existing.trim()) continue;
     if (isLikelyNavigationField(field as any)) continue;
+    // Skip fields that were explicitly skipped via open-question handling —
+    // refilling them with synthetic values like "N/A" defeats the skip intent.
+    if (skippedFieldIds?.has(field.id)) continue;
     // Skip optional fields — leave them empty rather than filling with "N/A"
     if (!field.required) continue;
     if (field.choices?.length) {
@@ -3421,6 +3451,7 @@ export function classifyFallbackAnswerMode(
   hasChoices: boolean,
   isDemographic: boolean = false,
 ): AnswerMode {
+  if (answer === '[NEEDS_USER_INPUT]') return 'needs_user_input';
   if (hasChoices && isDemographic && DECLINE_LEXICON.test(answer)) {
     return 'default_decline';
   }
@@ -3804,9 +3835,144 @@ export async function fillFormOnPage(
       }
     }
 
-    // Never-empty policy: sweep ALL non-file fields and fill deterministically if empty
+    // ── HITL: detect needs_user_input decisions and handle ──
+    const needsInputDecisions = (result.answerDecisions || []).filter(
+      (d) => d.answerMode === 'needs_user_input' || d.answer === '[NEEDS_USER_INPUT]',
+    );
+
+    // Track field IDs that were skipped via open-question handling so the
+    // never-empty fallback sweep does not refill them with synthetic values.
+    const skippedOpenQuestionFieldIds = new Set<string>();
+
+    // Helper: clear a skipped field from both fieldIdToResolvedAnswer and the
+    // legacy `answers` map so neither lookup path can resurrect the value.
+    const clearSkippedField = (fieldId: string): void => {
+      delete fieldIdToResolvedAnswer[fieldId];
+      skippedOpenQuestionFieldIds.add(fieldId);
+      // Also purge from legacy answers map: try mapped key first, then field name
+      const mappedKey = fieldIdMap[fieldId];
+      if (mappedKey && mappedKey in answers) {
+        delete answers[mappedKey];
+      }
+      const field = llmFields.find((f) => f.id === fieldId);
+      if (field && field.name in answers) {
+        delete answers[field.name];
+      }
+    };
+
+    if (needsInputDecisions.length > 0) {
+      // Build question metadata for the observer/HITL callback
+      const openQuestions = needsInputDecisions.map((d) => {
+        const snapshot = initialQuestionSnapshots.find((s) => s.questionKey === d.questionKey);
+        return {
+          questionKey: d.questionKey,
+          questionText: snapshot?.promptText || d.questionKey,
+          fieldType: snapshot?.questionType || 'text',
+          choices: snapshot?.options?.map((o) => o.label),
+        };
+      });
+
+      // Notify observer (for page context / analytics)
+      await notifyObserver(
+        'onNeedsUserInput',
+        observers?.onNeedsUserInput
+          ? () => observers.onNeedsUserInput!(openQuestions)
+          : undefined,
+      );
+
+      if (opts?.waitForManualAction) {
+        // Full HITL: pause and wait for user-provided answers
+        console.log(`[formFiller] ${needsInputDecisions.length} question(s) need user input — pausing for HITL.`);
+        let hitlResult: { resumed: boolean; resolutionData?: Record<string, unknown> } | null;
+        try {
+          hitlResult = await opts.waitForManualAction({
+            type: 'open_question',
+            description: `${needsInputDecisions.length} question(s) need your answer`,
+            timeoutSeconds: 300,
+            metadata: {
+              source: 'form_filler',
+              questions: openQuestions,
+              totalQuestions: openQuestions.length,
+            },
+          });
+        } catch (err) {
+          console.warn('[formFiller] waitForManualAction rejected, treating as skip:', err);
+          hitlResult = null;
+        }
+
+        if (hitlResult?.resumed && hitlResult.resolutionData) {
+          const userAnswers = (hitlResult.resolutionData.answers || {}) as Record<string, string>;
+          // Merge user-provided answers back into decisions and field map
+          for (const decision of result.answerDecisions || []) {
+            if (decision.answerMode === 'needs_user_input' && userAnswers[decision.questionKey]) {
+              decision.answer = userAnswers[decision.questionKey];
+              decision.answerMode = 'profile_backed'; // now user-provided
+              // Update the field-level answer map too
+              const snapshot = initialQuestionSnapshots.find((s) => s.questionKey === decision.questionKey);
+              if (snapshot) {
+                for (const fieldId of snapshot.fieldIds) {
+                  fieldIdToResolvedAnswer[fieldId] = decision.answer;
+                }
+              }
+            }
+          }
+          // Clean any remaining needs_user_input markers not answered by the user
+          for (const decision of result.answerDecisions || []) {
+            if (decision.answerMode === 'needs_user_input') {
+              decision.answer = '';
+              decision.answerMode = 'default_decline';
+              const snapshot = initialQuestionSnapshots.find((s) => s.questionKey === decision.questionKey);
+              if (snapshot) {
+                for (const fieldId of snapshot.fieldIds) {
+                  clearSkippedField(fieldId);
+                }
+              }
+            }
+          }
+          console.log(`[formFiller] HITL resumed — merged ${Object.keys(userAnswers).length} user answers.`);
+        } else {
+          // Timeout or skip — clear needs_user_input fields so they're skipped
+          console.log(`[formFiller] HITL timeout/skip — clearing ${needsInputDecisions.length} needs_user_input fields.`);
+          for (const decision of result.answerDecisions || []) {
+            if (decision.answerMode === 'needs_user_input') {
+              decision.answer = '';
+              decision.answerMode = 'default_decline';
+              const snapshot = initialQuestionSnapshots.find((s) => s.questionKey === decision.questionKey);
+              if (snapshot) {
+                for (const fieldId of snapshot.fieldIds) {
+                  clearSkippedField(fieldId);
+                }
+              }
+            }
+          }
+        }
+      } else {
+        // MVP: no waitForManualAction available — skip needs_user_input fields
+        console.log(`[formFiller] ${needsInputDecisions.length} question(s) need user input — skipping (no HITL context).`);
+        for (const decision of result.answerDecisions || []) {
+          if (decision.answerMode === 'needs_user_input') {
+            decision.answer = '';
+            decision.answerMode = 'default_decline';
+            const snapshot = initialQuestionSnapshots.find((s) => s.questionKey === decision.questionKey);
+            if (snapshot) {
+              for (const fieldId of snapshot.fieldIds) {
+                clearSkippedField(fieldId);
+              }
+            }
+          }
+        }
+      }
+
+      // Track which questions were unresolved
+      result.unresolvedQuestionKeys = needsInputDecisions
+        .filter((d) => d.answerMode === 'needs_user_input' || d.answer === '')
+        .map((d) => d.questionKey);
+    }
+
+    // Never-empty policy: sweep ALL non-file fields and fill deterministically if empty.
+    // Pass skippedOpenQuestionFieldIds so fields intentionally left blank are not refilled.
     const preFallback = { ...fieldIdToResolvedAnswer };
-    const postFallback = applyNeverEmptyFallback(llmFields, fieldIdToResolvedAnswer);
+    const postFallback = applyNeverEmptyFallback(llmFields, fieldIdToResolvedAnswer, skippedOpenQuestionFieldIds);
     for (const field of llmFields) {
       if (postFallback[field.id] && postFallback[field.id] !== preFallback[field.id]) {
         fieldIdToResolvedAnswer[field.id] = postFallback[field.id];
