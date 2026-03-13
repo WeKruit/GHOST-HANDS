@@ -103,7 +103,7 @@ export class StagehandHand extends LayerHand {
       }
     }
 
-    const { matches } = matcher.match(pageModel);
+    const { matches } = await matcher.match(pageModel);
 
     // Filter out matches where the v3 field can't be found — falling back to fields[0]
     // would silently map the wrong value to the wrong field.

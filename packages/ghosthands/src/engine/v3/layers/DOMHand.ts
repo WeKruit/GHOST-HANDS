@@ -195,7 +195,7 @@ export class DOMHand extends LayerHand {
     const matcher = new FieldMatcher(userData, qaAnswers, getPlatformHandler(observation.platform));
 
     const pageModel = toV2PageModel(observation);
-    const { matches } = matcher.match(pageModel);
+    const { matches } = await matcher.match(pageModel);
 
     // Convert v2 FieldMatch to v3 FieldMatch.
     // Filter out matches where the v3 field can't be found — falling back to fields[0]

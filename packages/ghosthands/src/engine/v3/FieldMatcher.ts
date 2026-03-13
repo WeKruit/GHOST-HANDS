@@ -16,6 +16,11 @@ import type {
   PlatformHandler,
 } from './v2types';
 import { getLogger } from '../../monitoring/logger';
+import { classifyQuestion } from '../../workers/taskHandlers/questionClassifier';
+import {
+  resolveFromBank,
+  type AnswerBankEntry,
+} from '../../workers/taskHandlers/answerBankResolver';
 
 // ── Static name-attribute-to-key map ──────────────────────────────────
 
@@ -162,12 +167,16 @@ function fuzzyLookup(
 
 export class FieldMatcher {
   private logger = getLogger({ service: 'FieldMatcher' });
+  private answerBank: AnswerBankEntry[];
 
   constructor(
     private userData: Record<string, string>,
     private qaAnswers: Record<string, string>,
     private platformHandler: PlatformHandler | null,
-  ) {}
+    answerBank?: AnswerBankEntry[],
+  ) {
+    this.answerBank = answerBank ?? [];
+  }
 
   /**
    * Match all eligible fields in a PageModel to user data / Q&A answers.
@@ -175,7 +184,7 @@ export class FieldMatcher {
    * Returns the list of successful matches and the list of unmatched fields
    * (unmatched means no strategy produced a value for that field).
    */
-  match(pageModel: PageModel): { matches: FieldMatch[]; unmatched: FieldModel[] } {
+  async match(pageModel: PageModel): Promise<{ matches: FieldMatch[]; unmatched: FieldModel[] }> {
     const matches: FieldMatch[] = [];
     const unmatched: FieldModel[] = [];
 
@@ -185,7 +194,7 @@ export class FieldMatcher {
         continue;
       }
 
-      const result = this.findBestMatch(field);
+      const result = await this.findBestMatch(field);
       if (result) {
         matches.push(result);
         this.logger.debug('Field matched', {
@@ -215,7 +224,7 @@ export class FieldMatcher {
    * Try each matching strategy in priority order. Return the first match
    * that resolves to a non-empty value, or null if nothing matches.
    */
-  private findBestMatch(field: FieldModel): FieldMatch | null {
+  private async findBestMatch(field: FieldModel): Promise<FieldMatch | null> {
     // Strategy 1: automation_id via platform handler (confidence 0.95)
     const automationIdMatch = this.matchByAutomationId(field);
     if (automationIdMatch) return automationIdMatch;
@@ -227,6 +236,10 @@ export class FieldMatcher {
     // Strategy 3: Exact label match against userData or qaAnswers (confidence 0.90)
     const labelExactMatch = this.matchByLabelExact(field);
     if (labelExactMatch) return labelExactMatch;
+
+    // Strategy 3.5: Answer bank 3-tier resolution (confidence 0.88)
+    const answerBankMatch = await this.matchByAnswerBank(field);
+    if (answerBankMatch) return answerBankMatch;
 
     // Strategy 4: Fuzzy Q&A match (confidence 0.85)
     const qaMatch = this.matchByQA(field);
@@ -331,6 +344,31 @@ export class FieldMatcher {
     }
 
     return null;
+  }
+
+  /**
+   * Strategy 3.5: answer_bank
+   * Classify the field label into an intent, then resolve against the answer bank
+   * using 3-tier matching (exact text -> canonical question -> intent tag).
+   * Only active when answerBank is populated.
+   */
+  private async matchByAnswerBank(field: FieldModel): Promise<FieldMatch | null> {
+    if (this.answerBank.length === 0) return null;
+
+    const questionText = field.label || field.ariaLabel;
+    if (!questionText) return null;
+
+    const classification = await classifyQuestion(questionText);
+    const resolved = resolveFromBank(questionText, classification, this.answerBank);
+    if (!resolved) return null;
+
+    return {
+      field,
+      userDataKey: resolved.entry.intentTag || resolved.entry.question,
+      value: resolved.answer,
+      confidence: 0.88,
+      matchMethod: 'answer_bank',
+    };
   }
 
   /**
