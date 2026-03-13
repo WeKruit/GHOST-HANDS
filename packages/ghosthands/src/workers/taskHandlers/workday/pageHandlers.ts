@@ -489,7 +489,7 @@ export async function handlePersonalInfoPage(
 
 SCREENING QUESTIONS (if any appear on this page):
   ${qaList}
-  For any question not listed, enter "[NEEDS_USER_INPUT]" to trigger a user prompt. NEVER guess.`;
+  For any REQUIRED question not listed above: if a neutral/decline option exists (e.g. "Prefer not to say", "Other", "N/A"), select it. Otherwise leave the field empty. For OPTIONAL questions not listed above, leave the field empty. NEVER fabricate or guess answers.`;
 
   const fillPrompt = buildPersonalInfoPrompt(dataBlock);
 
