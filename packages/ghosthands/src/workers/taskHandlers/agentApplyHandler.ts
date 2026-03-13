@@ -571,7 +571,7 @@ function buildSystemPrompt(
   lines.push('- ALWAYS prefer "Sign in with Google" or "Continue with Google" when available. Only use email/password if Google sign-in is not an option.');
   lines.push('- Fill ALL fields with ACTUAL DATA values, never field labels.');
   lines.push('- For dropdowns: (1) click the dropdown button to OPEN it, (2) then in a SEPARATE act call, click the option you want. Never try to select an option and open the dropdown in the same act call.');
-  lines.push('- For "How did you hear?" or referral source questions: if the applicant profile has a referral_source, use it. Otherwise select "Other" if available, or enter "[NEEDS_USER_INPUT]".');
+  lines.push('- For "How did you hear?" or referral source questions: if the applicant profile has a referral_source, use it. Otherwise select "Other" or "Website" if available. If no neutral option exists, leave the field empty.');
   lines.push('- Click Next/Continue to advance through pages.');
   lines.push('- NEVER click Submit / Submit Application. When all fields are filled and only a Submit button remains, call done.');
   lines.push('- If you reach a Review/Summary page, call done immediately. But not all applications have one — if all fields are filled and there is nothing left but Submit, call done.');
