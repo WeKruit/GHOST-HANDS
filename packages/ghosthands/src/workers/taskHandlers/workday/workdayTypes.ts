@@ -65,13 +65,16 @@ export const WorkdayUserProfileSchema = z.object({
   workday_email: z.string().email().optional(),
   workday_password: z.string().optional(),
 
+  // Compensation
+  salary_expectation: z.string().optional(),
+
   // Legal/compliance
   work_authorization: z.string().default('Yes'),
   visa_sponsorship: z.string().default('No'),
 
   // Voluntary self-identification (defaults to decline)
-  gender: z.string().default('Male'),
-  race_ethnicity: z.string().default('Asian'),
+  gender: z.string().default('I do not wish to answer'),
+  race_ethnicity: z.string().default('I do not wish to answer'),
   veteran_status: z.string().default('I am not a protected veteran'),
   disability_status: z.string().default('I do not wish to answer'),
 });

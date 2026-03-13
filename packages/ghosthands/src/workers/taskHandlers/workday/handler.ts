@@ -78,10 +78,10 @@ export class WorkdayApplyHandler implements TaskHandler {
 
     // Self-identification fields for voluntary disclosure / self-identify prompts
     const selfId = {
-      gender: userProfile.gender || 'Male',
-      race_ethnicity: userProfile.race_ethnicity || 'Asian (Not Hispanic or Latino)',
+      gender: userProfile.gender || 'I do not wish to answer',
+      race_ethnicity: userProfile.race_ethnicity || 'I do not wish to answer',
       veteran_status: userProfile.veteran_status || 'I am not a protected veteran',
-      disability_status: userProfile.disability_status || 'No, I Don\'t Have A Disability',
+      disability_status: userProfile.disability_status || 'I do not wish to answer',
     };
 
     let pagesProcessed = 0;
@@ -280,8 +280,8 @@ export class WorkdayApplyHandler implements TaskHandler {
       'Full name': `${profile.first_name} ${profile.last_name}`,
       'Signature': `${profile.first_name} ${profile.last_name}`,
       'Name': `${profile.first_name} ${profile.last_name}`,
-      'What is your desired salary?': 'Open to discussion',
-      'Desired salary': 'Open to discussion',
+      'What is your desired salary?': profile.salary_expectation || '[NEEDS_USER_INPUT]',
+      'Desired salary': profile.salary_expectation || '[NEEDS_USER_INPUT]',
       // User-provided Q&A overrides take highest priority (spread last)
       ...qaOverrides,
     };
@@ -346,7 +346,7 @@ export class WorkdayApplyHandler implements TaskHandler {
     parts.push(`Work Authorization → ${profile.work_authorization}`);
     parts.push(`Visa Sponsorship → ${profile.visa_sponsorship}`);
     parts.push(`For self-identification: Gender → select "${profile.gender}". Race/Ethnicity → select "${profile.race_ethnicity}". Veteran Status → select "${profile.veteran_status}". Disability → select "${profile.disability_status}".`);
-    parts.push('For any question not listed above, select the most reasonable/common answer.');
+    parts.push('For any REQUIRED question not listed above: if a neutral/decline option exists (e.g. "Prefer not to say", "Other", "N/A"), select it. If it is a free-text field with no decline option, enter exactly "[NEEDS_USER_INPUT]". For OPTIONAL questions not listed above, leave the field empty. NEVER fabricate salary, start date, referral source, or other substantive answers.');
     parts.push('DROPDOWN TECHNIQUE: After clicking a dropdown, ALWAYS TYPE your desired answer first (e.g. "No", "Yes", "Male", "Website") to filter the list. If a matching option appears, click it. If typing does not produce a match, click whitespace to close the dropdown, then re-click it and try typing a shorter keyword. The popup menu that appears after clicking a dropdown ALWAYS belongs to the dropdown you just clicked, even if it visually overlaps with other questions. NEVER use arrow keys inside dropdowns. NEVER use mouse scroll inside dropdowns.');
     parts.push('NESTED DROPDOWNS: Some dropdowns have sub-menus. After selecting a category (e.g. "Website"), a second list appears with specific options (e.g. "workday.com"). Select the sub-option. Do NOT click any back arrow or "\u2190 Category" button — that navigates backwards.');
     parts.push('DATE FIELDS: Workday date fields have separate MM/DD/YYYY parts. ALWAYS click on the MM (month) part FIRST, then type the full date as continuous digits WITHOUT slashes or dashes (e.g. for 02/18/2026, click on MM and type "02182026"). Workday auto-advances from month to day to year. For "today\'s date" or "signature date", type "02182026" (which is 02/18/2026). For "expected graduation date", use 05012027.');
