@@ -1453,6 +1453,9 @@ export class JobExecutor {
         });
 
         if (job.callback_url) {
+          // Hoist questions out of metadata to top-level interaction for VALET
+          const rawMeta = (actionOpts.metadata || {}) as Record<string, any>;
+          const { questions: hoistedQuestions, ...remainingMeta } = rawMeta;
           callbackNotifier.notifyHumanNeeded(
             job.id,
             job.callback_url,
@@ -1462,7 +1465,8 @@ export class JobExecutor {
               page_url: pageUrl,
               timeout_seconds: timeout,
               description: actionOpts.description,
-              metadata: actionOpts.metadata as any,
+              ...(hoistedQuestions ? { questions: hoistedQuestions } : {}),
+              metadata: remainingMeta,
             },
             job.valet_task_id,
             this.workerId,

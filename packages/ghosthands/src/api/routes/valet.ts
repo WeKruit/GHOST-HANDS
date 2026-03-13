@@ -216,11 +216,17 @@ export function createValetRoutes(pool: pg.Pool) {
       return c.json({ error: 'not_found', message: 'Job not found' }, 404);
     }
 
+    const isOpenQuestionResolution = body.resolution_type === 'open_question_answer' || body.resolution_type === 'open_question_skip';
+
     if (rows[0].status !== 'paused') {
-      return c.json({
-        error: 'invalid_state',
-        message: `Job is not paused (current status: ${rows[0].status})`,
-      }, 409);
+      // Allow open_question_answer/skip on 'running' jobs — answers accumulate
+      // across multiple resume calls before the worker reads them
+      if (!(isOpenQuestionResolution && rows[0].status === 'running')) {
+        return c.json({
+          error: 'invalid_state',
+          message: `Job is not paused (current status: ${rows[0].status})`,
+        }, 409);
+      }
     }
 
     const isMastra = rows[0].execution_mode === 'mastra';
@@ -294,17 +300,77 @@ export function createValetRoutes(pool: pg.Pool) {
     // Store resolution data in interaction_data JSONB before firing NOTIFY
     // so the JobExecutor can read credentials/codes when it wakes up
     if (body.resolution_type || body.resolution_data) {
-      await pool.query(`
-        UPDATE gh_automation_jobs
-        SET interaction_data = COALESCE(interaction_data, '{}'::jsonb) || $2::jsonb,
-            updated_at = NOW()
-        WHERE id = $1::UUID
-      `, [jobId, JSON.stringify({
-        resolution_type: body.resolution_type || 'manual',
-        resolution_data: body.resolution_data || null,
-        resolved_by: body.resolved_by,
-        resolved_at: new Date().toISOString(),
-      })]);
+      // For open_question_answer: deep-merge answers into existing resolution_data
+      // so multiple per-question resume calls accumulate all answers before the
+      // worker reads them. Only open_question_skip fires NOTIFY to wake the worker.
+      if (body.resolution_type === 'open_question_answer' && body.resolution_data?.answers) {
+        // Merge incoming answers with any previously accumulated answers
+        const { rows: currentRows } = await pool.query(
+          'SELECT interaction_data FROM gh_automation_jobs WHERE id = $1::UUID',
+          [jobId],
+        );
+        const existingInteraction = (currentRows[0]?.interaction_data || {}) as Record<string, any>;
+        const existingAnswers = existingInteraction?.resolution_data?.answers || {};
+        const mergedAnswers = { ...existingAnswers, ...(body.resolution_data.answers as Record<string, string>) };
+
+        await pool.query(`
+          UPDATE gh_automation_jobs
+          SET interaction_data = COALESCE(interaction_data, '{}'::jsonb) || $2::jsonb,
+              updated_at = NOW()
+          WHERE id = $1::UUID
+        `, [jobId, JSON.stringify({
+          resolution_type: body.resolution_type,
+          resolution_data: { ...body.resolution_data, answers: mergedAnswers },
+          resolved_by: body.resolved_by,
+          resolved_at: new Date().toISOString(),
+        })]);
+
+        // Do NOT fire NOTIFY or change status — wait for open_question_skip to signal completion
+        return c.json({
+          job_id: jobId,
+          status: rows[0].status,
+          resolved_by: body.resolved_by,
+          resolution_type: body.resolution_type,
+          answers_accumulated: Object.keys(mergedAnswers).length,
+        });
+      }
+
+      // For open_question_skip: merge any final answers with accumulated ones, then wake the worker
+      if (body.resolution_type === 'open_question_skip') {
+        const { rows: currentRows } = await pool.query(
+          'SELECT interaction_data FROM gh_automation_jobs WHERE id = $1::UUID',
+          [jobId],
+        );
+        const existingInteraction = (currentRows[0]?.interaction_data || {}) as Record<string, any>;
+        const existingAnswers = existingInteraction?.resolution_data?.answers || {};
+        const incomingAnswers = (body.resolution_data?.answers || {}) as Record<string, string>;
+        const mergedAnswers = { ...existingAnswers, ...incomingAnswers };
+
+        await pool.query(`
+          UPDATE gh_automation_jobs
+          SET interaction_data = COALESCE(interaction_data, '{}'::jsonb) || $2::jsonb,
+              updated_at = NOW()
+          WHERE id = $1::UUID
+        `, [jobId, JSON.stringify({
+          resolution_type: body.resolution_type,
+          resolution_data: { ...(body.resolution_data || {}), answers: mergedAnswers },
+          resolved_by: body.resolved_by,
+          resolved_at: new Date().toISOString(),
+        })]);
+      } else {
+        // Non-open_question types: overwrite as before
+        await pool.query(`
+          UPDATE gh_automation_jobs
+          SET interaction_data = COALESCE(interaction_data, '{}'::jsonb) || $2::jsonb,
+              updated_at = NOW()
+          WHERE id = $1::UUID
+        `, [jobId, JSON.stringify({
+          resolution_type: body.resolution_type || 'manual',
+          resolution_data: body.resolution_data || null,
+          resolved_by: body.resolved_by,
+          resolved_at: new Date().toISOString(),
+        })]);
+      }
     }
 
     // Fire NOTIFY so the listening JobExecutor picks up the resume signal
