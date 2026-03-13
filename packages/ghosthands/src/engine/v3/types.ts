@@ -136,6 +136,7 @@ export type MatchMethod =
   | 'placeholder'
   | 'stagehand_desc'
   | 'llm_inference'
+  | 'answer_bank'
   | 'default';
 
 export interface FieldMatch {
