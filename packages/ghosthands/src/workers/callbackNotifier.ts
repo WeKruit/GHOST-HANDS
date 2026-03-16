@@ -7,6 +7,7 @@
  */
 
 import { getLogger } from '../monitoring/logger.js';
+import { browserSessionRegistry } from './browserSessionRegistry.js';
 
 export interface InteractionInfo {
   type: string;
@@ -59,6 +60,8 @@ export interface CallbackPayload {
   } | null;
   /** Kasm session URL for live browser view (WEK-162) */
   kasm_url?: string;
+  /** Whether a browser liveview session is available for takeover */
+  browser_session_available?: boolean;
   completed_at?: string;
 }
 
@@ -131,6 +134,10 @@ export class CallbackNotifier {
       payload.kasm_url = kasmUrl;
     }
 
+    // Browser session availability — check the registry for this job
+    const sessionSnap = browserSessionRegistry.getPublicSnapshot();
+    payload.browser_session_available = sessionSnap.available === true;
+
     // Sprint 3: Mode tracking fields
     if (job.execution_mode) {
       payload.execution_mode = job.execution_mode;
@@ -162,7 +169,7 @@ export class CallbackNotifier {
     jobId: string,
     callbackUrl: string,
     valetTaskId?: string | null,
-    metadata?: { execution_mode?: string; manual_id?: string | null; kasm_url?: string },
+    metadata?: { execution_mode?: string; manual_id?: string | null; kasm_url?: string; browser_session_available?: boolean },
     workerId?: string,
   ): Promise<boolean> {
     const kasmUrl = metadata?.kasm_url || process.env.KASM_SESSION_URL;
@@ -173,6 +180,7 @@ export class CallbackNotifier {
       ...(workerId && { worker_id: workerId }),
       ...(metadata?.execution_mode && { execution_mode: metadata.execution_mode }),
       ...(kasmUrl && { kasm_url: kasmUrl }),
+      browser_session_available: metadata?.browser_session_available ?? false,
     };
     return this.sendWithRetry(callbackUrl, payload);
   }
@@ -188,6 +196,7 @@ export class CallbackNotifier {
     workerId?: string,
     cost?: { total_cost_usd: number; action_count: number; total_tokens: number },
     kasmUrl?: string,
+    browserSessionAvailable?: boolean,
   ): Promise<boolean> {
     const resolvedKasmUrl = kasmUrl || process.env.KASM_SESSION_URL;
     const payload: CallbackPayload = {
@@ -198,6 +207,7 @@ export class CallbackNotifier {
       interaction: interactionData,
       ...(cost && { cost }),
       ...(resolvedKasmUrl && { kasm_url: resolvedKasmUrl }),
+      browser_session_available: browserSessionAvailable ?? false,
     };
     return this.sendWithRetry(callbackUrl, payload);
   }
@@ -211,6 +221,7 @@ export class CallbackNotifier {
     valetTaskId?: string | null,
     workerId?: string,
     kasmUrl?: string,
+    browserSessionAvailable?: boolean,
   ): Promise<boolean> {
     const resolvedKasmUrl = kasmUrl || process.env.KASM_SESSION_URL;
     const payload: CallbackPayload = {
@@ -219,6 +230,7 @@ export class CallbackNotifier {
       status: 'resumed',
       ...(workerId && { worker_id: workerId }),
       ...(resolvedKasmUrl && { kasm_url: resolvedKasmUrl }),
+      browser_session_available: browserSessionAvailable ?? false,
     };
     return this.sendWithRetry(callbackUrl, payload);
   }
