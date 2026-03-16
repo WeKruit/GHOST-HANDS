@@ -3,6 +3,10 @@ import type { PageContextService } from '../../context/PageContextService.js';
 import type { CostTracker } from '../costControl.js';
 import type { ProgressTracker } from '../progressTracker.js';
 import type { EmailVerificationService } from '../emailVerification/types.js';
+import type {
+  AccountCreationEvent,
+  GeneratedPlatformCredential,
+} from './platforms/accountCredentials.js';
 
 /** Job record as fetched from gh_automation_jobs */
 export interface AutomationJob {
@@ -79,6 +83,16 @@ export interface TaskResult {
   keepBrowserOpen?: boolean;
   /** When true, the job is paused at the review page awaiting user submission. */
   awaitingUserReview?: boolean;
+  /**
+   * Internal-only runtime metadata. This is used to pass sensitive, non-persisted
+   * details such as generated ATS credentials to the finalization layer so it can
+   * forward them over the secure VALET service boundary without writing them into
+   * job/task result blobs.
+   */
+  runtimeMetadata?: {
+    generatedPlatformCredentials?: GeneratedPlatformCredential[];
+    accountCreationEvents?: AccountCreationEvent[];
+  };
 }
 
 export interface ValidationResult {

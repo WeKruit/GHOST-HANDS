@@ -79,6 +79,7 @@ function clonePage(page: LogicalPageRecord): LogicalPageRecord {
     })),
     coverage: { ...page.coverage },
     mergeStats: { ...page.mergeStats },
+    metadata: page.metadata ? { ...page.metadata } : undefined,
   };
 }
 
@@ -160,7 +161,33 @@ export function createPageRecord(input: PageEntryInput): LogicalPageRecord {
       duplicateQuestionSuppressions: 0,
     },
     domSummary: input.domSummary,
+    metadata: undefined,
   };
+}
+
+export function annotateActivePage(
+  session: PageContextSession,
+  metadata: Record<string, unknown>,
+  notes?: string,
+  actor: ContextEvent['actor'] = 'system',
+): PageContextSession {
+  const next = cloneSession(session);
+  const page = findActivePage(next);
+  if (!page) return session;
+
+  page.metadata = {
+    ...(page.metadata || {}),
+    ...metadata,
+  };
+  pushEvent(page, {
+    type: 'page_audited',
+    actor,
+    notes,
+    after: metadata,
+  });
+  next.updatedAt = nowIso();
+  next.version = session.version + 1;
+  return next;
 }
 
 export function applyPageEntry(

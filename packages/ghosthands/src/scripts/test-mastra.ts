@@ -75,6 +75,18 @@ function detectPlatform(url: string): string {
   return 'generic';
 }
 
+function resolveValetApiBase(): string {
+  const explicit =
+    process.env.VALET_API_URL?.trim() ||
+    process.env.API_URL?.trim();
+  if (explicit) return explicit.replace(/\/+$/, '');
+  return 'https://valet-api-stg.fly.dev';
+}
+
+function resolveValetCallbackUrl(): string {
+  return `${resolveValetApiBase()}/api/v1/webhooks/ghosthands`;
+}
+
 // ---------------------------------------------------------------------------
 // Status polling
 // ---------------------------------------------------------------------------
@@ -218,6 +230,7 @@ async function submitViaApi(
   const payload = {
     valet_task_id: `mastra-test-${Date.now()}`,
     valet_user_id: userId,
+    callback_url: resolveValetCallbackUrl(),
     target_url: targetUrl,
     execution_mode: 'mastra',
     profile: {
@@ -247,7 +260,7 @@ async function submitViaApi(
     priority: 1,
     timeout_seconds: opts.timeout,
     target_worker_id: opts.workerId || undefined,
-    metadata: { source: 'test-mastra-script' },
+    metadata: { source: 'test-mastra-script', platform: opts.platform },
   };
 
   const resp = await fetch(`${apiBase}/api/v1/gh/valet/apply`, {
@@ -279,6 +292,7 @@ async function submitViaDirect(
   profile: any,
   opts: { workerId: string | null; timeout: number; platform: string; resumeRef: any },
 ): Promise<string> {
+  const valetTaskId = `mastra-test-${Date.now()}`;
   const inputData = {
     user_data: profile,
     qa_overrides: {},
@@ -292,13 +306,13 @@ async function submitViaDirect(
        input_data, user_id, status,
        timeout_seconds, max_retries, priority,
        target_worker_id, tags, resume_ref,
-       execution_mode, metadata
+       execution_mode, metadata, callback_url, valet_task_id
      ) VALUES (
        'smart_apply', $1, $2,
        $3::jsonb, $4, 'pending',
        $5, 1, 1,
        $6, $7::jsonb, $8::jsonb,
-       'mastra', $9::jsonb
+       'mastra', $9::jsonb, $10, $11
      )
      RETURNING id`,
     [
@@ -310,7 +324,9 @@ async function submitViaDirect(
       opts.workerId,
       JSON.stringify([opts.platform, 'smart_apply', 'mastra']),
       opts.resumeRef ? JSON.stringify(opts.resumeRef) : null,
-      JSON.stringify({ source: 'test-mastra-script' }),
+      JSON.stringify({ source: 'test-mastra-script', platform: opts.platform }),
+      resolveValetCallbackUrl(),
+      valetTaskId,
     ],
   );
 

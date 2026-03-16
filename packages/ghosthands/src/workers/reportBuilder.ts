@@ -142,6 +142,22 @@ function countFields(fields: SubmittedField[]): {
   return { total: fields.length, filled, failed, unresolved };
 }
 
+function buildAccountCreationNote(taskResult: TaskResult): string | null {
+  const events = Array.isArray(taskResult.data?.account_creation_events)
+    ? taskResult.data.account_creation_events
+    : [];
+  const notes = events
+    .map((event) =>
+      event && typeof event === 'object' && typeof event.note === 'string'
+        ? event.note.trim()
+        : '',
+    )
+    .filter((note): note is string => note.length > 0);
+
+  if (notes.length === 0) return null;
+  return notes.join(' ');
+}
+
 // ---------------------------------------------------------------------------
 // Company/title extraction helpers
 // ---------------------------------------------------------------------------
@@ -209,11 +225,16 @@ export function buildApplicationReport(
   const counts = countFields(fields);
   const inputData = job.input_data || {};
 
-  const resultSummary =
+  const baseResultSummary =
     taskResult.data?.success_message ||
     taskResult.data?.summary ||
     taskResult.data?.message ||
     (taskResult.data?.submitted ? 'Application submitted successfully' : null);
+  const accountCreationNote = buildAccountCreationNote(taskResult);
+  const resultSummary =
+    baseResultSummary && accountCreationNote
+      ? `${baseResultSummary} ${accountCreationNote}`
+      : baseResultSummary ?? accountCreationNote;
 
   return {
     job_id: job.id,

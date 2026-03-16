@@ -15,7 +15,7 @@
         "api:dev": "bun --watch src/api/server.ts",
         "worker": "bun src/workers/workerLauncher.ts",
         "worker:dev": "bun --watch src/workers/workerLauncher.ts",
-        "worker:named": "bun src/workers/workerLauncher.ts --worker-id=my-name",
+        "worker:named": "bun src/workers/workerLauncher.ts",
         "apply:simple": "bun src/scripts/apply-simple.ts",
         "apply:web": "bun src/scripts/apply-web.ts",
         "apply:workday": "bun src/scripts/apply-workday.ts",

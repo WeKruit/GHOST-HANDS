@@ -13,6 +13,7 @@
 
 import { getLogger } from '../monitoring/logger.js';
 import { getSupabaseClient } from '../db/client.js';
+import type { GeneratedPlatformCredential } from './taskHandlers/platforms/accountCredentials.js';
 
 export interface InteractionInfo {
   type: string;
@@ -32,7 +33,8 @@ export interface InteractionInfo {
 export interface CallbackPayload {
   job_id: string;
   valet_task_id: string | null;
-  status: 'completed' | 'failed' | 'needs_human' | 'resumed' | 'running';
+  valet_user_id?: string | null;
+  status: 'completed' | 'failed' | 'needs_human' | 'resumed' | 'running' | 'awaiting_review';
   worker_id?: string;
   result_data?: Record<string, any>;
   result_summary?: string;
@@ -59,6 +61,7 @@ export interface CallbackPayload {
   } | null;
   /** Kasm session URL for live browser view (WEK-162) */
   kasm_url?: string;
+  generated_platform_credentials?: GeneratedPlatformCredential[];
   completed_at?: string;
 }
 
@@ -82,6 +85,7 @@ export class CallbackNotifier {
   async notifyFromJob(job: {
     id: string;
     valet_task_id?: string | null;
+    user_id?: string | null;
     callback_url?: string | null;
     status: string;
     worker_id?: string;
@@ -97,18 +101,27 @@ export class CallbackNotifier {
     browser_mode?: string;
     final_mode?: string;
     metadata?: Record<string, any>;
+    generated_platform_credentials?: GeneratedPlatformCredential[];
   }): Promise<boolean> {
     if (!job.callback_url) return false;
 
     const payload: CallbackPayload = {
       job_id: job.id,
       valet_task_id: job.valet_task_id || null,
-      status: job.status === 'completed' ? 'completed' : 'failed',
+      ...(job.user_id ? { valet_user_id: job.user_id } : {}),
+      status:
+        job.status === 'awaiting_review'
+          ? 'awaiting_review'
+          : job.status === 'completed'
+            ? 'completed'
+            : 'failed',
       ...(job.worker_id && { worker_id: job.worker_id }),
-      ...((job.status === 'completed' || job.status === 'failed') && { completed_at: new Date().toISOString() }),
+      ...((job.status === 'completed' || job.status === 'failed') && {
+        completed_at: new Date().toISOString(),
+      }),
     };
 
-    if (job.status === 'completed') {
+    if (job.status === 'completed' || job.status === 'awaiting_review') {
       payload.result_data = job.result_data;
       payload.result_summary = job.result_summary;
       payload.screenshot_url = job.screenshot_urls?.[0];
@@ -140,6 +153,9 @@ export class CallbackNotifier {
     }
     if (job.final_mode) {
       payload.final_mode = job.final_mode;
+    }
+    if (job.generated_platform_credentials?.length) {
+      payload.generated_platform_credentials = job.generated_platform_credentials;
     }
 
     return this.sendWithRetry(job.callback_url, payload);
@@ -297,9 +313,17 @@ export class CallbackNotifier {
           return true;
         }
 
+        let responseBody: string | undefined;
+        try {
+          responseBody = (await response.text()).slice(0, 500);
+        } catch {
+          responseBody = undefined;
+        }
+
         logger.warn('Callback returned non-OK status', {
           url, jobId: payload.job_id, status: response.status,
           attempt: attempt + 1, maxAttempts: MAX_RETRIES + 1,
+          ...(responseBody ? { body: responseBody } : {}),
         });
       } catch (err) {
         logger.warn('Callback request failed', {

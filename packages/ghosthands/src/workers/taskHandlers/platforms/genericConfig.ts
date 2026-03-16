@@ -2682,15 +2682,33 @@ ${dataBlock}`;
       const NEXT_INCLUDES = ['save and continue', 'save & continue', 'skip and continue', 'skip & continue', 'submit profile', 'submit and continue', 'submit & continue'];
 
       const vh = window.innerHeight;
-      const allButtons = Array.from(document.querySelectorAll<HTMLButtonElement | HTMLAnchorElement>(
-        'button, [role="button"], input[type="submit"], a.btn, a[class*="btn"], a[class*="button"]'
-      ));
+      const roots: ParentNode[] = [document];
+      const seenShadowRoots = new Set<ShadowRoot>();
+      for (let index = 0; index < roots.length; index++) {
+        const root = roots[index];
+        const elements = Array.from(root.querySelectorAll<HTMLElement>('*'));
+        for (const element of elements) {
+          const shadowRoot = element.shadowRoot;
+          if (shadowRoot && !seenShadowRoots.has(shadowRoot)) {
+            seenShadowRoots.add(shadowRoot);
+            roots.push(shadowRoot);
+          }
+        }
+      }
+
+      const allButtons: Array<HTMLButtonElement | HTMLAnchorElement | HTMLInputElement> = [];
+      for (const root of roots) {
+        const buttons = root.querySelectorAll<HTMLButtonElement | HTMLAnchorElement | HTMLInputElement>(
+          'button, [role="button"], [role="link"], input[type="submit"], input[type="button"], a[href], a.btn, a[class*="btn"], a[class*="button"]'
+        );
+        allButtons.push(...Array.from(buttons));
+      }
 
       const allButtonTexts = allButtons.map(b => {
         const rect = b.getBoundingClientRect();
         return {
           el: b,
-          text: (b.textContent || b.getAttribute('value') || '').trim().toLowerCase(),
+          text: (b.textContent || b.getAttribute('value') || b.getAttribute('aria-label') || b.getAttribute('title') || '').trim().toLowerCase(),
           visible: rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < vh,
         };
       });
@@ -2708,18 +2726,24 @@ ${dataBlock}`;
 
       if (hasSubmit && !hasNext) {
         // Gather all visible empty inputs
-        const allEmptyInputs = Array.from(document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(
-          'input[type="text"]:not([readonly]):not([disabled]):not([type="hidden"]), ' +
-          'input[type="email"]:not([readonly]):not([disabled]), ' +
-          'input[type="tel"]:not([readonly]):not([disabled]), ' +
-          'textarea:not([readonly]):not([disabled]), ' +
-          'select:not([disabled])'
-        )).filter(el => {
-          const rect = el.getBoundingClientRect();
-          if (rect.width === 0 || rect.height === 0) return false; // hidden
-          const val = el.value?.trim() || '';
-          return val === '' || val === el.getAttribute('placeholder');
-        });
+        const allEmptyInputs: Array<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement> = [];
+        for (const root of roots) {
+          const inputs = root.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(
+            'input[type="text"]:not([readonly]):not([disabled]):not([type="hidden"]), ' +
+            'input[type="email"]:not([readonly]):not([disabled]), ' +
+            'input[type="tel"]:not([readonly]):not([disabled]), ' +
+            'textarea:not([readonly]):not([disabled]), ' +
+            'select:not([disabled])'
+          );
+          for (const el of Array.from(inputs)) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+            const val = el.value?.trim() || '';
+            if (val === '' || val === el.getAttribute('placeholder')) {
+              allEmptyInputs.push(el);
+            }
+          }
+        }
 
         // Only block review for REQUIRED empty fields (not optional ones like EEO)
         const requiredEmpty = allEmptyInputs.filter(el => {
@@ -2727,8 +2751,10 @@ ${dataBlock}`;
           // Check associated label for * marker
           const id = el.id;
           if (id) {
-            const label = document.querySelector(`label[for="${id}"]`);
-            if (label && /\*/.test(label.textContent || '')) return true;
+            for (const root of roots) {
+              const label = root.querySelector(`label[for="${id}"]`);
+              if (label && /\*/.test(label.textContent || '')) return true;
+            }
           }
           // Check parent/ancestor for required indicator
           if (el.closest('.required, [class*="required"]')) return true;
@@ -2737,17 +2763,22 @@ ${dataBlock}`;
 
         // Check radio groups — only required ones block review
         const radioGroups = new Set<string>();
-        document.querySelectorAll<HTMLInputElement>('input[type="radio"]').forEach(r => {
-          if (r.name) radioGroups.add(r.name);
-        });
+        for (const root of roots) {
+          root.querySelectorAll<HTMLInputElement>('input[type="radio"]').forEach(r => {
+            if (r.name) radioGroups.add(r.name);
+          });
+        }
         let unfilledRequiredRadios = 0;
         radioGroups.forEach(name => {
-          const radios = document.querySelectorAll<HTMLInputElement>(`input[type="radio"][name="${name}"]`);
+          const radios: HTMLInputElement[] = [];
+          for (const root of roots) {
+            radios.push(...Array.from(root.querySelectorAll<HTMLInputElement>(`input[type="radio"][name="${name}"]`)));
+          }
           const isRequired = Array.from(radios).some(r =>
             r.required || r.getAttribute('aria-required') === 'true'
           );
           if (!isRequired) return;
-          const checked = document.querySelector<HTMLInputElement>(`input[type="radio"][name="${name}"]:checked`);
+          const checked = radios.find((radio) => radio.checked);
           if (!checked) unfilledRequiredRadios++;
         });
 
@@ -2789,30 +2820,45 @@ ${dataBlock}`;
       // Check specific error role elements and common error CSS classes
       // NOTE: Intentionally NOT using [class*="error"] — it matches React internals,
       // error boundary wrappers, and other false positives on SPAs like Amazon.jobs.
-      const errorEls = document.querySelectorAll(
-        '[role="alert"], .field-error, .validation-error, .form-error, .input-error, .error-message'
-      );
-      for (const el of errorEls) {
-        const rect = (el as HTMLElement).getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
-        const text = (el.textContent || '').trim().toLowerCase();
-        if (!text || text.length > 500) continue; // Skip empty or suspiciously large elements
-        // Must contain actual error language
-        if (ERROR_TEXT_PATTERNS.some(p => text.includes(p))) return true;
+      const roots: ParentNode[] = [document];
+      const seenShadowRoots = new Set<ShadowRoot>();
+      for (let index = 0; index < roots.length; index++) {
+        const root = roots[index];
+        const elements = Array.from(root.querySelectorAll<HTMLElement>('*'));
+        for (const element of elements) {
+          const shadowRoot = element.shadowRoot;
+          if (shadowRoot && !seenShadowRoots.has(shadowRoot)) {
+            seenShadowRoots.add(shadowRoot);
+            roots.push(shadowRoot);
+          }
+        }
+      }
+
+      for (const root of roots) {
+        const errorEls = root.querySelectorAll(
+          '[role="alert"], .field-error, .validation-error, .form-error, .input-error, .error-message'
+        );
+        for (const el of errorEls) {
+          const rect = (el as HTMLElement).getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          const text = (el.textContent || '').trim().toLowerCase();
+          if (!text || text.length > 500) continue;
+          if (ERROR_TEXT_PATTERNS.some(p => text.includes(p))) return true;
+        }
       }
 
       // Also check for red-bordered inputs (common validation indicator)
-      const inputs = document.querySelectorAll('input, select, textarea');
-      for (const input of inputs) {
-        const rect = (input as HTMLElement).getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
-        if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
-        const style = window.getComputedStyle(input as HTMLElement);
-        // Check for red border (common error indicator)
-        const borderColor = style.borderColor;
-        if (borderColor && (borderColor.includes('rgb(255, 0') || borderColor.includes('rgb(220, 53') || borderColor.includes('rgb(239, 68'))) {
-          // Only count if the input also has aria-invalid
-          if ((input as HTMLElement).getAttribute('aria-invalid') === 'true') return true;
+      for (const root of roots) {
+        const inputs = root.querySelectorAll('input, select, textarea');
+        for (const input of inputs) {
+          const rect = (input as HTMLElement).getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+          const style = window.getComputedStyle(input as HTMLElement);
+          const borderColor = style.borderColor;
+          if (borderColor && (borderColor.includes('rgb(255, 0') || borderColor.includes('rgb(220, 53') || borderColor.includes('rgb(239, 68'))) {
+            if ((input as HTMLElement).getAttribute('aria-invalid') === 'true') return true;
+          }
         }
       }
 

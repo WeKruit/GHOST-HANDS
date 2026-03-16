@@ -28,6 +28,10 @@ import {
 import { handleGoogleSignIn } from './googleSignIn.js';
 import { fillWithSmartScroll } from './smartScroll.js';
 import { waitForPageLoad, clickNextWithErrorRecovery } from './navigation.js';
+import {
+  resolvePlatformAccountEmail,
+  resolvePlatformAccountPassword,
+} from '../platforms/accountCredentials.js';
 
 // --- DOM Helpers ---
 
@@ -222,11 +226,20 @@ export async function handleJobListing(adapter: BrowserAutomationAdapter, pageSt
 
 export async function handleLogin(
   adapter: BrowserAutomationAdapter,
-  pageState: PageState,
+  _pageState: PageState,
   userProfile: WorkdayUserProfile,
 ): Promise<void> {
   const currentUrl = await adapter.getCurrentUrl();
-  const email = userProfile.email;
+  const email = resolvePlatformAccountEmail(
+    userProfile as unknown as Record<string, unknown>,
+    'workday',
+    { sourceUrl: currentUrl },
+  );
+  const password = resolvePlatformAccountPassword(
+    userProfile as unknown as Record<string, unknown>,
+    'workday',
+    { sourceUrl: currentUrl },
+  );
 
   // If we're on Google's sign-in page, handle each sub-page with DOM clicks
   // instead of act() to prevent the LLM from navigating into CAPTCHA pages.
@@ -235,40 +248,100 @@ export async function handleLogin(
     return;
   }
 
-  // Otherwise we're on the Workday login page — click "Sign in with Google"
   const logger = getLogger();
-  logger.info('On login page, clicking Sign in with Google');
+  logger.info('On login page, using native email/password sign-in', {
+    emailPresent: Boolean(email),
+    passwordSource: password.source,
+  });
 
-  // Use Playwright locator click (real mouse events) — JS .click() doesn't
-  // trigger Workday's event handlers for navigation buttons.
-  let clicked = false;
-  const googleBtnSelectors = [
-    'button:has-text("Sign in with Google")',
-    'button:has-text("Continue with Google")',
-    'a:has-text("Sign in with Google")',
-    '[data-automation-id*="google" i]',
-  ];
-  for (const sel of googleBtnSelectors) {
-    try {
-      const btn = adapter.page.locator(sel).first();
-      if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
-        await btn.click();
-        clicked = true;
-        logger.info('Clicked Sign in with Google via Playwright locator');
+  await adapter.page.evaluate(() => {
+    const els = document.querySelectorAll('button, a, [role="tab"], [role="button"], [role="link"]');
+    for (const el of els) {
+      const text = (el.textContent || '').trim().toLowerCase();
+      if (text === 'sign in' || text === 'log in') {
+        (el as HTMLElement).click();
+        return;
+      }
+    }
+  });
+  await adapter.page.waitForTimeout(1500);
+
+  const filled = await adapter.page.evaluate((creds: { email: string; password: string }) => {
+    const modal = document.querySelector<HTMLElement>(
+      '[role="dialog"], [aria-modal="true"], [data-automation-id="popUpDialog"]',
+    );
+    const ctx: ParentNode = modal || document;
+
+    const emailSelectors = [
+      'input[type="email"]',
+      'input[autocomplete="email"]',
+      'input[name*="email" i]',
+      'input[id*="email" i]',
+      'input[data-automation-id*="email" i]',
+    ];
+    let emailInput: HTMLInputElement | null = null;
+    for (const selector of emailSelectors) {
+      const input = ctx.querySelector<HTMLInputElement>(selector + ':not([disabled])');
+      if (input && input.getBoundingClientRect().width > 0) {
+        emailInput = input;
         break;
       }
-    } catch { /* try next selector */ }
-  }
-
-  if (!clicked) {
-    // Fallback to LLM
-    const result = await adapter.act(
-      'Look for a "Sign in with Google" button, a Google icon/logo button, or a "Continue with Google" option and click it. If there is no Google sign-in option, look for "Sign In" or "Log In" button instead.',
-    );
-    if (!result.success) {
-      logger.warn('Google sign-in button not found, trying generic sign-in', { message: result.message });
-      await adapter.act('Click the "Sign In", "Log In", or "Create Account" button.');
     }
+
+    const passwordInput = ctx.querySelector<HTMLInputElement>('input[type="password"]:not([disabled])');
+    if (!emailInput && !passwordInput) return false;
+
+    if (emailInput) {
+      emailInput.focus();
+      emailInput.value = creds.email;
+      emailInput.dispatchEvent(new Event('input', { bubbles: true }));
+      emailInput.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    if (passwordInput && passwordInput.getBoundingClientRect().width > 0) {
+      passwordInput.focus();
+      passwordInput.value = creds.password;
+      passwordInput.dispatchEvent(new Event('input', { bubbles: true }));
+      passwordInput.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    const submitButton = ctx.querySelector<HTMLElement>(
+      '[data-automation-id="click_filter"][aria-label*="Sign In" i], [data-automation-id="signInSubmitButton"]',
+    );
+    if (submitButton) {
+      submitButton.click();
+      return true;
+    }
+
+    const buttons = ctx.querySelectorAll<HTMLElement>('button, input[type="submit"], [role="button"]');
+    for (const button of buttons) {
+      const text = (
+        button.textContent ||
+        button.getAttribute('aria-label') ||
+        (button as HTMLInputElement).value ||
+        ''
+      )
+        .trim()
+        .toLowerCase();
+      if ((text === 'sign in' || text === 'log in' || text === 'login') && !button.matches('[role="tab"]')) {
+        button.click();
+        return true;
+      }
+    }
+
+    const form = (passwordInput || emailInput)?.closest('form');
+    if (form) {
+      form.requestSubmit();
+      return true;
+    }
+
+    return false;
+  }, { email, password: password.password });
+
+  if (!filled) {
+    await adapter.act(
+      'Open the native Workday sign-in form, enter the already-provided email and password, then click "Sign In". Do NOT click "Sign in with Google". Do NOT click "Create Account".',
+    );
   }
 
   await waitForPageLoad(adapter);

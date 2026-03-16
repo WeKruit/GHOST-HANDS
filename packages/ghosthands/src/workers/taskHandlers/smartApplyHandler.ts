@@ -1,13 +1,23 @@
 import { z } from 'zod';
 import path from 'node:path';
 import fs from 'node:fs';
-import type { TaskHandler, TaskContext, TaskResult, ValidationResult } from './types.js';
+import type { AutomationJob, TaskHandler, TaskContext, TaskResult, ValidationResult } from './types.js';
 import type { BrowserAutomationAdapter } from '../../adapters/types.js';
 import type { PageContextService } from '../../context/PageContextService.js';
 import type { PlatformConfig, PageState, PageType, ScannedField, ScanResult } from './platforms/types.js';
 import type { CostTracker } from '../costControl.js';
 import { detectPlatformFromUrl } from './platforms/index.js';
+import {
+  generatePlatformCredential,
+  inferCredentialDomainFromUrl,
+  inferCredentialPlatformFromUrl,
+  resolvePlatformAccountEmail,
+  resolvePlatformAccountPassword,
+  type AccountCreationEvent,
+  type GeneratedPlatformCredential,
+} from './platforms/accountCredentials.js';
 import { findBestAnswer } from './platforms/genericConfig.js';
+import { persistGeneratedPlatformCredential } from '../platformCredentialStore.js';
 import { ProgressStep } from '../progressTracker.js';
 import { fillFormOnPage, buildProfileText } from './formFiller.js';
 import type { WorkdayUserProfile } from './workday/workdayTypes.js';
@@ -30,6 +40,129 @@ const VERIFICATION_EMAIL_CONTEXT_BODY_MAX_CHARS = 4_000;
 const VERIFICATION_AGENT_MAX_ATTEMPTS = 2;
 const VERIFICATION_AGENT_RETRY_DELAY_MS = 1_500;
 
+function asMutableRecord(value: unknown): Record<string, any> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, any>;
+}
+
+function rememberCredentialOnProfile(
+  profile: Record<string, any>,
+  credential: GeneratedPlatformCredential,
+): void {
+  const platformKey = credential.platform;
+  const platformCredentials =
+    asMutableRecord(profile.platform_credentials) ??
+    asMutableRecord(profile.platformCredentials) ??
+    {};
+  const existingPlatformEntry = asMutableRecord(platformCredentials[platformKey]) ?? {};
+  const scopedByDomain = asMutableRecord(existingPlatformEntry.byDomain) ?? {};
+
+  if (credential.domain) {
+    scopedByDomain[credential.domain] = {
+      domain: credential.domain,
+      email: credential.loginIdentifier,
+      loginIdentifier: credential.loginIdentifier,
+      password: credential.secret,
+      secret: credential.secret,
+    };
+  }
+
+  platformCredentials[platformKey] = {
+    ...existingPlatformEntry,
+    email: credential.loginIdentifier,
+    loginIdentifier: credential.loginIdentifier,
+    password: credential.secret,
+    secret: credential.secret,
+    domain: credential.domain ?? null,
+    ...(Object.keys(scopedByDomain).length > 0 ? { byDomain: scopedByDomain } : {}),
+  };
+
+  profile.platform_credentials = platformCredentials;
+  profile.platformCredentials = platformCredentials;
+  profile[`${platformKey}_email`] = credential.loginIdentifier;
+  profile[`${platformKey}Email`] = credential.loginIdentifier;
+  profile[`${platformKey}_password`] = credential.secret;
+  profile[`${platformKey}Password`] = credential.secret;
+}
+
+export type AccountCreationTransitionState =
+  | 'account_creation'
+  | 'login'
+  | 'verification'
+  | 'advanced';
+
+type AccountCreationTransitionInput = {
+  currentUrl?: string | null;
+  hasPasswordField: boolean;
+  hasConfirmPassword: boolean;
+  hasSignInOption: boolean;
+  hasCreateAccountHeading: boolean;
+  hasVerificationPrompt: boolean;
+  validationText?: string | null;
+};
+
+export function inferAccountCreationTransition(
+  input: AccountCreationTransitionInput,
+): AccountCreationTransitionState {
+  const currentUrl = (input.currentUrl || '').toLowerCase();
+  if (input.hasVerificationPrompt) return 'verification';
+  if (
+    currentUrl.includes('/login') ||
+    currentUrl.includes('signin') ||
+    (input.hasPasswordField && input.hasSignInOption && !input.hasConfirmPassword)
+  ) {
+    return 'login';
+  }
+  if (
+    input.hasConfirmPassword ||
+    input.hasCreateAccountHeading ||
+    Boolean(input.validationText?.trim())
+  ) {
+    return 'account_creation';
+  }
+  return 'advanced';
+}
+
+export function shouldStopForManualReviewAfterStableRepeat(input: {
+  result: 'navigated' | 'review' | 'complete';
+  samePageCount: number;
+  totalFields: number;
+  pageType: string;
+  matchedCompletedSignature?: boolean;
+}): boolean {
+  if (input.result !== 'complete') return false;
+  if (input.samePageCount < 1 && !input.matchedCompletedSignature) return false;
+  if (input.totalFields <= 0) return false;
+  return !['login', 'account_creation', 'verification_code', 'phone_2fa'].includes(input.pageType);
+}
+
+export function resolvePlatformConfigForExecution(
+  targetUrl: string,
+  executionMode?: string | null,
+): PlatformConfig {
+  const config = detectPlatformFromUrl(targetUrl);
+  // "mastra" still executes SmartApplyHandler today. For known ATS platforms,
+  // preserve the platform-specific DOM/auth guardrails instead of forcing
+  // generic behavior and losing native login/account-creation flows.
+  return config;
+}
+
+export function shouldAllowGoogleSsoForLogin(
+  currentUrl: string,
+  profile: Record<string, any>,
+): boolean {
+  const normalizedUrl = currentUrl.toLowerCase();
+  const isWorkdayHost =
+    normalizedUrl.includes('myworkdayjobs.com') ||
+    normalizedUrl.includes('myworkdaysite.com') ||
+    normalizedUrl.includes('workday');
+  if (isWorkdayHost) return false;
+  if (profile._accountCreationCompleted || profile._forceNativeLoginAfterAccountCreation) {
+    return false;
+  }
+  return true;
+}
+
 // --- Handler ---
 
 export class SmartApplyHandler implements TaskHandler {
@@ -44,6 +177,210 @@ export class SmartApplyHandler implements TaskHandler {
   private _lastFillTotalFields = -1;
   private _lastFillDomFilled = -1;
   private _lastFillMagnitudeFilled = -1;
+  private accountCreationEvents: AccountCreationEvent[] = [];
+  private generatedPlatformCredentials: GeneratedPlatformCredential[] = [];
+  private confirmedAccountCreationEvents: AccountCreationEvent[] = [];
+  private confirmedGeneratedPlatformCredentials: GeneratedPlatformCredential[] = [];
+
+  private resetRunState(): void {
+    this.lastLlmCallTime = 0;
+    this.loginAttempted = false;
+    this.applyClicked = false;
+    this.accountCreationEvents = [];
+    this.generatedPlatformCredentials = [];
+    this.confirmedAccountCreationEvents = [];
+    this.confirmedGeneratedPlatformCredentials = [];
+  }
+
+  private rememberGeneratedPlatformCredential(
+    profile: Record<string, any>,
+    credential: GeneratedPlatformCredential,
+    event: AccountCreationEvent,
+  ): void {
+    const existingCredentialIndex = this.generatedPlatformCredentials.findIndex(
+      (entry) =>
+        entry.platform === credential.platform &&
+        (entry.domain ?? null) === (credential.domain ?? null) &&
+        entry.loginIdentifier === credential.loginIdentifier,
+    );
+    if (existingCredentialIndex >= 0) {
+      this.generatedPlatformCredentials[existingCredentialIndex] = credential;
+    } else {
+      this.generatedPlatformCredentials.push(credential);
+    }
+
+    const existingEventIndex = this.accountCreationEvents.findIndex(
+      (entry) =>
+        entry.platform === event.platform &&
+        (entry.domain ?? null) === (event.domain ?? null) &&
+        entry.action === event.action &&
+        entry.loginIdentifier === event.loginIdentifier,
+    );
+    if (existingEventIndex >= 0) {
+      this.accountCreationEvents[existingEventIndex] = event;
+    } else {
+      this.accountCreationEvents.push(event);
+    }
+
+    rememberCredentialOnProfile(profile, credential);
+  }
+
+  private confirmGeneratedPlatformCredential(
+    platform: string | null,
+    transitionUrl: string,
+  ): { credential?: GeneratedPlatformCredential; event?: AccountCreationEvent } {
+    if (!platform) return {};
+    const normalizedDomain = inferCredentialDomainFromUrl(transitionUrl);
+    const credential =
+      [...this.generatedPlatformCredentials]
+        .reverse()
+        .find(
+          (entry) =>
+            entry.platform === platform &&
+            ((normalizedDomain && entry.domain === normalizedDomain) || !normalizedDomain),
+        );
+    const event =
+      [...this.accountCreationEvents]
+        .reverse()
+        .find(
+          (entry) =>
+            entry.platform === platform &&
+            ((normalizedDomain && entry.domain === normalizedDomain) || !normalizedDomain),
+        );
+
+    if (credential) {
+      const existingIndex = this.confirmedGeneratedPlatformCredentials.findIndex(
+        (entry) =>
+          entry.platform === credential.platform &&
+          (entry.domain ?? null) === (credential.domain ?? null) &&
+          entry.loginIdentifier === credential.loginIdentifier,
+      );
+      if (existingIndex >= 0) {
+        this.confirmedGeneratedPlatformCredentials[existingIndex] = credential;
+      } else {
+        this.confirmedGeneratedPlatformCredentials.push(credential);
+      }
+    }
+
+    if (event) {
+      const existingIndex = this.confirmedAccountCreationEvents.findIndex(
+        (entry) =>
+          entry.platform === event.platform &&
+          (entry.domain ?? null) === (event.domain ?? null) &&
+          entry.loginIdentifier === event.loginIdentifier &&
+          entry.action === event.action,
+      );
+      if (existingIndex >= 0) {
+        this.confirmedAccountCreationEvents[existingIndex] = event;
+      } else {
+        this.confirmedAccountCreationEvents.push(event);
+      }
+    }
+
+    return { credential, event };
+  }
+
+  private async persistConfirmedAccountCreationBestEffort(input: {
+    job: AutomationJob;
+    platform: string | null;
+    transition: { state: AccountCreationTransitionState; currentUrl: string };
+    pageContext?: PageContextService;
+  }): Promise<void> {
+    const { credential, event } = this.confirmGeneratedPlatformCredential(
+      input.platform,
+      input.transition.currentUrl,
+    );
+    if (!credential) return;
+
+    await input.pageContext?.annotateActivePage(
+      {
+        authObservation: {
+          state: input.transition.state,
+          currentUrl: input.transition.currentUrl,
+          platform: input.platform,
+          accountCreationConfirmed: true,
+          tenantCredentialPersisted: true,
+        },
+      },
+      'Confirmed account-creation transition',
+      'dom',
+    ).catch(() => {});
+
+    await persistGeneratedPlatformCredential({
+      userId: input.job.user_id,
+      credential,
+      event,
+      jobId: input.job.id,
+      sourceUrl: input.transition.currentUrl,
+      reason: 'confirmed_account_creation_transition',
+    }).catch((error) => {
+      console.warn(
+        `[SmartApply] Failed to persist confirmed generated credential: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
+  }
+
+  private async annotateLatestAuthObservation(
+    pageContext: PageContextService | undefined,
+    profile: Record<string, any>,
+    notes: string,
+  ): Promise<void> {
+    const observation = (profile as any)._lastAuthObservation;
+    if (!pageContext || !observation || typeof observation !== 'object') return;
+    await pageContext
+      .annotateActivePage(
+        { authObservation: observation as Record<string, unknown> },
+        notes,
+        'dom',
+      )
+      .catch(() => {});
+  }
+
+  private async invokePlatformLogin(
+    config: PlatformConfig,
+    adapter: BrowserAutomationAdapter,
+    profile: Record<string, any>,
+    pageContext?: PageContextService,
+  ): Promise<void> {
+    if (!config.handleLogin) return;
+    try {
+      await config.handleLogin(adapter, profile);
+      await this.annotateLatestAuthObservation(pageContext, profile, 'Auth observation after native login step');
+    } catch (error) {
+      await this.annotateLatestAuthObservation(pageContext, profile, 'Auth observation at login failure');
+      throw error;
+    }
+  }
+
+  private withAccountCreationMetadata(result: TaskResult): TaskResult {
+    if (
+      this.confirmedAccountCreationEvents.length === 0 &&
+      this.confirmedGeneratedPlatformCredentials.length === 0
+    ) {
+      return result;
+    }
+
+    return {
+      ...result,
+      data: {
+        ...(result.data || {}),
+        ...(this.confirmedAccountCreationEvents.length > 0
+          ? { account_creation_events: this.confirmedAccountCreationEvents }
+          : {}),
+      },
+      runtimeMetadata: {
+        ...(result.runtimeMetadata || {}),
+        ...(this.confirmedAccountCreationEvents.length > 0
+          ? { accountCreationEvents: this.confirmedAccountCreationEvents }
+          : {}),
+        ...(this.confirmedGeneratedPlatformCredentials.length > 0
+          ? { generatedPlatformCredentials: this.confirmedGeneratedPlatformCredentials }
+          : {}),
+      },
+    };
+  }
 
   private attachPageDebugListeners(adapter: BrowserAutomationAdapter): void {
     const page = adapter.page as typeof adapter.page & { __ghSmartApplyDebugAttached?: boolean };
@@ -102,6 +439,128 @@ export class SmartApplyHandler implements TaskHandler {
     }
   }
 
+  private async logVisibleValidationErrors(
+    adapter: BrowserAutomationAdapter,
+    label: string,
+  ): Promise<void> {
+    try {
+      const snapshot = await adapter.page.evaluate(() => {
+        const roots: Array<Document | ShadowRoot> = [document];
+        for (let index = 0; index < roots.length; index += 1) {
+          const root = roots[index]!;
+          for (const host of Array.from(root.querySelectorAll('*'))) {
+            const shadowRoot = (host as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+            if (shadowRoot) roots.push(shadowRoot);
+          }
+        }
+
+        const visible = (node: Element | null): boolean => {
+          if (!node) return false;
+          const el = node as HTMLElement;
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+        };
+
+        const errorSelector = [
+          '[role="alert"]',
+          '[aria-live="assertive"]',
+          '[data-automation-id*="error"]',
+          '[class*="error"]',
+          '[class*="Error"]',
+        ].join(', ');
+
+        const lines: string[] = [];
+        const fieldErrors: Array<{ label: string; error: string }> = [];
+        for (const root of roots) {
+          if (!root.querySelectorAll) continue;
+          for (const node of Array.from(root.querySelectorAll(errorSelector))) {
+            if (!visible(node)) continue;
+            const text = (node.textContent || '')
+              .split(/\n+/)
+              .map((line) => line.trim())
+              .filter((line) => line.length > 5)
+              .filter((line) => /error|required|invalid|must|enter|select/i.test(line));
+            lines.push(...text);
+          }
+
+          for (const field of Array.from(root.querySelectorAll('[aria-invalid="true"], input:invalid, select:invalid, textarea:invalid'))) {
+            if (!visible(field)) continue;
+            const input = field as HTMLElement;
+            const container =
+              input.closest('[data-automation-id], .form-group, .field, .form-field, fieldset')
+              || input.parentElement
+              || input;
+            const labelNode = container.querySelector(
+              'label, legend, [aria-label], [data-automation-id*="label"]',
+            ) as HTMLElement | null;
+            const label = labelNode?.textContent?.trim()
+              || input.getAttribute('aria-label')
+              || input.getAttribute('name')
+              || input.id
+              || '(unlabeled field)';
+            const errorText = Array.from(container.querySelectorAll(errorSelector))
+              .filter((node) => visible(node))
+              .map((node) => (node.textContent || '').trim())
+              .filter((line) => line.length > 0)
+              .join(' | ');
+            if (errorText) {
+              fieldErrors.push({ label, error: errorText });
+            }
+          }
+        }
+
+        return {
+          summary: [...new Set(lines)].slice(0, 20),
+          fieldErrors,
+        };
+      });
+
+      if (snapshot.summary.length > 0 || snapshot.fieldErrors.length > 0) {
+        console.warn(`[SmartApply] ${label}: ${JSON.stringify(snapshot)}`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[SmartApply] ${label}: failed to inspect validation errors: ${message}`);
+    }
+  }
+
+  private async closeUnexpectedSiblingPages(
+    adapter: BrowserAutomationAdapter,
+    expectedUrl: string,
+  ): Promise<void> {
+    let expectedHost = "";
+    try {
+      expectedHost = new URL(expectedUrl).hostname.toLowerCase();
+    } catch {
+      return;
+    }
+
+    const currentPage = adapter.page;
+    const siblingPages = currentPage.context().pages().filter((page) => page !== currentPage && !page.isClosed());
+    for (const sibling of siblingPages) {
+      const siblingUrl = sibling.url();
+      let siblingHost = "";
+      try {
+        siblingHost = siblingUrl ? new URL(siblingUrl).hostname.toLowerCase() : "";
+      } catch {
+        siblingHost = "";
+      }
+
+      if (!siblingHost || siblingHost === expectedHost) {
+        continue;
+      }
+
+      console.warn(
+        `[SmartApply] Closing unexpected sibling page during apply flow ` +
+        `(expected host: ${expectedHost}, found: ${siblingHost || siblingUrl || 'about:blank'})`,
+      );
+      await sibling.close().catch(() => {});
+    }
+
+    await currentPage.bringToFront().catch(() => {});
+  }
+
   validate(inputData: Record<string, any>): ValidationResult {
     const errors: string[] = [];
     const userData = inputData.user_data;
@@ -124,9 +583,7 @@ export class SmartApplyHandler implements TaskHandler {
 
     // TaskHandlerRegistry stores singleton handler instances, so reset
     // per-run state at the start of each execute() call.
-    this.lastLlmCallTime = 0;
-    this.loginAttempted = false;
-    this.applyClicked = false;
+    this.resetRunState();
 
     // Normalize address: API route stores flat (city, state, country, zip)
     // but platform configs expect nested address object
@@ -153,13 +610,10 @@ export class SmartApplyHandler implements TaskHandler {
     await adapter.page.evaluate(namePolyfill);
     this.attachPageDebugListeners(adapter);
 
-    // Resolve platform config from URL
-    // When running under Mastra, force generic config — skip platform-specific
-    // logic (e.g. Workday skills/dropdown handlers) so the generic flow is exercised.
-    const config = job.execution_mode === 'mastra'
-      ? detectPlatformFromUrl('')   // empty URL → GenericPlatformConfig
-      : detectPlatformFromUrl(job.target_url);
-    console.log(`[SmartApply] Platform: ${config.displayName} (${config.platformId})${job.execution_mode === 'mastra' ? ' (forced generic for Mastra)' : ''}`);
+    // Resolve platform config from URL. Even for mastra-orchestrated runs,
+    // SmartApplyHandler still needs platform-native DOM/auth behavior.
+    const config = resolvePlatformConfigForExecution(job.target_url, job.execution_mode);
+    console.log(`[SmartApply] Platform: ${config.displayName} (${config.platformId})`);
     console.log(`[SmartApply] Starting application for ${job.target_url}`);
     console.log(`[SmartApply] Applicant: ${userProfile.first_name} ${userProfile.last_name}`);
 
@@ -213,6 +667,7 @@ export class SmartApplyHandler implements TaskHandler {
 
     let pagesProcessed = 0;
     let lastPageSignature = '';
+    let lastCompletedPageSignature = '';
     let samePageCount = 0;
     let consecutiveZeroFieldPages = 0;
     const ESCALATE_AFTER = 3;  // escalate to MagnitudeHand after this many stuck iterations
@@ -225,6 +680,9 @@ export class SmartApplyHandler implements TaskHandler {
         pagesProcessed++;
 
         await this.waitForPageLoad(adapter);
+        if (config.platformId === 'workday') {
+          await this.closeUnexpectedSiblingPages(adapter, job.target_url);
+        }
 
         // Dismiss cookie consent banners (common on many job sites)
         await this.dismissCookieBanner(adapter);
@@ -243,6 +701,9 @@ export class SmartApplyHandler implements TaskHandler {
         // so we also check headings, field count, and active sidebar item.
         const contentFingerprint = await this.getPageFingerprint(adapter);
         const pageSignature = `${currentPageUrl}|${contentFingerprint}`;
+        const matchedCompletedSignature =
+          Boolean(lastCompletedPageSignature) &&
+          pageSignature === lastCompletedPageSignature;
         let stuckEscalate = false;
         if (pageSignature === lastPageSignature) {
           samePageCount++;
@@ -251,7 +712,7 @@ export class SmartApplyHandler implements TaskHandler {
             await pageContext?.finalizeActivePage({ status: 'blocked' });
             await pageContext?.markAwaitingReview();
             await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
-            return {
+            return this.withAccountCreationMetadata({
               success: true,
               keepBrowserOpen: true,
               awaitingUserReview: true,
@@ -261,7 +722,7 @@ export class SmartApplyHandler implements TaskHandler {
                 final_page: 'stuck',
                 message: `Application appears stuck on the same page. Browser open for manual takeover.`,
               },
-            };
+            });
           }
           if (samePageCount >= ESCALATE_AFTER) {
             console.log(`[SmartApply] Stuck ${samePageCount}/${MAX_SAME_PAGE} — escalating to MagnitudeHand for this page.`);
@@ -290,6 +751,32 @@ export class SmartApplyHandler implements TaskHandler {
           domSummary: this.buildPageDomSummary(pageState),
         });
 
+        if (matchedCompletedSignature && shouldStopForManualReviewAfterStableRepeat({
+          result: 'complete',
+          samePageCount,
+          totalFields: this._lastFillTotalFields,
+          pageType: pageState.page_type,
+          matchedCompletedSignature,
+        })) {
+          console.warn(
+            `[SmartApply] Current page matches the previously completed form state ` +
+            `(url: ${currentPageUrl}, pageType: ${pageState.page_type}) — stopping for manual review before refilling.`,
+          );
+          await pageContext?.markAwaitingReview();
+          await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
+          return this.withAccountCreationMetadata({
+            success: true,
+            keepBrowserOpen: true,
+            awaitingUserReview: true,
+            data: {
+              platform: config.platformId,
+              pages_processed: pagesProcessed,
+              final_page: 'stable_repeat_review',
+              message: 'Form filled, but the site did not advance. Browser open for manual review.',
+            },
+          });
+        }
+
         // Handle based on page type
         switch (pageState.page_type) {
           case 'job_listing':
@@ -300,7 +787,7 @@ export class SmartApplyHandler implements TaskHandler {
           case 'login':
           case 'google_signin':
             if (config.handleLogin) {
-              await config.handleLogin(adapter, userProfile);
+              await this.invokePlatformLogin(config, adapter, userProfile, pageContext);
             } else {
               await this.handleGenericLogin(adapter, userProfile, dataPrompt, ctx);
             }
@@ -322,7 +809,22 @@ export class SmartApplyHandler implements TaskHandler {
             // present a combined auth screen, but for our desktop apply flow we want
             // a new account created unless we explicitly entered the login branch.
             if (config.platformId === 'workday') {
-              await this.handleAccountCreation(adapter, dataPrompt, userProfile);
+              const shouldPreferNativeLogin =
+                Boolean((userProfile as any)._forceNativeLoginAfterAccountCreation) ||
+                (Boolean((userProfile as any)._accountCreationCompleted) &&
+                  /\/login\b|signin/i.test(currentPageUrl));
+              if (shouldPreferNativeLogin && config.handleLogin) {
+                console.log(
+                  '[SmartApply] Workday account was already created for this host — treating mixed auth view as native login.',
+                );
+                await this.invokePlatformLogin(config, adapter, userProfile, pageContext);
+                this.loginAttempted = true;
+                break;
+              }
+              await this.handleAccountCreation(adapter, dataPrompt, userProfile, {
+                job,
+                pageContext,
+              });
               break;
             }
 
@@ -331,7 +833,7 @@ export class SmartApplyHandler implements TaskHandler {
             if (!this.loginAttempted) {
               console.log('[SmartApply] Account creation page detected but login not yet attempted — trying login first.');
               if (config.handleLogin) {
-                await config.handleLogin(adapter, userProfile);
+                await this.invokePlatformLogin(config, adapter, userProfile, pageContext);
               } else {
                 await this.handleGenericLogin(adapter, userProfile, dataPrompt, ctx);
               }
@@ -342,7 +844,10 @@ export class SmartApplyHandler implements TaskHandler {
               // and the next iteration will classify it as account_creation with loginAttempted=true.
               break;
             }
-            await this.handleAccountCreation(adapter, dataPrompt, userProfile);
+            await this.handleAccountCreation(adapter, dataPrompt, userProfile, {
+              job,
+              pageContext,
+            });
             break;
 
           case 'review':
@@ -356,7 +861,7 @@ export class SmartApplyHandler implements TaskHandler {
             console.log('[SmartApply] DO NOT close this terminal until you are done.');
             console.log('='.repeat(70) + '\n');
 
-            return {
+            return this.withAccountCreationMetadata({
               success: true,
               keepBrowserOpen: true,
               awaitingUserReview: true,
@@ -366,12 +871,12 @@ export class SmartApplyHandler implements TaskHandler {
                 final_page: 'review',
                 message: 'Application filled. Waiting for user to review and submit.',
               },
-            };
+            });
 
           case 'confirmation':
             console.warn('[SmartApply] Unexpected: landed on confirmation page');
             await pageContext?.finalizeActivePage({ status: 'completed' });
-            return {
+            return this.withAccountCreationMetadata({
               success: true,
               data: {
                 platform: config.platformId,
@@ -379,14 +884,14 @@ export class SmartApplyHandler implements TaskHandler {
                 final_page: 'confirmation',
                 message: 'Application appears to have been submitted (unexpected).',
               },
-            };
+            });
 
           case 'error':
-            return {
+            return this.withAccountCreationMetadata({
               success: false,
               error: `Application error page: ${pageState.error_message || 'Unknown error'}`,
               data: { platform: config.platformId, pages_processed: pagesProcessed },
-            };
+            });
 
           default: {
             // ALL form pages — personal_info, experience, resume_upload, questions, etc.
@@ -495,7 +1000,7 @@ export class SmartApplyHandler implements TaskHandler {
               console.log('[SmartApply] DO NOT close this terminal until you are done.');
               console.log('='.repeat(70) + '\n');
 
-              return {
+              return this.withAccountCreationMetadata({
                 success: true,
                 keepBrowserOpen: true,
                 awaitingUserReview: true,
@@ -505,7 +1010,7 @@ export class SmartApplyHandler implements TaskHandler {
                   final_page: 'review',
                   message: 'Application filled. Waiting for user to review and submit.',
                 },
-              };
+              });
             }
             // Track consecutive zero-field pages: if the site consistently has
             // 0 detectable form fields, it's incompatible with our field extraction.
@@ -522,7 +1027,7 @@ export class SmartApplyHandler implements TaskHandler {
                 await pageContext?.finalizeActivePage({ status: 'blocked' });
                 await pageContext?.markAwaitingReview();
                 await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
-                return {
+                return this.withAccountCreationMetadata({
                   success: true,
                   keepBrowserOpen: true,
                   awaitingUserReview: true,
@@ -532,10 +1037,42 @@ export class SmartApplyHandler implements TaskHandler {
                     final_page: 'incompatible',
                     message: 'Site uses non-standard form components that cannot be automated. Browser open for manual takeover.',
                   },
-                };
+                });
               }
             } else {
               consecutiveZeroFieldPages = 0;
+            }
+            if (shouldStopForManualReviewAfterStableRepeat({
+              result,
+              samePageCount,
+              totalFields: this._lastFillTotalFields,
+              pageType: pageState.page_type,
+              matchedCompletedSignature,
+            })) {
+              console.warn(
+                `[SmartApply] Form page repeated with no navigation after a successful fill ` +
+                `(url: ${currentPageUrl}, pageType: ${pageState.page_type}) — stopping for manual review.`,
+              );
+              await pageContext?.markAwaitingReview();
+              await progress.setStep(ProgressStep.AWAITING_USER_REVIEW);
+              return this.withAccountCreationMetadata({
+                success: true,
+                keepBrowserOpen: true,
+                awaitingUserReview: true,
+                data: {
+                  platform: config.platformId,
+                  pages_processed: pagesProcessed,
+                  final_page: 'stable_repeat_review',
+                  message: 'Form filled, but the site did not advance. Browser open for manual review.',
+                },
+              });
+            }
+            if (result === 'complete') {
+              const settledFingerprint = await this.getPageFingerprint(adapter);
+              const settledUrl = await adapter.getCurrentUrl().catch(() => currentPageUrl);
+              lastCompletedPageSignature = `${settledUrl}|${settledFingerprint}`;
+            } else {
+              lastCompletedPageSignature = '';
             }
             // 'navigated' and 'complete' both continue the main loop
             break;
@@ -553,7 +1090,7 @@ export class SmartApplyHandler implements TaskHandler {
       console.log('[SmartApply] DO NOT close this terminal until you are done.');
       console.log('='.repeat(70) + '\n');
 
-      return {
+      return this.withAccountCreationMetadata({
         success: true,
         keepBrowserOpen: true,
         awaitingUserReview: true,
@@ -563,7 +1100,7 @@ export class SmartApplyHandler implements TaskHandler {
           final_page: 'max_pages_reached',
           message: `Processed ${pagesProcessed} pages. Browser open for manual review.`,
         },
-      };
+      });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       console.error(`[SmartApply] Error on page ${pagesProcessed}: ${msg}`);
@@ -575,19 +1112,19 @@ export class SmartApplyHandler implements TaskHandler {
       // If we fail mid-application, keep browser open so user can recover
       if (pagesProcessed > 2) {
         console.log('[SmartApply] Keeping browser open for manual recovery.');
-        return {
+        return this.withAccountCreationMetadata({
           success: false,
           keepBrowserOpen: true,
           error: msg,
           data: { platform: config.platformId, pages_processed: pagesProcessed },
-        };
+        });
       }
 
-      return {
+      return this.withAccountCreationMetadata({
         success: false,
         error: msg,
         data: { platform: config.platformId, pages_processed: pagesProcessed },
-      };
+      });
     }
   }
 
@@ -789,6 +1326,120 @@ export class SmartApplyHandler implements TaskHandler {
   // Universal Page Handlers
   // =========================================================================
 
+  private async clickApplyButtonDom(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    return adapter.page.evaluate(() => {
+      const visible = (element: Element | null): element is HTMLElement => {
+        if (!element) return false;
+        const node = element as HTMLElement;
+        const style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+          return false;
+        }
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
+      const candidates = Array.from(
+        document.querySelectorAll<HTMLElement>('button, a, [role="button"], [role="link"]'),
+      ).filter((candidate) => visible(candidate));
+      const preferredTexts = ['apply now', 'apply', 'start application'];
+      for (const preferredText of preferredTexts) {
+        const match = candidates.find((candidate) => {
+          const text = (candidate.textContent || candidate.getAttribute('aria-label') || '')
+            .trim()
+            .toLowerCase();
+          if (!text) return false;
+          if (text.includes('save') || text.includes('submit') || text.includes('sign in')) return false;
+          return text === preferredText || text.startsWith(preferredText);
+        });
+        if (match) {
+          match.click();
+          return true;
+        }
+      }
+      return false;
+    });
+  }
+
+  private async observeApplyEntryState(
+    adapter: BrowserAutomationAdapter,
+  ): Promise<'form' | 'auth' | 'modal' | 'unchanged'> {
+    const currentUrl = await adapter.getCurrentUrl().catch(() => adapter.page.url() || '');
+    const authPage = await this.isLikelyAuthPage(adapter);
+    if (authPage) return 'auth';
+    return adapter.page.evaluate((url: string) => {
+      const visible = (element: Element | null): element is HTMLElement => {
+        if (!element) return false;
+        const node = element as HTMLElement;
+        const style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+          return false;
+        }
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
+      const modalCandidates = Array.from(
+        document.querySelectorAll<HTMLElement>('[role="dialog"], [aria-modal="true"], [class*="modal"], [class*="dialog"]'),
+      ).filter((candidate) => visible(candidate));
+      const modalText = modalCandidates
+        .map((candidate) => (candidate.textContent || '').toLowerCase())
+        .join(' ');
+      if (
+        modalText.includes('apply manually') ||
+        modalText.includes('autofill with resume') ||
+        modalText.includes('use my last application')
+      ) {
+        return 'modal';
+      }
+
+      const formFieldCount = document.querySelectorAll(
+        'input:not([type="hidden"]), textarea, select, [role="combobox"]',
+      ).length;
+      if (formFieldCount >= 3) return 'form';
+
+      if (/\/apply\b|applymanually|login|signin/i.test(url)) {
+        return 'auth';
+      }
+      return 'unchanged';
+    }, currentUrl);
+  }
+
+  private async clickApplyManuallyDom(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    return adapter.page.evaluate(() => {
+      const visible = (element: Element | null): element is HTMLElement => {
+        if (!element) return false;
+        const node = element as HTMLElement;
+        const style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+          return false;
+        }
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
+      const candidates = Array.from(
+        document.querySelectorAll<HTMLElement>('button, a, [role="button"], [role="link"]'),
+      ).filter((candidate) => visible(candidate));
+      const texts = [
+        'apply manually',
+        'manual apply',
+        'continue without autofill',
+      ];
+      for (const textNeedle of texts) {
+        const match = candidates.find((candidate) =>
+          ((candidate.textContent || candidate.getAttribute('aria-label') || '').trim().toLowerCase())
+            .includes(textNeedle),
+        );
+        if (match) {
+          match.click();
+          return true;
+        }
+      }
+      return false;
+    });
+  }
+
   private async handleJobListing(adapter: BrowserAutomationAdapter): Promise<void> {
     console.log('[SmartApply] On job listing page, clicking Apply...');
 
@@ -800,6 +1451,25 @@ export class SmartApplyHandler implements TaskHandler {
     });
 
     const urlBefore = await adapter.getCurrentUrl();
+    const domClickedApply = await this.clickApplyButtonDom(adapter);
+    if (domClickedApply) {
+      await adapter.page.waitForTimeout(1500);
+      const domState = await this.observeApplyEntryState(adapter);
+      if (domState === 'modal') {
+        const clickedManual = await this.clickApplyManuallyDom(adapter);
+        if (clickedManual) {
+          console.log('[SmartApply] DOM clicked Apply Manually from modal.');
+          await this.waitForPageLoad(adapter);
+          return;
+        }
+      }
+      if (domState === 'form' || domState === 'auth') {
+        console.log(`[SmartApply] DOM Apply click advanced to ${domState}. Continuing...`);
+        await this.waitForPageLoad(adapter);
+        return;
+      }
+    }
+
     await this.throttleLlm(adapter);
     const result = await adapter.act(
       'Click the "Apply" or "Apply Now" button to start the job application. ' +
@@ -820,6 +1490,12 @@ export class SmartApplyHandler implements TaskHandler {
       if (urlAfter !== urlBefore || onAuthPage) {
         console.log('[SmartApply] Apply button clicked — page navigated. Continuing...');
       } else {
+        const domState = await this.observeApplyEntryState(adapter);
+        if (domState === 'modal' && (await this.clickApplyManuallyDom(adapter))) {
+          console.log('[SmartApply] DOM clicked Apply Manually after LLM timeout.');
+          await this.waitForPageLoad(adapter);
+          return;
+        }
         // The modal might still be open — try clicking "Apply Manually" directly
         try {
           await this.throttleLlm(adapter);
@@ -1232,9 +1908,13 @@ Click only ONE button, then report the task as done.`,
       return { hasEmail, hasPassword, isCreateAccountForm };
     });
 
-    // Step 1: Prefer Google SSO when available.
+    const allowGoogleSso = shouldAllowGoogleSsoForLogin(currentUrl, profile);
+
+    // Step 1: Prefer Google SSO only when explicitly allowed for this host/flow.
     let googleClickDidNotNavigate = false;
-    const clickedGoogle = await this.clickPreferredGoogleSignIn(adapter);
+    const clickedGoogle = allowGoogleSso
+      ? await this.clickPreferredGoogleSignIn(adapter)
+      : false;
     if (clickedGoogle) {
       console.log('[SmartApply] Clicked Google SSO option.');
       await this.waitForPageLoad(adapter);
@@ -1252,6 +1932,8 @@ Click only ONE button, then report the task as done.`,
       } else {
         return;
       }
+    } else if (!allowGoogleSso) {
+      console.log('[SmartApply] Google SSO disabled for this login flow — using native DOM sign-in/account creation only.');
     }
 
     // Step 2: No Google SSO — try opening the platform-specific sign-in path.
@@ -1287,7 +1969,17 @@ Click only ONE button, then report the task as done.`,
     if (formState.isCreateAccountForm) {
       console.log('[SmartApply] On Create Account form — creating account...');
       try {
-        await this.handleAccountCreation(adapter, dataPrompt, profile);
+        await this.handleAccountCreation(
+          adapter,
+          dataPrompt,
+          profile,
+          ctx
+            ? {
+                job: ctx.job,
+                pageContext: ctx.pageContext,
+              }
+            : undefined,
+        );
         (profile as any)._accountCreationCompleted = true;
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -1913,130 +2605,112 @@ Click only ONE button, then report the task as done.`,
     adapter: BrowserAutomationAdapter,
     dataPrompt: string,
     profile: Record<string, any>,
+    opts?: {
+      job: AutomationJob;
+      pageContext?: PageContextService;
+    },
   ): Promise<void> {
     console.log('[SmartApply] Account creation page detected, filling in details...');
 
-    // Use the shared application password for ATS account creation.
-    // Keep the legacy fallback chain temporarily so older profiles keep working
-    // until VALET finishes collecting this secret for every user.
-    const email = process.env.TEST_GMAIL_EMAIL || profile.email || '';
-    const password = this.resolveAccountCreationPassword(profile);
+    const currentUrl = adapter.page.url();
+    const platform = inferCredentialPlatformFromUrl(currentUrl);
+    const email = resolvePlatformAccountEmail(profile, platform, { sourceUrl: currentUrl });
+    const initialValidationText = await this.readAccountCreationValidationText(adapter);
+    let passwordResolution = resolvePlatformAccountPassword(profile, platform, {
+      validationText: initialValidationText,
+      sourceUrl: currentUrl,
+    });
+    let password = passwordResolution.password;
+
+    if (
+      platform === 'workday' &&
+      email &&
+      passwordResolution.source !== 'platform_override'
+    ) {
+      const generated = generatePlatformCredential(profile, platform, email, {
+        validationText: initialValidationText,
+        sourceUrl: currentUrl,
+      });
+      this.rememberGeneratedPlatformCredential(profile, generated.credential, generated.event);
+      passwordResolution = {
+        password: generated.credential.secret,
+        source: generated.credential.source,
+      };
+      password = generated.credential.secret;
+      console.log(
+        `[SmartApply] Generated ${platform} account password for ${email} ` +
+        `(${generated.credential.requirements.join(', ')})`,
+      );
+    }
+
+    console.log(
+      `[SmartApply] Account credentials resolved for ${platform ?? 'generic'}: ` +
+      `email=${email ? 'present' : 'missing'}, passwordSource=${passwordResolution.source}`,
+    );
 
     // ── DOM-first: fill everything without LLM (cost: $0) ──
 
-    // 1. DOM-fill email
-    await adapter.page.evaluate((e: string) => {
-      const sels = [
-        'input[type="email"]', 'input[autocomplete="email"]',
-        'input[data-automation-id*="email" i]',
-        'input[name*="email" i]', 'input[id*="email" i]',
-      ];
-      for (const sel of sels) {
-        const input = document.querySelector<HTMLInputElement>(sel + ':not([disabled])');
-        if (input && input.getBoundingClientRect().width > 0 && !input.value?.trim()) {
-          input.focus();
-          input.value = e;
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-          break;
-        }
-      }
-    }, email);
-
-    // 2. DOM-fill ALL visible password inputs (password + confirm password)
-    await adapter.page.evaluate((pw: string) => {
-      const inputs = document.querySelectorAll<HTMLInputElement>('input[type="password"]:not([disabled])');
-      for (const input of inputs) {
-        if (input.getBoundingClientRect().width > 0) {
-          input.focus();
-          input.value = pw;
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      }
-    }, password);
-
-    await adapter.page.waitForTimeout(300);
-
-    // 3. DOM-scroll the form/modal to bottom so checkboxes become visible
-    await adapter.page.evaluate(() => {
-      // Try scrollable containers: modal dialogs, form containers, etc.
-      const containers = document.querySelectorAll(
-        '[role="dialog"], [class*="modal"], [class*="Modal"], [class*="dialog"], ' +
-        '[class*="Dialog"], [data-automation-id*="dialog"], [data-automation-id*="panel"], ' +
-        'form, [class*="scroll"], [class*="Scroll"]'
-      );
-      for (const container of containers) {
-        const el = container as HTMLElement;
-        if (el.scrollHeight > el.clientHeight) {
-          el.scrollTop = el.scrollHeight;
-        }
-      }
-      // Also scroll the page itself
-      window.scrollTo(0, document.documentElement.scrollHeight);
-    });
-
-    await adapter.page.waitForTimeout(500);
-
-    // 4. DOM-check ALL unchecked checkboxes (privacy policy, terms, consent, etc.)
-    const checkedCount = await adapter.page.evaluate(() => {
-      let count = 0;
-
-      // Standard HTML checkboxes
-      const htmlCheckboxes = document.querySelectorAll<HTMLInputElement>(
-        'input[type="checkbox"]:not(:checked):not([disabled])'
-      );
-      for (const cb of htmlCheckboxes) {
-        cb.click();
-        count++;
-      }
-
-      // ARIA checkboxes (Workday, custom UI frameworks)
-      const ariaCheckboxes = document.querySelectorAll<HTMLElement>(
-        '[role="checkbox"][aria-checked="false"]:not([aria-disabled="true"])'
-      );
-      for (const cb of ariaCheckboxes) {
-        cb.click();
-        count++;
-      }
-
-      return count;
-    });
-    console.log(`[SmartApply] DOM checked ${checkedCount} checkbox(es)`);
-
-    await adapter.page.waitForTimeout(300);
-
-    // 5. DOM-click the Create Account / Register / Submit button
-    const submitted = await adapter.page.evaluate(() => {
-      const TEXTS = ['create account', 'register', 'sign up', 'continue', 'next', 'submit'];
-      const btns = document.querySelectorAll<HTMLElement>(
-        'button, input[type="submit"], [role="button"]'
-      );
-      for (const btn of btns) {
-        const text = (btn.textContent || (btn as HTMLInputElement).value || '').trim().toLowerCase();
-        if (TEXTS.some(t => text === t || (text.length < 30 && text.includes(t)))) {
-          btn.click();
-          return true;
-        }
-      }
-      // Try submitting the form directly
-      const form = document.querySelector('form');
-      if (form) { form.requestSubmit(); return true; }
-      return false;
-    });
+    await this.fillAccountCreationCredentials(adapter, email, password);
+    const submitted = await this.submitAccountCreationDom(adapter);
 
     if (submitted) {
       console.log('[SmartApply] DOM submitted account creation form.');
       await adapter.page.waitForTimeout(3000);
       await this.waitForPageLoad(adapter);
 
-      // Check if we're still on the account creation page (validation errors, missed checkbox, etc.)
-      const stillOnCreateAccount = await adapter.page.evaluate(() => {
-        return document.querySelectorAll('input[type="password"]:not([disabled])').length > 1;
-      });
+      let transition = await this.inspectAccountCreationTransition(adapter);
+      let stillOnCreateAccount = transition.state === 'account_creation';
+
+      if (stillOnCreateAccount && passwordResolution.source !== 'platform_override') {
+        const validationText = transition.validationText;
+        if (validationText) {
+          const strengthened =
+            platform === 'workday' && email
+              ? (() => {
+                  const generated = generatePlatformCredential(profile, platform, email, {
+                    validationText,
+                    sourceUrl: currentUrl,
+                  });
+                  this.rememberGeneratedPlatformCredential(profile, generated.credential, generated.event);
+                  return {
+                    password: generated.credential.secret,
+                    source: generated.credential.source,
+                  };
+                })()
+              : resolvePlatformAccountPassword(profile, platform, {
+                  validationText,
+                  sourceUrl: currentUrl,
+                });
+          if (strengthened.password !== password) {
+            passwordResolution = strengthened;
+            password = strengthened.password;
+            console.log(
+              `[SmartApply] Retrying account creation with strengthened password ` +
+              `(source=${strengthened.source}) after validation hint: ${validationText.slice(0, 180)}`,
+            );
+            await this.fillAccountCreationCredentials(adapter, email, password);
+            const retried = await this.submitAccountCreationDom(adapter);
+            if (retried) {
+              await adapter.page.waitForTimeout(3000);
+              await this.waitForPageLoad(adapter);
+              transition = await this.inspectAccountCreationTransition(adapter);
+              stillOnCreateAccount = transition.state === 'account_creation';
+            }
+          }
+        }
+      }
 
       if (!stillOnCreateAccount) {
-        console.log('[SmartApply] Account creation succeeded (DOM-only).');
+        this.markAccountCreationCompleted(profile, platform, transition);
+        if (opts) {
+          await this.persistConfirmedAccountCreationBestEffort({
+            job: opts.job,
+            platform,
+            transition,
+            pageContext: opts.pageContext,
+          });
+        }
+        console.log(`[SmartApply] Account creation succeeded (DOM-only → ${transition.state}).`);
         return;
       }
       console.log('[SmartApply] Still on account creation page after DOM submit — falling back to MagnitudeHand...');
@@ -2059,27 +2733,260 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
     );
 
     if (!result.success) {
-      const hasPasswordField = await adapter.page.evaluate(() =>
-        document.querySelectorAll('input[type="password"]').length > 0
-      );
-      if (!hasPasswordField) {
-        console.log('[SmartApply] act() reported failure but page has moved past account creation — continuing.');
+      const transition = await this.inspectAccountCreationTransition(adapter);
+      if (transition.state !== 'account_creation') {
+        this.markAccountCreationCompleted(profile, platform, transition);
+        if (opts) {
+          await this.persistConfirmedAccountCreationBestEffort({
+            job: opts.job,
+            platform,
+            transition,
+            pageContext: opts.pageContext,
+          });
+        }
+        console.log(
+          `[SmartApply] act() reported failure but account creation transitioned to ${transition.state} — continuing.`,
+        );
         return;
       }
       throw new Error(`Failed to create account: ${result.message}`);
     }
 
     await this.waitForPageLoad(adapter);
+    const transition = await this.inspectAccountCreationTransition(adapter);
+    if (transition.state !== 'account_creation') {
+      this.markAccountCreationCompleted(profile, platform, transition);
+      if (opts) {
+        await this.persistConfirmedAccountCreationBestEffort({
+          job: opts.job,
+          platform,
+          transition,
+          pageContext: opts.pageContext,
+        });
+      }
+      console.log(`[SmartApply] Account creation succeeded (Magnitude fallback → ${transition.state}).`);
+      return;
+    }
+    const validationSuffix = transition.validationText
+      ? `: ${transition.validationText.slice(0, 180)}`
+      : '';
+    throw new Error(`Account creation did not leave the create-account view${validationSuffix}`);
   }
 
-  private resolveAccountCreationPassword(profile: Record<string, any>): string {
-    const fromProfile =
-      (typeof profile.applicationPassword === 'string' && profile.applicationPassword.trim()) ||
-      (typeof profile.application_password === 'string' && profile.application_password.trim()) ||
-      (typeof profile.password === 'string' && profile.password.trim()) ||
-      '';
+  private async fillAccountCreationCredentials(
+    adapter: BrowserAutomationAdapter,
+    email: string,
+    password: string,
+  ): Promise<void> {
+    await adapter.page.evaluate((e: string) => {
+      const sels = [
+        'input[type="email"]', 'input[autocomplete="email"]',
+        'input[data-automation-id*="email" i]',
+        'input[name*="email" i]', 'input[id*="email" i]',
+      ];
+      for (const sel of sels) {
+        const input = document.querySelector<HTMLInputElement>(sel + ':not([disabled])');
+        if (input && input.getBoundingClientRect().width > 0 && !input.value?.trim()) {
+          input.focus();
+          input.value = e;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          break;
+        }
+      }
+    }, email);
 
-    return fromProfile || process.env.TEST_GMAIL_PASSWORD || 'defaultPassword123';
+    await adapter.page.evaluate((pw: string) => {
+      const inputs = document.querySelectorAll<HTMLInputElement>('input[type="password"]:not([disabled])');
+      for (const input of inputs) {
+        if (input.getBoundingClientRect().width > 0) {
+          input.focus();
+          input.value = pw;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
+    }, password);
+
+    await adapter.page.waitForTimeout(300);
+  }
+
+  private async submitAccountCreationDom(adapter: BrowserAutomationAdapter): Promise<boolean> {
+    await adapter.page.evaluate(() => {
+      const containers = document.querySelectorAll(
+        '[role="dialog"], [class*="modal"], [class*="Modal"], [class*="dialog"], ' +
+        '[class*="Dialog"], [data-automation-id*="dialog"], [data-automation-id*="panel"], ' +
+        'form, [class*="scroll"], [class*="Scroll"]',
+      );
+      for (const container of containers) {
+        const el = container as HTMLElement;
+        if (el.scrollHeight > el.clientHeight) {
+          el.scrollTop = el.scrollHeight;
+        }
+      }
+      window.scrollTo(0, document.documentElement.scrollHeight);
+    });
+
+    await adapter.page.waitForTimeout(500);
+
+    const checkedCount = await adapter.page.evaluate(() => {
+      let count = 0;
+      const htmlCheckboxes = document.querySelectorAll<HTMLInputElement>(
+        'input[type="checkbox"]:not(:checked):not([disabled])',
+      );
+      for (const cb of htmlCheckboxes) {
+        cb.click();
+        count++;
+      }
+
+      const ariaCheckboxes = document.querySelectorAll<HTMLElement>(
+        '[role="checkbox"][aria-checked="false"]:not([aria-disabled="true"])',
+      );
+      for (const cb of ariaCheckboxes) {
+        cb.click();
+        count++;
+      }
+
+      return count;
+    });
+    console.log(`[SmartApply] DOM checked ${checkedCount} checkbox(es)`);
+
+    await adapter.page.waitForTimeout(300);
+
+    return adapter.page.evaluate(() => {
+      const TEXTS = ['create account', 'register', 'sign up', 'continue', 'next', 'submit'];
+      const btns = document.querySelectorAll<HTMLElement>(
+        'button, input[type="submit"], [role="button"]',
+      );
+      for (const btn of btns) {
+        const text = (btn.textContent || (btn as HTMLInputElement).value || '').trim().toLowerCase();
+        if (TEXTS.some((t) => text === t || (text.length < 30 && text.includes(t)))) {
+          btn.click();
+          return true;
+        }
+      }
+
+      const form = document.querySelector('form');
+      if (form) {
+        form.requestSubmit();
+        return true;
+      }
+      return false;
+    });
+  }
+
+  private markAccountCreationCompleted(
+    profile: Record<string, any>,
+    platform: string | null,
+    transition: {
+      state: AccountCreationTransitionState;
+      currentUrl: string;
+    },
+  ): void {
+    profile._createAccountAttempted = true;
+    profile._accountCreationCompleted = true;
+    profile._workdayForceAccountCreation = false;
+    profile._lastAccountCreationTransition = transition.state;
+    const domain = inferCredentialDomainFromUrl(transition.currentUrl);
+    if (domain) {
+      profile._lastAccountCreationDomain = domain;
+    }
+    profile._forceNativeLoginAfterAccountCreation =
+      platform === 'workday' && transition.state === 'login';
+  }
+
+  private async inspectAccountCreationTransition(
+    adapter: BrowserAutomationAdapter,
+  ): Promise<{
+    state: AccountCreationTransitionState;
+    currentUrl: string;
+    validationText: string;
+  }> {
+    const currentUrl = await adapter.getCurrentUrl().catch(() => adapter.page.url() || '');
+    const validationText = await this.readAccountCreationValidationText(adapter);
+    const domState = await adapter.page.evaluate(() => {
+      const isVisible = (el: Element | null): el is HTMLElement => {
+        if (!el) return false;
+        const node = el as HTMLElement;
+        if (node.closest('[hidden], [aria-hidden="true"]')) return false;
+        const style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+          return false;
+        }
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
+      const visiblePasswordFields = Array.from(
+        document.querySelectorAll<HTMLInputElement>('input[type="password"]:not([disabled])'),
+      ).filter((input) => isVisible(input));
+      const headings = Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]'));
+      const headingText = headings
+        .map((heading) => (heading.textContent || '').toLowerCase())
+        .join(' ');
+      const clickables = Array.from(
+        document.querySelectorAll<HTMLElement>('button, a, [role="tab"], [role="button"], [role="link"]'),
+      ).filter((el) => isVisible(el));
+      const clickableText = clickables
+        .map((el) => (el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase())
+        .join(' ');
+      const bodyText = document.body.innerText.toLowerCase();
+
+      return {
+        hasPasswordField: visiblePasswordFields.length > 0,
+        hasConfirmPassword: visiblePasswordFields.length > 1,
+        hasSignInOption:
+          clickableText.includes('sign in') ||
+          clickableText.includes('log in') ||
+          clickableText.includes('continue with google') ||
+          clickableText.includes('sign in with google'),
+        hasCreateAccountHeading:
+          headingText.includes('create account') ||
+          headingText.includes('register') ||
+          headingText.includes('sign up'),
+        hasVerificationPrompt:
+          bodyText.includes('verify your email') ||
+          bodyText.includes('check your email') ||
+          bodyText.includes('verification code') ||
+          bodyText.includes('confirm your email') ||
+          bodyText.includes('one-time code'),
+      };
+    });
+
+    return {
+      state: inferAccountCreationTransition({
+        currentUrl,
+        validationText,
+        ...domState,
+      }),
+      currentUrl,
+      validationText,
+    };
+  }
+
+  private async readAccountCreationValidationText(adapter: BrowserAutomationAdapter): Promise<string> {
+    return adapter.page.evaluate(() => {
+      const selectors = [
+        '[role="alert"]',
+        '[aria-live="assertive"]',
+        '[aria-live="polite"]',
+        '[data-automation-id*="error" i]',
+        '[class*="error"]',
+        '[class*="Error"]',
+        '[class*="validation"]',
+      ];
+      const messages = new Set<string>();
+      for (const selector of selectors) {
+        const elements = document.querySelectorAll<HTMLElement>(selector);
+        for (const element of elements) {
+          const rect = element.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          const text = (element.textContent || '').replace(/\s+/g, ' ').trim();
+          if (text) messages.add(text);
+        }
+      }
+      return [...messages].join(' | ').slice(0, 500);
+    });
   }
 
   // =========================================================================
@@ -2141,6 +3048,20 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
           : undefined,
       });
       console.log(`[SmartApply] formFiller: ${fillResult.domFilled} DOM + ${fillResult.magnitudeFilled} Magnitude filled (${fillResult.llmCalls} LLM calls)`);
+      if (fillResult.pageFillContext) {
+        const unresolved = fillResult.pageFillContext.fields
+          .filter((field) => field.state !== 'valid' && field.state !== 'skipped_optional')
+          .map((field) => ({
+            name: field.name,
+            state: field.state,
+            currentValue: field.currentValue,
+            desiredAnswer: field.desiredAnswer,
+            visibleErrors: field.visibleErrors,
+          }));
+        if (unresolved.length > 0) {
+          console.log(`[SmartApply] DOM sanity unresolved context: ${JSON.stringify(unresolved)}`);
+        }
+      }
       // Expose fill counts for the main loop's zero-field detection
       this._lastFillTotalFields = fillResult.totalFields;
       this._lastFillDomFilled = fillResult.domFilled;
@@ -2216,6 +3137,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       // Check for validation errors
       const hasErrors = await config.detectValidationErrors(adapter);
       if (hasErrors) {
+        await this.logVisibleValidationErrors(adapter, 'Validation errors after clicking Next');
         console.log(`[SmartApply] Validation errors after clicking Next — re-filling.`);
         // Pass null for resumePath on retries — resume was already uploaded on first attempt.
         // Workday replaces the file input after processing, creating a fresh one for "add another file",
@@ -2256,6 +3178,7 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
       // Check if site auto-scrolled (validation errors without error markers)
       const scrollAfterClick = await adapter.page.evaluate(() => window.scrollY);
       if (Math.abs(scrollAfterClick - scrollBeforeClick) > 50) {
+        await this.logVisibleValidationErrors(adapter, 'Validation errors after auto-scroll');
         console.log(`[SmartApply] Clicked Next — page auto-scrolled to unfilled fields. Re-filling.`);
         return this.fillPage(
           adapter,
@@ -2305,11 +3228,45 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
 
     // Fallback review detection
     const hasSubmitFallback = await adapter.page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a.btn'));
-      return btns.some(b => {
-        const text = (b.textContent || (b as HTMLInputElement).value || '').trim().toLowerCase();
-        return text.includes('submit') || text === 'send application';
-      });
+      const roots: ParentNode[] = [document];
+      const seenShadowRoots = new Set<ShadowRoot>();
+      for (let index = 0; index < roots.length; index += 1) {
+        const root = roots[index];
+        const elements = Array.from(root.querySelectorAll<HTMLElement>('*'));
+        for (const element of elements) {
+          const shadowRoot = element.shadowRoot;
+          if (shadowRoot && !seenShadowRoots.has(shadowRoot)) {
+            seenShadowRoots.add(shadowRoot);
+            roots.push(shadowRoot);
+          }
+        }
+      }
+
+      for (const root of roots) {
+        const clickables = Array.from(
+          root.querySelectorAll<HTMLElement>(
+            'button, [role="button"], [role="link"], input[type="submit"], input[type="button"], a[href], a.btn, a[class*="btn"], a[class*="button"]',
+          ),
+        );
+        for (const clickable of clickables) {
+          const rect = clickable.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          const text = (
+            clickable.textContent ||
+            clickable.getAttribute('value') ||
+            clickable.getAttribute('aria-label') ||
+            clickable.getAttribute('title') ||
+            ''
+          )
+            .trim()
+            .toLowerCase();
+          if (text.includes('submit') || text === 'send application' || text.includes('review')) {
+            return true;
+          }
+        }
+      }
+
+      return false;
     });
     if (hasSubmitFallback) {
       const domReview = await this.checkIfReviewPage(adapter);
@@ -2939,26 +3896,57 @@ IMPORTANT: Do NOT select, clear, or retype any already-filled fields.`,
    */
   private async checkIfReviewPage(adapter: BrowserAutomationAdapter): Promise<boolean> {
     return adapter.page.evaluate(() => {
-      const headings = Array.from(document.querySelectorAll('h1, h2, h3'));
+      const roots: ParentNode[] = [document];
+      const seenShadowRoots = new Set<ShadowRoot>();
+      for (let index = 0; index < roots.length; index += 1) {
+        const root = roots[index];
+        const elements = Array.from(root.querySelectorAll<HTMLElement>('*'));
+        for (const element of elements) {
+          const shadowRoot = element.shadowRoot;
+          if (shadowRoot && !seenShadowRoots.has(shadowRoot)) {
+            seenShadowRoots.add(shadowRoot);
+            roots.push(shadowRoot);
+          }
+        }
+      }
+
+      const headings = roots.flatMap((root) => Array.from(root.querySelectorAll('h1, h2, h3, [role="heading"]')));
       const isReviewHeading = headings.some(h => (h.textContent || '').toLowerCase().includes('review'));
       if (!isReviewHeading) return false;
-      const buttons = Array.from(document.querySelectorAll('button'));
+      const buttons = roots.flatMap((root) =>
+        Array.from(
+          root.querySelectorAll('button, [role="button"], [role="link"], input[type="submit"], input[type="button"], a[href]'),
+        ),
+      );
       const SUBMIT_TEXTS = ['submit', 'submit application', 'submit my application', 'submit this application', 'send application'];
       const hasSubmit = buttons.some(b => {
-        const text = (b.textContent?.trim().toLowerCase() || '');
+        const text = (
+          b.textContent ||
+          b.getAttribute('value') ||
+          b.getAttribute('aria-label') ||
+          b.getAttribute('title') ||
+          ''
+        )
+          .trim()
+          .toLowerCase();
         return SUBMIT_TEXTS.indexOf(text) !== -1 || text.startsWith('submit');
       });
       if (!hasSubmit) return false;
       // Check entire page for any editable form elements
-      const editableCount = document.querySelectorAll(
-        'input[type="text"]:not([readonly]):not([disabled]), ' +
-        'input[type="email"]:not([readonly]):not([disabled]), ' +
-        'input[type="tel"]:not([readonly]):not([disabled]), ' +
-        'textarea:not([readonly]):not([disabled]), ' +
-        'select:not([disabled]), ' +
-        'input[type="radio"]:not([disabled]), ' +
-        'input[type="checkbox"]:not([disabled])'
-      ).length;
+      const editableCount = roots.reduce((count, root) => {
+        return (
+          count +
+          root.querySelectorAll(
+            'input[type="text"]:not([readonly]):not([disabled]), ' +
+              'input[type="email"]:not([readonly]):not([disabled]), ' +
+              'input[type="tel"]:not([readonly]):not([disabled]), ' +
+              'textarea:not([readonly]):not([disabled]), ' +
+              'select:not([disabled]), ' +
+              'input[type="radio"]:not([disabled]), ' +
+              'input[type="checkbox"]:not([disabled])',
+          ).length
+        );
+      }, 0);
       // If there are interactive form elements, probably not a true review page
       return editableCount === 0;
     });

@@ -76,25 +76,8 @@ export class PageScanner {
     const url = this.page.url();
     const pageType = await detectPageType(this.page);
 
-    // Clean stale scan indices from prior scans
-    await this.page.evaluate(`
-      (() => {
-        var tagged = document.querySelectorAll('[data-gh-scan-idx]');
-        for (var i = 0; i < tagged.length; i++) {
-          tagged[i].removeAttribute('data-gh-scan-idx');
-        }
-      })()
-    `);
-
-    // Get page dimensions
-    const dimensions = await this.page.evaluate(`
-      (() => {
-        return {
-          scrollHeight: document.documentElement.scrollHeight,
-          viewportHeight: window.innerHeight,
-        };
-      })()
-    `) as { scrollHeight: number; viewportHeight: number };
+    await this.clearScanIndices();
+    const dimensions = await this.getPageDimensions();
 
     // Scroll to top
     await this.page.evaluate('window.scrollTo(0, 0)');
@@ -214,6 +197,99 @@ export class PageScanner {
   }
 
   /**
+   * Perform a non-mutating scan of only the currently visible viewport.
+   * Used by the decision loop so page observations do not scroll the page
+   * and accidentally invalidate the user-visible/auth state we are deciding on.
+   */
+  async scanCurrentViewport(): Promise<PageModel> {
+    const url = this.page.url();
+    const pageType = await detectPageType(this.page);
+
+    await this.clearScanIndices();
+    const dimensions = await this.getPageDimensions();
+    const scrollY = await this.page.evaluate(() => Math.round(window.scrollY));
+
+    const visibleResult = await this.extractVisibleElements(scrollY, 0, 0);
+    const fields: FieldModel[] = visibleResult.fields
+      .sort((a, b) => a.absoluteY - b.absoluteY)
+      .map((field, index) => ({
+        ...field,
+        id: `field-${index}`,
+      }));
+
+    const pageLabel = await this.page.evaluate(`
+      (() => {
+        function isVisible(el) {
+          if (!el) return false;
+          var rect = el.getBoundingClientRect();
+          var style = window.getComputedStyle(el);
+          return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            rect.bottom > 0 &&
+            rect.top < window.innerHeight &&
+            style.display !== 'none' &&
+            style.visibility !== 'hidden'
+          );
+        }
+        var headings = document.querySelectorAll('h1, [role="heading"][aria-level="1"], [data-automation-id="pageHeaderText"]');
+        for (var i = 0; i < headings.length; i++) {
+          if (isVisible(headings[i])) {
+            return (headings[i].textContent || '').trim();
+          }
+        }
+        return '';
+      })()
+    `) as string;
+
+    const model: PageModel = {
+      url,
+      platform: this.platform,
+      pageType,
+      fields,
+      buttons: visibleResult.buttons,
+      pageLabel: pageLabel || undefined,
+      scrollHeight: dimensions.scrollHeight,
+      viewportHeight: dimensions.viewportHeight,
+      timestamp: Date.now(),
+    };
+
+    this.logger.info('Current-view page scan complete', {
+      url,
+      platform: this.platform,
+      pageType,
+      fieldCount: fields.length,
+      buttonCount: visibleResult.buttons.length,
+      pageLabel: pageLabel || '(none)',
+      scrollY,
+    });
+
+    return model;
+  }
+
+  private async clearScanIndices(): Promise<void> {
+    await this.page.evaluate(`
+      (() => {
+        var tagged = document.querySelectorAll('[data-gh-scan-idx]');
+        for (var i = 0; i < tagged.length; i++) {
+          tagged[i].removeAttribute('data-gh-scan-idx');
+        }
+      })()
+    `);
+  }
+
+  private async getPageDimensions(): Promise<{ scrollHeight: number; viewportHeight: number }> {
+    return this.page.evaluate(`
+      (() => {
+        return {
+          scrollHeight: document.documentElement.scrollHeight,
+          viewportHeight: window.innerHeight,
+        };
+      })()
+    `) as Promise<{ scrollHeight: number; viewportHeight: number }>;
+  }
+
+  /**
    * Extract all interactive elements visible at the current scroll position.
    * Runs a single page.evaluate() call that returns raw field/button data.
    */
@@ -235,6 +311,7 @@ export class PageScanner {
         var viewportHeight = window.innerHeight;
         var viewportWidth = window.innerWidth;
         var idx = startIdx;
+        var ff = window.__ff;
 
         // ── Helpers ────────────────────────────────────────────────
 
@@ -260,6 +337,13 @@ export class PageScanner {
             width: Math.round(rect.width),
             height: Math.round(rect.height),
           };
+        }
+
+        function qAll(selector) {
+          if (ff && typeof ff.queryAll === 'function') {
+            return ff.queryAll(selector);
+          }
+          return Array.from(document.querySelectorAll(selector));
         }
 
         function buildSelector(el, idx) {
@@ -503,7 +587,7 @@ export class PageScanner {
           if (fieldType === 'radio') {
             var groupName = el.getAttribute('name');
             if (groupName) {
-              var radios = document.querySelectorAll('input[type="radio"][name="' + CSS.escape(groupName) + '"]');
+              var radios = qAll('input[type="radio"][name="' + CSS.escape(groupName) + '"]');
               var rOpts = [];
               for (var r = 0; r < radios.length; r++) {
                 var rLabel = '';
@@ -553,7 +637,7 @@ export class PageScanner {
           'select',
         ].join(', ');
 
-        var standardEls = document.querySelectorAll(inputSelectors);
+        var standardEls = qAll(inputSelectors);
         for (var si = 0; si < standardEls.length; si++) {
           var el = standardEls[si];
           if (!isVisible(el)) continue;
@@ -610,7 +694,7 @@ export class PageScanner {
         }
 
         // Radio inputs (type="radio") that may not have been caught
-        var radioEls = document.querySelectorAll('input[type="radio"]');
+        var radioEls = qAll('input[type="radio"]');
         for (var ri = 0; ri < radioEls.length; ri++) {
           var radio = radioEls[ri];
           if (!isVisible(radio)) continue;
@@ -648,7 +732,7 @@ export class PageScanner {
         }
 
         // Custom dropdowns: role="combobox", [aria-haspopup="listbox"] (non-button)
-        var comboboxEls = document.querySelectorAll('[role="combobox"], [aria-haspopup="listbox"]:not(button):not(select)');
+        var comboboxEls = qAll('[role="combobox"], [aria-haspopup="listbox"]:not(button):not(select)');
         for (var ci = 0; ci < comboboxEls.length; ci++) {
           var cEl = comboboxEls[ci];
           if (!isVisible(cEl)) continue;
@@ -687,7 +771,7 @@ export class PageScanner {
 
         // Workday "Select One" buttons
         if (platform === 'workday') {
-          var allBtns = document.querySelectorAll('button');
+          var allBtns = qAll('button');
           for (var wb = 0; wb < allBtns.length; wb++) {
             var wBtn = allBtns[wb];
             var wText = (wBtn.textContent || '').trim();
@@ -726,7 +810,7 @@ export class PageScanner {
         }
 
         // ARIA radio groups
-        var radioGroups = document.querySelectorAll('[role="radiogroup"]');
+        var radioGroups = qAll('[role="radiogroup"]');
         for (var rg = 0; rg < radioGroups.length; rg++) {
           var rgEl = radioGroups[rg];
           if (!isVisible(rgEl)) continue;
@@ -762,7 +846,7 @@ export class PageScanner {
         }
 
         // Contenteditable elements
-        var ceEls = document.querySelectorAll('[contenteditable="true"]');
+        var ceEls = qAll('[contenteditable="true"]');
         for (var ce = 0; ce < ceEls.length; ce++) {
           var ceEl = ceEls[ce];
           if (!isVisible(ceEl)) continue;
@@ -803,7 +887,7 @@ export class PageScanner {
 
         (function detectButtonGroups() {
           // Find all visible buttons that could be answer choices
-          var allBtnEls = document.querySelectorAll('button, [role="button"]');
+          var allBtnEls = qAll('button, [role="button"]');
           // Group buttons by their parent container
           var parentMap = {};
           for (var bg = 0; bg < allBtnEls.length; bg++) {
@@ -924,9 +1008,9 @@ export class PageScanner {
 
             // Clean up the label
             questionLabel = questionLabel
-              .replace(/\s*\*\s*/g, ' ')
-              .replace(/\s*Required\s*/gi, '')
-              .replace(/\s+/g, ' ')
+              .replace(/\\s*\\*\\s*/g, ' ')
+              .replace(/\\s*Required\\s*/gi, '')
+              .replace(/\\s+/g, ' ')
               .trim();
             if (questionLabel.length > 200) questionLabel = questionLabel.substring(0, 200).trim();
 
@@ -1009,7 +1093,7 @@ export class PageScanner {
 
         // ── Scan buttons ──────────────────────────────────────────
 
-        var btnEls = document.querySelectorAll('button, [role="button"], input[type="submit"]');
+        var btnEls = qAll('button, [role="button"], input[type="submit"]');
         for (var bi = 0; bi < btnEls.length; bi++) {
           var bEl = btnEls[bi];
           if (!isVisible(bEl)) continue;

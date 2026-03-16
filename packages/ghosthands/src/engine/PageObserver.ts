@@ -77,7 +77,15 @@ export async function detectPageType(page: Page): Promise<string> {
       const hasForm = forms.length > 0;
       const hasFileInput = !!document.querySelector('input[type="file"]');
       const hasPasswordInput = !!document.querySelector('input[type="password"]');
+      const passwordCount = document.querySelectorAll('input[type="password"]').length;
       const bodyText = document.body?.innerText?.toLowerCase() ?? '';
+
+      if (
+        passwordCount >= 2 &&
+        (bodyText.includes('create account') || bodyText.includes('start your application') || bodyText.includes('verify new password'))
+      ) {
+        return 'account_creation';
+      }
 
       // Login page
       if (hasPasswordInput && (bodyText.includes('sign in') || bodyText.includes('log in'))) {
@@ -112,6 +120,14 @@ export async function detectPageType(page: Page): Promise<string> {
 
       // Regular form
       if (hasForm) return 'form';
+
+      const hasApplyButton = Array.from(
+        document.querySelectorAll('button, a, [role="button"], input[type="submit"]'),
+      ).some((el) => {
+        const text = (el.textContent || (el as HTMLInputElement).value || '').toLowerCase();
+        return /apply( now)?|start application|apply manually/.test(text) && !/submit/.test(text);
+      });
+      if (hasApplyButton) return 'job_listing';
 
       return 'unknown';
     });

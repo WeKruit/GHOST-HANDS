@@ -546,7 +546,7 @@ function buildSystemPrompt(
     for (const exp of expArr) {
       const end = exp.currently_work_here ? 'Present' : (exp.end_date || '');
       lines.push(`    - ${exp.title || ''} at ${exp.company || ''}, ${exp.start_date || ''}–${end}`);
-      if (exp.description) lines.push(`      ${String(exp.description).slice(0, 200)}`);
+      if (exp.description) lines.push(`      ${String(exp.description).slice(0, 1000)}`);
     }
   }
   lines.push('');

@@ -135,6 +135,24 @@ export interface QuestionRecord {
   verificationCount: number;
   warnings: string[];
   fieldIds: string[];
+  /**
+   * Which actor last modified this field.
+   * Added by merged observer; null for legacy flows.
+   */
+  lastActor?: 'dom' | 'stagehand' | 'magnitude' | 'human' | null;
+  /**
+   * Stable hash of the section heading + field order within that section.
+   * Used to detect DOM restructuring (repeater expansion) without full navigation.
+   */
+  sectionFingerprint?: string | null;
+  /**
+   * Provenance from the merged observer (which observation systems saw this field).
+   * Only present when the merged observer pipeline is active.
+   */
+  observerProvenance?: {
+    sources: Array<'dom' | 'ax' | 'stagehand'>;
+    concordant: boolean | null;
+  };
   lastUpdatedAt: string;
 }
 
@@ -158,6 +176,7 @@ export interface LogicalPageRecord {
   coverage: PageCoverage;
   mergeStats: PageMergeStats;
   domSummary?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface ContextReport {

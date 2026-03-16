@@ -21,10 +21,11 @@ const logger = getLogger({ service: 'Worker' });
  *   by the heartbeat stale-worker reaper.
  */
 export async function resolveWorkerId(): Promise<string> {
-  // 1. CLI arg (explicit override)
-  const arg = process.argv.find((a) => a.startsWith('--worker-id='));
+  // 1. CLI arg (explicit override) — use last occurrence so "bun run worker:named --worker-id=dev-1" wins over script's --worker-id=my-name
+  const args = process.argv.filter((a) => a.startsWith('--worker-id='));
+  const arg = args.length > 0 ? args[args.length - 1] : null;
   if (arg) {
-    const id = arg.split('=')[1];
+    const id = arg.split('=').slice(1).join('=').trim();
     if (!id) {
       throw new Error('--worker-id requires a value (e.g. --worker-id=adam)');
     }

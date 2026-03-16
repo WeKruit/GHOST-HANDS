@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'bun:test';
-import { SmartApplyHandler } from '../../workers/taskHandlers/smartApplyHandler.js';
+import {
+  SmartApplyHandler,
+  inferAccountCreationTransition,
+  resolvePlatformConfigForExecution,
+  shouldAllowGoogleSsoForLogin,
+  shouldStopForManualReviewAfterStableRepeat,
+} from '../../workers/taskHandlers/smartApplyHandler.js';
 
 describe('SmartApplyHandler', () => {
   const handler = new SmartApplyHandler();
@@ -72,5 +78,124 @@ describe('SmartApplyHandler', () => {
       expect(result.valid).toBe(false);
       expect(result.errors).toHaveLength(3);
     });
+  });
+
+  test('records generated tenant credentials on the in-memory profile and result metadata', () => {
+    const mutableHandler = new SmartApplyHandler() as any;
+    const profile: Record<string, unknown> = {
+      email: 'profile@example.com',
+    };
+
+    mutableHandler.rememberGeneratedPlatformCredential(
+      profile,
+      {
+        platform: 'workday',
+        domain: 'cadence.wd1.myworkdayjobs.com',
+        loginIdentifier: 'tenant@example.com',
+        secret: 'TenantWorkday!234',
+        source: 'generated_platform_password',
+        requirements: ['minimum 12 characters'],
+      },
+      {
+        platform: 'workday',
+        domain: 'cadence.wd1.myworkdayjobs.com',
+        loginIdentifier: 'tenant@example.com',
+        action: 'generated_platform_password',
+        passwordSource: 'generated_platform_password',
+        requirements: ['minimum 12 characters'],
+        note: 'Generated a tenant-scoped Workday credential.',
+      },
+    );
+    mutableHandler.confirmGeneratedPlatformCredential(
+      'workday',
+      'https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers/login?redirect=apply',
+    );
+
+    const result = mutableHandler.withAccountCreationMetadata({
+      success: true,
+    });
+
+    expect((profile as any).workday_email).toBe('tenant@example.com');
+    expect((profile as any).workday_password).toBe('TenantWorkday!234');
+    expect((profile as any).platform_credentials.workday.byDomain['cadence.wd1.myworkdayjobs.com']).toMatchObject({
+      email: 'tenant@example.com',
+      password: 'TenantWorkday!234',
+    });
+    expect(result.runtimeMetadata?.generatedPlatformCredentials?.[0]?.domain).toBe(
+      'cadence.wd1.myworkdayjobs.com',
+    );
+    expect(result.runtimeMetadata?.accountCreationEvents?.[0]?.domain).toBe(
+      'cadence.wd1.myworkdayjobs.com',
+    );
+  });
+
+  test('infers login transition after account creation when Workday lands on sign-in', () => {
+    expect(
+      inferAccountCreationTransition({
+        currentUrl:
+          'https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers/login?redirect=apply',
+        hasPasswordField: true,
+        hasConfirmPassword: false,
+        hasSignInOption: true,
+        hasCreateAccountHeading: true,
+        hasVerificationPrompt: false,
+        validationText: '',
+      }),
+    ).toBe('login');
+  });
+
+  test('stops for manual review when a filled form repeats without navigation', () => {
+    expect(
+      shouldStopForManualReviewAfterStableRepeat({
+        result: 'complete',
+        samePageCount: 1,
+        totalFields: 16,
+        pageType: 'personal_info',
+      }),
+    ).toBe(true);
+    expect(
+      shouldStopForManualReviewAfterStableRepeat({
+        result: 'complete',
+        samePageCount: 0,
+        totalFields: 16,
+        pageType: 'personal_info',
+        matchedCompletedSignature: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldStopForManualReviewAfterStableRepeat({
+        result: 'complete',
+        samePageCount: 0,
+        totalFields: 16,
+        pageType: 'personal_info',
+      }),
+    ).toBe(false);
+  });
+
+  test('preserves Workday platform config for mastra execution', () => {
+    const config = resolvePlatformConfigForExecution(
+      'https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers/job/SAN-JOSE/Software-Engineer-I_R53533-1/apply/applyManually',
+      'mastra',
+    );
+
+    expect(config.platformId).toBe('workday');
+  });
+
+  test('disables Google SSO on Workday-host login flows', () => {
+    expect(
+      shouldAllowGoogleSsoForLogin(
+        'https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers/login?redirect=apply',
+        {},
+      ),
+    ).toBe(false);
+  });
+
+  test('disables Google SSO after account creation even on non-Workday hosts', () => {
+    expect(
+      shouldAllowGoogleSsoForLogin(
+        'https://jobs.example.com/login',
+        { _accountCreationCompleted: true },
+      ),
+    ).toBe(false);
   });
 });

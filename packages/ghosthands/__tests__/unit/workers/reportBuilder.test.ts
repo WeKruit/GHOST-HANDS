@@ -294,4 +294,28 @@ describe('buildApplicationReport', () => {
     const report = buildApplicationReport(job, null, makeCostSnapshot(), { success: true }, [], 'completed');
     expect(report.resume_ref).toBe('resumes/my-resume.pdf');
   });
+
+  test('appends account-creation notes to the report summary', () => {
+    const report = buildApplicationReport(
+      makeJob(),
+      null,
+      makeCostSnapshot(),
+      {
+        success: true,
+        data: {
+          summary: 'Application submitted successfully',
+          account_creation_events: [
+            {
+              note: 'Generated a workday account password for test@example.com to satisfy: minimum 12 characters, special character.',
+            },
+          ],
+        },
+      },
+      [],
+      'completed',
+    );
+
+    expect(report.result_summary).toContain('Application submitted successfully');
+    expect(report.result_summary).toContain('Generated a workday account password');
+  });
 });

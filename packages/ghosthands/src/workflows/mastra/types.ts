@@ -2,10 +2,11 @@ import { z } from 'zod';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { BrowserAutomationAdapter, HitlCapableAdapter } from '../../adapters/types.js';
 import type { PageContextService } from '../../context/PageContextService.js';
+import { DecisionLoopStateSchema } from '../../engine/decision/types.js';
 import type { CostTracker } from '../../workers/costControl.js';
 import type { ProgressTracker } from '../../workers/progressTracker.js';
 import type { EmailVerificationService } from '../../workers/emailVerification/types.js';
-import type { TaskHandler, AutomationJob } from '../../workers/taskHandlers/types.js';
+import type { TaskHandler, AutomationJob, AnthropicClientConfig } from '../../workers/taskHandlers/types.js';
 
 // ---------------------------------------------------------------------------
 // Serializable Workflow State (persisted by Mastra in PostgresStore)
@@ -58,6 +59,10 @@ export const workflowState = z.object({
     'completed',
     'failed',
   ]).default('running'),
+
+  // Decision loop state (only present when using page_decision_loop step).
+  // Schema imported from the canonical source in engine/decision/types.
+  decisionLoop: DecisionLoopStateSchema.optional(),
 });
 
 export type WorkflowState = z.infer<typeof workflowState>;
@@ -81,6 +86,10 @@ export interface RuntimeContext {
   logEvent: (eventType: string, metadata: Record<string, unknown>) => Promise<void>;
   workerId: string;
   uploadScreenshot?: (jobId: string, name: string, buffer: Buffer) => Promise<string>;
+  /** LLM client config for the decision engine (VALET proxy baseURL + managed grant). */
+  llmClientConfig?: {
+    anthropic?: AnthropicClientConfig;
+  };
   /** Block handler execution until human completes a manual action (email verification, etc.) */
   waitForManualAction?: (options: {
     type: string;
